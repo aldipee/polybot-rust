@@ -7,7 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 instance_name="$1"
-root_dir="${POLYBOT_ROOT:-/opt/polybot}"
+root_dir="${POLYBOT_ROOT:-/root/polybot-rust}"
 instance_dir="$root_dir/instances/$instance_name"
 bin_path="${POLYBOT_BIN:-$root_dir/target/release/polybot_convert_rust}"
 env_file="$instance_dir/.env"
@@ -43,10 +43,12 @@ set -a
 source "$env_file"
 set +a
 
-export DB_URL="${DB_URL:-sqlite:///$instance_dir/data/bot.sqlite3}"
-export LOG_DIR="${LOG_DIR:-$instance_dir/output}"
-export EXEC_LATENCY_LOG_DIR="${EXEC_LATENCY_LOG_DIR:-$instance_dir/logs}"
-export SIGNAL_FILE_DIR="${SIGNAL_FILE_DIR:-$instance_dir/signals}"
+# Force per-instance runtime paths by default so instances stay isolated.
+# If needed, override only DB with POLYBOT_DB_URL in service.env.
+export DB_URL="${POLYBOT_DB_URL:-sqlite:///$instance_dir/data/bot.sqlite3}"
+export LOG_DIR="$instance_dir/output"
+export EXEC_LATENCY_LOG_DIR="$instance_dir/logs"
+export SIGNAL_FILE_DIR="$instance_dir/signals"
 
 cd "$instance_dir/state"
 

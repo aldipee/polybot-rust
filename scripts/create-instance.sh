@@ -10,7 +10,7 @@ fi
 instance_name="$1"
 cpu_set="${2:-}"
 
-root_dir="${POLYBOT_ROOT:-/opt/polybot}"
+root_dir="${POLYBOT_ROOT:-/root/polybot-rust}"
 template_env="${POLYBOT_TEMPLATE_ENV:-$root_dir/.env}"
 instance_dir="$root_dir/instances/$instance_name"
 
@@ -53,6 +53,6 @@ echo "Instance created: $instance_name"
 echo "Path: $instance_dir"
 echo "Next:"
 echo "  1) Edit $instance_dir/.env and set strategy vars (BOT_ID already set)"
-echo "  2) sudo cp $root_dir/deploy/systemd/polybot@.service /etc/systemd/system/"
-echo "  3) sudo systemctl daemon-reload"
-echo "  4) sudo systemctl enable --now polybot@$instance_name"
+echo "  2) cp $root_dir/deploy/systemd/polybot@.service /etc/systemd/system/"
+echo "  3) systemctl daemon-reload"
+echo "  4) systemctl enable --now polybot@$instance_name"

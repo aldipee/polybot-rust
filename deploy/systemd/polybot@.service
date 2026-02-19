@@ -5,12 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=polybot
-Group=polybot
-WorkingDirectory=/opt/polybot
-Environment=POLYBOT_ROOT=/opt/polybot
+User=root
+Group=root
+WorkingDirectory=/root/polybot-rust
+Environment=POLYBOT_ROOT=/root/polybot-rust
 EnvironmentFile=-/etc/default/polybot
-ExecStart=/opt/polybot/scripts/run-instance.sh %i
+ExecStart=/root/polybot-rust/scripts/run-instance.sh %i
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
