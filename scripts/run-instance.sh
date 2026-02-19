@@ -43,12 +43,20 @@ set -a
 source "$env_file"
 set +a
 
-# Force per-instance runtime paths by default so instances stay isolated.
-# If needed, override only DB with POLYBOT_DB_URL in service.env.
-export DB_URL="${POLYBOT_DB_URL:-sqlite:///$instance_dir/data/bot.sqlite3}"
+# DB resolution priority:
+# 1) POLYBOT_DB_URL from service.env
+# 2) DB_URL from instance .env
+# 3) default local postgres URL
+export DB_URL="${POLYBOT_DB_URL:-${DB_URL:-postgresql://postgres:postgres@localhost:5432/polybot}}"
 export LOG_DIR="$instance_dir/output"
 export EXEC_LATENCY_LOG_DIR="$instance_dir/logs"
 export SIGNAL_FILE_DIR="$instance_dir/signals"
+
+db_url_log="$DB_URL"
+if [[ "$db_url_log" != sqlite://* ]]; then
+  db_url_log="${db_url_log%%://*}://<redacted>"
+fi
+echo "[$(date -Iseconds)] instance=$instance_name DB_URL=$db_url_log" >&2
 
 cd "$instance_dir/state"
 

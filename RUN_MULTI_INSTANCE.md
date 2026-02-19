@@ -30,7 +30,7 @@ Each instance gets:
 - `/root/polybot-rust/instances/<name>/{state,data,output,logs,signals}`
 
 `BOT_ID` is automatically set to the instance name during creation.
-`DB_URL` from `.env` is ignored by the runner unless you set `POLYBOT_DB_URL` in `service.env`.
+`DB_URL` from `.env` is used by default. You can override per instance via `POLYBOT_DB_URL` in `service.env`.
 
 ## 4) Edit each env
 
