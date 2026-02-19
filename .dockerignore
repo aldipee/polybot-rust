@@ -1,0 +1,16 @@
+.git
+.idea
+.venv
+target
+logs
+output
+data
+signals
+state
+db/__pycache__
+utils/__pycache__
+__pycache__
+*.pyc
+*.sqlite3
+maker_hedgecap_state_*.json
+.env

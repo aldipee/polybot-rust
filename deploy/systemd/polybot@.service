@@ -1,0 +1,20 @@
+[Unit]
+Description=Polybot Rust Instance (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+Environment=POLYBOT_ROOT=/opt/polybot
+EnvironmentFile=-/etc/default/polybot
+ExecStart=/opt/polybot/scripts/run-instance.sh %i
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
