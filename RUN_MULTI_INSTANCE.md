@@ -14,6 +14,7 @@ cargo build --release --locked
 ```bash
 chmod +x /root/polybot-rust/scripts/create-instance.sh
 chmod +x /root/polybot-rust/scripts/run-instance.sh
+sed -i 's/\r$//' /root/polybot-rust/scripts/create-instance.sh /root/polybot-rust/scripts/run-instance.sh
 ```
 
 ## 3) Create instances
@@ -60,6 +61,18 @@ systemctl status polybot@bot-a
 journalctl -u polybot@bot-a -f
 systemctl restart polybot@bot-a
 systemctl stop polybot@bot-b
+```
+
+If you see `status=203/EXEC` or `Permission denied` on `run-instance.sh`:
+
+```bash
+chmod 755 /root/polybot-rust/scripts/create-instance.sh /root/polybot-rust/scripts/run-instance.sh
+sed -i 's/\r$//' /root/polybot-rust/scripts/create-instance.sh /root/polybot-rust/scripts/run-instance.sh
+cp /root/polybot-rust/deploy/systemd/polybot@.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl reset-failed polybot@bot-a
+systemctl restart polybot@bot-a
+journalctl -u polybot@bot-a -n 120 -f
 ```
 
 If your repo path is not `/root/polybot-rust`, set an override:
