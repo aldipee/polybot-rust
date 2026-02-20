@@ -14,6 +14,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::Message;
 
+#[path = "copy_trading.rs"]
+mod copy_trading;
+
 fn now_ts() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -501,6 +504,8 @@ pub struct SignalHub {
     last_conn_ts: Arc<Mutex<f64>>,
     dedup: Arc<Mutex<DedupState>>,
     seen_max: usize,
+    copy_logic: copy_trading::CopyTradingLogic,
+    subscribe_payload: Option<String>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -521,8 +526,11 @@ impl SignalHub {
         ws_debug: bool,
         log_raw: bool,
     ) -> Self {
+        let ws_url = ws_url.into().trim().to_string();
+        let copy_logic = copy_trading::CopyTradingLogic::new(&ws_url);
+        let subscribe_payload = copy_logic.subscription_payload();
         Self {
-            ws_url: ws_url.into().trim().to_string(),
+            ws_url,
             inbox,
             stop_event,
             file_service,
@@ -540,6 +548,8 @@ impl SignalHub {
             last_conn_ts: Arc::new(Mutex::new(0.0)),
             dedup: Arc::new(Mutex::new(DedupState::default())),
             seen_max: 10000,
+            copy_logic,
+            subscribe_payload,
             thread: Mutex::new(None),
         }
     }
@@ -617,83 +627,13 @@ impl SignalHub {
         true
     }
 
-    fn as_f64(v: Option<&Value>) -> f64 {
-        match v {
-            Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-            Some(Value::String(s)) => s.parse::<f64>().unwrap_or(0.0),
-            _ => 0.0,
-        }
-    }
-
     fn _extract_signal(&self, msg: &Value) -> Option<SignalTrade> {
-        let mtype = msg
-            .get("type")
-            .or_else(|| msg.get("event"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        if mtype != "trade" {
-            return None;
-        }
-        let trade = msg.get("trade")?;
-        if !trade.is_object() {
-            return None;
-        }
-        let status = trade
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_ascii_uppercase();
-        if !status.is_empty() && status != "SIGNAL" && status != "TRADE" && status != "OPEN" {
-            return None;
-        }
-        let market_slug = trade
-            .get("market_slug")
-            .or_else(|| trade.get("market"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let direction = trade
-            .get("direction")
-            .or_else(|| trade.get("side"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_ascii_uppercase();
-        if market_slug.is_empty() || direction.is_empty() {
-            return None;
-        }
-
-        let event_timestamp = trade
-            .get("event_timestamp")
-            .or_else(|| trade.get("timestamp"))
-            .or_else(|| trade.get("created_at"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let key = trade
-            .get("id")
-            .or_else(|| trade.get("discord_message_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{market_slug}|{direction}|{event_timestamp}"));
+        let sig = self.copy_logic.extract_signal(msg, now_ts())?;
+        let key = sig.key.trim().to_string();
         if !self._dedup_ok(&key) {
             return None;
         }
-        Some(SignalTrade {
-            provider: "WEBSOCKET".to_string(),
-            key,
-            market_slug,
-            direction,
-            confidence: Self::as_f64(trade.get("confidence")),
-            entry_price: Self::as_f64(trade.get("entry_price")),
-            event_timestamp,
-            raw: Some(msg.clone()),
-            received_ts: now_ts(),
-        })
+        Some(sig)
     }
 
     // Compatibility placeholders with Python method names.
@@ -733,7 +673,15 @@ impl SignalHub {
     }
 
     pub fn ingest_raw_message(&self, raw: &str) -> Result<Option<SignalTrade>> {
-        let msg: Value = serde_json::from_str(raw).map_err(|e| anyhow!(e))?;
+        let text = raw.trim();
+        if text.is_empty()
+            || text.eq_ignore_ascii_case("ping")
+            || text.eq_ignore_ascii_case("pong")
+        {
+            return Ok(None);
+        }
+
+        let msg: Value = serde_json::from_str(text).map_err(|e| anyhow!(e))?;
         if self.log_raw {
             if let Some(fs) = &self.file_service {
                 fs.append(&json!({"ts": now_ts(), "raw": msg}));
@@ -784,6 +732,19 @@ impl SignalHub {
                 *ts = now_ts();
             }
             self._log("[SIGNAL_WS] connected");
+            if let Some(subscribe_payload) = &self.subscribe_payload {
+                if self.ws_debug {
+                    self._log(&format!("[SIGNAL_WS] send subscribe: {subscribe_payload}"));
+                }
+                if let Err(e) = ws.send(Message::Text(subscribe_payload.clone().into())) {
+                    self._log_err(&format!("[SIGNAL_WS] subscribe send error: {e}"));
+                    let _ = ws.close(None);
+                    self.connected.store(false, Ordering::SeqCst);
+                    let sleep_for = self.reconnect_min.max(0.1);
+                    thread::sleep(Duration::from_secs_f64(sleep_for));
+                    continue;
+                }
+            }
 
             let mut last_ping = Instant::now();
             while !self.stop_event.load(Ordering::SeqCst) {
@@ -807,10 +768,18 @@ impl SignalHub {
 
                 match msg {
                     Message::Text(text) => {
-                        if self.ws_debug {
-                            self._log(&format!("[SIGNAL_WS] recv: {text}"));
+                        let text_ref: &str = text.as_ref();
+                        if text_ref.eq_ignore_ascii_case("ping") {
+                            let _ = ws.send(Message::Text("pong".into()));
+                            continue;
                         }
-                        self._on_message(&text);
+                        if text_ref.eq_ignore_ascii_case("pong") {
+                            continue;
+                        }
+                        if self.ws_debug {
+                            self._log(&format!("[SIGNAL_WS] recv: {text_ref}"));
+                        }
+                        self._on_message(text_ref);
                     }
                     Message::Binary(bin) => {
                         if let Ok(text) = String::from_utf8(bin.to_vec()) {

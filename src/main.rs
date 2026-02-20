@@ -8,6 +8,7 @@ mod env_utils;
 mod gamma;
 mod helpers;
 mod logging;
+mod rtds;
 mod signal;
 
 use anyhow::{anyhow, Context, Result};
@@ -20,6 +21,7 @@ use db::{
 use env_utils::{env_bool, env_float};
 use helpers::{get_next_slug, segment, segment_defaults};
 use logging::{setup_item_logger, LogLike};
+use rtds::RtdsService;
 use signal::{JsonlFileService, SignalHub, SignalInbox};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,9 +165,7 @@ fn run() -> Result<()> {
             }
             Err(err) => {
                 let msg = format!("{err:#}");
-                eprintln!(
-                    "db init attempt {attempt}/5 failed (DB_URL={db_url_log}): {msg}"
-                );
+                eprintln!("db init attempt {attempt}/5 failed (DB_URL={db_url_log}): {msg}");
                 last_init_err = Some(msg);
                 thread::sleep(Duration::from_secs(2));
             }
@@ -350,7 +350,28 @@ fn run() -> Result<()> {
             continue;
         }
 
-        let run_reason = match bot.run() {
+        let rtds_service =
+            match RtdsService::for_market(&current_slug, &run_cfg, bot_logger.clone()) {
+                Ok(Some(svc)) => {
+                    svc.start();
+                    Some(svc)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    bot_logger.warning(&format!(
+                        "[RTDS] failed to initialize market={} err={e}",
+                        current_slug
+                    ));
+                    None
+                }
+            };
+
+        let run_result = bot.run();
+        if let Some(svc) = &rtds_service {
+            svc.close();
+        }
+
+        let run_reason = match run_result {
             Ok(r) => r,
             Err(e) if e.to_string() == "NO_MARKET" => {
                 bot_logger.info(&format!("No market yet for {current_slug}. Skipping."));

@@ -37,8 +37,7 @@ impl SessionFactory {
 }
 
 fn open_conn(engine: &Engine) -> Result<Client> {
-    if !engine.db_url.starts_with("postgres://") && !engine.db_url.starts_with("postgresql://")
-    {
+    if !engine.db_url.starts_with("postgres://") && !engine.db_url.starts_with("postgresql://") {
         return Err(anyhow!(
             "unsupported DB_URL (expected postgres:// or postgresql://): {}",
             engine.db_url

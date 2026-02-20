@@ -6,6 +6,7 @@ use crate::helpers::{
     round_up, save_state, segment_defaults, BotState, OpenOrderState,
 };
 use crate::logging::LogLike;
+use crate::rtds::get_live_snapshot_for_market;
 use crate::signal::{LatencyLogService, SignalHub};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Result};
@@ -21,6 +22,7 @@ use rs_clob_client::{
 use serde_json::json;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -683,6 +685,319 @@ impl MakerHedgeCapBot {
         if let Ok(mut m) = self.debug_last_ts.lock() {
             m.insert(key.to_string(), value);
         }
+    }
+
+    fn _rtds_gate_log(&self, bucket: &str, msg: &str) {
+        let every_s = env_float("RTDS_ENTRY_GATE_LOG_EVERY_SECONDS", 0.0);
+        if every_s <= 0.0 {
+            self.logger.info(msg);
+            return;
+        }
+        let key = format!("__rtds_entry_gate_log_{bucket}");
+        let now = now_ts_f64();
+        if now >= self._runtime_ts_get(&key) {
+            self.logger.info(msg);
+            self._runtime_ts_set(&key, now + every_s);
+        }
+    }
+
+    fn _rtds_gate_load_payload(&self, context: &str) -> Result<Value, String> {
+        let use_memory = env_bool("RTDS_ENTRY_GATE_USE_MEMORY", true);
+        let fallback_file = env_bool("RTDS_ENTRY_GATE_FALLBACK_FILE", false);
+        let latest_path = std::env::var("RTDS_LATEST_PATH")
+            .unwrap_or_else(|_| "state/rtds_latest.json".to_string())
+            .trim()
+            .to_string();
+        if use_memory {
+            if let Some(s) = get_live_snapshot_for_market(&self.market_slug) {
+                return Ok(json!({
+                    "market_slug": s.market_slug,
+                    "timestamp_ms": s.timestamp_ms,
+                    "received_at_ms": s.received_at_ms,
+                    "updated_at_ms": s.updated_at_ms,
+                    "price": s.price,
+                    "price_to_beat": s.price_to_beat,
+                    "diff_vs_price_to_beat": s.diff_vs_price_to_beat,
+                    "diff_vs_price_to_beat_percentage": s.diff_vs_price_to_beat_percentage,
+                }));
+            }
+        }
+        if use_memory && !fallback_file {
+            return Err(format!("{context}: missing in-memory RTDS snapshot"));
+        }
+        if latest_path.is_empty() {
+            return Err(format!("{context}: RTDS_LATEST_PATH is empty"));
+        }
+        let raw = fs::read_to_string(&latest_path).map_err(|e| {
+            format!("{context}: cannot read latest file path={latest_path} err={e}")
+        })?;
+        let payload = serde_json::from_str::<Value>(&raw)
+            .map_err(|e| format!("{context}: invalid latest JSON path={latest_path} err={e}"))?;
+        Ok(payload)
+    }
+
+    fn _rtds_gate_diff_price(payload: &Value) -> Option<f64> {
+        let mut diff_price = Self::_value_f64(payload.get("diff_vs_price_to_beat"));
+        if diff_price.is_none() {
+            let px = Self::_value_f64(payload.get("price"));
+            let ptb = Self::_value_f64(payload.get("price_to_beat"));
+            if let (Some(px), Some(ptb)) = (px, ptb) {
+                diff_price = Some(px - ptb);
+            }
+        }
+        diff_price
+    }
+
+    fn _rtds_gate_snapshot(
+        &self,
+        context: &str,
+        max_age_seconds: f64,
+        require_market_match: bool,
+    ) -> Result<(f64, i64, i64), String> {
+        let payload = self._rtds_gate_load_payload(context)?;
+        let payload_market = payload
+            .get("market_slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if require_market_match && !payload_market.is_empty() && payload_market != self.market_slug
+        {
+            return Err(format!(
+                "{context}: market mismatch current={} latest={}",
+                self.market_slug, payload_market
+            ));
+        }
+
+        let ts_ms = Self::_value_f64(
+            payload
+                .get("updated_at_ms")
+                .or_else(|| payload.get("received_at_ms"))
+                .or_else(|| payload.get("timestamp_ms"))
+                .or_else(|| payload.get("ts_ms")),
+        )
+        .map(|v| v as i64)
+        .unwrap_or(0);
+        let now_ms = (now_ts_f64() * 1000.0) as i64;
+        let age_ms = (now_ms - ts_ms).max(0);
+        let max_age_ms = (max_age_seconds.max(0.05) * 1000.0) as i64;
+        if ts_ms <= 0 || age_ms > max_age_ms {
+            return Err(format!(
+                "{context}: stale/missing RTDS tick ts_ms={} age_ms={} max_age_ms={}",
+                ts_ms, age_ms, max_age_ms
+            ));
+        }
+        let diff_price = Self::_rtds_gate_diff_price(&payload)
+            .ok_or_else(|| format!("{context}: missing diff_vs_price_to_beat/price_to_beat"))?;
+        Ok((diff_price, age_ms, ts_ms))
+    }
+
+    fn _rtds_entry_gate_min_diff_price_for_context(&self, side: &str, context: &str) -> f64 {
+        let min_common = env_float(
+            "RTDS_ENTRY_GATE_MIN_DIFF_PRICE",
+            env_float("RTDS_ENTRY_GATE_MIN_DIFF_PCT", 0.0),
+        )
+        .max(0.0);
+        let min_force = std::env::var("RTDS_ENTRY_GATE_MIN_DIFF_PRICE_FORCE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .or_else(|| {
+                std::env::var("RTDS_ENTRY_GATE_MIN_DIFF_PCT_FORCE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
+            .unwrap_or(min_common)
+            .max(0.0);
+        if context.contains("FORCE") {
+            return min_force;
+        }
+        let min_yes = std::env::var("RTDS_ENTRY_GATE_MIN_DIFF_PRICE_YES")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .or_else(|| {
+                std::env::var("RTDS_ENTRY_GATE_MIN_DIFF_PCT_YES")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
+            .unwrap_or(min_common)
+            .max(0.0);
+        let min_no = std::env::var("RTDS_ENTRY_GATE_MIN_DIFF_PRICE_NO")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .or_else(|| {
+                std::env::var("RTDS_ENTRY_GATE_MIN_DIFF_PCT_NO")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
+            .unwrap_or(min_common)
+            .max(0.0);
+        if side == "YES" {
+            min_yes
+        } else {
+            min_no
+        }
+    }
+
+    fn _rtds_entry_gate_allows_side(&self, side: &str, seconds_left: f64, context: &str) -> bool {
+        if !env_bool("RTDS_ENTRY_GATE_ENABLED", false) {
+            return true;
+        }
+        let side = side.trim().to_ascii_uppercase();
+        if !matches!(side.as_str(), "YES" | "NO") {
+            return true;
+        }
+
+        let allow_missing = env_bool("RTDS_ENTRY_GATE_ALLOW_MISSING", false);
+        let require_market_match = env_bool("RTDS_ENTRY_GATE_REQUIRE_MARKET_MATCH", true);
+        let max_age_seconds = env_float("RTDS_ENTRY_GATE_MAX_AGE_SECONDS", 2.0);
+        let diff_price = match self._rtds_gate_snapshot(
+            context,
+            max_age_seconds,
+            require_market_match,
+        ) {
+            Ok((d, age_ms, ts_ms)) => {
+                self._rtds_gate_log(
+                    "snapshot_ok",
+                    &format!(
+                        "[RTDS_GATE] {} snapshot side={} ts_ms={} age_ms={} diff_price={:+.6} t_left={:.2}s",
+                        context, side, ts_ms, age_ms, d, seconds_left
+                    ),
+                );
+                d
+            }
+            Err(reason) => {
+                self._rtds_gate_log(
+                    "snapshot_block",
+                    &format!("[RTDS_GATE] {} blocked: {}", context, reason),
+                );
+                return allow_missing;
+            }
+        };
+
+        let min_req = self._rtds_entry_gate_min_diff_price_for_context(&side, context);
+        let pass = if side == "YES" {
+            diff_price + 1e-12 >= min_req
+        } else {
+            diff_price - 1e-12 <= -min_req
+        };
+        if !pass {
+            self._rtds_gate_log(
+                "threshold",
+                &format!(
+                    "[RTDS_GATE] {} blocked: side={} diff_price={:+.6} required={:.6} t_left={:.2}s",
+                    context, side, diff_price, min_req, seconds_left
+                ),
+            );
+            return false;
+        }
+
+        self._rtds_gate_log(
+            "pass",
+            &format!(
+                "[RTDS_GATE] {} pass: side={} diff_price={:+.6} required={:.6} t_left={:.2}s",
+                context, side, diff_price, min_req, seconds_left
+            ),
+        );
+        true
+    }
+
+    fn _rtds_hold_till_resolution_active(
+        &self,
+        side: &str,
+        seconds_left: f64,
+        context: &str,
+    ) -> bool {
+        if !env_bool("RTDS_HOLD_TILL_RESOLUTION_ENABLED", true) {
+            self._runtime_ts_set("__rtds_hold_active", 0.0);
+            return false;
+        }
+        let hold_diff = std::env::var("RTDS_GATE_DIFF_PRICE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| env_float("RTDS_GATE_PCT", 0.0))
+            .max(0.0);
+        if hold_diff <= 0.0 {
+            self._runtime_ts_set("__rtds_hold_active", 0.0);
+            return false;
+        }
+        let side = side.trim().to_ascii_uppercase();
+        if !matches!(side.as_str(), "YES" | "NO") {
+            self._runtime_ts_set("__rtds_hold_active", 0.0);
+            self._rtds_gate_log(
+                "hold_invalid_side",
+                &format!("[RTDS_HOLD] {} off: invalid side='{}'", context, side),
+            );
+            return false;
+        }
+
+        let max_age_seconds = env_float(
+            "RTDS_GATE_MAX_AGE_SECONDS",
+            env_float("RTDS_ENTRY_GATE_MAX_AGE_SECONDS", 2.0),
+        );
+        let require_market_match = env_bool("RTDS_ENTRY_GATE_REQUIRE_MARKET_MATCH", true);
+        let snap = self._rtds_gate_snapshot(context, max_age_seconds, require_market_match);
+        let (diff_price, age_ms, ts_ms) = match snap {
+            Ok(v) => v,
+            Err(reason) => {
+                let was_active = self._runtime_ts_get("__rtds_hold_active") > 0.0;
+                self._runtime_ts_set("__rtds_hold_active", 0.0);
+                self._runtime_ts_set("__rtds_hold_side_yes", 0.0);
+                self._rtds_gate_log(
+                    if was_active {
+                        "hold_off_snapshot"
+                    } else {
+                        "hold_skip_snapshot"
+                    },
+                    &format!("[RTDS_HOLD] {} off: {}", context, reason),
+                );
+                return false;
+            }
+        };
+        let should_hold = if side == "YES" {
+            diff_price + 1e-12 >= hold_diff
+        } else {
+            diff_price - 1e-12 <= -hold_diff
+        };
+        let was_active = self._runtime_ts_get("__rtds_hold_active") > 0.0;
+        if should_hold {
+            self._runtime_ts_set("__rtds_hold_active", 1.0);
+            self._runtime_ts_set(
+                "__rtds_hold_side_yes",
+                if side == "YES" { 1.0 } else { 0.0 },
+            );
+            self._rtds_gate_log(
+                if was_active { "hold_keep" } else { "hold_on" },
+                &format!(
+                    "[RTDS_HOLD] {} {}: side={} diff_price={:+.6} threshold={:.6} ts_ms={} age_ms={} t_left={:.2}s reason=diff_price_meets_threshold",
+                    context,
+                    if was_active { "keep" } else { "ON" },
+                    side,
+                    diff_price,
+                    hold_diff,
+                    ts_ms,
+                    age_ms,
+                    seconds_left
+                ),
+            );
+            return true;
+        }
+        self._runtime_ts_set("__rtds_hold_active", 0.0);
+        self._runtime_ts_set("__rtds_hold_side_yes", 0.0);
+        self._rtds_gate_log(
+            if was_active { "hold_off" } else { "hold_skip" },
+            &format!(
+                "[RTDS_HOLD] {} {}: side={} diff_price={:+.6} threshold={:.6} ts_ms={} age_ms={} t_left={:.2}s reason=diff_price_below_threshold",
+                context,
+                if was_active { "OFF" } else { "skip" },
+                side,
+                diff_price,
+                hold_diff,
+                ts_ms,
+                age_ms,
+                seconds_left
+            ),
+        );
+        false
     }
 
     fn _sniper_entry_pending_key(asset_id: &str) -> String {
@@ -2606,14 +2921,12 @@ impl MakerHedgeCapBot {
         let mut best_size = 0.0f64;
         let mut any_ok = false;
         for user in users {
-            let mut req = http
-                .get(&url)
-                .query(&[
-                    ("user", user.as_str()),
-                    ("sizeThreshold", "0"),
-                    ("limit", "500"),
-                    ("offset", "0"),
-                ]);
+            let mut req = http.get(&url).query(&[
+                ("user", user.as_str()),
+                ("sizeThreshold", "0"),
+                ("limit", "500"),
+                ("offset", "0"),
+            ]);
             if market_filter {
                 if let Some(mkt) = market.as_deref() {
                     req = req.query(&[("market", mkt)]);
@@ -2654,12 +2967,7 @@ impl MakerHedgeCapBot {
             let rows = payload
                 .as_array()
                 .cloned()
-                .or_else(|| {
-                    payload
-                        .get("data")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                })
+                .or_else(|| payload.get("data").and_then(|v| v.as_array()).cloned())
                 .unwrap_or_default();
             let mut sz = 0.0f64;
             for row in &rows {
@@ -2882,12 +3190,7 @@ impl MakerHedgeCapBot {
             let side = msg
                 .get("side")
                 .and_then(|v| v.as_str())
-                .filter(|s| {
-                    matches!(
-                        s.trim().to_ascii_uppercase().as_str(),
-                        "BUY" | "SELL"
-                    )
-                })
+                .filter(|s| matches!(s.trim().to_ascii_uppercase().as_str(), "BUY" | "SELL"))
                 .unwrap_or(rec0.side.as_str());
             let key = format!("order_evt:{order_id}:{matched_total:.8}");
             let applied = self._apply_fill(asset, price, inc, &key, side);
@@ -2960,7 +3263,11 @@ impl MakerHedgeCapBot {
             .unwrap_or("")
             .to_ascii_uppercase();
         if !status.is_empty() && !token_id.trim().is_empty() {
-            let key = format!("__sniper_trade_status_{}_{}", token_id, status.to_ascii_lowercase());
+            let key = format!(
+                "__sniper_trade_status_{}_{}",
+                token_id,
+                status.to_ascii_lowercase()
+            );
             self._runtime_ts_set(&key, now_ts_f64());
             if env_bool("SNIPER_ORDER_STATUS_DEBUG", false) {
                 let tail: String = token_id
@@ -3049,9 +3356,7 @@ impl MakerHedgeCapBot {
                 }
             }
         }
-        if !status.is_empty()
-            && !matches!(status.as_str(), "MATCHED" | "MINED" | "CONFIRMED")
-        {
+        if !status.is_empty() && !matches!(status.as_str(), "MATCHED" | "MINED" | "CONFIRMED") {
             return;
         }
 
@@ -3277,9 +3582,7 @@ impl MakerHedgeCapBot {
                 let key = if !trade_id.is_empty() {
                     format!("{trade_id}:taker")
                 } else {
-                    format!(
-                        "trade_fallback:taker:{taker_oid}:{token_id}:{side}:{qty:.8}:{px:.8}"
-                    )
+                    format!("trade_fallback:taker:{taker_oid}:{token_id}:{side}:{qty:.8}:{px:.8}")
                 };
                 let applied = self._apply_fill(&token_id, px, qty, &key, &side);
                 if applied {
@@ -3441,7 +3744,11 @@ impl MakerHedgeCapBot {
             .unwrap_or("")
             .to_ascii_uppercase();
         if !status.is_empty() {
-            let st_key = format!("__sniper_entry_status_{}_{}", asset_id, status.to_ascii_lowercase());
+            let st_key = format!(
+                "__sniper_entry_status_{}_{}",
+                asset_id,
+                status.to_ascii_lowercase()
+            );
             self._runtime_ts_set(&st_key, now_ts_f64());
             if status == "CONFIRMED" {
                 let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
@@ -3796,7 +4103,7 @@ impl MakerHedgeCapBot {
             }
             Err(e) => {
                 self.logger
-                .error(&format!("get_orders failed during reconcile: {e}"));
+                    .error(&format!("get_orders failed during reconcile: {e}"));
                 fallback()
             }
         }
@@ -5761,6 +6068,11 @@ impl MakerHedgeCapBot {
         let Some(side) = side else {
             return false;
         };
+        if env_bool("RTDS_ENTRY_GATE_APPLY_ENDGAME", true)
+            && !self._rtds_entry_gate_allows_side(&side, seconds_left, "SNIPER_ENDGAME")
+        {
+            return false;
+        }
         let asset_id = if side == "YES" {
             self.yes_asset.clone().unwrap_or_default()
         } else {
@@ -6004,6 +6316,24 @@ impl MakerHedgeCapBot {
         if ask <= 0.0 {
             return false;
         }
+        let side = cand.get("side").and_then(|v| v.as_str()).unwrap_or("");
+        let seconds_left = cand
+            .get("seconds_left")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(self.expiry_ts as f64 - now);
+        let entry_mode = cand
+            .get("entry_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("NORMAL")
+            .to_ascii_uppercase();
+        let gate_context = if entry_mode == "FORCE" {
+            "SNIPER_ENTRY_FORCE"
+        } else {
+            "SNIPER_ENTRY"
+        };
+        if !self._rtds_entry_gate_allows_side(side, seconds_left, gate_context) {
+            return false;
+        }
         let entry_type_name = std::env::var("SNIPER_ENTRY_ORDER_TYPE")
             .unwrap_or_else(|_| "FOK".to_string())
             .to_ascii_uppercase();
@@ -6242,7 +6572,8 @@ impl MakerHedgeCapBot {
             let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
             let pending_ts = self._runtime_ts_get(&pending_key);
             let confirmed_ts = self._runtime_ts_get(&confirmed_key);
-            let confirmed_ok = confirmed_ts > 0.0 && (pending_ts <= 0.0 || confirmed_ts + 1e-9 >= pending_ts);
+            let confirmed_ok =
+                confirmed_ts > 0.0 && (pending_ts <= 0.0 || confirmed_ts + 1e-9 >= pending_ts);
             if !confirmed_ok {
                 let now = now_ts_f64();
                 let log_key = format!("__sniper_exit_wait_confirm_log_until_{asset_id}");
@@ -6308,7 +6639,8 @@ impl MakerHedgeCapBot {
             allow_sh = allow.max(0.0);
         }
         if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true)
-            && ((exit_allow_fractional && (balance_avail_sh < min_exit_size || allow_sh < min_exit_size))
+            && ((exit_allow_fractional
+                && (balance_avail_sh < min_exit_size || allow_sh < min_exit_size))
                 || (!exit_allow_fractional && (balance_avail_int < min_int || allow_int < min_int)))
         {
             if let Some(sz) = self._get_position_size_data_api(&asset_id) {
@@ -6349,9 +6681,8 @@ impl MakerHedgeCapBot {
                 }
             }
         }
-        let precheck_allow_low =
-            (exit_allow_fractional && allow_sh + 1e-12 < min_exit_size)
-                || (!exit_allow_fractional && allow_int < min_int);
+        let precheck_allow_low = (exit_allow_fractional && allow_sh + 1e-12 < min_exit_size)
+            || (!exit_allow_fractional && allow_int < min_int);
         if env_bool("SNIPER_EXIT_PRECHECK_BALANCE_ALLOWANCE", false) && precheck_allow_low {
             let aid_tail: String = asset_id
                 .chars()
@@ -6388,15 +6719,7 @@ impl MakerHedgeCapBot {
             let (q_yes, q_no, c_yes, c_no, oo_count) = self
                 .state
                 .lock()
-                .map(|s| {
-                    (
-                        s.q_yes,
-                        s.q_no,
-                        s.c_yes,
-                        s.c_no,
-                        s.open_orders.len() as i64,
-                    )
-                })
+                .map(|s| (s.q_yes, s.q_no, s.c_yes, s.c_no, s.open_orders.len() as i64))
                 .unwrap_or((0.0, 0.0, 0.0, 0.0, 0));
             let wallet_tail: String = self
                 .wallet_address
@@ -6494,10 +6817,8 @@ impl MakerHedgeCapBot {
                     .and_then(|o| o.order_id)
                     .map(|oid| !oid.trim().is_empty())
                     .unwrap_or(false);
-                let has_exchange_order_for_asset = self
-                    ._list_open_orders_exchange()
-                    .iter()
-                    .any(|o| {
+                let has_exchange_order_for_asset =
+                    self._list_open_orders_exchange().iter().any(|o| {
                         self._extract_order_token_id(o).as_deref() == Some(asset_id.as_str())
                             && self
                                 ._extract_order_id(o)
@@ -6591,8 +6912,7 @@ impl MakerHedgeCapBot {
                 let stop_ot = std::env::var("SNIPER_STOP_LIMIT_ORDER_TYPE")
                     .unwrap_or_else(|_| "GTC".to_string())
                     .to_ascii_uppercase();
-                let oid =
-                    self._place_taker_ask_fak(&asset_id, floor_px, sell_sz, Some(&stop_ot));
+                let oid = self._place_taker_ask_fak(&asset_id, floor_px, sell_sz, Some(&stop_ot));
                 if oid.is_some() {
                     self._runtime_ts_set("__sniper_stop_limit_order_ts", now_ts_f64());
                     self._runtime_ts_set("__sniper_stop_limit_order_px", floor_px);
@@ -6773,9 +7093,9 @@ impl MakerHedgeCapBot {
                         self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 2.0);
                         return false;
                     }
-                    let allow_below_min =
-                        (exit_allow_fractional && allow_sh_fresh + 1e-12 < min_exit_size)
-                            || (!exit_allow_fractional && allow_int_fresh < min_int);
+                    let allow_below_min = (exit_allow_fractional
+                        && allow_sh_fresh + 1e-12 < min_exit_size)
+                        || (!exit_allow_fractional && allow_int_fresh < min_int);
                     if allow_below_min {
                         if sold_any || recent_submit {
                             self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 5.0);
@@ -7089,6 +7409,8 @@ impl MakerHedgeCapBot {
 
             let pos = self._sniper_position();
             if pos.is_none() {
+                self._runtime_ts_set("__rtds_hold_active", 0.0);
+                self._runtime_ts_set("__rtds_hold_side_yes", 0.0);
                 if sniper_in_pos {
                     sniper_in_pos = false;
                     sniper_pos_open_ts = 0.0;
@@ -7224,6 +7546,15 @@ impl MakerHedgeCapBot {
             let exit_px = self._sniper_est_exit_price(bid, 0.0);
             let pnl = qty * exit_px - cost;
             let pnl_pct = if cost > 1e-12 { pnl / cost } else { 0.0 };
+            let pos_side = pos
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            if self._rtds_hold_till_resolution_active(&pos_side, seconds_left, "SIGNAL_HOLD") {
+                sniper_stop_breach_since = None;
+                continue;
+            }
 
             if env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)
                 && seconds_left <= env_float("SNIPER_FORCE_EXIT_SECONDS", 8.0)
@@ -7326,6 +7657,8 @@ impl MakerHedgeCapBot {
 
             let pos = self._sniper_position();
             if pos.is_none() {
+                self._runtime_ts_set("__rtds_hold_active", 0.0);
+                self._runtime_ts_set("__rtds_hold_side_yes", 0.0);
                 if sniper_in_pos {
                     sniper_in_pos = false;
                     sniper_pos_open_ts = 0.0;
@@ -7413,7 +7746,10 @@ impl MakerHedgeCapBot {
                                 if env_float("SNIPER_ENTRY_CONFIRM_SECONDS", 0.0) > 0.0 {
                                     self._runtime_ts_set("__sniper_entry_gate_since", 0.0);
                                 }
-                            } else if let Some(cand) = cand {
+                            } else if let Some(mut cand) = cand {
+                                if let Value::Object(ref mut o) = cand {
+                                    o.insert("entry_mode".to_string(), json!("FORCE"));
+                                }
                                 if !self._sniper_entry_confirmed(&cand, now) {
                                     continue;
                                 }
@@ -7471,6 +7807,15 @@ impl MakerHedgeCapBot {
             let exit_px = self._sniper_est_exit_price(bid, 0.0);
             let pnl = qty * exit_px - cost;
             let pnl_pct = if cost > 1e-12 { pnl / cost } else { 0.0 };
+            let pos_side = pos
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            if self._rtds_hold_till_resolution_active(&pos_side, seconds_left, "SNIPER_HOLD") {
+                sniper_stop_breach_since = None;
+                continue;
+            }
 
             if env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)
                 && seconds_left <= env_float("SNIPER_FORCE_EXIT_SECONDS", 8.0)
