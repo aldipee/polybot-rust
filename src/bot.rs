@@ -685,6 +685,14 @@ impl MakerHedgeCapBot {
         }
     }
 
+    fn _sniper_entry_pending_key(asset_id: &str) -> String {
+        format!("__sniper_entry_pending_{asset_id}")
+    }
+
+    fn _sniper_entry_confirmed_key(asset_id: &str) -> String {
+        format!("__sniper_entry_confirmed_{asset_id}")
+    }
+
     fn _set_exit_reason(&self, reason: &str) {
         if let Ok(mut r) = self.exit_reason.lock() {
             *r = reason.to_string();
@@ -2550,6 +2558,139 @@ impl MakerHedgeCapBot {
             .unwrap_or(false)
     }
 
+    pub fn _get_position_size_data_api(&self, asset_id: &str) -> Option<f64> {
+        let aid = asset_id.trim();
+        if aid.is_empty() {
+            return None;
+        }
+        let base = std::env::var("POLY_DATA_API_BASE_URL")
+            .unwrap_or_else(|_| "https://data-api.polymarket.com".to_string());
+        let url = format!("{}/positions", base.trim_end_matches('/'));
+        let timeout_s = env_float("SNIPER_POSITIONS_API_TIMEOUT_SECONDS", 3.0).clamp(0.2, 15.0);
+        let http = match Client::builder()
+            .timeout(Duration::from_secs_f64(timeout_s))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+
+        let mut users: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let override_user = std::env::var("SNIPER_POSITIONS_USER").unwrap_or_default();
+        for cand in [
+            override_user,
+            self.cfg.funder.clone().unwrap_or_default(),
+            self.wallet_address.clone(),
+        ] {
+            let t = cand.trim().to_string();
+            if t.is_empty() {
+                continue;
+            }
+            let key = t.to_ascii_lowercase();
+            if seen.insert(key) {
+                users.push(t);
+            }
+        }
+        if users.is_empty() {
+            return None;
+        }
+
+        let market_filter = env_bool("SNIPER_POSITIONS_FILTER_MARKET", false);
+        let market = self
+            .condition_id
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let mut best_size = 0.0f64;
+        let mut any_ok = false;
+        for user in users {
+            let mut req = http
+                .get(&url)
+                .query(&[
+                    ("user", user.as_str()),
+                    ("sizeThreshold", "0"),
+                    ("limit", "500"),
+                    ("offset", "0"),
+                ]);
+            if market_filter {
+                if let Some(mkt) = market.as_deref() {
+                    req = req.query(&[("market", mkt)]);
+                }
+            }
+            let resp = match req.send() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let payload: Value = match resp.json() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if env_bool("SNIPER_POSITIONS_DEBUG_ALL", false) {
+                let aid_tail: String = aid
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                let user_tail: String = user
+                    .chars()
+                    .rev()
+                    .take(8)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                self.logger.info(&format!(
+                    "[SNIPER][DBG_POS_API] asset={aid_tail} user=*{user_tail} resp={payload}"
+                ));
+            }
+            let rows = payload
+                .as_array()
+                .cloned()
+                .or_else(|| {
+                    payload
+                        .get("data")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                })
+                .unwrap_or_default();
+            let mut sz = 0.0f64;
+            for row in &rows {
+                let row_asset = row
+                    .get("asset")
+                    .or_else(|| row.get("asset_id"))
+                    .or_else(|| row.get("token_id"))
+                    .or_else(|| row.get("tokenId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if row_asset != aid {
+                    continue;
+                }
+                let s = Self::_value_f64(row.get("size")).unwrap_or(0.0);
+                if s.is_finite() && s > 0.0 {
+                    sz += s;
+                }
+            }
+            any_ok = true;
+            if sz > best_size {
+                best_size = sz;
+            }
+        }
+
+        if any_ok {
+            Some(best_size.max(0.0))
+        } else {
+            None
+        }
+    }
+
     pub fn _get_balance_allowance_conditional_cached(
         &self,
         token_id: &str,
@@ -2796,7 +2937,7 @@ impl MakerHedgeCapBot {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if !event_type.is_empty() && event_type != "trade" {
+        if !event_type.is_empty() && !event_type.contains("trade") {
             return;
         }
 
@@ -2805,6 +2946,109 @@ impl MakerHedgeCapBot {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_ascii_uppercase();
+        let token_id = msg
+            .get("asset_id")
+            .or_else(|| msg.get("assetId"))
+            .or_else(|| msg.get("token_id"))
+            .or_else(|| msg.get("tokenId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let side_top = msg
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !status.is_empty() && !token_id.trim().is_empty() {
+            let key = format!("__sniper_trade_status_{}_{}", token_id, status.to_ascii_lowercase());
+            self._runtime_ts_set(&key, now_ts_f64());
+            if env_bool("SNIPER_ORDER_STATUS_DEBUG", false) {
+                let tail: String = token_id
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                self.logger.info(&format!(
+                    "[SNIPER][TRADE] status={} asset={tail} side={side_top}",
+                    status
+                ));
+            }
+        }
+        if status == "CONFIRMED" {
+            if !token_id.trim().is_empty() && side_top == "BUY" {
+                let confirmed_key = Self::_sniper_entry_confirmed_key(&token_id);
+                self._runtime_ts_set(&confirmed_key, now_ts_f64());
+                if env_bool("SNIPER_ORDER_STATUS_DEBUG", false) {
+                    let tail: String = token_id
+                        .chars()
+                        .rev()
+                        .take(6)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    self.logger.info(&format!(
+                        "[SNIPER][TRADE] entry status CONFIRMED asset={tail} (top-level BUY)"
+                    ));
+                }
+            }
+            // LIMIT/GTC entries can show up as maker legs; confirm using maker leg for our wallet.
+            let wallet = self.wallet_address.to_ascii_lowercase();
+            let maker_orders = msg
+                .get("maker_orders")
+                .or_else(|| msg.get("makerOrders"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for mo in maker_orders {
+                let mo_addr = mo
+                    .get("maker_address")
+                    .or_else(|| mo.get("makerAddress"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !wallet.trim().is_empty() && !mo_addr.is_empty() && mo_addr != wallet {
+                    continue;
+                }
+                let mo_side = mo
+                    .get("side")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                if mo_side != "BUY" {
+                    continue;
+                }
+                let mo_asset = mo
+                    .get("asset_id")
+                    .or_else(|| mo.get("assetId"))
+                    .or_else(|| mo.get("token_id"))
+                    .or_else(|| mo.get("tokenId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if mo_asset.trim().is_empty() {
+                    continue;
+                }
+                let confirmed_key = Self::_sniper_entry_confirmed_key(&mo_asset);
+                self._runtime_ts_set(&confirmed_key, now_ts_f64());
+                if env_bool("SNIPER_ORDER_STATUS_DEBUG", false) {
+                    let tail: String = mo_asset
+                        .chars()
+                        .rev()
+                        .take(6)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    self.logger.info(&format!(
+                        "[SNIPER][TRADE] entry status CONFIRMED asset={tail} (maker BUY leg)"
+                    ));
+                }
+            }
+        }
         if !status.is_empty()
             && !matches!(status.as_str(), "MATCHED" | "MINED" | "CONFIRMED")
         {
@@ -3140,8 +3384,145 @@ impl MakerHedgeCapBot {
     }
 
     pub fn _handle_user_order_event(&self, msg: &Value) {
+        let event_type = msg
+            .get("event_type")
+            .or_else(|| msg.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !event_type.is_empty() && !event_type.contains("order") {
+            return;
+        }
+
         if self.taker_fill_fallback_from_order_events {
             self._taker_order_fallback_on_order_event(msg);
+        }
+
+        let asset_id = msg
+            .get("asset_id")
+            .or_else(|| msg.get("token_id"))
+            .or_else(|| msg.get("assetId"))
+            .or_else(|| msg.get("tokenId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if asset_id.trim().is_empty() {
+            return;
+        }
+        let is_yn = self.yes_asset.as_deref() == Some(asset_id.as_str())
+            || self.no_asset.as_deref() == Some(asset_id.as_str());
+        if !is_yn {
+            return;
+        }
+
+        let side = msg
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if side != "BUY" {
+            return;
+        }
+
+        let oid = self._extract_order_id(msg).unwrap_or_default();
+        if oid.trim().is_empty() {
+            return;
+        }
+
+        let typ = msg
+            .get("type")
+            .or_else(|| msg.get("event_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let status = msg
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !status.is_empty() {
+            let st_key = format!("__sniper_entry_status_{}_{}", asset_id, status.to_ascii_lowercase());
+            self._runtime_ts_set(&st_key, now_ts_f64());
+            if status == "CONFIRMED" {
+                let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
+                self._runtime_ts_set(&confirmed_key, now_ts_f64());
+                if env_bool("SNIPER_ORDER_STATUS_DEBUG", false) {
+                    let tail: String = asset_id
+                        .chars()
+                        .rev()
+                        .take(6)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    self.logger.info(&format!(
+                        "[SNIPER][ORDER] entry status CONFIRMED asset={tail} oid={}..",
+                        oid.chars().take(10).collect::<String>()
+                    ));
+                }
+            }
+        }
+        let cancelish = matches!(
+            typ.as_str(),
+            "CANCELLATION" | "CANCELED" | "CANCELLED" | "REJECTION" | "REJECTED"
+        ) || matches!(status.as_str(), "CANCELED" | "CANCELLED" | "REJECTED");
+
+        let price = Self::_value_f64(msg.get("price")).unwrap_or(0.0);
+        let original = Self::_value_f64(
+            msg.get("original_size")
+                .or_else(|| msg.get("originalSize"))
+                .or_else(|| msg.get("size")),
+        )
+        .unwrap_or(0.0);
+        let matched = Self::_value_f64(
+            msg.get("size_matched")
+                .or_else(|| msg.get("matched_size"))
+                .or_else(|| msg.get("filled_size"))
+                .or_else(|| msg.get("filled")),
+        )
+        .unwrap_or(0.0);
+        let mut remaining = if original > 0.0 {
+            (original - matched).max(0.0)
+        } else {
+            Self::_value_f64(
+                msg.get("remaining_size")
+                    .or_else(|| msg.get("remainingSize"))
+                    .or_else(|| msg.get("size")),
+            )
+            .unwrap_or(0.0)
+            .max(0.0)
+        };
+        if !remaining.is_finite() {
+            remaining = 0.0;
+        }
+
+        if cancelish || remaining <= 0.0 {
+            if let Ok(mut s) = self.state.lock() {
+                let should_remove = s
+                    .open_orders
+                    .get(&asset_id)
+                    .and_then(|oo| oo.order_id.clone())
+                    .map(|x| x == oid)
+                    .unwrap_or(false);
+                if should_remove {
+                    s.open_orders.remove(&asset_id);
+                    let _ = save_state(&self.state_file, &mut s);
+                }
+            }
+            return;
+        }
+
+        if let Ok(mut s) = self.state.lock() {
+            s.open_orders.insert(
+                asset_id,
+                OpenOrderState {
+                    order_id: Some(oid),
+                    price: Some(price),
+                    size: Some(remaining),
+                    ts: Some(now_ts_f64()),
+                },
+            );
+            let _ = save_state(&self.state_file, &mut s);
         }
     }
 
@@ -3497,6 +3878,11 @@ impl MakerHedgeCapBot {
             mine.push(o);
         }
         if mine.is_empty() {
+            if let Ok(mut s) = self.state.lock() {
+                if s.open_orders.remove(asset_id).is_some() {
+                    let _ = save_state(&self.state_file, &mut s);
+                }
+            }
             return;
         }
 
@@ -4061,17 +4447,36 @@ impl MakerHedgeCapBot {
         };
         let mut px = round_down(price, tick);
         px = clamp(px, tick, 0.99);
-        let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1);
-        let size_int = (size + 1e-12).floor() as i64;
-        if size_int < min_int {
-            return None;
-        }
-        let size = size_int as f64;
+        let mut dp_i = env_int("SIZE_DECIMALS", 6);
+        dp_i = dp_i.clamp(0, 8);
+        let dp = dp_i as u32;
+        let allow_fractional = env_bool("SNIPER_EXIT_ALLOW_FRACTIONAL_SIZE", false);
+        let size = if allow_fractional {
+            let min_step = 10f64.powi(-(dp as i32));
+            let min_size = env_float("SNIPER_EXIT_MIN_ORDER_SIZE", 0.1).max(min_step);
+            let q = q_down(size.max(0.0), dp);
+            if q + 1e-12 < min_size {
+                return None;
+            }
+            q
+        } else {
+            let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1);
+            let size_int = (size + 1e-12).floor() as i64;
+            if size_int < min_int {
+                return None;
+            }
+            size_int as f64
+        };
+        let sz_disp = if (size - size.round()).abs() <= 1e-9 {
+            format!("{:.0}", size)
+        } else {
+            format!("{:.4}", size)
+        };
         let ot_name = order_type_name.unwrap_or(&self.hedge_taker_order_type);
         let ot = self._resolve_order_type(ot_name);
         if self.cfg.dry_run {
             self.logger.info(&format!(
-                "[DRY] TAKER SELL asset={} price={px:.2} size={size_int} type={ot}",
+                "[DRY] TAKER SELL asset={} price={px:.2} size={sz_disp} type={ot}",
                 asset_id
                     .chars()
                     .rev()
@@ -4089,7 +4494,16 @@ impl MakerHedgeCapBot {
             "price": px,
             "size": size,
         });
-        let oid = self._post_order_compat(&signed, &ot, None)?;
+        let oid = match self._post_order_compat(&signed, &ot, None) {
+            Some(v) => v,
+            None => {
+                self.logger.warning(&format!(
+                    "[TAKER {ot}] rejected SELL asset={} px={px:.4} sz={sz_disp} (no oid)",
+                    asset_id
+                ));
+                return None;
+            }
+        };
         self._remember_taker_order(&oid, asset_id, size, px, "SELL");
         self._track_order_execution_context(
             &oid,
@@ -4107,7 +4521,7 @@ impl MakerHedgeCapBot {
             }),
         );
         self.logger.info(&format!(
-            "[TAKER {ot}] sent SELL asset={} px={px:.4} sz={size:.0} oid={oid}",
+            "[TAKER {ot}] sent SELL asset={} px={px:.4} sz={sz_disp} oid={oid}",
             asset_id
         ));
         Some(oid)
@@ -5193,42 +5607,44 @@ impl MakerHedgeCapBot {
         let s = self.state.lock().map(|v| v.clone()).unwrap_or_default();
         let yes = s.q_yes;
         let no = s.q_no;
-        if yes <= 0.0 && no <= 0.0 {
+        let min_sh = self.cfg.min_shares.max(0.0);
+        let (side, qty, avg, cost, asset_id) =
+            if yes >= (min_sh - 1e-12) && (yes >= no || no < (min_sh - 1e-12)) {
+                let qty = yes.max(0.0);
+                let avg = if yes > 1e-12 { s.c_yes / yes } else { 0.0 };
+                let cost = s.c_yes.max(0.0);
+                (
+                    "YES",
+                    qty,
+                    avg,
+                    cost,
+                    self.yes_asset.clone().unwrap_or_default(),
+                )
+            } else if no >= (min_sh - 1e-12) {
+                let qty = no.max(0.0);
+                let avg = if no > 1e-12 { s.c_no / no } else { 0.0 };
+                let cost = s.c_no.max(0.0);
+                (
+                    "NO",
+                    qty,
+                    avg,
+                    cost,
+                    self.no_asset.clone().unwrap_or_default(),
+                )
+            } else {
+                return None;
+            };
+        if qty < (min_sh - 1e-12) {
             return None;
         }
-        let (side, qty, avg, cost, asset_id) = if yes >= no {
-            let qty = (yes - no).max(0.0);
-            let avg = if yes > 1e-12 { s.c_yes / yes } else { 0.0 };
-            let cost = qty * avg;
-            (
-                "YES",
-                qty,
-                avg,
-                cost,
-                self.yes_asset.clone().unwrap_or_default(),
-            )
-        } else {
-            let qty = (no - yes).max(0.0);
-            let avg = if no > 1e-12 { s.c_no / no } else { 0.0 };
-            let cost = qty * avg;
-            (
-                "NO",
-                qty,
-                avg,
-                cost,
-                self.no_asset.clone().unwrap_or_default(),
-            )
-        };
-        if qty <= 0.0 {
-            return None;
-        }
-        let bid = self._best_bid_ask(&asset_id).map(|(b, _)| b).unwrap_or(0.0);
+        let (bid, ask) = self._best_bid_ask(&asset_id).unwrap_or((0.0, 0.0));
         Some(json!({
             "side": side,
             "qty": qty,
             "avg": avg,
             "cost": cost,
             "bid": bid,
+            "ask": ask,
             "asset_id": asset_id,
         }))
     }
@@ -5691,6 +6107,10 @@ impl MakerHedgeCapBot {
             if oid.is_none() {
                 return false;
             }
+            let pending_key = Self::_sniper_entry_pending_key(&asset_id);
+            let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
+            self._runtime_ts_set(&pending_key, now_ts_f64());
+            self._runtime_ts_set(&confirmed_key, 0.0);
             // Python parity: for resting LIMIT/GTC entry, record last-entry metadata
             // but do not count it as a completed sniper trade until a fill exists.
             if let Ok(mut s) = self.state.lock() {
@@ -5771,6 +6191,11 @@ impl MakerHedgeCapBot {
             return false;
         }
 
+        let pending_key = Self::_sniper_entry_pending_key(&asset_id);
+        let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
+        self._runtime_ts_set(&pending_key, now_ts_f64());
+        self._runtime_ts_set(&confirmed_key, 0.0);
+
         thread::sleep(Duration::from_secs_f64(inflight_s.max(1.0).min(4.0)));
         let filled = self._sniper_position().is_some();
         if !filled {
@@ -5812,6 +6237,39 @@ impl MakerHedgeCapBot {
         }
         let mut stop_limit_mode = reason_u == "STOP_LOSS" && mode == "LIMIT";
 
+        if env_bool("SNIPER_EXIT_REQUIRE_CONFIRMED_ENTRY", true) {
+            let pending_key = Self::_sniper_entry_pending_key(&asset_id);
+            let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
+            let pending_ts = self._runtime_ts_get(&pending_key);
+            let confirmed_ts = self._runtime_ts_get(&confirmed_key);
+            let confirmed_ok = confirmed_ts > 0.0 && (pending_ts <= 0.0 || confirmed_ts + 1e-9 >= pending_ts);
+            if !confirmed_ok {
+                let now = now_ts_f64();
+                let log_key = format!("__sniper_exit_wait_confirm_log_until_{asset_id}");
+                if now >= self._runtime_ts_get(&log_key) {
+                    let aid_tail: String = asset_id
+                        .chars()
+                        .rev()
+                        .take(6)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    let pending_age = if pending_ts > 0.0 {
+                        (now - pending_ts).max(0.0)
+                    } else {
+                        -1.0
+                    };
+                    self.logger.info(&format!(
+                        "[SNIPER] exit gate: waiting entry order status CONFIRMED asset={aid_tail} pending_age={pending_age:.2}s"
+                    ));
+                    self._runtime_ts_set(&log_key, now + 2.0);
+                }
+                self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 0.5);
+                return false;
+            }
+        }
+
         let remaining = pos.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0);
         if remaining <= 0.0 {
             self._mark_sniper_exit_state();
@@ -5819,19 +6277,82 @@ impl MakerHedgeCapBot {
         }
         let tick = self.cfg.tick.max(0.0001);
         let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1);
+        let exit_allow_fractional = env_bool("SNIPER_EXIT_ALLOW_FRACTIONAL_SIZE", false);
+        let mut exit_size_dp_i = env_int("SNIPER_EXIT_SIZE_DECIMALS", env_int("SIZE_DECIMALS", 6));
+        exit_size_dp_i = exit_size_dp_i.clamp(0, 8);
+        let exit_size_dp = exit_size_dp_i as u32;
+        let exit_size_step = 10f64.powi(-(exit_size_dp as i32));
+        let exit_size_subtract = env_float("SNIPER_EXIT_SIZE_SUBTRACT", 0.0).max(0.0);
+        let min_exit_size = if exit_allow_fractional {
+            env_float("SNIPER_EXIT_MIN_ORDER_SIZE", 0.1).max(exit_size_step)
+        } else {
+            min_int as f64
+        };
         let remaining_int = (remaining + 1e-12).floor() as i64;
-        if remaining_int < min_int {
+        if (exit_allow_fractional && remaining + 1e-12 < min_exit_size)
+            || (!exit_allow_fractional && remaining_int < min_int)
+        {
             self._mark_sniper_exit_state();
             return true;
         }
 
         let mut balance_avail_int = remaining_int;
         let mut allow_int = remaining_int;
-        if let Some((bal, allow)) = self._get_balance_allowance_conditional_cached(&asset_id, 2.0) {
+        let mut balance_avail_sh = remaining;
+        let mut allow_sh = remaining;
+        let mut pos_api_size = -1.0f64;
+        if let Some((bal, allow)) = self._get_balance_allowance_conditional_cached(&asset_id, 0.0) {
             balance_avail_int = (bal + 1e-12).floor() as i64;
             allow_int = (allow + 1e-12).floor() as i64;
+            balance_avail_sh = bal.max(0.0);
+            allow_sh = allow.max(0.0);
         }
-        if allow_int < min_int {
+        if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true)
+            && ((exit_allow_fractional && (balance_avail_sh < min_exit_size || allow_sh < min_exit_size))
+                || (!exit_allow_fractional && (balance_avail_int < min_int || allow_int < min_int)))
+        {
+            if let Some(sz) = self._get_position_size_data_api(&asset_id) {
+                pos_api_size = sz;
+                let pos_int = (sz + 1e-12).floor() as i64;
+                if pos_int > balance_avail_int {
+                    balance_avail_int = pos_int;
+                }
+                if sz > balance_avail_sh {
+                    balance_avail_sh = sz;
+                }
+                // Soft-guard: if we can see shares from positions API, don't hard-block on
+                // potentially stale allowance snapshot; let exchange decide on submit.
+                if env_bool("SNIPER_EXIT_ALLOWANCE_SOFT_CHECK", true)
+                    && ((exit_allow_fractional
+                        && allow_sh < min_exit_size
+                        && balance_avail_sh >= min_exit_size)
+                        || (!exit_allow_fractional
+                            && allow_int < min_int
+                            && balance_avail_int >= min_int))
+                {
+                    allow_int = balance_avail_int;
+                    allow_sh = balance_avail_sh;
+                    if now >= self._runtime_ts_get("__sniper_soft_allow_log_until") {
+                        let aid_tail: String = asset_id
+                            .chars()
+                            .rev()
+                            .take(6)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
+                        self.logger.warning(&format!(
+                            "[SNIPER] soft-allowance enabled: positions API shows shares for asset={aid_tail}; trying exit despite allowance snapshot."
+                        ));
+                        self._runtime_ts_set("__sniper_soft_allow_log_until", now + 10.0);
+                    }
+                }
+            }
+        }
+        let precheck_allow_low =
+            (exit_allow_fractional && allow_sh + 1e-12 < min_exit_size)
+                || (!exit_allow_fractional && allow_int < min_int);
+        if env_bool("SNIPER_EXIT_PRECHECK_BALANCE_ALLOWANCE", false) && precheck_allow_low {
             let aid_tail: String = asset_id
                 .chars()
                 .rev()
@@ -5844,8 +6365,13 @@ impl MakerHedgeCapBot {
                 "[SNIPER] exit failed: allowance too low. Approve conditional tokens for selling, then the bot will retry.",
             );
             self.logger.info(&format!(
-                "[SNIPER] allowance snapshot asset={aid_tail} bal={balance_avail_int} allow={allow_int} min_shares={min_int}"
+                "[SNIPER] allowance snapshot asset={aid_tail} bal={balance_avail_sh:.6} allow={allow_sh:.6} min_required={min_exit_size:.6}"
             ));
+            if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true) {
+                self.logger.info(&format!(
+                    "[SNIPER][DBG_POS] asset={aid_tail} pos_api_size={pos_api_size:.6}"
+                ));
+            }
             let ba_last_ts = self._runtime_ts_get("__ba_last_fetch_ts");
             let ba_age_s = if ba_last_ts > 0.0 {
                 (now - ba_last_ts).max(0.0)
@@ -5918,6 +6444,41 @@ impl MakerHedgeCapBot {
             self.logger.info(&format!(
                 "[SNIPER][DBG_ALLOW] side={side_dbg} qty={remaining:.4} avg={avg_dbg:.4} asset={aid_tail} yes={yes_tail} no={no_tail} ba_age={ba_age_s:.3}s raw_bal={ba_raw_bal:.0} raw_allow={ba_raw_allow:.0} units={ba_units:.0} sh_bal={ba_bal_sh:.6} sh_allow={ba_allow_sh:.6} wallet=*{wallet_tail} funder=*{funder_tail} state(qy={q_yes:.6},qn={q_no:.6},cy={c_yes:.6},cn={c_no:.6},open_orders={oo_count})"
             ));
+            if env_bool("SNIPER_DEBUG_BALANCE_BOTH", false) {
+                let yes_id = self.yes_asset.clone().unwrap_or_default();
+                let no_id = self.no_asset.clone().unwrap_or_default();
+                let (yes_bal, yes_allow) = if !yes_id.trim().is_empty() {
+                    self._get_balance_allowance_conditional_cached(&yes_id, 0.0)
+                        .unwrap_or((0.0, 0.0))
+                } else {
+                    (0.0, 0.0)
+                };
+                let (no_bal, no_allow) = if !no_id.trim().is_empty() {
+                    self._get_balance_allowance_conditional_cached(&no_id, 0.0)
+                        .unwrap_or((0.0, 0.0))
+                } else {
+                    (0.0, 0.0)
+                };
+                let yes_tail2: String = yes_id
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                let no_tail2: String = no_id
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                self.logger.info(&format!(
+                    "[SNIPER][DBG_BOTH] yes={yes_tail2} bal={yes_bal:.6} allow={yes_allow:.6} | no={no_tail2} bal={no_bal:.6} allow={no_allow:.6}"
+                ));
+            }
             // Safety-first: auto reconcile is opt-in and conservative.
             // Default is disabled to avoid clearing positions due to transient API/cache issues.
             if balance_avail_int <= 0
@@ -6010,16 +6571,28 @@ impl MakerHedgeCapBot {
                 );
                 thread::sleep(Duration::from_millis(150));
 
-                let mut sell_int = remaining_int.min(balance_avail_int).min(allow_int);
-                sell_int = (sell_int / min_int) * min_int;
-                if sell_int < min_int {
-                    return false;
+                let mut sell_sz = remaining.min(balance_avail_sh).min(allow_sh);
+                if exit_size_subtract > 0.0 {
+                    sell_sz = (sell_sz - exit_size_subtract).max(0.0);
+                }
+                if exit_allow_fractional {
+                    sell_sz = q_down(sell_sz, exit_size_dp);
+                    if sell_sz + 1e-12 < min_exit_size {
+                        return false;
+                    }
+                } else {
+                    let mut sell_int = (sell_sz + 1e-12).floor() as i64;
+                    sell_int = (sell_int / min_int) * min_int;
+                    if sell_int < min_int {
+                        return false;
+                    }
+                    sell_sz = sell_int as f64;
                 }
                 let stop_ot = std::env::var("SNIPER_STOP_LIMIT_ORDER_TYPE")
                     .unwrap_or_else(|_| "GTC".to_string())
                     .to_ascii_uppercase();
                 let oid =
-                    self._place_taker_ask_fak(&asset_id, floor_px, sell_int as f64, Some(&stop_ot));
+                    self._place_taker_ask_fak(&asset_id, floor_px, sell_sz, Some(&stop_ot));
                 if oid.is_some() {
                     self._runtime_ts_set("__sniper_stop_limit_order_ts", now_ts_f64());
                     self._runtime_ts_set("__sniper_stop_limit_order_px", floor_px);
@@ -6041,12 +6614,22 @@ impl MakerHedgeCapBot {
             );
             thread::sleep(Duration::from_millis(200));
         }
-        let mut chunk = env_int("SNIPER_EXIT_CHUNK_SHARES", min_int);
-        if chunk < min_int {
-            chunk = min_int;
+        let mut chunk = env_float("SNIPER_EXIT_CHUNK_SHARES", min_int as f64);
+        if chunk <= 0.0 {
+            chunk = min_int as f64;
         }
+        chunk = q_down(chunk, exit_size_dp);
+        if chunk <= 0.0 {
+            chunk = min_exit_size.max(exit_size_step);
+        }
+        let full_size_first = env_bool("SNIPER_EXIT_FULL_SIZE_FIRST", true);
+        let recent_submit_guard_s =
+            env_float("SNIPER_EXIT_RECENT_SUBMIT_GUARD_SECONDS", 8.0).max(1.0);
         let exit_slip_ticks = env_int("SNIPER_EXIT_SLIPPAGE_TICKS", 1).max(0);
-        let max_passes = 4i64;
+        let max_passes = 3i64;
+        let mut sold_any = false;
+        let mut submitted_any = false;
+        let mut last_submit_ts = 0.0f64;
         for pass_i in 0..max_passes {
             let cur = self._sniper_position();
             if cur.is_none() {
@@ -6056,38 +6639,193 @@ impl MakerHedgeCapBot {
             let cur = cur.unwrap_or_default();
             let remaining = cur.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let remaining_int = (remaining + 1e-12).floor() as i64;
-            if remaining_int < min_int {
+            if (exit_allow_fractional && remaining + 1e-12 < min_exit_size)
+                || (!exit_allow_fractional && remaining_int < min_int)
+            {
                 return true;
             }
             let bid = cur.get("bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let mut px = bid - (exit_slip_ticks + pass_i) as f64 * tick;
             px = clamp(round_down(px, tick), tick, 0.99);
-            let mut sell_int = remaining_int.min(chunk);
-            sell_int = (sell_int / min_int) * min_int;
-            if sell_int < min_int {
-                sell_int = min_int;
+            let mut sell_sz = if pass_i == 0 && full_size_first {
+                remaining
+            } else {
+                remaining.min(chunk)
+            };
+            if exit_size_subtract > 0.0 {
+                sell_sz = (sell_sz - exit_size_subtract).max(0.0);
             }
-            sell_int = sell_int.min(balance_avail_int).min(allow_int);
-            sell_int = (sell_int / min_int) * min_int;
-            if sell_int < min_int {
-                return false;
+            if exit_allow_fractional {
+                sell_sz = q_down(sell_sz, exit_size_dp);
+                let cap = balance_avail_sh.min(allow_sh);
+                if cap > 0.0 {
+                    sell_sz = sell_sz.min(cap);
+                }
+                sell_sz = q_down(sell_sz, exit_size_dp);
+                if sell_sz + 1e-12 < min_exit_size {
+                    self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+                    return false;
+                }
+            } else {
+                let mut sell_int = (sell_sz + 1e-12).floor() as i64;
+                sell_int = (sell_int / min_int) * min_int;
+                if sell_int < min_int {
+                    sell_int = min_int;
+                }
+                if balance_avail_int >= min_int {
+                    sell_int = sell_int.min(balance_avail_int);
+                    sell_int = (sell_int / min_int) * min_int;
+                }
+                if sell_int < min_int {
+                    let chunk_i = (chunk + 1e-12).floor() as i64;
+                    sell_int = remaining_int.min(chunk_i.max(min_int));
+                }
+                sell_sz = sell_int as f64;
             }
+            self._runtime_ts_set("__taker_inflight_until", now_ts_f64() + 0.75);
             let ot = std::env::var("SNIPER_EXIT_ORDER_TYPE")
                 .unwrap_or_else(|_| "FOK".to_string())
                 .to_ascii_uppercase();
-            let mut oid = self._place_taker_ask_fak(&asset_id, px, sell_int as f64, Some(&ot));
+            let mut oid = self._place_taker_ask_fak(&asset_id, px, sell_sz, Some(&ot));
             if oid.is_none() {
                 let fb = std::env::var("SNIPER_EXIT_ORDER_TYPE_FALLBACK")
                     .unwrap_or_default()
                     .to_ascii_uppercase();
                 if !fb.trim().is_empty() && fb != ot {
-                    oid = self._place_taker_ask_fak(&asset_id, px, sell_int as f64, Some(&fb));
+                    oid = self._place_taker_ask_fak(&asset_id, px, sell_sz, Some(&fb));
                 }
             }
             if oid.is_none() {
-                continue;
+                if let Some((bal, allow)) =
+                    self._get_balance_allowance_conditional_cached(&asset_id, 0.0)
+                {
+                    let bal_int = (bal + 1e-12).floor() as i64;
+                    let allow_int_fresh = (allow + 1e-12).floor() as i64;
+                    let bal_sh = bal.max(0.0);
+                    let allow_sh_fresh = allow.max(0.0);
+                    let recent_submit =
+                        submitted_any && (now_ts_f64() - last_submit_ts) <= recent_submit_guard_s;
+                    let bal_below_min = (exit_allow_fractional && bal_sh + 1e-12 < min_exit_size)
+                        || (!exit_allow_fractional && bal_int < min_int);
+                    if bal_below_min {
+                        if sold_any || recent_submit {
+                            let aid_tail: String = asset_id
+                                .chars()
+                                .rev()
+                                .take(6)
+                                .collect::<String>()
+                                .chars()
+                                .rev()
+                                .collect();
+                            self.logger.warning(&format!(
+                                "[SNIPER] balance snapshot below min after recent/partial exit for asset={aid_tail}; deferring local-state reconcile and retrying."
+                            ));
+                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 2.0);
+                            return false;
+                        }
+                        if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true) {
+                            if let Some(sz_live) = self._get_position_size_data_api(&asset_id) {
+                                let live_int = (sz_live + 1e-12).floor() as i64;
+                                let live_ok = (exit_allow_fractional
+                                    && sz_live + 1e-12 >= min_exit_size)
+                                    || (!exit_allow_fractional && live_int >= min_int);
+                                if live_ok {
+                                    let aid_tail: String = asset_id
+                                        .chars()
+                                        .rev()
+                                        .take(6)
+                                        .collect::<String>()
+                                        .chars()
+                                        .rev()
+                                        .collect();
+                                    self.logger.warning(&format!(
+                                        "[SNIPER] balance snapshot below min but positions API still shows shares for asset={aid_tail} (pos={live_int}); deferring local-state reconcile."
+                                    ));
+                                    self._runtime_ts_set(
+                                        "__taker_fail_pause_until",
+                                        now_ts_f64() + 2.0,
+                                    );
+                                    return false;
+                                }
+                            }
+                        }
+                        let aid_tail: String = asset_id
+                            .chars()
+                            .rev()
+                            .take(6)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
+                        if env_bool("SNIPER_EXIT_CLEAR_LOCAL_ON_REJECT_ZERO_BALANCE", false) {
+                            self.logger.warning(&format!(
+                                "[SNIPER] exit rejected (bal<min). Clearing local position state for asset={aid_tail} due to SNIPER_EXIT_CLEAR_LOCAL_ON_REJECT_ZERO_BALANCE=true."
+                            ));
+                            self._clear_local_position_for_asset(
+                                &asset_id,
+                                "exit rejected but clob balance below min_shares",
+                            );
+                        } else {
+                            self.logger.warning(&format!(
+                                "[SNIPER] exit rejected (bal<min) for asset={aid_tail}; keeping local state and retrying (no immediate market stop)."
+                            ));
+                        }
+                        self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 2.0);
+                        return false;
+                    }
+                    let allow_below_min =
+                        (exit_allow_fractional && allow_sh_fresh + 1e-12 < min_exit_size)
+                            || (!exit_allow_fractional && allow_int_fresh < min_int);
+                    if allow_below_min {
+                        if sold_any || recent_submit {
+                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 5.0);
+                            return false;
+                        }
+                        let aid_tail: String = asset_id
+                            .chars()
+                            .rev()
+                            .take(6)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
+                        self.logger.warning(
+                            "[SNIPER] exit failed: allowance too low. Approve conditional tokens for selling, then the bot will retry.",
+                        );
+                        self.logger.info(&format!(
+                            "[SNIPER] allowance snapshot asset={aid_tail} bal={bal_sh:.6} allow={allow_sh_fresh:.6} min_required={min_exit_size:.6}"
+                        ));
+                        self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 60.0);
+                        return false;
+                    }
+                    if exit_allow_fractional {
+                        let mut sellable_sh = bal_sh.min(allow_sh_fresh);
+                        sellable_sh = q_down(sellable_sh, exit_size_dp);
+                        if sellable_sh + 1e-12 >= min_exit_size && sellable_sh + 1e-9 < remaining {
+                            balance_avail_sh = sellable_sh;
+                            allow_sh = sellable_sh;
+                            balance_avail_int = (sellable_sh + 1e-12).floor() as i64;
+                            allow_int = balance_avail_int;
+                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+                            continue;
+                        }
+                    } else {
+                        let mut sellable_int = bal_int.min(allow_int_fresh);
+                        sellable_int = (sellable_int / min_int) * min_int;
+                        if sellable_int >= min_int && sellable_int < remaining_int {
+                            balance_avail_int = sellable_int;
+                            allow_int = sellable_int;
+                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+                            continue;
+                        }
+                    }
+                }
+                self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 5.0);
+                return false;
             }
-            thread::sleep(Duration::from_secs_f64(1.5));
+            submitted_any = true;
+            last_submit_ts = now_ts_f64();
+            thread::sleep(Duration::from_secs_f64(1.0));
             let cur2 = self._sniper_position();
             if cur2.is_none() {
                 self._mark_sniper_exit_state();
@@ -6099,12 +6837,20 @@ impl MakerHedgeCapBot {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
             if rem2 <= remaining - 1e-9 {
+                sold_any = true;
                 continue;
             }
-            if let Some(oid) = oid {
-                let _ = self._cancel(&oid);
+            if env_bool("SNIPER_CANCEL_EXIT_ORDERS_BEFORE_RETRY", true) {
+                self._cancel_exchange_orders_for_assets(
+                    std::slice::from_ref(&asset_id),
+                    &format!("sniper exit {reason_u} no-fill cancel"),
+                );
             }
-            thread::sleep(Duration::from_millis(350));
+            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+            break;
+        }
+        if sold_any {
+            return false;
         }
         false
     }

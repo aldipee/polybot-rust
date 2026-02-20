@@ -27,6 +27,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+fn db_url_hint(db_url: &str) -> String {
+    if db_url.starts_with("sqlite://") {
+        return db_url.to_string();
+    }
+    if let Some((scheme, _)) = db_url.split_once("://") {
+        return format!("{scheme}://<redacted>");
+    }
+    "<invalid-db-url>".to_string()
+}
+
 fn print_pnl_metrics(repo: &BotRepository, bot_id: &str, logger: &Arc<dyn LogLike>) -> String {
     let today = date_jakarta();
     let week_start = week_start_date_jakarta();
@@ -141,18 +151,30 @@ fn run() -> Result<()> {
 
     let db_url = env::var("DB_URL")
         .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5432/polybot".to_string());
+    let db_url_log = db_url_hint(&db_url);
     let engine = make_engine(&db_url);
     let session_factory = make_session_factory(engine.clone());
-    let mut init_ok = false;
-    for _ in 0..5 {
-        if BotRepository::init_schema(&engine).is_ok() {
-            init_ok = true;
-            break;
+    let mut last_init_err: Option<String> = None;
+    for attempt in 1..=5 {
+        match BotRepository::init_schema(&engine) {
+            Ok(_) => {
+                last_init_err = None;
+                break;
+            }
+            Err(err) => {
+                let msg = format!("{err:#}");
+                eprintln!(
+                    "db init attempt {attempt}/5 failed (DB_URL={db_url_log}): {msg}"
+                );
+                last_init_err = Some(msg);
+                thread::sleep(Duration::from_secs(2));
+            }
         }
-        thread::sleep(Duration::from_secs(2));
     }
-    if !init_ok {
-        return Err(anyhow!("DB Init Error after 5 retries"));
+    if let Some(last) = last_init_err {
+        return Err(anyhow!(
+            "DB Init Error after 5 retries (DB_URL={db_url_log}): {last}"
+        ));
     }
 
     let bot_id = env::var("BOT_ID").unwrap_or_else(|_| "maker_hedgecap_bot".to_string());
