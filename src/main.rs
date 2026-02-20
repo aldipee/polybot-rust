@@ -29,6 +29,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+fn build_version() -> String {
+    let commit_id = option_env!("GIT_COMMIT_ID").unwrap_or("unknown");
+    format!("{}+{commit_id}", env!("CARGO_PKG_VERSION"))
+}
+
 fn db_url_hint(db_url: &str) -> String {
     if db_url.starts_with("sqlite://") {
         return db_url.to_string();
@@ -123,6 +128,7 @@ fn run() -> Result<()> {
         }
         return Ok(());
     }
+    println!("polybot version: {}", build_version());
 
     let mut cfg = BotConfig::from_env();
 
