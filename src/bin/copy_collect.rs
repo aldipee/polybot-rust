@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use chrono::DateTime;
+use chrono::{DateTime, TimeZone, Utc};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -93,6 +93,87 @@ fn as_f64(v: Option<&Value>) -> Option<f64> {
 
 fn as_i64_ms(v: Option<&Value>) -> Option<i64> {
     as_i64_ms_with_precision(v).0
+}
+
+fn as_i64(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn format_utc_ms(ms: i64) -> Option<String> {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+}
+
+fn infer_unix_ms_for_key(key: &str, v: &Value) -> Option<i64> {
+    if v.is_null() {
+        return None;
+    }
+    let k = key.trim().to_ascii_lowercase();
+    if k.is_empty() || k.ends_with("_utc") {
+        return None;
+    }
+
+    let is_unix_ts_key = k.contains("timestamp")
+        || k == "ts_ms"
+        || k == "ts_sec"
+        || k.ends_with("_ts_ms")
+        || k.ends_with("_ts_sec")
+        || k.ends_with("_at_ms")
+        || k.ends_with("_at_sec");
+    if !is_unix_ts_key {
+        return None;
+    }
+
+    let raw = as_i64(Some(v))?;
+    if k == "ts_sec"
+        || k.ends_with("_ts_sec")
+        || k.ends_with("_at_sec")
+        || k.contains("timestamp_sec")
+    {
+        return Some(raw.saturating_mul(1000));
+    }
+    if k == "ts_ms"
+        || k.ends_with("_ts_ms")
+        || k.ends_with("_at_ms")
+        || k.contains("timestamp_ms")
+    {
+        return Some(raw);
+    }
+    if raw > 1_000_000_000_000 {
+        Some(raw)
+    } else if raw > 1_000_000_000 {
+        Some(raw.saturating_mul(1000))
+    } else {
+        None
+    }
+}
+
+fn append_utc_timestamp_columns(row: &mut Value) {
+    let Some(obj) = row.as_object_mut() else {
+        return;
+    };
+    let keys: Vec<String> = obj.keys().cloned().collect();
+    for key in keys {
+        let out_key = format!("{key}_utc");
+        if obj.contains_key(&out_key) {
+            continue;
+        }
+        let Some(v) = obj.get(&key) else {
+            continue;
+        };
+        let Some(ms) = infer_unix_ms_for_key(&key, v) else {
+            continue;
+        };
+        let Some(iso) = format_utc_ms(ms) else {
+            continue;
+        };
+        obj.insert(out_key, Value::String(iso));
+    }
 }
 
 fn as_i64_ms_with_precision(v: Option<&Value>) -> (Option<i64>, &'static str) {
@@ -498,7 +579,9 @@ impl JsonlWriter {
     }
 
     fn append(&self, obj: &Value) -> Result<()> {
-        let line = serde_json::to_string(obj)?;
+        let mut out = obj.clone();
+        append_utc_timestamp_columns(&mut out);
+        let line = serde_json::to_string(&out)?;
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)

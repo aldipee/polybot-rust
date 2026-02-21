@@ -58,9 +58,10 @@ systemctl enable --now polybot@bot-b
 
 ```bash
 systemctl status polybot@bot-a
-journalctl -u polybot@bot-a -f
+journalctl -u polybot@bot-a -f -n 100
 systemctl restart polybot@bot-a
 systemctl stop polybot@bot-b
+systemctl list-units --type=service --state=running
 ```
 
 If you see `status=203/EXEC` or `Permission denied` on `run-instance.sh`:

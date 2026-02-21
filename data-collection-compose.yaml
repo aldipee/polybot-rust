@@ -20,6 +20,7 @@ services:
     
   polybot-btc-data-collection-5m:
     container_name: polybot-btc-5m-data-collection
+    user: "0:0"
     working_dir: /app/state
     build:
       context: .
@@ -39,6 +40,7 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
+      MARKET_SLUG: btc-updown-5m-1771655400
     volumes:
       - ./data:/app/data
       - ./signals:/app/signals
@@ -48,33 +50,34 @@ services:
       - /app/logs:size=64m,mode=1777
     restart: unless-stopped
 
-  polybot-copy-data-collection:
-    container_name: polybot-copy-data-collection
-    working_dir: /app/state
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: runtime
-    network_mode: host
-    entrypoint: ["/usr/local/bin/copy_collect"]
-    env_file:
-      - data_collection.env
-    environment:
-      COPY_COLLECT_OUT_PATH: /app/state/copy_collect.jsonl
-      COPY_COLLECT_INCLUDE_RTDS_DATA: "true"
-      COPY_COLLECT_CLOB_JOIN_ENABLED: "true"
-      COPY_COLLECT_INCLUDE_RFQ: "true"
-      COPY_COLLECT_LOG_PRICE_TICKS: "true"
-      COPY_COLLECT_WS_URL: wss://ws-live-data.polymarket.com
-      COPY_COLLECT_CLOB_WS_URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
-    volumes:
-      - ./data:/app/data
-      - ./signals:/app/signals
-      - ./state:/app/state
-    tmpfs:
-      - /app/output:size=64m,mode=1777
-      - /app/logs:size=64m,mode=1777
-    restart: unless-stopped
+  # polybot-copy-data-collection:
+  #   container_name: polybot-copy-data-collection
+  #   user: "0:0"
+  #   working_dir: /app/state
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #     target: runtime
+  #   network_mode: host
+  #   entrypoint: ["/usr/local/bin/copy_collect"]
+  #   env_file:
+  #     - data_collection.env
+  #   environment:
+  #     COPY_COLLECT_OUT_PATH: /app/state/copy_collect.jsonl
+  #     COPY_COLLECT_INCLUDE_RTDS_DATA: "true"
+  #     COPY_COLLECT_CLOB_JOIN_ENABLED: "true"
+  #     COPY_COLLECT_INCLUDE_RFQ: "true"
+  #     COPY_COLLECT_LOG_PRICE_TICKS: "true"
+  #     COPY_COLLECT_WS_URL: wss://ws-live-data.polymarket.com
+  #     COPY_COLLECT_CLOB_WS_URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./signals:/app/signals
+  #     - ./state:/app/state
+  #   tmpfs:
+  #     - /app/output:size=64m,mode=1777
+  #     - /app/logs:size=64m,mode=1777
+  #   restart: unless-stopped
 
 volumes:
   postgres_data:

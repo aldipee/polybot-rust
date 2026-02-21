@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,27 +38,41 @@ struct RtdsPricesRow {
     asset_id: String,
     kind: String,
     timestamp_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    timestamp_ms_utc: Option<DateTime<Utc>>,
     received_at_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    received_at_ms_utc: Option<DateTime<Utc>>,
     price: Option<f64>,
     value: Option<f64>,
     price_to_beat: Option<f64>,
     diff_vs_price_to_beat: Option<f64>,
     diff_vs_price_to_beat_percentage: Option<f64>,
     clob_join_target_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_join_target_ts_ms_utc: Option<DateTime<Utc>>,
     clob_up_asset_id: String,
     clob_up_best_bid_price: Option<f64>,
     clob_up_best_ask_price: Option<f64>,
     clob_up_mid_price: Option<f64>,
     clob_up_spread: Option<f64>,
     clob_up_exchange_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_up_exchange_ts_ms_utc: Option<DateTime<Utc>>,
     clob_up_recv_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_up_recv_ts_ms_utc: Option<DateTime<Utc>>,
     clob_down_asset_id: String,
     clob_down_best_bid_price: Option<f64>,
     clob_down_best_ask_price: Option<f64>,
     clob_down_mid_price: Option<f64>,
     clob_down_spread: Option<f64>,
     clob_down_exchange_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_down_exchange_ts_ms_utc: Option<DateTime<Utc>>,
     clob_down_recv_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_down_recv_ts_ms_utc: Option<DateTime<Utc>>,
     row_json: String,
     ingested_at_ms: i64,
 }
@@ -67,6 +82,8 @@ struct CopyCollectRow {
     row_hash: String,
     kind: String,
     collector_ts_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    collector_ts_ms_utc: Option<DateTime<Utc>>,
     wallet: String,
     market_slug: String,
     event_slug: String,
@@ -75,25 +92,39 @@ struct CopyCollectRow {
     side: String,
     outcome: String,
     trade_ts_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    trade_ts_ms_utc: Option<DateTime<Utc>>,
     trade_price: Option<f64>,
     trade_size: Option<f64>,
     rtds_price: Option<f64>,
     rtds_price_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    rtds_price_ts_ms_utc: Option<DateTime<Utc>>,
     clob_join_target_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_join_target_ts_ms_utc: Option<DateTime<Utc>>,
     clob_up_asset_id: String,
     clob_up_best_bid_price: Option<f64>,
     clob_up_best_ask_price: Option<f64>,
     clob_up_mid_price: Option<f64>,
     clob_up_spread: Option<f64>,
     clob_up_exchange_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_up_exchange_ts_ms_utc: Option<DateTime<Utc>>,
     clob_up_recv_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_up_recv_ts_ms_utc: Option<DateTime<Utc>>,
     clob_down_asset_id: String,
     clob_down_best_bid_price: Option<f64>,
     clob_down_best_ask_price: Option<f64>,
     clob_down_mid_price: Option<f64>,
     clob_down_spread: Option<f64>,
     clob_down_exchange_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_down_exchange_ts_ms_utc: Option<DateTime<Utc>>,
     clob_down_recv_ts_ms: Option<i64>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    clob_down_recv_ts_ms_utc: Option<DateTime<Utc>>,
     row_json: String,
     ingested_at_ms: i64,
 }
@@ -104,6 +135,8 @@ struct PriceToBeatRow {
     market_slug: String,
     price_to_beat: Option<f64>,
     updated_at_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    updated_at_ms_utc: Option<DateTime<Utc>>,
     row_json: String,
     ingested_at_ms: i64,
 }
@@ -113,11 +146,17 @@ struct ResolutionStateRow {
     row_hash: String,
     state_version: i64,
     state_updated_at_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    state_updated_at_ms_utc: Option<DateTime<Utc>>,
     market_slug: String,
     symbol: String,
     asset_id: String,
     resolution_ts_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    resolution_ts_ms_utc: Option<DateTime<Utc>>,
     source_ts_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    source_ts_ms_utc: Option<DateTime<Utc>>,
     resolution_price: Option<f64>,
     resolution_value: Option<f64>,
     capture_mode: String,
@@ -125,6 +164,8 @@ struct ResolutionStateRow {
     diff_vs_price_to_beat: Option<f64>,
     diff_vs_price_to_beat_percentage: Option<f64>,
     captured_at_ms: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+    captured_at_ms_utc: Option<DateTime<Utc>>,
     row_json: String,
     ingested_at_ms: i64,
 }
@@ -160,6 +201,52 @@ fn val_i64(v: Option<&Value>) -> Option<i64> {
             .or_else(|| n.as_f64().map(|f| f as i64))
             .filter(|x| *x != 0),
         Some(Value::String(s)) => s.trim().parse::<i64>().ok().filter(|x| *x != 0),
+        _ => None,
+    }
+}
+
+fn epoch_ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
+    if ms == 0 {
+        None
+    } else {
+        DateTime::<Utc>::from_timestamp_millis(ms)
+    }
+}
+
+fn parse_utc_datetime(raw: &str) -> Option<DateTime<Utc>> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(ms) = t.parse::<i64>() {
+        return epoch_ms_to_utc(ms);
+    }
+    if let Ok(secs) = t.parse::<f64>() {
+        if secs.abs() >= 1_000_000_000_000.0 {
+            return epoch_ms_to_utc(secs as i64);
+        }
+        return DateTime::<Utc>::from_timestamp_millis((secs * 1000.0) as i64);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(t) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
+    None
+}
+
+fn val_opt_datetime_utc(v: Option<&Value>) -> Option<DateTime<Utc>> {
+    match v {
+        Some(Value::String(s)) => parse_utc_datetime(s),
+        Some(Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                epoch_ms_to_utc(i)
+            } else {
+                n.as_f64()
+                    .and_then(|f| DateTime::<Utc>::from_timestamp_millis((f * 1000.0) as i64))
+            }
+        }
         _ => None,
     }
 }
@@ -273,27 +360,34 @@ async fn create_schema(root_client: &Client, db_client: &Client, cfg: &PushConfi
                 asset_id String,
                 kind String,
                 timestamp_ms Int64,
+                timestamp_ms_utc Nullable(DateTime64(3, 'UTC')),
                 received_at_ms Int64,
+                received_at_ms_utc Nullable(DateTime64(3, 'UTC')),
                 price Nullable(Float64),
                 value Nullable(Float64),
                 price_to_beat Nullable(Float64),
                 diff_vs_price_to_beat Nullable(Float64),
                 diff_vs_price_to_beat_percentage Nullable(Float64),
                 clob_join_target_ts_ms Nullable(Int64),
+                clob_join_target_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_up_asset_id String,
                 clob_up_best_bid_price Nullable(Float64),
                 clob_up_best_ask_price Nullable(Float64),
                 clob_up_mid_price Nullable(Float64),
                 clob_up_spread Nullable(Float64),
                 clob_up_exchange_ts_ms Nullable(Int64),
+                clob_up_exchange_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_up_recv_ts_ms Nullable(Int64),
+                clob_up_recv_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_down_asset_id String,
                 clob_down_best_bid_price Nullable(Float64),
                 clob_down_best_ask_price Nullable(Float64),
                 clob_down_mid_price Nullable(Float64),
                 clob_down_spread Nullable(Float64),
                 clob_down_exchange_ts_ms Nullable(Int64),
+                clob_down_exchange_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_down_recv_ts_ms Nullable(Int64),
+                clob_down_recv_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 row_json String,
                 ingested_at_ms Int64
             ) ENGINE = MergeTree
@@ -310,6 +404,7 @@ async fn create_schema(root_client: &Client, db_client: &Client, cfg: &PushConfi
                 row_hash String,
                 kind String,
                 collector_ts_ms Int64,
+                collector_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 wallet String,
                 market_slug String,
                 event_slug String,
@@ -318,25 +413,32 @@ async fn create_schema(root_client: &Client, db_client: &Client, cfg: &PushConfi
                 side String,
                 outcome String,
                 trade_ts_ms Int64,
+                trade_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 trade_price Nullable(Float64),
                 trade_size Nullable(Float64),
                 rtds_price Nullable(Float64),
                 rtds_price_ts_ms Nullable(Int64),
+                rtds_price_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_join_target_ts_ms Nullable(Int64),
+                clob_join_target_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_up_asset_id String,
                 clob_up_best_bid_price Nullable(Float64),
                 clob_up_best_ask_price Nullable(Float64),
                 clob_up_mid_price Nullable(Float64),
                 clob_up_spread Nullable(Float64),
                 clob_up_exchange_ts_ms Nullable(Int64),
+                clob_up_exchange_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_up_recv_ts_ms Nullable(Int64),
+                clob_up_recv_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_down_asset_id String,
                 clob_down_best_bid_price Nullable(Float64),
                 clob_down_best_ask_price Nullable(Float64),
                 clob_down_mid_price Nullable(Float64),
                 clob_down_spread Nullable(Float64),
                 clob_down_exchange_ts_ms Nullable(Int64),
+                clob_down_exchange_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 clob_down_recv_ts_ms Nullable(Int64),
+                clob_down_recv_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 row_json String,
                 ingested_at_ms Int64
             ) ENGINE = MergeTree
@@ -354,6 +456,7 @@ async fn create_schema(root_client: &Client, db_client: &Client, cfg: &PushConfi
                 market_slug String,
                 price_to_beat Nullable(Float64),
                 updated_at_ms Int64,
+                updated_at_ms_utc Nullable(DateTime64(3, 'UTC')),
                 row_json String,
                 ingested_at_ms Int64
             ) ENGINE = ReplacingMergeTree(updated_at_ms)
@@ -370,11 +473,14 @@ async fn create_schema(root_client: &Client, db_client: &Client, cfg: &PushConfi
                 row_hash String,
                 state_version Int64,
                 state_updated_at_ms Int64,
+                state_updated_at_ms_utc Nullable(DateTime64(3, 'UTC')),
                 market_slug String,
                 symbol String,
                 asset_id String,
                 resolution_ts_ms Int64,
+                resolution_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 source_ts_ms Int64,
+                source_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                 resolution_price Nullable(Float64),
                 resolution_value Nullable(Float64),
                 capture_mode String,
@@ -382,6 +488,7 @@ async fn create_schema(root_client: &Client, db_client: &Client, cfg: &PushConfi
                 diff_vs_price_to_beat Nullable(Float64),
                 diff_vs_price_to_beat_percentage Nullable(Float64),
                 captured_at_ms Int64,
+                captured_at_ms_utc Nullable(DateTime64(3, 'UTC')),
                 row_json String,
                 ingested_at_ms Int64
             ) ENGINE = MergeTree
@@ -438,34 +545,57 @@ async fn ingest_rtds_prices(client: &Client, cfg: &PushConfig) -> Result<usize> 
                 continue;
             }
         };
+        let timestamp_ms = val_i64(obj.get("timestamp_ms")).unwrap_or(0);
+        let received_at_ms = val_i64(obj.get("received_at_ms")).unwrap_or(0);
+        let clob_join_target_ts_ms = val_i64(obj.get("clob_join_target_ts_ms"));
+        let clob_up_exchange_ts_ms = val_i64(obj.get("clob_up_exchange_ts_ms"));
+        let clob_up_recv_ts_ms = val_i64(obj.get("clob_up_recv_ts_ms"));
+        let clob_down_exchange_ts_ms = val_i64(obj.get("clob_down_exchange_ts_ms"));
+        let clob_down_recv_ts_ms = val_i64(obj.get("clob_down_recv_ts_ms"));
         let row = RtdsPricesRow {
             row_hash: row_hash_hex(raw),
             market_slug: val_str(obj.get("market_slug")),
             symbol: val_str(obj.get("symbol")),
             asset_id: val_str(obj.get("asset_id")),
             kind: val_str(obj.get("kind")),
-            timestamp_ms: val_i64(obj.get("timestamp_ms")).unwrap_or(0),
-            received_at_ms: val_i64(obj.get("received_at_ms")).unwrap_or(0),
+            timestamp_ms,
+            timestamp_ms_utc: val_opt_datetime_utc(obj.get("timestamp_ms_utc"))
+                .or_else(|| epoch_ms_to_utc(timestamp_ms)),
+            received_at_ms,
+            received_at_ms_utc: val_opt_datetime_utc(obj.get("received_at_ms_utc"))
+                .or_else(|| epoch_ms_to_utc(received_at_ms)),
             price: val_f64(obj.get("price")),
             value: val_f64(obj.get("value")),
             price_to_beat: val_f64(obj.get("price_to_beat")),
             diff_vs_price_to_beat: val_f64(obj.get("diff_vs_price_to_beat")),
             diff_vs_price_to_beat_percentage: val_f64(obj.get("diff_vs_price_to_beat_percentage")),
-            clob_join_target_ts_ms: val_i64(obj.get("clob_join_target_ts_ms")),
+            clob_join_target_ts_ms,
+            clob_join_target_ts_ms_utc: val_opt_datetime_utc(obj.get("clob_join_target_ts_ms_utc"))
+                .or_else(|| clob_join_target_ts_ms.and_then(epoch_ms_to_utc)),
             clob_up_asset_id: val_str(obj.get("clob_up_asset_id")),
             clob_up_best_bid_price: val_f64(obj.get("clob_up_best_bid_price")),
             clob_up_best_ask_price: val_f64(obj.get("clob_up_best_ask_price")),
             clob_up_mid_price: val_f64(obj.get("clob_up_mid_price")),
             clob_up_spread: val_f64(obj.get("clob_up_spread")),
-            clob_up_exchange_ts_ms: val_i64(obj.get("clob_up_exchange_ts_ms")),
-            clob_up_recv_ts_ms: val_i64(obj.get("clob_up_recv_ts_ms")),
+            clob_up_exchange_ts_ms,
+            clob_up_exchange_ts_ms_utc: val_opt_datetime_utc(obj.get("clob_up_exchange_ts_ms_utc"))
+                .or_else(|| clob_up_exchange_ts_ms.and_then(epoch_ms_to_utc)),
+            clob_up_recv_ts_ms,
+            clob_up_recv_ts_ms_utc: val_opt_datetime_utc(obj.get("clob_up_recv_ts_ms_utc"))
+                .or_else(|| clob_up_recv_ts_ms.and_then(epoch_ms_to_utc)),
             clob_down_asset_id: val_str(obj.get("clob_down_asset_id")),
             clob_down_best_bid_price: val_f64(obj.get("clob_down_best_bid_price")),
             clob_down_best_ask_price: val_f64(obj.get("clob_down_best_ask_price")),
             clob_down_mid_price: val_f64(obj.get("clob_down_mid_price")),
             clob_down_spread: val_f64(obj.get("clob_down_spread")),
-            clob_down_exchange_ts_ms: val_i64(obj.get("clob_down_exchange_ts_ms")),
-            clob_down_recv_ts_ms: val_i64(obj.get("clob_down_recv_ts_ms")),
+            clob_down_exchange_ts_ms,
+            clob_down_exchange_ts_ms_utc: val_opt_datetime_utc(
+                obj.get("clob_down_exchange_ts_ms_utc"),
+            )
+            .or_else(|| clob_down_exchange_ts_ms.and_then(epoch_ms_to_utc)),
+            clob_down_recv_ts_ms,
+            clob_down_recv_ts_ms_utc: val_opt_datetime_utc(obj.get("clob_down_recv_ts_ms_utc"))
+                .or_else(|| clob_down_recv_ts_ms.and_then(epoch_ms_to_utc)),
             row_json: raw.to_string(),
             ingested_at_ms,
         };
@@ -516,10 +646,19 @@ async fn ingest_copy_collect(client: &Client, cfg: &PushConfig) -> Result<usize>
                 .map(|x| x * 1000)
                 .unwrap_or(0)
         });
+        let collector_ts_ms = val_i64(obj.get("collector_ts_ms")).unwrap_or(0);
+        let rtds_price_ts_ms = val_i64(obj.get("rtds_price_ts_ms"));
+        let clob_join_target_ts_ms = val_i64(obj.get("clob_join_target_ts_ms"));
+        let clob_up_exchange_ts_ms = val_i64(obj.get("clob_up_exchange_ts_ms"));
+        let clob_up_recv_ts_ms = val_i64(obj.get("clob_up_recv_ts_ms"));
+        let clob_down_exchange_ts_ms = val_i64(obj.get("clob_down_exchange_ts_ms"));
+        let clob_down_recv_ts_ms = val_i64(obj.get("clob_down_recv_ts_ms"));
         let row = CopyCollectRow {
             row_hash: row_hash_hex(raw),
             kind: val_str(obj.get("kind")),
-            collector_ts_ms: val_i64(obj.get("collector_ts_ms")).unwrap_or(0),
+            collector_ts_ms,
+            collector_ts_ms_utc: val_opt_datetime_utc(obj.get("collector_ts_ms_utc"))
+                .or_else(|| epoch_ms_to_utc(collector_ts_ms)),
             wallet: val_str(obj.get("wallet")),
             market_slug: val_str(obj.get("market_slug")),
             event_slug: val_str(obj.get("event_slug")),
@@ -528,25 +667,41 @@ async fn ingest_copy_collect(client: &Client, cfg: &PushConfig) -> Result<usize>
             side: val_str(obj.get("side")),
             outcome: val_str(obj.get("outcome")),
             trade_ts_ms,
+            trade_ts_ms_utc: val_opt_datetime_utc(obj.get("trade_ts_ms_utc"))
+                .or_else(|| epoch_ms_to_utc(trade_ts_ms)),
             trade_price: val_f64(obj.get("trade_price")),
             trade_size: val_f64(obj.get("trade_size")),
             rtds_price: val_f64(obj.get("rtds_price")),
-            rtds_price_ts_ms: val_i64(obj.get("rtds_price_ts_ms")),
-            clob_join_target_ts_ms: val_i64(obj.get("clob_join_target_ts_ms")),
+            rtds_price_ts_ms,
+            rtds_price_ts_ms_utc: val_opt_datetime_utc(obj.get("rtds_price_ts_ms_utc"))
+                .or_else(|| rtds_price_ts_ms.and_then(epoch_ms_to_utc)),
+            clob_join_target_ts_ms,
+            clob_join_target_ts_ms_utc: val_opt_datetime_utc(obj.get("clob_join_target_ts_ms_utc"))
+                .or_else(|| clob_join_target_ts_ms.and_then(epoch_ms_to_utc)),
             clob_up_asset_id: val_str(obj.get("clob_up_asset_id")),
             clob_up_best_bid_price: val_f64(obj.get("clob_up_best_bid_price")),
             clob_up_best_ask_price: val_f64(obj.get("clob_up_best_ask_price")),
             clob_up_mid_price: val_f64(obj.get("clob_up_mid_price")),
             clob_up_spread: val_f64(obj.get("clob_up_spread")),
-            clob_up_exchange_ts_ms: val_i64(obj.get("clob_up_exchange_ts_ms")),
-            clob_up_recv_ts_ms: val_i64(obj.get("clob_up_recv_ts_ms")),
+            clob_up_exchange_ts_ms,
+            clob_up_exchange_ts_ms_utc: val_opt_datetime_utc(obj.get("clob_up_exchange_ts_ms_utc"))
+                .or_else(|| clob_up_exchange_ts_ms.and_then(epoch_ms_to_utc)),
+            clob_up_recv_ts_ms,
+            clob_up_recv_ts_ms_utc: val_opt_datetime_utc(obj.get("clob_up_recv_ts_ms_utc"))
+                .or_else(|| clob_up_recv_ts_ms.and_then(epoch_ms_to_utc)),
             clob_down_asset_id: val_str(obj.get("clob_down_asset_id")),
             clob_down_best_bid_price: val_f64(obj.get("clob_down_best_bid_price")),
             clob_down_best_ask_price: val_f64(obj.get("clob_down_best_ask_price")),
             clob_down_mid_price: val_f64(obj.get("clob_down_mid_price")),
             clob_down_spread: val_f64(obj.get("clob_down_spread")),
-            clob_down_exchange_ts_ms: val_i64(obj.get("clob_down_exchange_ts_ms")),
-            clob_down_recv_ts_ms: val_i64(obj.get("clob_down_recv_ts_ms")),
+            clob_down_exchange_ts_ms,
+            clob_down_exchange_ts_ms_utc: val_opt_datetime_utc(
+                obj.get("clob_down_exchange_ts_ms_utc"),
+            )
+            .or_else(|| clob_down_exchange_ts_ms.and_then(epoch_ms_to_utc)),
+            clob_down_recv_ts_ms,
+            clob_down_recv_ts_ms_utc: val_opt_datetime_utc(obj.get("clob_down_recv_ts_ms_utc"))
+                .or_else(|| clob_down_recv_ts_ms.and_then(epoch_ms_to_utc)),
             row_json: raw.to_string(),
             ingested_at_ms,
         };
@@ -570,11 +725,14 @@ async fn ingest_price_to_beat(client: &Client, cfg: &PushConfig) -> Result<usize
     }
     let obj: Value = serde_json::from_str(trimmed)
         .with_context(|| format!("invalid json in {}", cfg.path_price_to_beat.display()))?;
+    let updated_at_ms = val_i64(obj.get("updated_at_ms")).unwrap_or(0);
     let row = PriceToBeatRow {
         row_hash: row_hash_hex(trimmed),
         market_slug: val_str(obj.get("market_slug")),
         price_to_beat: val_f64(obj.get("price_to_beat")),
-        updated_at_ms: val_i64(obj.get("updated_at_ms")).unwrap_or(0),
+        updated_at_ms,
+        updated_at_ms_utc: val_opt_datetime_utc(obj.get("updated_at_ms_utc"))
+            .or_else(|| epoch_ms_to_utc(updated_at_ms)),
         row_json: trimmed.to_string(),
         ingested_at_ms: now_ms(),
     };
@@ -607,15 +765,25 @@ async fn ingest_resolution_state(client: &Client, cfg: &PushConfig) -> Result<us
     if let Some(records) = root.get("records").and_then(|v| v.as_array()) {
         for rec in records {
             let rec_raw = serde_json::to_string(rec).unwrap_or_else(|_| "{}".to_string());
+            let resolution_ts_ms = val_i64(rec.get("resolution_ts_ms")).unwrap_or(0);
+            let source_ts_ms = val_i64(rec.get("source_ts_ms")).unwrap_or(0);
+            let captured_at_ms = val_i64(rec.get("captured_at_ms")).unwrap_or(0);
             let row = ResolutionStateRow {
                 row_hash: row_hash_hex(&rec_raw),
                 state_version,
                 state_updated_at_ms,
+                state_updated_at_ms_utc: val_opt_datetime_utc(rec.get("state_updated_at_ms_utc"))
+                    .or_else(|| val_opt_datetime_utc(root.get("updated_at_ms_utc")))
+                    .or_else(|| epoch_ms_to_utc(state_updated_at_ms)),
                 market_slug: val_str(rec.get("market_slug")),
                 symbol: val_str(rec.get("symbol")),
                 asset_id: val_str(rec.get("asset_id")),
-                resolution_ts_ms: val_i64(rec.get("resolution_ts_ms")).unwrap_or(0),
-                source_ts_ms: val_i64(rec.get("source_ts_ms")).unwrap_or(0),
+                resolution_ts_ms,
+                resolution_ts_ms_utc: val_opt_datetime_utc(rec.get("resolution_ts_ms_utc"))
+                    .or_else(|| epoch_ms_to_utc(resolution_ts_ms)),
+                source_ts_ms,
+                source_ts_ms_utc: val_opt_datetime_utc(rec.get("source_ts_ms_utc"))
+                    .or_else(|| epoch_ms_to_utc(source_ts_ms)),
                 resolution_price: val_f64(rec.get("resolution_price")),
                 resolution_value: val_f64(rec.get("resolution_value")),
                 capture_mode: val_str(rec.get("capture_mode")),
@@ -624,7 +792,9 @@ async fn ingest_resolution_state(client: &Client, cfg: &PushConfig) -> Result<us
                 diff_vs_price_to_beat_percentage: val_f64(
                     rec.get("diff_vs_price_to_beat_percentage"),
                 ),
-                captured_at_ms: val_i64(rec.get("captured_at_ms")).unwrap_or(0),
+                captured_at_ms,
+                captured_at_ms_utc: val_opt_datetime_utc(rec.get("captured_at_ms_utc"))
+                    .or_else(|| epoch_ms_to_utc(captured_at_ms)),
                 row_json: rec_raw,
                 ingested_at_ms,
             };

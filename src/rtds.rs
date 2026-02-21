@@ -5,6 +5,7 @@ use crate::helpers::iso_to_epoch;
 use crate::logging::LogLike;
 use crate::signal::JsonlFileService;
 use anyhow::{anyhow, Result};
+use chrono::{TimeZone, Utc};
 use rand::Rng;
 use reqwest::blocking::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -208,6 +209,85 @@ fn val_as_string(v: Option<&Value>) -> String {
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::Bool(b)) => b.to_string(),
         _ => String::new(),
+    }
+}
+
+fn format_utc_ms(ms: i64) -> Option<String> {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+}
+
+fn format_clickhouse_utc_ms(ms: i64) -> Option<String> {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+}
+
+fn infer_unix_ms_for_key(key: &str, v: &Value) -> Option<i64> {
+    if v.is_null() {
+        return None;
+    }
+    let k = key.trim().to_ascii_lowercase();
+    if k.is_empty() || k.ends_with("_utc") {
+        return None;
+    }
+
+    let is_unix_ts_key = k.contains("timestamp")
+        || k == "ts_ms"
+        || k == "ts_sec"
+        || k.ends_with("_ts_ms")
+        || k.ends_with("_ts_sec")
+        || k.ends_with("_at_ms")
+        || k.ends_with("_at_sec");
+    if !is_unix_ts_key {
+        return None;
+    }
+
+    let raw = val_as_i64(Some(v))?;
+    if k == "ts_sec"
+        || k.ends_with("_ts_sec")
+        || k.ends_with("_at_sec")
+        || k.contains("timestamp_sec")
+    {
+        return Some(raw.saturating_mul(1000));
+    }
+    if k == "ts_ms"
+        || k.ends_with("_ts_ms")
+        || k.ends_with("_at_ms")
+        || k.contains("timestamp_ms")
+    {
+        return Some(raw);
+    }
+    if raw > 1_000_000_000_000 {
+        Some(raw)
+    } else if raw > 1_000_000_000 {
+        Some(raw.saturating_mul(1000))
+    } else {
+        None
+    }
+}
+
+fn append_utc_timestamp_columns(row: &mut Value) {
+    let Some(obj) = row.as_object_mut() else {
+        return;
+    };
+    let keys: Vec<String> = obj.keys().cloned().collect();
+    for key in keys {
+        let out_key = format!("{key}_utc");
+        if obj.contains_key(&out_key) {
+            continue;
+        }
+        let Some(v) = obj.get(&key) else {
+            continue;
+        };
+        let Some(ms) = infer_unix_ms_for_key(&key, v) else {
+            continue;
+        };
+        let Some(iso) = format_utc_ms(ms) else {
+            continue;
+        };
+        obj.insert(out_key, Value::String(iso));
     }
 }
 
@@ -464,27 +544,34 @@ impl RtdsClickhouseSink {
                     asset_id String,
                     kind String,
                     timestamp_ms Int64,
+                    timestamp_ms_utc Nullable(DateTime64(3, 'UTC')),
                     received_at_ms Int64,
+                    received_at_ms_utc Nullable(DateTime64(3, 'UTC')),
                     price Nullable(Float64),
                     value Nullable(Float64),
                     price_to_beat Nullable(Float64),
                     diff_vs_price_to_beat Nullable(Float64),
                     diff_vs_price_to_beat_percentage Nullable(Float64),
                     clob_join_target_ts_ms Nullable(Int64),
+                    clob_join_target_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                     clob_up_asset_id String,
                     clob_up_best_bid_price Nullable(Float64),
                     clob_up_best_ask_price Nullable(Float64),
                     clob_up_mid_price Nullable(Float64),
                     clob_up_spread Nullable(Float64),
                     clob_up_exchange_ts_ms Nullable(Int64),
+                    clob_up_exchange_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                     clob_up_recv_ts_ms Nullable(Int64),
+                    clob_up_recv_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                     clob_down_asset_id String,
                     clob_down_best_bid_price Nullable(Float64),
                     clob_down_best_ask_price Nullable(Float64),
                     clob_down_mid_price Nullable(Float64),
                     clob_down_spread Nullable(Float64),
                     clob_down_exchange_ts_ms Nullable(Int64),
+                    clob_down_exchange_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                     clob_down_recv_ts_ms Nullable(Int64),
+                    clob_down_recv_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                     row_json String,
                     ingested_at_ms Int64
                 ) ENGINE = MergeTree
@@ -502,6 +589,7 @@ impl RtdsClickhouseSink {
                     market_slug String,
                     price_to_beat Nullable(Float64),
                     updated_at_ms Int64,
+                    updated_at_ms_utc Nullable(DateTime64(3, 'UTC')),
                     row_json String,
                     ingested_at_ms Int64
                 ) ENGINE = ReplacingMergeTree(updated_at_ms)
@@ -518,11 +606,14 @@ impl RtdsClickhouseSink {
                     row_hash String,
                     state_version Int64,
                     state_updated_at_ms Int64,
+                    state_updated_at_ms_utc Nullable(DateTime64(3, 'UTC')),
                     market_slug String,
                     symbol String,
                     asset_id String,
                     resolution_ts_ms Int64,
+                    resolution_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                     source_ts_ms Int64,
+                    source_ts_ms_utc Nullable(DateTime64(3, 'UTC')),
                     resolution_price Nullable(Float64),
                     resolution_value Nullable(Float64),
                     capture_mode String,
@@ -530,6 +621,7 @@ impl RtdsClickhouseSink {
                     diff_vs_price_to_beat Nullable(Float64),
                     diff_vs_price_to_beat_percentage Nullable(Float64),
                     captured_at_ms Int64,
+                    captured_at_ms_utc Nullable(DateTime64(3, 'UTC')),
                     row_json String,
                     ingested_at_ms Int64
                 ) ENGINE = MergeTree
@@ -651,34 +743,48 @@ impl RtdsClickhouseSink {
             }
         };
         let now = now_ms();
+        let timestamp_ms = val_as_i64(source_row.get("timestamp_ms")).unwrap_or(0);
+        let received_at_ms = val_as_i64(source_row.get("received_at_ms")).unwrap_or(now);
+        let clob_join_target_ts_ms = val_as_i64(source_row.get("clob_join_target_ts_ms"));
+        let clob_up_exchange_ts_ms = val_as_i64(source_row.get("clob_up_exchange_ts_ms"));
+        let clob_up_recv_ts_ms = val_as_i64(source_row.get("clob_up_recv_ts_ms"));
+        let clob_down_exchange_ts_ms = val_as_i64(source_row.get("clob_down_exchange_ts_ms"));
+        let clob_down_recv_ts_ms = val_as_i64(source_row.get("clob_down_recv_ts_ms"));
         let row = json!({
             "row_hash": row_hash_hex(&row_json),
             "market_slug": val_as_string(source_row.get("market_slug")),
             "symbol": val_as_string(source_row.get("symbol")),
             "asset_id": val_as_string(source_row.get("asset_id")),
             "kind": val_as_string(source_row.get("kind")),
-            "timestamp_ms": val_as_i64(source_row.get("timestamp_ms")).unwrap_or(0),
-            "received_at_ms": val_as_i64(source_row.get("received_at_ms")).unwrap_or(now),
+            "timestamp_ms": timestamp_ms,
+            "timestamp_ms_utc": format_clickhouse_utc_ms(timestamp_ms),
+            "received_at_ms": received_at_ms,
+            "received_at_ms_utc": format_clickhouse_utc_ms(received_at_ms),
             "price": val_as_f64(source_row.get("price")),
             "value": val_as_f64(source_row.get("value")),
             "price_to_beat": val_as_f64(source_row.get("price_to_beat")),
             "diff_vs_price_to_beat": val_as_f64(source_row.get("diff_vs_price_to_beat")),
             "diff_vs_price_to_beat_percentage": val_as_f64(source_row.get("diff_vs_price_to_beat_percentage")),
-            "clob_join_target_ts_ms": val_as_i64(source_row.get("clob_join_target_ts_ms")),
+            "clob_join_target_ts_ms": clob_join_target_ts_ms,
+            "clob_join_target_ts_ms_utc": clob_join_target_ts_ms.and_then(format_clickhouse_utc_ms),
             "clob_up_asset_id": val_as_string(source_row.get("clob_up_asset_id")),
             "clob_up_best_bid_price": val_as_f64(source_row.get("clob_up_best_bid_price")),
             "clob_up_best_ask_price": val_as_f64(source_row.get("clob_up_best_ask_price")),
             "clob_up_mid_price": val_as_f64(source_row.get("clob_up_mid_price")),
             "clob_up_spread": val_as_f64(source_row.get("clob_up_spread")),
-            "clob_up_exchange_ts_ms": val_as_i64(source_row.get("clob_up_exchange_ts_ms")),
-            "clob_up_recv_ts_ms": val_as_i64(source_row.get("clob_up_recv_ts_ms")),
+            "clob_up_exchange_ts_ms": clob_up_exchange_ts_ms,
+            "clob_up_exchange_ts_ms_utc": clob_up_exchange_ts_ms.and_then(format_clickhouse_utc_ms),
+            "clob_up_recv_ts_ms": clob_up_recv_ts_ms,
+            "clob_up_recv_ts_ms_utc": clob_up_recv_ts_ms.and_then(format_clickhouse_utc_ms),
             "clob_down_asset_id": val_as_string(source_row.get("clob_down_asset_id")),
             "clob_down_best_bid_price": val_as_f64(source_row.get("clob_down_best_bid_price")),
             "clob_down_best_ask_price": val_as_f64(source_row.get("clob_down_best_ask_price")),
             "clob_down_mid_price": val_as_f64(source_row.get("clob_down_mid_price")),
             "clob_down_spread": val_as_f64(source_row.get("clob_down_spread")),
-            "clob_down_exchange_ts_ms": val_as_i64(source_row.get("clob_down_exchange_ts_ms")),
-            "clob_down_recv_ts_ms": val_as_i64(source_row.get("clob_down_recv_ts_ms")),
+            "clob_down_exchange_ts_ms": clob_down_exchange_ts_ms,
+            "clob_down_exchange_ts_ms_utc": clob_down_exchange_ts_ms.and_then(format_clickhouse_utc_ms),
+            "clob_down_recv_ts_ms": clob_down_recv_ts_ms,
+            "clob_down_recv_ts_ms_utc": clob_down_recv_ts_ms.and_then(format_clickhouse_utc_ms),
             "row_json": row_json,
             "ingested_at_ms": now,
         });
@@ -698,6 +804,7 @@ impl RtdsClickhouseSink {
             "market_slug": state.market_slug,
             "price_to_beat": state.price_to_beat,
             "updated_at_ms": state.updated_at_ms,
+            "updated_at_ms_utc": format_clickhouse_utc_ms(state.updated_at_ms),
             "row_json": row_json,
             "ingested_at_ms": now_ms(),
         });
@@ -721,11 +828,14 @@ impl RtdsClickhouseSink {
             "row_hash": row_hash_hex(&row_json),
             "state_version": state_version,
             "state_updated_at_ms": state_updated_at_ms,
+            "state_updated_at_ms_utc": format_clickhouse_utc_ms(state_updated_at_ms),
             "market_slug": snapshot.market_slug,
             "symbol": snapshot.symbol,
             "asset_id": snapshot.asset_id,
             "resolution_ts_ms": snapshot.resolution_ts_ms,
+            "resolution_ts_ms_utc": format_clickhouse_utc_ms(snapshot.resolution_ts_ms),
             "source_ts_ms": snapshot.source_ts_ms,
+            "source_ts_ms_utc": format_clickhouse_utc_ms(snapshot.source_ts_ms),
             "resolution_price": snapshot.resolution_price,
             "resolution_value": snapshot.resolution_value,
             "capture_mode": snapshot.capture_mode,
@@ -733,6 +843,7 @@ impl RtdsClickhouseSink {
             "diff_vs_price_to_beat": snapshot.diff_vs_price_to_beat,
             "diff_vs_price_to_beat_percentage": snapshot.diff_vs_price_to_beat_percentage,
             "captured_at_ms": snapshot.captured_at_ms,
+            "captured_at_ms_utc": format_clickhouse_utc_ms(snapshot.captured_at_ms),
             "row_json": row_json,
             "ingested_at_ms": now_ms(),
         });
@@ -1677,11 +1788,13 @@ impl RtdsService {
     }
 
     fn append_tick_log(&self, obj: &Value) {
+        let mut out = obj.clone();
+        append_utc_timestamp_columns(&mut out);
         if let Some(fs) = &self.tick_log {
-            fs.append(obj);
+            fs.append(&out);
         }
         if let Some(ch) = &self.clickhouse_sink {
-            ch.insert_rtds_price_best_effort(obj);
+            ch.insert_rtds_price_best_effort(&out);
         }
     }
 
