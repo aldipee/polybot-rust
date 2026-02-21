@@ -1,25 +1,6 @@
 services:
-  postgres:
-    container_name: polybot-postgres
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: polybot
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      TZ: Asia/Jakarta
-    ports:
-      - "5432:5432"
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d polybot"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-  polybot-rust:
-    container_name: polybot-convert-rust
+  polybot-btc-after-market_2:
+    container_name: polybot-btc-after-market_2
     working_dir: /app/state
     build:
       context: .
@@ -38,19 +19,16 @@ services:
         max-file: "3"
     init: true
     env_file:
-      - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
+      - after_market.env
     environment:
-      TZ: Asia/Jakarta
-      DB_URL: postgresql://postgres:postgres@localhost:5432/polybot
       LOG_DIR: /app/output
       EXEC_LATENCY_LOG_DIR: /app/logs
       SIGNAL_FILE_DIR: /app/signals
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
+      MARKET_SLUG: btc-updown-5m-1771668000
+        
     volumes:
       - ./data:/app/data
       - ./signals:/app/signals
@@ -59,3 +37,82 @@ services:
       - /app/output:size=64m,mode=1777
       - /app/logs:size=64m,mode=1777
     restart: unless-stopped
+
+  polybot-eth-after-market:
+    container_name: polybot-eth-after-market
+    working_dir: /app/state
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    network_mode: host
+    cpuset: "2"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    init: true
+    env_file:
+      - after_market.env
+    environment:
+      LOG_DIR: /app/output
+      EXEC_LATENCY_LOG_DIR: /app/logs
+      SIGNAL_FILE_DIR: /app/signals
+      EXEC_LATENCY_FILE_LOG_ENABLED: "false"
+      EXEC_LATENCY_JSONL_ENABLED: "false"
+      EXEC_LATENCY_CSV_ENABLED: "false"
+      MARKET_SLUG: eth-updown-5m-1771668000
+      BOT_ID: analytic_bot_after_market_eth
+    volumes:
+      - ./data:/app/data
+      - ./signals:/app/signals
+      - ./state:/app/state
+    tmpfs:
+      - /app/output:size=64m,mode=1777
+      - /app/logs:size=64m,mode=1777
+    restart: unless-stopped
+
+  polybot-sol-after-market:
+    container_name: polybot-sol-after-market
+    working_dir: /app/state
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    network_mode: host
+    cpuset: "2"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    init: true
+    env_file:
+      - after_market.env
+    environment:
+      LOG_DIR: /app/output
+      EXEC_LATENCY_LOG_DIR: /app/logs
+      SIGNAL_FILE_DIR: /app/signals
+      EXEC_LATENCY_FILE_LOG_ENABLED: "false"
+      EXEC_LATENCY_JSONL_ENABLED: "false"
+      EXEC_LATENCY_CSV_ENABLED: "false"
+      MARKET_SLUG: sol-updown-5m-1771668000
+      BOT_ID: analytic_bot_after_market_sol
+    volumes:
+      - ./data:/app/data
+      - ./signals:/app/signals
+      - ./state:/app/state
+    tmpfs:
+      - /app/output:size=64m,mode=1777
+      - /app/logs:size=64m,mode=1777
+    restart: unless-stopped
+
