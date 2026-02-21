@@ -901,6 +901,85 @@ impl MakerHedgeCapBot {
         true
     }
 
+    fn _sniper_endgame_side_from_rtds(&self, seconds_left: f64) -> Option<String> {
+        let snap = match get_live_snapshot_for_market(&self.market_slug) {
+            Some(s) => s,
+            None => {
+                self._rtds_gate_log(
+                    "endgame_rtds_missing",
+                    "[RTDS_ENDGAME] blocked: missing in-memory RTDS snapshot",
+                );
+                return None;
+            }
+        };
+        let ts_ms = if snap.updated_at_ms > 0 {
+            snap.updated_at_ms
+        } else if snap.received_at_ms > 0 {
+            snap.received_at_ms
+        } else {
+            snap.timestamp_ms
+        };
+        let now_ms = (now_ts_f64() * 1000.0) as i64;
+        let age_ms = (now_ms - ts_ms).max(0);
+        let max_age_s = env_float(
+            "SNIPER_ENDGAME_RTDS_MAX_AGE_SECONDS",
+            env_float("RTDS_ENTRY_GATE_MAX_AGE_SECONDS", 0.15),
+        )
+        .max(0.01);
+        let max_age_ms = (max_age_s * 1000.0) as i64;
+        if ts_ms <= 0 || age_ms > max_age_ms {
+            self._rtds_gate_log(
+                "endgame_rtds_stale",
+                &format!(
+                    "[RTDS_ENDGAME] blocked: stale/missing tick ts_ms={} age_ms={} max_age_ms={} t_left={:.2}s",
+                    ts_ms, age_ms, max_age_ms, seconds_left
+                ),
+            );
+            return None;
+        }
+
+        let diff_price = snap
+            .diff_vs_price_to_beat
+            .or_else(|| snap.price_to_beat.map(|ptb| snap.price - ptb));
+        let Some(diff_price) = diff_price.filter(|v| v.is_finite()) else {
+            self._rtds_gate_log(
+                "endgame_rtds_nodiff",
+                &format!(
+                    "[RTDS_ENDGAME] blocked: missing diff_vs_price_to_beat/price_to_beat ts_ms={} age_ms={} t_left={:.2}s",
+                    ts_ms, age_ms, seconds_left
+                ),
+            );
+            return None;
+        };
+
+        let min_abs = env_float("SNIPER_ENDGAME_RTDS_MIN_DIFF_PRICE", 0.0)
+            .max(0.0)
+            .max(1e-12);
+        if diff_price.abs() + 1e-12 < min_abs {
+            self._rtds_gate_log(
+                "endgame_rtds_min_diff",
+                &format!(
+                    "[RTDS_ENDGAME] blocked: |diff_price|={:.6} < min_required={:.6} age_ms={} t_left={:.2}s",
+                    diff_price.abs(),
+                    min_abs,
+                    age_ms,
+                    seconds_left
+                ),
+            );
+            return None;
+        }
+
+        let side = if diff_price > 0.0 { "YES" } else { "NO" };
+        self._rtds_gate_log(
+            "endgame_rtds_pick",
+            &format!(
+                "[RTDS_ENDGAME] pick side={} diff_price={:+.6} age_ms={} ts_ms={} t_left={:.2}s",
+                side, diff_price, age_ms, ts_ms, seconds_left
+            ),
+        );
+        Some(side.to_string())
+    }
+
     fn _rtds_hold_till_resolution_active(
         &self,
         side: &str,
@@ -6028,9 +6107,13 @@ impl MakerHedgeCapBot {
         let side_cfg = std::env::var("SNIPER_ENDGAME_SIDE")
             .unwrap_or_else(|_| "AUTO".to_string())
             .to_ascii_uppercase();
-        let mut side: Option<String> = None;
-        if side_cfg == "YES" || side_cfg == "NO" {
-            side = Some(side_cfg);
+        let mut side_src = "AUTO_BBO".to_string();
+        let side: Option<String> = if side_cfg == "YES" || side_cfg == "NO" {
+            side_src = "FIXED".to_string();
+            Some(side_cfg)
+        } else if side_cfg == "RTDS" {
+            side_src = "RTDS".to_string();
+            self._sniper_endgame_side_from_rtds(seconds_left)
         } else {
             let (_yb, ya, _nb, na) = self._sniper_best_snapshot();
             let mut opts: Vec<(&str, f64)> = Vec::new();
@@ -6051,22 +6134,23 @@ impl MakerHedgeCapBot {
                 .copied()
                 .filter(|(_, p)| *p + 1e-12 >= (price_min - eps))
                 .collect();
-            if good.len() == 1 {
-                side = Some(good[0].0.to_string());
+            let side = if good.len() == 1 {
+                Some(good[0].0.to_string())
             } else if good.len() > 1 {
-                side = good
+                good
                     .iter()
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(s, _)| s.to_string());
+                    .map(|(s, _)| s.to_string())
             } else if require_min && price_min > 0.0 {
                 return false;
             } else {
-                side = opts
+                opts
                     .iter()
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(s, _)| s.to_string());
-            }
-        }
+                    .map(|(s, _)| s.to_string())
+            };
+            side
+        };
         let Some(side) = side else {
             return false;
         };
@@ -6129,7 +6213,7 @@ impl MakerHedgeCapBot {
         );
         let fresh = if self._market_data_fresh() { "Y" } else { "N" };
         self.logger.info(&format!(
-            "[SNIPER] ENDGAME blind-post side={side} px={px:.3} sz={size_target} t_left={seconds_left:.2}s fresh={fresh} type={endgame_ot}"
+            "[SNIPER] ENDGAME blind-post side={side} src={side_src} px={px:.3} sz={size_target} t_left={seconds_left:.2}s fresh={fresh} type={endgame_ot}"
         ));
         let oid = if endgame_ot == "GTC" {
             self._place_limit_bid_gtc(&asset_id, px, size_target as f64, post_only)

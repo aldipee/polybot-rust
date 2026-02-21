@@ -7,6 +7,9 @@ build = "build.rs"
 [dependencies]
 anyhow = "1.0"
 alloy-signer-local = "0.5"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-credential-types = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 chrono-tz = "0.10"
 clickhouse = { version = "0.13", features = ["rustls-tls", "chrono"] }

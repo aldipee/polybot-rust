@@ -8,6 +8,7 @@ mod env_utils;
 mod gamma;
 mod helpers;
 mod logging;
+mod r2_storage;
 mod rtds;
 mod signal;
 
@@ -21,6 +22,7 @@ use db::{
 use env_utils::{env_bool, env_float};
 use helpers::{get_next_slug, segment, segment_defaults};
 use logging::{setup_item_logger, LogLike};
+use r2_storage::upload_logs_before_rollover;
 use rtds::RtdsService;
 use signal::{JsonlFileService, SignalHub, SignalInbox};
 use std::env;
@@ -417,6 +419,7 @@ fn run() -> Result<()> {
 
         thread::sleep(Duration::from_secs(2));
         bot_logger.info(&format!("Ending this market {current_slug}"));
+        upload_logs_before_rollover(&current_slug, &bot_id, &bot_logger);
         let next_slug = if run_reason.starts_with("SWITCH:") {
             let ns = run_reason.trim_start_matches("SWITCH:").trim().to_string();
             bot_logger.info(&format!(
