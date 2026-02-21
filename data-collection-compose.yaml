@@ -1,0 +1,79 @@
+services:
+  postgres:
+    container_name: polybot-postgres
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: polybot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      TZ: Asia/Jakarta
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d polybot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    
+  polybot-btc-data-collection-5m:
+    container_name: polybot-btc-5m-data-collection
+    working_dir: /app/state
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    network_mode: host
+    env_file:
+      - data_collection.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_URL: postgresql://postgres:postgres@localhost:5432/polybot
+      LOG_DIR: /app/output
+      EXEC_LATENCY_LOG_DIR: /app/logs
+      SIGNAL_FILE_DIR: /app/signals
+      EXEC_LATENCY_FILE_LOG_ENABLED: "false"
+      EXEC_LATENCY_JSONL_ENABLED: "false"
+      EXEC_LATENCY_CSV_ENABLED: "false"
+    volumes:
+      - ./data:/app/data
+      - ./signals:/app/signals
+      - ./state:/app/state
+    tmpfs:
+      - /app/output:size=64m,mode=1777
+      - /app/logs:size=64m,mode=1777
+    restart: unless-stopped
+
+  polybot-copy-data-collection:
+    container_name: polybot-copy-data-collection
+    working_dir: /app/state
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    network_mode: host
+    entrypoint: ["/usr/local/bin/copy_collect"]
+    env_file:
+      - data_collection.env
+    environment:
+      COPY_COLLECT_OUT_PATH: /app/state/copy_collect.jsonl
+      COPY_COLLECT_CLOB_JOIN_ENABLED: "true"
+      COPY_COLLECT_INCLUDE_RFQ: "true"
+      COPY_COLLECT_LOG_PRICE_TICKS: "true"
+      COPY_COLLECT_WS_URL: wss://ws-live-data.polymarket.com
+      COPY_COLLECT_CLOB_WS_URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
+    volumes:
+      - ./data:/app/data
+      - ./signals:/app/signals
+      - ./state:/app/state
+    tmpfs:
+      - /app/output:size=64m,mode=1777
+      - /app/logs:size=64m,mode=1777
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

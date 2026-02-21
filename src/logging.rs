@@ -33,7 +33,7 @@ impl ItemLogger {
     }
 
     fn write_text_log(&self, level: &str, msg: &str) {
-        let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         let line = format!("{ts}|{level}| {msg}\n");
         let path = self.item_dir.join("app.log");
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
@@ -67,7 +67,7 @@ impl ItemLogger {
     fn emit(&self, level: &str, msg: &str) {
         let stderr_line = format!(
             "{}|{}| {}",
-            Local::now().format("%Y-%m-%d %H:%M:%S"),
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
             level,
             msg
         );

@@ -29,6 +29,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 fn build_version() -> String {
     let commit_id = option_env!("GIT_COMMIT_ID").unwrap_or("unknown");
     format!("{}+{commit_id}", env!("CARGO_PKG_VERSION"))
@@ -120,6 +124,7 @@ fn cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
 }
 
 fn run() -> Result<()> {
+    install_rustls_crypto_provider();
     let _ = dotenvy::dotenv();
 
     if env::var("POLYBOT_PRINT_ENV_CONTRACT").ok().as_deref() == Some("1") {

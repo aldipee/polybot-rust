@@ -1,14 +1,16 @@
 use crate::config::BotConfig;
 use crate::env_utils::{env_bool, env_float, env_int};
-use crate::gamma::fetch_market_by_slug;
+use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
 use crate::helpers::iso_to_epoch;
 use crate::logging::LogLike;
 use crate::signal::JsonlFileService;
 use anyhow::{anyhow, Result};
 use rand::Rng;
+use reqwest::blocking::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
@@ -28,6 +30,12 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn row_hash_hex(raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn val_as_f64(v: Option<&Value>) -> Option<f64> {
     match v {
         Some(Value::Number(n)) => n.as_f64(),
@@ -37,54 +45,58 @@ fn val_as_f64(v: Option<&Value>) -> Option<f64> {
 }
 
 fn val_as_i64_ms(v: Option<&Value>) -> Option<i64> {
+    val_as_i64_ms_with_precision(v).0
+}
+
+fn val_as_i64_ms_with_precision(v: Option<&Value>) -> (Option<i64>, &'static str) {
     match v {
         Some(Value::Number(n)) => {
             if let Some(i) = n.as_i64() {
                 if i > 1_000_000_000_000 {
-                    Some(i)
+                    (Some(i), "ms")
                 } else if i > 1_000_000_000 {
-                    Some(i * 1000)
+                    (Some(i * 1000), "s")
                 } else {
-                    None
+                    (None, "none")
                 }
             } else if let Some(f) = n.as_f64() {
                 if f > 1_000_000_000_000.0 {
-                    Some(f as i64)
+                    (Some(f as i64), "ms")
                 } else if f > 1_000_000_000.0 {
-                    Some((f * 1000.0) as i64)
+                    (Some((f * 1000.0) as i64), "s")
                 } else {
-                    None
+                    (None, "none")
                 }
             } else {
-                None
+                (None, "none")
             }
         }
         Some(Value::String(s)) => {
             let t = s.trim();
             if t.is_empty() {
-                return None;
+                return (None, "none");
             }
             if let Ok(i) = t.parse::<i64>() {
                 if i > 1_000_000_000_000 {
-                    Some(i)
+                    (Some(i), "ms")
                 } else if i > 1_000_000_000 {
-                    Some(i * 1000)
+                    (Some(i * 1000), "s")
                 } else {
-                    None
+                    (None, "none")
                 }
             } else if let Ok(f) = t.parse::<f64>() {
                 if f > 1_000_000_000_000.0 {
-                    Some(f as i64)
+                    (Some(f as i64), "ms")
                 } else if f > 1_000_000_000.0 {
-                    Some((f * 1000.0) as i64)
+                    (Some((f * 1000.0) as i64), "s")
                 } else {
-                    None
+                    (None, "none")
                 }
             } else {
-                None
+                (None, "none")
             }
         }
-        _ => None,
+        _ => (None, "none"),
     }
 }
 
@@ -182,6 +194,98 @@ fn diff_percentage(price: f64, price_to_beat: Option<f64>) -> Option<f64> {
     Some(((price - ptb) / ptb) * 100.0)
 }
 
+fn val_as_i64(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|x| x as i64)),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn val_as_string(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn validate_ident(raw: &str, key: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(anyhow!("{key} cannot be empty"));
+    }
+    if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        Ok(name.to_string())
+    } else {
+        Err(anyhow!(
+            "{key} must contain only [A-Za-z0-9_], got '{name}'"
+        ))
+    }
+}
+
+fn quote_ident(raw: &str) -> String {
+    format!("`{raw}`")
+}
+
+#[derive(Debug, Clone)]
+struct RtdsSinkSelection {
+    file: bool,
+    clickhouse: bool,
+    mode_label: String,
+}
+
+fn parse_rtds_sink_selection() -> RtdsSinkSelection {
+    let raw = env::var("RTDS_SINK")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if raw.is_empty() {
+        let file = env_bool("RTDS_LOG_TO_FILE", true);
+        let clickhouse = env_bool("RTDS_CLICKHOUSE_ENABLED", false);
+        return RtdsSinkSelection {
+            file,
+            clickhouse,
+            mode_label: "legacy".to_string(),
+        };
+    }
+    match raw.as_str() {
+        "file" => RtdsSinkSelection {
+            file: true,
+            clickhouse: false,
+            mode_label: raw,
+        },
+        "clickhouse" | "ch" => RtdsSinkSelection {
+            file: false,
+            clickhouse: true,
+            mode_label: raw,
+        },
+        "both" | "all" => RtdsSinkSelection {
+            file: true,
+            clickhouse: true,
+            mode_label: raw,
+        },
+        "none" | "off" => RtdsSinkSelection {
+            file: false,
+            clickhouse: false,
+            mode_label: raw,
+        },
+        _ => {
+            let file = env_bool("RTDS_LOG_TO_FILE", true);
+            let clickhouse = env_bool("RTDS_CLICKHOUSE_ENABLED", false);
+            RtdsSinkSelection {
+                file,
+                clickhouse,
+                mode_label: format!("legacy_invalid:{raw}"),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PriceTick {
     symbol: String,
@@ -222,6 +326,420 @@ struct PriceToBeatStateFile {
     updated_at_ms: i64,
 }
 
+#[derive(Debug, Default)]
+struct ClickhouseBatchBuffer {
+    rows: Vec<String>,
+    first_enqueue_ms: i64,
+}
+
+#[derive(Debug, Default)]
+struct ClickhouseBatchState {
+    by_table: HashMap<String, ClickhouseBatchBuffer>,
+}
+
+struct RtdsClickhouseSink {
+    client: HttpClient,
+    url: String,
+    user: String,
+    password: String,
+    database: String,
+    table_rtds_prices: String,
+    table_price_to_beat: String,
+    table_resolution_state: String,
+    logger: Arc<dyn LogLike>,
+    error_log_every_ms: i64,
+    last_error_log_ms: Mutex<i64>,
+    batch_max_rows: usize,
+    batch_max_delay_ms: i64,
+    batch_state: Mutex<ClickhouseBatchState>,
+}
+
+impl RtdsClickhouseSink {
+    fn from_env(logger: Arc<dyn LogLike>) -> Result<Self> {
+        let url = env::var("CLICKHOUSE_URL")
+            .unwrap_or_else(|_| "http://localhost:8123".to_string())
+            .trim()
+            .to_string();
+        if url.is_empty() {
+            return Err(anyhow!("CLICKHOUSE_URL is empty"));
+        }
+
+        let user = env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
+        let password = env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
+        let database = validate_ident(
+            &env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "polybot".to_string()),
+            "CLICKHOUSE_DATABASE",
+        )?;
+        let table_rtds_prices = validate_ident(
+            &env::var("CLICKHOUSE_TABLE_RTDS_PRICES")
+                .unwrap_or_else(|_| "rtds_prices".to_string()),
+            "CLICKHOUSE_TABLE_RTDS_PRICES",
+        )?;
+        let table_price_to_beat = validate_ident(
+            &env::var("CLICKHOUSE_TABLE_RTDS_PRICE_TO_BEAT")
+                .unwrap_or_else(|_| "rtds_price_to_beat_state".to_string()),
+            "CLICKHOUSE_TABLE_RTDS_PRICE_TO_BEAT",
+        )?;
+        let table_resolution_state = validate_ident(
+            &env::var("CLICKHOUSE_TABLE_RTDS_RESOLUTION_STATE")
+                .unwrap_or_else(|_| "rtds_resolution_state".to_string()),
+            "CLICKHOUSE_TABLE_RTDS_RESOLUTION_STATE",
+        )?;
+        let timeout_seconds = env_float("RTDS_CLICKHOUSE_TIMEOUT_SECONDS", 2.0).max(0.2);
+        let error_log_every_ms = env_int("RTDS_CLICKHOUSE_ERROR_LOG_EVERY_MS", 5000).max(500);
+        let batch_max_rows = env_int("RTDS_CLICKHOUSE_BATCH_MAX_ROWS", 200).max(1) as usize;
+        let batch_max_delay_ms = env_int("RTDS_CLICKHOUSE_BATCH_MAX_DELAY_MS", 250).max(1) as i64;
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs_f64(timeout_seconds))
+            .build()
+            .map_err(|e| anyhow!("failed creating ClickHouse HTTP client: {e}"))?;
+
+        Ok(Self {
+            client,
+            url,
+            user,
+            password,
+            database,
+            table_rtds_prices,
+            table_price_to_beat,
+            table_resolution_state,
+            logger,
+            error_log_every_ms: error_log_every_ms as i64,
+            last_error_log_ms: Mutex::new(0),
+            batch_max_rows,
+            batch_max_delay_ms,
+            batch_state: Mutex::new(ClickhouseBatchState::default()),
+        })
+    }
+
+    fn preview_text(s: &str, max: usize) -> String {
+        if s.len() <= max {
+            s.to_string()
+        } else {
+            format!("{}...", &s[..max])
+        }
+    }
+
+    fn execute_query(&self, query: &str, body: Option<String>, with_database: bool) -> Result<()> {
+        let mut req = self.client.post(&self.url);
+        if with_database {
+            req = req.query(&[
+                ("database", self.database.as_str()),
+                ("query", query),
+            ]);
+        } else {
+            req = req.query(&[("query", query)]);
+        }
+        if !self.user.trim().is_empty() {
+            req = req.basic_auth(self.user.clone(), Some(self.password.clone()));
+        }
+        req = req.body(body.unwrap_or_default());
+        let resp = req
+            .send()
+            .map_err(|e| anyhow!("ClickHouse request failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "ClickHouse query failed status={} query='{}' body='{}'",
+            status,
+            query,
+            Self::preview_text(&text, 400)
+        ))
+    }
+
+    fn ensure_schema(&self) -> Result<()> {
+        let db = quote_ident(&self.database);
+        self.execute_query(&format!("CREATE DATABASE IF NOT EXISTS {db}"), None, false)?;
+
+        let t_rtds_prices = quote_ident(&self.table_rtds_prices);
+        self.execute_query(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {t_rtds_prices} (
+                    row_hash String,
+                    market_slug String,
+                    symbol String,
+                    asset_id String,
+                    kind String,
+                    timestamp_ms Int64,
+                    received_at_ms Int64,
+                    price Nullable(Float64),
+                    value Nullable(Float64),
+                    price_to_beat Nullable(Float64),
+                    diff_vs_price_to_beat Nullable(Float64),
+                    diff_vs_price_to_beat_percentage Nullable(Float64),
+                    clob_join_target_ts_ms Nullable(Int64),
+                    clob_up_asset_id String,
+                    clob_up_best_bid_price Nullable(Float64),
+                    clob_up_best_ask_price Nullable(Float64),
+                    clob_up_mid_price Nullable(Float64),
+                    clob_up_spread Nullable(Float64),
+                    clob_up_exchange_ts_ms Nullable(Int64),
+                    clob_up_recv_ts_ms Nullable(Int64),
+                    clob_down_asset_id String,
+                    clob_down_best_bid_price Nullable(Float64),
+                    clob_down_best_ask_price Nullable(Float64),
+                    clob_down_mid_price Nullable(Float64),
+                    clob_down_spread Nullable(Float64),
+                    clob_down_exchange_ts_ms Nullable(Int64),
+                    clob_down_recv_ts_ms Nullable(Int64),
+                    row_json String,
+                    ingested_at_ms Int64
+                ) ENGINE = MergeTree
+                ORDER BY (market_slug, timestamp_ms, row_hash)"
+            ),
+            None,
+            true,
+        )?;
+
+        let t_price_to_beat = quote_ident(&self.table_price_to_beat);
+        self.execute_query(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {t_price_to_beat} (
+                    row_hash String,
+                    market_slug String,
+                    price_to_beat Nullable(Float64),
+                    updated_at_ms Int64,
+                    row_json String,
+                    ingested_at_ms Int64
+                ) ENGINE = ReplacingMergeTree(updated_at_ms)
+                ORDER BY (market_slug, row_hash)"
+            ),
+            None,
+            true,
+        )?;
+
+        let t_resolution = quote_ident(&self.table_resolution_state);
+        self.execute_query(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {t_resolution} (
+                    row_hash String,
+                    state_version Int64,
+                    state_updated_at_ms Int64,
+                    market_slug String,
+                    symbol String,
+                    asset_id String,
+                    resolution_ts_ms Int64,
+                    source_ts_ms Int64,
+                    resolution_price Nullable(Float64),
+                    resolution_value Nullable(Float64),
+                    capture_mode String,
+                    price_to_beat Nullable(Float64),
+                    diff_vs_price_to_beat Nullable(Float64),
+                    diff_vs_price_to_beat_percentage Nullable(Float64),
+                    captured_at_ms Int64,
+                    row_json String,
+                    ingested_at_ms Int64
+                ) ENGINE = MergeTree
+                ORDER BY (market_slug, symbol, resolution_ts_ms, row_hash)"
+            ),
+            None,
+            true,
+        )?;
+
+        Ok(())
+    }
+
+    fn insert_json_rows(&self, table: &str, rows: &[String]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let query = format!(
+            "INSERT INTO {} SETTINGS input_format_skip_unknown_fields=1 FORMAT JSONEachRow",
+            quote_ident(table)
+        );
+        let mut payload = rows.join("\n");
+        payload.push('\n');
+        self.execute_query(&query, Some(payload), true)
+    }
+
+    fn enqueue_row_best_effort(&self, table: &str, row: &Value, force_flush: bool) {
+        let row_raw = match serde_json::to_string(row) {
+            Ok(v) => v,
+            Err(e) => {
+                self.warn_throttled(&format!("[RTDS][CH] serialize row failed table={table}: {e}"));
+                return;
+            }
+        };
+
+        let now = now_ms();
+        let mut flush_rows: Option<Vec<String>> = None;
+        if let Ok(mut state) = self.batch_state.lock() {
+            let entry = state
+                .by_table
+                .entry(table.to_string())
+                .or_insert_with(ClickhouseBatchBuffer::default);
+            if entry.rows.is_empty() {
+                entry.first_enqueue_ms = now;
+            }
+            entry.rows.push(row_raw);
+            let age_ms = now.saturating_sub(entry.first_enqueue_ms);
+            let should_flush = force_flush
+                || entry.rows.len() >= self.batch_max_rows
+                || age_ms >= self.batch_max_delay_ms;
+            if should_flush {
+                flush_rows = Some(std::mem::take(&mut entry.rows));
+                entry.first_enqueue_ms = 0;
+            }
+        } else {
+            self.warn_throttled("[RTDS][CH] batch lock poisoned");
+            return;
+        }
+
+        if let Some(rows) = flush_rows {
+            if let Err(e) = self.insert_json_rows(table, &rows) {
+                self.warn_throttled(&format!(
+                    "[RTDS][CH] batch insert failed table={} rows={} err={e:#}",
+                    table,
+                    rows.len()
+                ));
+            }
+        }
+    }
+
+    fn flush_table_best_effort(&self, table: &str) {
+        let mut rows = Vec::new();
+        if let Ok(mut state) = self.batch_state.lock() {
+            if let Some(entry) = state.by_table.get_mut(table) {
+                if !entry.rows.is_empty() {
+                    rows = std::mem::take(&mut entry.rows);
+                    entry.first_enqueue_ms = 0;
+                }
+            }
+        } else {
+            self.warn_throttled("[RTDS][CH] batch lock poisoned on flush");
+            return;
+        }
+        if rows.is_empty() {
+            return;
+        }
+        if let Err(e) = self.insert_json_rows(table, &rows) {
+            self.warn_throttled(&format!(
+                "[RTDS][CH] flush batch failed table={} rows={} err={e:#}",
+                table,
+                rows.len()
+            ));
+        }
+    }
+
+    fn flush_all_best_effort(&self) {
+        self.flush_table_best_effort(&self.table_rtds_prices);
+        self.flush_table_best_effort(&self.table_price_to_beat);
+        self.flush_table_best_effort(&self.table_resolution_state);
+    }
+
+    fn warn_throttled(&self, msg: &str) {
+        let now = now_ms();
+        if let Ok(mut last) = self.last_error_log_ms.lock() {
+            if now - *last >= self.error_log_every_ms {
+                self.logger.warning(msg);
+                *last = now;
+            }
+        } else {
+            self.logger.warning(msg);
+        }
+    }
+
+    fn insert_rtds_price_best_effort(&self, source_row: &Value) {
+        let row_json = match serde_json::to_string(source_row) {
+            Ok(v) => v,
+            Err(e) => {
+                self.warn_throttled(&format!("[RTDS][CH] serialize rtds row failed: {e}"));
+                return;
+            }
+        };
+        let now = now_ms();
+        let row = json!({
+            "row_hash": row_hash_hex(&row_json),
+            "market_slug": val_as_string(source_row.get("market_slug")),
+            "symbol": val_as_string(source_row.get("symbol")),
+            "asset_id": val_as_string(source_row.get("asset_id")),
+            "kind": val_as_string(source_row.get("kind")),
+            "timestamp_ms": val_as_i64(source_row.get("timestamp_ms")).unwrap_or(0),
+            "received_at_ms": val_as_i64(source_row.get("received_at_ms")).unwrap_or(now),
+            "price": val_as_f64(source_row.get("price")),
+            "value": val_as_f64(source_row.get("value")),
+            "price_to_beat": val_as_f64(source_row.get("price_to_beat")),
+            "diff_vs_price_to_beat": val_as_f64(source_row.get("diff_vs_price_to_beat")),
+            "diff_vs_price_to_beat_percentage": val_as_f64(source_row.get("diff_vs_price_to_beat_percentage")),
+            "clob_join_target_ts_ms": val_as_i64(source_row.get("clob_join_target_ts_ms")),
+            "clob_up_asset_id": val_as_string(source_row.get("clob_up_asset_id")),
+            "clob_up_best_bid_price": val_as_f64(source_row.get("clob_up_best_bid_price")),
+            "clob_up_best_ask_price": val_as_f64(source_row.get("clob_up_best_ask_price")),
+            "clob_up_mid_price": val_as_f64(source_row.get("clob_up_mid_price")),
+            "clob_up_spread": val_as_f64(source_row.get("clob_up_spread")),
+            "clob_up_exchange_ts_ms": val_as_i64(source_row.get("clob_up_exchange_ts_ms")),
+            "clob_up_recv_ts_ms": val_as_i64(source_row.get("clob_up_recv_ts_ms")),
+            "clob_down_asset_id": val_as_string(source_row.get("clob_down_asset_id")),
+            "clob_down_best_bid_price": val_as_f64(source_row.get("clob_down_best_bid_price")),
+            "clob_down_best_ask_price": val_as_f64(source_row.get("clob_down_best_ask_price")),
+            "clob_down_mid_price": val_as_f64(source_row.get("clob_down_mid_price")),
+            "clob_down_spread": val_as_f64(source_row.get("clob_down_spread")),
+            "clob_down_exchange_ts_ms": val_as_i64(source_row.get("clob_down_exchange_ts_ms")),
+            "clob_down_recv_ts_ms": val_as_i64(source_row.get("clob_down_recv_ts_ms")),
+            "row_json": row_json,
+            "ingested_at_ms": now,
+        });
+        self.enqueue_row_best_effort(&self.table_rtds_prices, &row, false);
+    }
+
+    fn insert_price_to_beat_best_effort(&self, state: &PriceToBeatStateFile) {
+        let row_json = match serde_json::to_string(state) {
+            Ok(v) => v,
+            Err(e) => {
+                self.warn_throttled(&format!("[RTDS][CH] serialize price_to_beat failed: {e}"));
+                return;
+            }
+        };
+        let row = json!({
+            "row_hash": row_hash_hex(&row_json),
+            "market_slug": state.market_slug,
+            "price_to_beat": state.price_to_beat,
+            "updated_at_ms": state.updated_at_ms,
+            "row_json": row_json,
+            "ingested_at_ms": now_ms(),
+        });
+        self.enqueue_row_best_effort(&self.table_price_to_beat, &row, true);
+    }
+
+    fn insert_resolution_best_effort(
+        &self,
+        snapshot: &ResolutionSnapshot,
+        state_version: i64,
+        state_updated_at_ms: i64,
+    ) {
+        let row_json = match serde_json::to_string(snapshot) {
+            Ok(v) => v,
+            Err(e) => {
+                self.warn_throttled(&format!("[RTDS][CH] serialize resolution failed: {e}"));
+                return;
+            }
+        };
+        let row = json!({
+            "row_hash": row_hash_hex(&row_json),
+            "state_version": state_version,
+            "state_updated_at_ms": state_updated_at_ms,
+            "market_slug": snapshot.market_slug,
+            "symbol": snapshot.symbol,
+            "asset_id": snapshot.asset_id,
+            "resolution_ts_ms": snapshot.resolution_ts_ms,
+            "source_ts_ms": snapshot.source_ts_ms,
+            "resolution_price": snapshot.resolution_price,
+            "resolution_value": snapshot.resolution_value,
+            "capture_mode": snapshot.capture_mode,
+            "price_to_beat": snapshot.price_to_beat,
+            "diff_vs_price_to_beat": snapshot.diff_vs_price_to_beat,
+            "diff_vs_price_to_beat_percentage": snapshot.diff_vs_price_to_beat_percentage,
+            "captured_at_ms": snapshot.captured_at_ms,
+            "row_json": row_json,
+            "ingested_at_ms": now_ms(),
+        });
+        self.enqueue_row_best_effort(&self.table_resolution_state, &row, true);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct RuntimeState {
     latest: Option<PriceTick>,
@@ -229,6 +747,33 @@ struct RuntimeState {
     first_after_resolution: Option<PriceTick>,
     price_to_beat: Option<f64>,
     finalized: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ClobTopOfBook {
+    asset_id: String,
+    best_bid_price: Option<f64>,
+    best_ask_price: Option<f64>,
+    mid_price: Option<f64>,
+    spread: Option<f64>,
+    exchange_ts_ms: Option<i64>,
+    exchange_ts_precision: String,
+    recv_ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClobTopOfBookState {
+    up_asset_id: String,
+    down_asset_id: String,
+    latest_by_asset: HashMap<String, ClobTopOfBook>,
+    history_by_asset: HashMap<String, VecDeque<ClobTopOfBook>>,
+}
+
+#[derive(Debug, Clone)]
+struct ClobMatchedTopOfBook {
+    sample: ClobTopOfBook,
+    match_mode: String,
+    match_delta_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,14 +838,25 @@ pub struct RtdsService {
     log_realtime: bool,
     log_raw: bool,
     write_latest_file: bool,
+    persist_state_to_file: bool,
     state_path: PathBuf,
     price_to_beat_state_path: PathBuf,
     latest_path: PathBuf,
     max_records: usize,
     tick_log: Option<Arc<JsonlFileService>>,
+    clickhouse_sink: Option<Arc<RtdsClickhouseSink>>,
+    clob_join_enabled: bool,
+    clob_ws_url: String,
+    clob_reconnect_min: f64,
+    clob_reconnect_max: f64,
+    clob_ping_interval: f64,
+    clob_read_timeout: f64,
+    clob_match_max_age_ms: i64,
+    clob_state: Arc<Mutex<ClobTopOfBookState>>,
     runtime: Arc<Mutex<RuntimeState>>,
     stop_event: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    clob_thread: Mutex<Option<JoinHandle<()>>>,
     logger: Arc<dyn LogLike>,
 }
 
@@ -401,12 +957,105 @@ impl RtdsService {
             .unwrap_or_else(|_| "state/rtds_prices.jsonl".to_string())
             .trim()
             .to_string();
-        let tick_log_enabled = env_bool("RTDS_LOG_TO_FILE", true) && !tick_log_path.is_empty();
+        let sink_selection = parse_rtds_sink_selection();
+        let tick_log_enabled = sink_selection.file && !tick_log_path.is_empty();
         let tick_log = if tick_log_enabled {
             Some(Arc::new(JsonlFileService::new(tick_log_path, true)))
         } else {
             None
         };
+        let write_latest_file = env_bool("RTDS_WRITE_LATEST_FILE", sink_selection.file);
+        let persist_state_to_file =
+            env_bool("RTDS_PERSIST_STATE_TO_FILE", sink_selection.file);
+
+        let mut clickhouse_sink: Option<Arc<RtdsClickhouseSink>> = None;
+        if sink_selection.clickhouse {
+            match RtdsClickhouseSink::from_env(logger.clone()) {
+                Ok(sink) => {
+                    if env_bool("RTDS_CLICKHOUSE_AUTO_CREATE_SCHEMA", true) {
+                        if let Err(e) = sink.ensure_schema() {
+                            if !sink_selection.file {
+                                return Err(anyhow!(
+                                    "RTDS sink requires ClickHouse, but schema init failed: {e:#}"
+                                ));
+                            }
+                            logger.warning(&format!(
+                                "[RTDS] clickhouse schema init failed; continuing file sink only: {e:#}"
+                            ));
+                        } else {
+                            clickhouse_sink = Some(Arc::new(sink));
+                        }
+                    } else {
+                        clickhouse_sink = Some(Arc::new(sink));
+                    }
+                }
+                Err(e) => {
+                    if !sink_selection.file {
+                        return Err(anyhow!(
+                            "RTDS sink requires ClickHouse, but configuration is invalid: {e:#}"
+                        ));
+                    }
+                    logger.warning(&format!(
+                        "[RTDS] clickhouse config invalid; continuing file sink only: {e:#}"
+                    ));
+                }
+            }
+        }
+        logger.info(&format!(
+            "[RTDS] sink mode={} file={} clickhouse={} write_latest_file={} persist_state_to_file={}",
+            sink_selection.mode_label,
+            sink_selection.file,
+            clickhouse_sink.is_some(),
+            write_latest_file,
+            persist_state_to_file
+        ));
+        if let Some(ch) = &clickhouse_sink {
+            logger.info(&format!(
+                "[RTDS] clickhouse batching rows={} max_delay_ms={}",
+                ch.batch_max_rows, ch.batch_max_delay_ms
+            ));
+        }
+        if tick_log.is_none() && clickhouse_sink.is_none() {
+            logger.warning("[RTDS] no tick sink is active (file and clickhouse are both disabled)");
+        }
+
+        let (up_asset_id, down_asset_id) =
+            match market
+                .as_ref()
+                .and_then(|m| parse_tokens_and_condition(m).ok())
+            {
+                Some((up, down, _)) => (up, down),
+                None => (String::new(), String::new()),
+            };
+
+        let clob_ws_url = env::var("RTDS_CLOB_WS_URL")
+            .unwrap_or_else(|_| format!("{}/ws/market", cfg.ws_base.trim_end_matches('/')))
+            .trim()
+            .to_string();
+        let clob_join_enabled = env_bool("RTDS_CLOB_JOIN_ENABLED", true)
+            && !up_asset_id.trim().is_empty()
+            && !down_asset_id.trim().is_empty()
+            && !clob_ws_url.trim().is_empty();
+        let clob_state = Arc::new(Mutex::new(ClobTopOfBookState {
+            up_asset_id: up_asset_id.clone(),
+            down_asset_id: down_asset_id.clone(),
+            latest_by_asset: HashMap::new(),
+            history_by_asset: HashMap::new(),
+        }));
+        if clob_join_enabled {
+            logger.info(&format!(
+                "[RTDS] CLOB join enabled market={} up_asset={} down_asset={}",
+                market_slug, up_asset_id, down_asset_id
+            ));
+        } else {
+            logger.info(&format!(
+                "[RTDS] CLOB join disabled market={} up_asset_present={} down_asset_present={} ws_url_present={}",
+                market_slug,
+                !up_asset_id.trim().is_empty(),
+                !down_asset_id.trim().is_empty(),
+                !clob_ws_url.trim().is_empty()
+            ));
+        }
 
         let mut runtime = RuntimeState::default();
         let store = Self::load_state_file(&state_path);
@@ -418,15 +1067,17 @@ impl RtdsService {
         runtime.price_to_beat = configured_ptb
             .or(slug_ptb)
             .or_else(|| prev.as_ref().map(|s| s.resolution_price));
-
-        let _ = Self::save_price_to_beat_state(
-            &price_to_beat_state_path,
-            &PriceToBeatStateFile {
-                market_slug: market_slug.to_string(),
-                price_to_beat: runtime.price_to_beat,
-                updated_at_ms: now_ms(),
-            },
-        );
+        let initial_ptb_state = PriceToBeatStateFile {
+            market_slug: market_slug.to_string(),
+            price_to_beat: runtime.price_to_beat,
+            updated_at_ms: now_ms(),
+        };
+        if persist_state_to_file {
+            let _ = Self::save_price_to_beat_state(&price_to_beat_state_path, &initial_ptb_state);
+        }
+        if let Some(ch) = &clickhouse_sink {
+            ch.insert_price_to_beat_best_effort(&initial_ptb_state);
+        }
 
         if let Some(p) = runtime.price_to_beat {
             logger.info(&format!(
@@ -461,15 +1112,26 @@ impl RtdsService {
             read_timeout: env_float("RTDS_WS_READ_TIMEOUT_SECONDS", 1.0).max(0.1),
             log_realtime: env_bool("RTDS_LOG_REALTIME", false),
             log_raw: env_bool("RTDS_LOG_RAW", false),
-            write_latest_file: env_bool("RTDS_WRITE_LATEST_FILE", true),
+            write_latest_file,
+            persist_state_to_file,
             state_path,
             price_to_beat_state_path,
             latest_path,
             max_records: env_int("RTDS_STATE_MAX_RECORDS", 2000).max(100) as usize,
             tick_log,
+            clickhouse_sink,
+            clob_join_enabled,
+            clob_ws_url,
+            clob_reconnect_min: env_float("RTDS_CLOB_WS_RECONNECT_MIN", 1.0).max(0.1),
+            clob_reconnect_max: env_float("RTDS_CLOB_WS_RECONNECT_MAX", 20.0).max(0.5),
+            clob_ping_interval: env_float("RTDS_CLOB_WS_PING_INTERVAL", 5.0).max(0.0),
+            clob_read_timeout: env_float("RTDS_CLOB_WS_READ_TIMEOUT_SECONDS", 1.0).max(0.1),
+            clob_match_max_age_ms: env_int("RTDS_CLOB_MATCH_MAX_AGE_MS", 2500).max(100) as i64,
+            clob_state,
             runtime: Arc::new(Mutex::new(runtime)),
             stop_event: Arc::new(AtomicBool::new(false)),
             thread: Mutex::new(None),
+            clob_thread: Mutex::new(None),
             logger,
         });
 
@@ -485,6 +1147,15 @@ impl RtdsService {
             let this = Arc::clone(self);
             *slot = Some(thread::spawn(move || this.run_loop()));
         }
+        if self.clob_join_enabled {
+            if let Ok(mut slot) = self.clob_thread.lock() {
+                if slot.as_ref().map(|h| !h.is_finished()).unwrap_or(false) {
+                    return;
+                }
+                let this = Arc::clone(self);
+                *slot = Some(thread::spawn(move || this.run_clob_loop()));
+            }
+        }
     }
 
     pub fn close(&self) {
@@ -494,7 +1165,15 @@ impl RtdsService {
                 let _ = handle.join();
             }
         }
+        if let Ok(mut slot) = self.clob_thread.lock() {
+            if let Some(handle) = slot.take() {
+                let _ = handle.join();
+            }
+        }
         let _ = self.persist_resolution_snapshot();
+        if let Some(ch) = &self.clickhouse_sink {
+            ch.flush_all_best_effort();
+        }
         clear_live_snapshot(&self.market_slug);
     }
 
@@ -586,8 +1265,241 @@ impl RtdsService {
         }
     }
 
+    fn run_clob_loop(self: Arc<Self>) {
+        if !self.clob_join_enabled {
+            return;
+        }
+        if self.clob_ws_url.trim().is_empty() {
+            self.logger.error("[RTDS][CLOB] missing RTDS_CLOB_WS_URL");
+            return;
+        }
+        let mut backoff = self.clob_reconnect_min.max(0.1);
+        while !self.stop_event.load(Ordering::SeqCst) {
+            let conn = connect(&self.clob_ws_url);
+            let (mut ws, _) = match conn {
+                Ok(v) => v,
+                Err(e) => {
+                    self.logger.warning(&format!("[RTDS][CLOB] connect error: {e}"));
+                    let sleep_for = (backoff.min(self.clob_reconnect_max))
+                        * (0.7 + rand::thread_rng().gen_range(0.0..0.6));
+                    thread::sleep(Duration::from_secs_f64(sleep_for.max(0.1)));
+                    backoff = (backoff * 2.0).min(self.clob_reconnect_max);
+                    continue;
+                }
+            };
+
+            backoff = self.clob_reconnect_min.max(0.1);
+            Self::configure_socket_timeouts_with(&mut ws, self.clob_read_timeout);
+            if let Err(e) = self.send_clob_subscription(&mut ws) {
+                self.logger
+                    .warning(&format!("[RTDS][CLOB] subscribe error: {e}"));
+                let _ = ws.close(None);
+                thread::sleep(Duration::from_secs_f64(backoff));
+                continue;
+            }
+
+            let (up, down) = self.clob_asset_pair();
+            self.logger.info(&format!(
+                "[RTDS][CLOB] connected market={} up_asset={} down_asset={}",
+                self.market_slug, up, down
+            ));
+            let mut last_ping = Instant::now();
+            while !self.stop_event.load(Ordering::SeqCst) {
+                if self.clob_ping_interval > 0.0
+                    && last_ping.elapsed() >= Duration::from_secs_f64(self.clob_ping_interval)
+                {
+                    let _ = ws.send(Message::Text("ping".into()));
+                    last_ping = Instant::now();
+                }
+
+                let msg = match ws.read() {
+                    Ok(m) => m,
+                    Err(tungstenite::Error::Io(e))
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
+                        continue
+                    }
+                    Err(e) => {
+                        self.logger.warning(&format!("[RTDS][CLOB] ws read error: {e}"));
+                        break;
+                    }
+                };
+
+                match msg {
+                    Message::Text(text) => self.process_clob_text_message(&text),
+                    Message::Binary(bin) => {
+                        if let Ok(text) = String::from_utf8(bin.to_vec()) {
+                            self.process_clob_text_message(&text);
+                        }
+                    }
+                    Message::Close(frame) => {
+                        let code = frame.as_ref().map(|f| u16::from(f.code)).unwrap_or(0);
+                        let reason = frame
+                            .as_ref()
+                            .map(|f| f.reason.to_string())
+                            .unwrap_or_default();
+                        self.logger.warning(&format!(
+                            "[RTDS][CLOB] ws closed code={code} reason={reason}"
+                        ));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = ws.close(None);
+            if self.stop_event.load(Ordering::SeqCst) {
+                break;
+            }
+            let sleep_for = (backoff.min(self.clob_reconnect_max))
+                * (0.7 + rand::thread_rng().gen_range(0.0..0.6));
+            self.logger
+                .warning(&format!("[RTDS][CLOB] reconnecting in {sleep_for:.1}s"));
+            thread::sleep(Duration::from_secs_f64(sleep_for.max(0.1)));
+            backoff = (backoff * 2.0).min(self.clob_reconnect_max);
+        }
+    }
+
+    fn process_clob_text_message(&self, raw: &str) {
+        let text = raw.trim();
+        if text.is_empty() {
+            return;
+        }
+        if text.eq_ignore_ascii_case("pong") || text.eq_ignore_ascii_case("ping") {
+            return;
+        }
+        let msg: Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(e) => {
+                self.logger
+                    .warning(&format!("[RTDS][CLOB] parse error: {e}; payload={text}"));
+                return;
+            }
+        };
+        self.process_clob_json_value(&msg);
+    }
+
+    fn process_clob_json_value(&self, v: &Value) {
+        match v {
+            Value::Array(items) => {
+                for item in items {
+                    self.process_clob_json_value(item);
+                }
+            }
+            Value::Object(map) => {
+                self.process_clob_event(v);
+                if let Some(payload) = map.get("payload") {
+                    self.process_clob_json_value(payload);
+                }
+                if let Some(data) = map.get("data") {
+                    self.process_clob_json_value(data);
+                }
+                if let Some(events) = map.get("events") {
+                    self.process_clob_json_value(events);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn process_clob_event(&self, msg: &Value) {
+        let et = msg
+            .get("event_type")
+            .or_else(|| msg.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if !et.is_empty() && et != "best_bid_ask" {
+            return;
+        }
+
+        let asset_id = msg
+            .get("asset_id")
+            .or_else(|| msg.get("token_id"))
+            .or_else(|| msg.get("asset"))
+            .or_else(|| msg.get("token"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if asset_id.is_empty() {
+            return;
+        }
+        let (up, down) = self.clob_asset_pair();
+        if asset_id != up && asset_id != down {
+            return;
+        }
+
+        let best_bid_price = val_as_f64(
+            msg.get("best_bid_price")
+                .or_else(|| msg.get("best_bid"))
+                .or_else(|| msg.get("bid"))
+                .or_else(|| msg.get("b")),
+        );
+        let best_ask_price = val_as_f64(
+            msg.get("best_ask_price")
+                .or_else(|| msg.get("best_ask"))
+                .or_else(|| msg.get("ask"))
+                .or_else(|| msg.get("a")),
+        );
+        if best_bid_price.is_none() && best_ask_price.is_none() {
+            return;
+        }
+        let (exchange_ts_ms, exchange_ts_precision) = val_as_i64_ms_with_precision(
+            msg.get("timestamp_ms")
+                .or_else(|| msg.get("timestampMs"))
+                .or_else(|| msg.get("timestamp"))
+                .or_else(|| msg.get("ts"))
+                .or_else(|| msg.get("t"))
+                .or_else(|| msg.get("time"))
+                .or_else(|| msg.get("updated_at")),
+        );
+        let recv_ts_ms = now_ms();
+        let mid_price = match (best_bid_price, best_ask_price) {
+            (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some((b + a) * 0.5),
+            _ => None,
+        };
+        let spread = match (best_bid_price, best_ask_price) {
+            (Some(b), Some(a)) if b > 0.0 && a > 0.0 => Some(a - b),
+            _ => None,
+        };
+
+        self.upsert_clob_top_of_book(ClobTopOfBook {
+            asset_id,
+            best_bid_price,
+            best_ask_price,
+            mid_price,
+            spread,
+            exchange_ts_ms,
+            exchange_ts_precision: exchange_ts_precision.to_string(),
+            recv_ts_ms,
+        });
+    }
+
+    fn send_clob_subscription(&self, ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> {
+        let (up, down) = self.clob_asset_pair();
+        if up.trim().is_empty() || down.trim().is_empty() {
+            return Err(anyhow!("missing CLOB up/down asset ids"));
+        }
+        let sub = json!({
+            "assets_ids": [up, down],
+            "type": "market",
+            "custom_feature_enabled": true
+        });
+        ws.send(Message::Text(sub.to_string().into()))
+            .map_err(|e| anyhow!("send CLOB subscribe failed: {e}"))?;
+        Ok(())
+    }
+
     fn configure_socket_timeouts(&self, ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
-        let timeout = Some(Duration::from_secs_f64(self.read_timeout.max(0.1)));
+        Self::configure_socket_timeouts_with(ws, self.read_timeout);
+    }
+
+    fn configure_socket_timeouts_with(
+        ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+        timeout_seconds: f64,
+    ) {
+        let timeout = Some(Duration::from_secs_f64(timeout_seconds.max(0.1)));
         match ws.get_mut() {
             MaybeTlsStream::Plain(s) => {
                 let _ = s.set_read_timeout(timeout);
@@ -728,7 +1640,7 @@ impl RtdsService {
         };
         upsert_live_snapshot(live_snapshot.clone());
         self.write_latest_snapshot(&live_snapshot);
-        self.append_tick_log(&json!({
+        let mut row = json!({
             "kind": "tick",
             "market_slug": self.market_slug,
             "symbol": self.symbol,
@@ -740,7 +1652,9 @@ impl RtdsService {
             "diff_vs_price_to_beat": diff,
             "diff_vs_price_to_beat_percentage": diff_percentage_value,
             "received_at_ms": now_ms(),
-        }));
+        });
+        self.apply_clob_join_to_tick_row(&mut row, tick.timestamp_ms);
+        self.append_tick_log(&row);
     }
 
     fn write_latest_snapshot(&self, snapshot: &RtdsLiveSnapshot) {
@@ -765,6 +1679,213 @@ impl RtdsService {
     fn append_tick_log(&self, obj: &Value) {
         if let Some(fs) = &self.tick_log {
             fs.append(obj);
+        }
+        if let Some(ch) = &self.clickhouse_sink {
+            ch.insert_rtds_price_best_effort(obj);
+        }
+    }
+
+    fn clob_asset_pair(&self) -> (String, String) {
+        self.clob_state
+            .lock()
+            .map(|s| (s.up_asset_id.clone(), s.down_asset_id.clone()))
+            .unwrap_or_else(|_| (String::new(), String::new()))
+    }
+
+    fn upsert_clob_top_of_book(&self, snapshot: ClobTopOfBook) {
+        if !self.clob_join_enabled {
+            return;
+        }
+        let max_records = env_int("RTDS_CLOB_HISTORY_MAX_RECORDS", 800).max(32) as usize;
+        let max_age_ms = env_int("RTDS_CLOB_HISTORY_MAX_AGE_MS", 45_000).max(1000) as i64;
+        if let Ok(mut state) = self.clob_state.lock() {
+            let queue = state
+                .history_by_asset
+                .entry(snapshot.asset_id.clone())
+                .or_insert_with(VecDeque::new);
+            queue.push_back(snapshot.clone());
+            while queue.len() > max_records {
+                let _ = queue.pop_front();
+            }
+            while queue
+                .front()
+                .map(|s| snapshot.recv_ts_ms - s.recv_ts_ms > max_age_ms)
+                .unwrap_or(false)
+            {
+                let _ = queue.pop_front();
+            }
+            state.latest_by_asset.insert(snapshot.asset_id.clone(), snapshot);
+        }
+    }
+
+    fn pick_best_clob_snapshot(
+        history: Option<&VecDeque<ClobTopOfBook>>,
+        latest: Option<&ClobTopOfBook>,
+        target_ts_ms: i64,
+        max_age_ms: i64,
+    ) -> Option<ClobMatchedTopOfBook> {
+        let mut best_ms: Option<(i64, ClobTopOfBook)> = None;
+        let mut best_s: Option<(i64, ClobTopOfBook)> = None;
+        if let Some(hist) = history {
+            for sample in hist {
+                if let Some(exchange_ts_ms) = sample.exchange_ts_ms {
+                    if sample.exchange_ts_precision == "s" {
+                        let delta_s = ((target_ts_ms / 1000) - (exchange_ts_ms / 1000)).abs();
+                        let replace = best_s
+                            .as_ref()
+                            .map(|(d, _)| delta_s < *d)
+                            .unwrap_or(true);
+                        if replace {
+                            best_s = Some((delta_s, sample.clone()));
+                        }
+                    } else {
+                        let delta_ms = (target_ts_ms - exchange_ts_ms).abs();
+                        let replace = best_ms
+                            .as_ref()
+                            .map(|(d, _)| delta_ms < *d)
+                            .unwrap_or(true);
+                        if replace {
+                            best_ms = Some((delta_ms, sample.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((delta_ms, sample)) = best_ms {
+            if delta_ms <= max_age_ms {
+                return Some(ClobMatchedTopOfBook {
+                    sample,
+                    match_mode: "exchange_ms".to_string(),
+                    match_delta_ms: Some(delta_ms),
+                });
+            }
+        }
+
+        if let Some((delta_s, sample)) = best_s {
+            let max_age_s = (max_age_ms / 1000).max(1);
+            if delta_s <= max_age_s {
+                return Some(ClobMatchedTopOfBook {
+                    sample,
+                    match_mode: "exchange_second".to_string(),
+                    match_delta_ms: Some(delta_s * 1000),
+                });
+            }
+        }
+
+        let latest = latest
+            .cloned()
+            .or_else(|| history.and_then(|h| h.back().cloned()));
+        if let Some(sample) = latest {
+            let ts_ref = sample.exchange_ts_ms.unwrap_or(sample.recv_ts_ms);
+            let delta_ms = (target_ts_ms - ts_ref).abs();
+            if delta_ms <= max_age_ms {
+                let mode = if sample.exchange_ts_ms.is_some() {
+                    "exchange_fallback"
+                } else {
+                    "recv_fallback"
+                };
+                return Some(ClobMatchedTopOfBook {
+                    sample,
+                    match_mode: mode.to_string(),
+                    match_delta_ms: Some(delta_ms),
+                });
+            }
+        }
+        None
+    }
+
+    fn match_clob_for_tick(
+        &self,
+        target_ts_ms: i64,
+    ) -> (Option<ClobMatchedTopOfBook>, Option<ClobMatchedTopOfBook>) {
+        if !self.clob_join_enabled {
+            return (None, None);
+        }
+        let state = match self.clob_state.lock() {
+            Ok(v) => v,
+            Err(_) => return (None, None),
+        };
+        let up = if state.up_asset_id.trim().is_empty() {
+            None
+        } else {
+            Self::pick_best_clob_snapshot(
+                state.history_by_asset.get(&state.up_asset_id),
+                state.latest_by_asset.get(&state.up_asset_id),
+                target_ts_ms,
+                self.clob_match_max_age_ms,
+            )
+        };
+        let down = if state.down_asset_id.trim().is_empty() {
+            None
+        } else {
+            Self::pick_best_clob_snapshot(
+                state.history_by_asset.get(&state.down_asset_id),
+                state.latest_by_asset.get(&state.down_asset_id),
+                target_ts_ms,
+                self.clob_match_max_age_ms,
+            )
+        };
+        (up, down)
+    }
+
+    fn apply_clob_join_to_tick_row(&self, row: &mut Value, tick_ts_ms: i64) {
+        let (up_match, down_match) = self.match_clob_for_tick(tick_ts_ms);
+        let Some(obj) = row.as_object_mut() else {
+            return;
+        };
+        obj.insert("clob_join_target_ts_ms".to_string(), json!(tick_ts_ms));
+        Self::insert_clob_fields(obj, "clob_up", up_match);
+        Self::insert_clob_fields(obj, "clob_down", down_match);
+    }
+
+    fn insert_clob_fields(
+        obj: &mut serde_json::Map<String, Value>,
+        prefix: &str,
+        matched: Option<ClobMatchedTopOfBook>,
+    ) {
+        let keys = [
+            "asset_id",
+            "best_bid_price",
+            "best_ask_price",
+            "mid_price",
+            "spread",
+            "exchange_ts_ms",
+            "recv_ts_ms",
+            "exchange_ts_precision",
+            "match_mode",
+            "match_delta_ms",
+        ];
+        if let Some(m) = matched {
+            obj.insert(
+                format!("{prefix}_asset_id"),
+                json!(m.sample.asset_id.clone()),
+            );
+            obj.insert(
+                format!("{prefix}_best_bid_price"),
+                json!(m.sample.best_bid_price),
+            );
+            obj.insert(
+                format!("{prefix}_best_ask_price"),
+                json!(m.sample.best_ask_price),
+            );
+            obj.insert(format!("{prefix}_mid_price"), json!(m.sample.mid_price));
+            obj.insert(format!("{prefix}_spread"), json!(m.sample.spread));
+            obj.insert(
+                format!("{prefix}_exchange_ts_ms"),
+                json!(m.sample.exchange_ts_ms),
+            );
+            obj.insert(format!("{prefix}_recv_ts_ms"), json!(m.sample.recv_ts_ms));
+            obj.insert(
+                format!("{prefix}_exchange_ts_precision"),
+                json!(m.sample.exchange_ts_precision.clone()),
+            );
+            obj.insert(format!("{prefix}_match_mode"), json!(m.match_mode));
+            obj.insert(format!("{prefix}_match_delta_ms"), json!(m.match_delta_ms));
+            return;
+        }
+        for key in keys {
+            obj.insert(format!("{prefix}_{key}"), Value::Null);
         }
     }
 
@@ -941,27 +2062,33 @@ impl RtdsService {
             captured_at_ms: now_ms(),
         };
 
-        let mut state = Self::load_state_file(&self.state_path);
-        state.version = 1;
-        state.updated_at_ms = now_ms();
-        if let Some(existing) = state
-            .records
-            .iter_mut()
-            .find(|r| r.market_slug == snapshot.market_slug && r.symbol == snapshot.symbol)
-        {
-            *existing = snapshot.clone();
-        } else {
-            state.records.push(snapshot.clone());
+        let mut state_version = 1i64;
+        let mut state_updated_at_ms = now_ms();
+        if self.persist_state_to_file {
+            let mut state = Self::load_state_file(&self.state_path);
+            state.version = 1;
+            state.updated_at_ms = now_ms();
+            if let Some(existing) = state
+                .records
+                .iter_mut()
+                .find(|r| r.market_slug == snapshot.market_slug && r.symbol == snapshot.symbol)
+            {
+                *existing = snapshot.clone();
+            } else {
+                state.records.push(snapshot.clone());
+            }
+            state.records.sort_by_key(|r| r.resolution_ts_ms);
+            if state.records.len() > self.max_records {
+                let keep_from = state.records.len().saturating_sub(self.max_records);
+                state.records = state.records[keep_from..].to_vec();
+            }
+            state
+                .last_by_symbol
+                .insert(self.symbol.clone(), snapshot.clone());
+            Self::save_state_file(&self.state_path, &state)?;
+            state_version = state.version;
+            state_updated_at_ms = state.updated_at_ms;
         }
-        state.records.sort_by_key(|r| r.resolution_ts_ms);
-        if state.records.len() > self.max_records {
-            let keep_from = state.records.len().saturating_sub(self.max_records);
-            state.records = state.records[keep_from..].to_vec();
-        }
-        state
-            .last_by_symbol
-            .insert(self.symbol.clone(), snapshot.clone());
-        Self::save_state_file(&self.state_path, &state)?;
 
         self.logger.info(&format!(
             "[RTDS] persisted resolution market={} symbol={} price={:.6} source_ts_ms={} mode={} diff_vs_price_to_beat={} diff_vs_price_to_beat_percentage={}",
@@ -979,14 +2106,18 @@ impl RtdsService {
                 .map(|d| format!("{d:+.6}%"))
                 .unwrap_or_else(|| "-".to_string())
         ));
-        let _ = Self::save_price_to_beat_state(
-            &self.price_to_beat_state_path,
-            &PriceToBeatStateFile {
-                market_slug: self.market_slug.clone(),
-                price_to_beat: snapshot.price_to_beat,
-                updated_at_ms: now_ms(),
-            },
-        );
+        let ptb_state = PriceToBeatStateFile {
+            market_slug: self.market_slug.clone(),
+            price_to_beat: snapshot.price_to_beat,
+            updated_at_ms: now_ms(),
+        };
+        if self.persist_state_to_file {
+            let _ = Self::save_price_to_beat_state(&self.price_to_beat_state_path, &ptb_state);
+        }
+        if let Some(ch) = &self.clickhouse_sink {
+            ch.insert_resolution_best_effort(&snapshot, state_version, state_updated_at_ms);
+            ch.insert_price_to_beat_best_effort(&ptb_state);
+        }
         Ok(Some(snapshot))
     }
 }

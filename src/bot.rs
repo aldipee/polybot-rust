@@ -5998,10 +5998,12 @@ impl MakerHedgeCapBot {
             return false;
         }
         let win_s = env_float("SNIPER_ENDGAME_BLIND_POST_WINDOW_SECONDS", 0.0);
-        if win_s <= 0.0 {
+        // 0 disables. Positive means "final N seconds before expiry".
+        // Negative means "start posting N seconds after expiry" (within grace).
+        if win_s.abs() <= 1e-9 {
             return false;
         }
-        let grace = env_float("SNIPER_EXPIRY_GRACE_SECONDS", 0.0);
+        let grace = env_float("SNIPER_EXPIRY_GRACE_SECONDS", 0.0).max(0.0);
         if seconds_left > win_s + 1e-9 || seconds_left < (-grace - 1e-9) {
             return false;
         }
