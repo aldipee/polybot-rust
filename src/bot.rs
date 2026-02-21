@@ -6120,13 +6120,42 @@ impl MakerHedgeCapBot {
         } else {
             None
         };
+        let endgame_ot = self._resolve_order_type(
+            &std::env::var("SNIPER_ENDGAME_ORDER_TYPE")
+                .unwrap_or_else(|_| "GTC".to_string())
+                .to_ascii_uppercase(),
+        );
         let fresh = if self._market_data_fresh() { "Y" } else { "N" };
         self.logger.info(&format!(
-            "[SNIPER] ENDGAME blind-post side={side} px={px:.3} sz={size_target} t_left={seconds_left:.2}s fresh={fresh}"
+            "[SNIPER] ENDGAME blind-post side={side} px={px:.3} sz={size_target} t_left={seconds_left:.2}s fresh={fresh} type={endgame_ot}"
         ));
-        let oid = self._place_limit_bid_gtc(&asset_id, px, size_target as f64, post_only);
+        let oid = if endgame_ot == "GTC" {
+            self._place_limit_bid_gtc(&asset_id, px, size_target as f64, post_only)
+        } else {
+            let inflight_s = env_float("SNIPER_ENTRY_INFLIGHT_SECONDS", 1.5).max(0.25);
+            self._runtime_ts_set("__taker_inflight_until", now_ts_f64() + inflight_s);
+            self._place_taker_bid_fak(&asset_id, px, size_target as f64, Some(&endgame_ot))
+        };
         if oid.is_none() {
             return false;
+        }
+        let pending_key = Self::_sniper_entry_pending_key(&asset_id);
+        let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
+        self._runtime_ts_set(&pending_key, now_ts_f64());
+        self._runtime_ts_set(&confirmed_key, 0.0);
+        if endgame_ot != "GTC" {
+            let inflight_s = env_float("SNIPER_ENTRY_INFLIGHT_SECONDS", 1.5).max(0.25);
+            thread::sleep(Duration::from_secs_f64(inflight_s.max(1.0).min(4.0)));
+            let filled = self._sniper_position().is_some();
+            if !filled {
+                let pause_s = env_float("SNIPER_ENTRY_RETRY_PAUSE_SECONDS", 0.0).max(0.0);
+                if pause_s > 0.0 {
+                    self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + pause_s);
+                }
+                return false;
+            }
+            self._mark_sniper_entry_state(&side);
+            return true;
         }
         if let Ok(mut s) = self.state.lock() {
             s.sniper_last_entry_ts = now_ts_f64();
