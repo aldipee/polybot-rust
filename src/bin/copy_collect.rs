@@ -343,6 +343,7 @@ struct CollectorConfig {
     read_timeout: f64,
     ws_debug: bool,
     log_raw: bool,
+    include_rtds_data: bool,
     include_price_ticks: bool,
     include_rfq: bool,
     max_trades: i64,
@@ -386,6 +387,8 @@ impl CollectorConfig {
     }
 
     fn from_env() -> Self {
+        let include_rtds_data =
+            env_bool(&["COPY_COLLECT_INCLUDE_RTDS_DATA", "COPY_COLLECT_ENABLE_RTDS_DATA"], true);
         let ws_url = env_first(&["COPY_COLLECT_WS_URL", "SIGNAL_WS_URL", "RTDS_WS_URL"])
             .unwrap_or_else(|| "wss://ws-live-data.polymarket.com".to_string());
         let out_path = PathBuf::from(
@@ -410,6 +413,10 @@ impl CollectorConfig {
                     price_symbols.push(sym);
                 }
             }
+        }
+        if !include_rtds_data {
+            price_topics.clear();
+            price_symbols.clear();
         }
         price_symbols.sort();
         price_symbols.dedup();
@@ -440,6 +447,7 @@ impl CollectorConfig {
             .max(0.05),
             ws_debug: env_bool(&["COPY_COLLECT_WS_DEBUG", "SIGNAL_WS_DEBUG"], false),
             log_raw: env_bool(&["COPY_COLLECT_LOG_RAW"], false),
+            include_rtds_data,
             include_price_ticks: env_bool(&["COPY_COLLECT_LOG_PRICE_TICKS"], true),
             include_rfq: env_bool(&["COPY_COLLECT_INCLUDE_RFQ"], true),
             max_trades: env_i64(&["COPY_COLLECT_MAX_TRADES"], 0),
@@ -1381,18 +1389,20 @@ fn process_data_message(
         }));
     }
 
-    for pp in extract_price_points(&msg_json, now) {
-        latest_price_by_symbol.insert(pp.symbol.clone(), pp.clone());
-        if cfg.include_price_ticks {
-            let _ = writer.append(&json!({
-                "kind": "price_tick",
-                "collector_ts_ms": now,
-                "topic": pp.topic,
-                "symbol": pp.symbol,
-                "value": pp.value,
-                "price_ts_ms": pp.timestamp_ms,
-                "price_age_ms": (now - pp.timestamp_ms).max(0),
-            }));
+    if cfg.include_rtds_data {
+        for pp in extract_price_points(&msg_json, now) {
+            latest_price_by_symbol.insert(pp.symbol.clone(), pp.clone());
+            if cfg.include_price_ticks {
+                let _ = writer.append(&json!({
+                    "kind": "price_tick",
+                    "collector_ts_ms": now,
+                    "topic": pp.topic,
+                    "symbol": pp.symbol,
+                    "value": pp.value,
+                    "price_ts_ms": pp.timestamp_ms,
+                    "price_age_ms": (now - pp.timestamp_ms).max(0),
+                }));
+            }
         }
     }
 
@@ -1448,7 +1458,7 @@ fn process_data_message(
             return Ok(());
         }
         let symbol = trade_symbol_guess(&trade);
-        let latest = if symbol.is_empty() {
+        let latest = if !cfg.include_rtds_data || symbol.is_empty() {
             None
         } else {
             latest_price_by_symbol.get(&symbol).cloned()
@@ -1536,13 +1546,15 @@ fn run() -> Result<()> {
     };
 
     println!(
-        "[copy_collect] ws={} out={} wallets={} market_filters={} event_filters={} include_rfq={} price_topics={:?} price_symbols={:?}",
+        "[copy_collect] ws={} out={} wallets={} market_filters={} event_filters={} include_rfq={} include_rtds_data={} include_price_ticks={} price_topics={:?} price_symbols={:?}",
         cfg.ws_url,
         cfg.out_path.display(),
         cfg.wallet_filters.len(),
         cfg.market_slug_filters.len(),
         cfg.event_slug_filters.len(),
         cfg.include_rfq,
+        cfg.include_rtds_data,
+        cfg.include_price_ticks,
         cfg.price_topics,
         cfg.price_symbols
     );
@@ -1554,6 +1566,8 @@ fn run() -> Result<()> {
         "ws_url": cfg.ws_url,
         "clob_ws_url": cfg.clob_ws_url,
         "clob_join_enabled": cfg.clob_join_enabled,
+        "include_rtds_data": cfg.include_rtds_data,
+        "include_price_ticks": cfg.include_price_ticks,
         "out_path": cfg.out_path.to_string_lossy(),
         "subscribe": subscribe,
     }))?;

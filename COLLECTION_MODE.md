@@ -109,6 +109,20 @@ RTDS_PERSIST_STATE_TO_FILE=true
 
 Use the same ClickHouse variables above.
 
+## Copy Collect RTDS Toggle
+
+`copy_collect` now supports disabling RTDS price data ingestion/enrichment:
+
+```env
+COPY_COLLECT_INCLUDE_RTDS_DATA=false
+```
+
+When disabled:
+
+- no RTDS price topic subscriptions are added
+- `rtds_price` fields in `copy_trade` rows become `null`
+- CLOB join enrichment still works if `COPY_COLLECT_CLOB_JOIN_ENABLED=true`
+
 ## Docker Compose
 
 Add ClickHouse service to `docker-compose.yml`:

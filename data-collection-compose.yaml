@@ -61,6 +61,7 @@ services:
       - data_collection.env
     environment:
       COPY_COLLECT_OUT_PATH: /app/state/copy_collect.jsonl
+      COPY_COLLECT_INCLUDE_RTDS_DATA: "true"
       COPY_COLLECT_CLOB_JOIN_ENABLED: "true"
       COPY_COLLECT_INCLUDE_RFQ: "true"
       COPY_COLLECT_LOG_PRICE_TICKS: "true"
