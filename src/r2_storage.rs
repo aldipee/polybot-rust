@@ -5,6 +5,7 @@ use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{config::Region, Client};
 use chrono::Utc;
@@ -38,6 +39,8 @@ struct UploadStats {
     uploaded_files: usize,
     uploaded_bytes: u64,
     skipped_files: usize,
+    failed_files: usize,
+    failed_reasons: Vec<String>,
 }
 
 impl R2UploadConfig {
@@ -192,7 +195,11 @@ async fn upload_items_async(
                 continue;
             }
             Err(e) => {
-                return Err(e).with_context(|| format!("read {}", item.local_path.display()));
+                stats.failed_files += 1;
+                stats
+                    .failed_reasons
+                    .push(format!("read {}: {}", item.local_path.display(), e));
+                continue;
             }
         };
         let size = bytes.len() as u64;
@@ -205,16 +212,34 @@ async fn upload_items_async(
             )
         };
 
-        client
+        match client
             .put_object()
             .bucket(&cfg.bucket)
-            .key(key)
+            .key(&key)
             .body(ByteStream::from(bytes))
             .send()
             .await
-            .with_context(|| format!("upload {}", item.local_path.display()))?;
-        stats.uploaded_files += 1;
-        stats.uploaded_bytes += size;
+        {
+            Ok(_) => {
+                stats.uploaded_files += 1;
+                stats.uploaded_bytes += size;
+            }
+            Err(e) => {
+                stats.failed_files += 1;
+                let err_ctx = DisplayErrorContext(&e).to_string();
+                stats
+                    .failed_reasons
+                    .push(format!(
+                        "upload {} key={} bucket={} endpoint={}: {} | debug={:?}",
+                        item.local_path.display(),
+                        key,
+                        cfg.bucket,
+                        cfg.endpoint,
+                        err_ctx,
+                        e
+                    ));
+            }
+        }
     }
 
     Ok(stats)
@@ -240,20 +265,35 @@ pub fn upload_logs_before_rollover(market_slug: &str, bot_id: &str, logger: &Arc
     }
     match upload_logs_before_rollover_inner(market_slug, bot_id) {
         Ok(stats) => {
-            if stats.uploaded_files == 0 {
+            if stats.uploaded_files == 0 && stats.failed_files == 0 {
                 logger.info(&format!(
                     "[R2] no files found for market {market_slug}; skipped upload"
                 ));
             } else {
-                logger.info(&format!(
-                    "[R2] uploaded {} files ({} bytes, {} skipped) for market {}",
-                    stats.uploaded_files, stats.uploaded_bytes, stats.skipped_files, market_slug
-                ));
+                if stats.uploaded_files > 0 {
+                    logger.info(&format!(
+                        "[R2] uploaded {} files ({} bytes, {} skipped) for market {}",
+                        stats.uploaded_files, stats.uploaded_bytes, stats.skipped_files, market_slug
+                    ));
+                }
+                if stats.failed_files > 0 {
+                    let preview = stats
+                        .failed_reasons
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    logger.warning(&format!(
+                        "[R2] {} file uploads failed for market {}. Sample errors: {}",
+                        stats.failed_files, market_slug, preview
+                    ));
+                }
             }
         }
         Err(e) => {
             logger.warning(&format!(
-                "[R2] upload failed for market {}: {}. Continuing without blocking rollover.",
+                "[R2] upload failed for market {}: {:#}. Continuing without blocking rollover.",
                 market_slug, e
             ));
         }

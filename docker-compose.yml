@@ -27,7 +27,10 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: btc-updown-5m-1771676700
+      MARKET_SLUG: btc-updown-5m-1771691700
+      RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_btc.json
+      RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_btc.json
+      RTDS_LATEST_PATH: /app/state/state/rtds_latest_btc.json
         
     volumes:
       - ./data:/app/data
@@ -66,8 +69,11 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: eth-updown-5m-1771676700
+      MARKET_SLUG: eth-updown-5m-1771691700
       BOT_ID: analytic_bot_after_market_eth
+      RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_eth.json
+      RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_eth.json
+      RTDS_LATEST_PATH: /app/state/state/rtds_latest_eth.json
     volumes:
       - ./data:/app/data
       - ./signals:/app/signals
@@ -105,8 +111,11 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: sol-updown-5m-1771676700
+      MARKET_SLUG: sol-updown-5m-1771691700
       BOT_ID: analytic_bot_after_market_sol
+      RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_sol.json
+      RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_sol.json
+      RTDS_LATEST_PATH: /app/state/state/rtds_latest_sol.json
     volumes:
       - ./data:/app/data
       - ./signals:/app/signals
@@ -144,8 +153,11 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: xrp-updown-5m-1771676700
+      MARKET_SLUG: xrp-updown-5m-1771691700
       BOT_ID: analytic_bot_after_market_xrp
+      RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_xrp.json
+      RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_xrp.json
+      RTDS_LATEST_PATH: /app/state/state/rtds_latest_xrp.json
     volumes:
       - ./data:/app/data
       - ./signals:/app/signals

@@ -980,6 +980,69 @@ impl MakerHedgeCapBot {
         Some(side.to_string())
     }
 
+    fn _sniper_endgame_resolution_tick_ready(&self, seconds_left: f64) -> bool {
+        let snap = match get_live_snapshot_for_market(&self.market_slug) {
+            Some(s) => s,
+            None => {
+                self._rtds_gate_log(
+                    "endgame_res_wait_missing",
+                    "[RTDS_ENDGAME] waiting: missing in-memory RTDS snapshot for resolution trigger",
+                );
+                return false;
+            }
+        };
+
+        let resolution_ts_ms = self.expiry_ts.saturating_mul(1000);
+        let source_ts_ms = snap.timestamp_ms;
+        if source_ts_ms <= 0 || source_ts_ms + 1 < resolution_ts_ms {
+            self._rtds_gate_log(
+                "endgame_res_wait_source_ts",
+                &format!(
+                    "[RTDS_ENDGAME] waiting: source_ts_ms={} < resolution_ts_ms={} t_left={:.2}s",
+                    source_ts_ms, resolution_ts_ms, seconds_left
+                ),
+            );
+            return false;
+        }
+
+        let tick_ts_ms = if snap.updated_at_ms > 0 {
+            snap.updated_at_ms
+        } else if snap.received_at_ms > 0 {
+            snap.received_at_ms
+        } else {
+            source_ts_ms
+        };
+        let now_ms = (now_ts_f64() * 1000.0) as i64;
+        let age_ms = (now_ms - tick_ts_ms).max(0);
+        let max_age_s = env_float(
+            "SNIPER_ENDGAME_RTDS_MAX_AGE_SECONDS",
+            env_float("RTDS_ENTRY_GATE_MAX_AGE_SECONDS", 0.15),
+        )
+        .max(0.01);
+        let max_age_ms = (max_age_s * 1000.0) as i64;
+        if tick_ts_ms <= 0 || age_ms > max_age_ms {
+            self._rtds_gate_log(
+                "endgame_res_wait_stale",
+                &format!(
+                    "[RTDS_ENDGAME] waiting: stale tick ts_ms={} age_ms={} max_age_ms={} t_left={:.2}s",
+                    tick_ts_ms, age_ms, max_age_ms, seconds_left
+                ),
+            );
+            return false;
+        }
+        if self._runtime_ts_get("__sniper_endgame_resolution_ready_logged_ts") <= 0.0 {
+            let now_ms = (now_ts_f64() * 1000.0) as i64;
+            let since_resolution_ms = now_ms.saturating_sub(resolution_ts_ms);
+            let source_delta_ms = source_ts_ms.saturating_sub(resolution_ts_ms);
+            self.logger.info(&format!(
+                "[RTDS_ENDGAME][TIMING] resolution_ready now_ms={} resolution_ts_ms={} since_resolution_ms={} source_ts_ms={} source_delta_ms={} tick_age_ms={} t_left={:.2}s",
+                now_ms, resolution_ts_ms, since_resolution_ms, source_ts_ms, source_delta_ms, age_ms, seconds_left
+            ));
+            self._runtime_ts_set("__sniper_endgame_resolution_ready_logged_ts", now_ts_f64());
+        }
+        true
+    }
+
     fn _rtds_hold_till_resolution_active(
         &self,
         side: &str,
@@ -6076,15 +6139,43 @@ impl MakerHedgeCapBot {
         if !env_bool("SNIPER_ENDGAME_BLIND_POST", false) {
             return false;
         }
+        let trigger_mode = std::env::var("SNIPER_ENDGAME_TRIGGER_MODE")
+            .unwrap_or_else(|_| "WINDOW".to_string())
+            .to_ascii_uppercase();
         let win_s = env_float("SNIPER_ENDGAME_BLIND_POST_WINDOW_SECONDS", 0.0);
-        // 0 disables. Positive means "final N seconds before expiry".
-        // Negative means "start posting N seconds after expiry" (within grace).
-        if win_s.abs() <= 1e-9 {
-            return false;
-        }
         let grace = env_float("SNIPER_EXPIRY_GRACE_SECONDS", 0.0).max(0.0);
-        if seconds_left > win_s + 1e-9 || seconds_left < (-grace - 1e-9) {
-            return false;
+        if trigger_mode == "RESOLUTION" {
+            if seconds_left > 1e-9 || seconds_left < (-grace - 1e-9) {
+                return false;
+            }
+            if self._runtime_ts_get("__sniper_endgame_resolution_watch_start_ts") <= 0.0 {
+                let now_ms = (now_ts * 1000.0) as i64;
+                let resolution_ts_ms = self.expiry_ts.saturating_mul(1000);
+                self.logger.info(&format!(
+                    "[RTDS_ENDGAME][TIMING] watch_start now_ms={} resolution_ts_ms={} pre_resolution_ms={} t_left={:.2}s",
+                    now_ms,
+                    resolution_ts_ms,
+                    resolution_ts_ms.saturating_sub(now_ms),
+                    seconds_left
+                ));
+                self._runtime_ts_set("__sniper_endgame_resolution_watch_start_ts", now_ts);
+            }
+            if self._runtime_ts_get("__sniper_endgame_resolution_attempted_ts") > 0.0 {
+                return false;
+            }
+            if !self._sniper_endgame_resolution_tick_ready(seconds_left) {
+                return false;
+            }
+        } else {
+            // WINDOW mode: keep previous behavior.
+            // 0 disables. Positive means "final N seconds before expiry".
+            // Negative means "start posting N seconds after expiry" (within grace).
+            if win_s.abs() <= 1e-9 {
+                return false;
+            }
+            if seconds_left > win_s + 1e-9 || seconds_left < (-grace - 1e-9) {
+                return false;
+            }
         }
         let (qy, qn, trade_count, open_orders) = self
             .state
@@ -6211,9 +6302,39 @@ impl MakerHedgeCapBot {
                 .unwrap_or_else(|_| "GTC".to_string())
                 .to_ascii_uppercase(),
         );
+        if trigger_mode == "RESOLUTION" {
+            let now_ms = (now_ts * 1000.0) as i64;
+            let resolution_ts_ms = self.expiry_ts.saturating_mul(1000);
+            let watch_start = self._runtime_ts_get("__sniper_endgame_resolution_watch_start_ts");
+            let watch_start_ms = if watch_start > 0.0 {
+                (watch_start * 1000.0) as i64
+            } else {
+                0
+            };
+            let since_watch_ms = if watch_start_ms > 0 {
+                now_ms.saturating_sub(watch_start_ms)
+            } else {
+                0
+            };
+            self.logger.info(&format!(
+                "[RTDS_ENDGAME][TIMING] fire_order now_ms={} resolution_ts_ms={} since_resolution_ms={} since_watch_ms={} side={} px={:.3} sz={} t_left={:.2}s",
+                now_ms,
+                resolution_ts_ms,
+                now_ms.saturating_sub(resolution_ts_ms),
+                since_watch_ms,
+                side,
+                px,
+                size_target,
+                seconds_left
+            ));
+        }
+        if trigger_mode == "RESOLUTION" {
+            // One-shot mode: mark attempted when we are actually about to submit.
+            self._runtime_ts_set("__sniper_endgame_resolution_attempted_ts", now_ts);
+        }
         let fresh = if self._market_data_fresh() { "Y" } else { "N" };
         self.logger.info(&format!(
-            "[SNIPER] ENDGAME blind-post side={side} src={side_src} px={px:.3} sz={size_target} t_left={seconds_left:.2}s fresh={fresh} type={endgame_ot}"
+            "[SNIPER] ENDGAME blind-post side={side} src={side_src} trigger={trigger_mode} px={px:.3} sz={size_target} t_left={seconds_left:.2}s fresh={fresh} type={endgame_ot}"
         ));
         let oid = if endgame_ot == "GTC" {
             self._place_limit_bid_gtc(&asset_id, px, size_target as f64, post_only)
