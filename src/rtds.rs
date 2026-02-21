@@ -1270,6 +1270,7 @@ impl RtdsService {
     }
 
     pub fn close(&self) {
+        self.wait_for_resolution_before_close();
         self.stop_event.store(true, Ordering::SeqCst);
         if let Ok(mut slot) = self.thread.lock() {
             if let Some(handle) = slot.take() {
@@ -1286,6 +1287,23 @@ impl RtdsService {
             ch.flush_all_best_effort();
         }
         clear_live_snapshot(&self.market_slug);
+    }
+
+    fn wait_for_resolution_before_close(&self) {
+        let settle_after_ms = 2500i64;
+        let now = now_ms();
+        let target_ms = self.resolution_ts_ms.saturating_add(settle_after_ms);
+        let remaining_ms = target_ms.saturating_sub(now);
+        if remaining_ms <= 0 {
+            return;
+        }
+        self.logger.info(&format!(
+            "[RTDS] waiting for resolution before close market={} wait_ms={} target_ts_ms={}",
+            self.market_slug, remaining_ms, target_ms
+        ));
+        while !self.stop_event.load(Ordering::SeqCst) && now_ms() < target_ms {
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn run_loop(self: Arc<Self>) {
@@ -1693,7 +1711,9 @@ impl RtdsService {
                 Err(_) => return,
             };
             st.latest = Some(tick.clone());
-            if tick.timestamp_ms <= self.resolution_ts_ms {
+            // Treat exact boundary tick (timestamp == resolution_ts_ms) as the
+            // resolution tick for the just-finished market.
+            if tick.timestamp_ms < self.resolution_ts_ms {
                 let should = st
                     .before_resolution
                     .as_ref()
@@ -1706,7 +1726,9 @@ impl RtdsService {
                 let should = st
                     .first_after_resolution
                     .as_ref()
-                    .map(|t| tick.timestamp_ms <= t.timestamp_ms)
+                    // Keep the earliest timestamp >= resolution_ts_ms.
+                    // If timestamps are equal, keep the first seen sample.
+                    .map(|t| tick.timestamp_ms < t.timestamp_ms)
                     .unwrap_or(true);
                 if should {
                     st.first_after_resolution = Some(tick.clone());
@@ -2135,14 +2157,15 @@ impl RtdsService {
             if rt.finalized {
                 return Ok(None);
             }
-            let chosen = if let Some(t) = rt.before_resolution.clone() {
-                (Some(t), "before_resolution".to_string())
-            } else if let Some(t) = rt.first_after_resolution.clone() {
+            let chosen = if let Some(t) = rt.first_after_resolution.clone() {
                 (Some(t), "first_after_resolution".to_string())
-            } else if let Some(t) = rt.latest.clone() {
-                (Some(t), "latest_seen".to_string())
             } else {
-                (None, "none".to_string())
+                self.logger.warning(&format!(
+                    "[RTDS] skip persist market={} symbol={} reason=missing_post_resolution_tick",
+                    self.market_slug, self.symbol
+                ));
+                rt.finalized = true;
+                return Ok(None);
             };
             rt.finalized = true;
             (chosen.0, chosen.1, rt.price_to_beat)
