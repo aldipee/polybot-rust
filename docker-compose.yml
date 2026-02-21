@@ -27,7 +27,7 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: btc-updown-5m-1771675500
+      MARKET_SLUG: btc-updown-5m-1771676700
         
     volumes:
       - ./data:/app/data
@@ -66,7 +66,7 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: eth-updown-5m-1771675500
+      MARKET_SLUG: eth-updown-5m-1771676700
       BOT_ID: analytic_bot_after_market_eth
     volumes:
       - ./data:/app/data
@@ -105,7 +105,7 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: sol-updown-5m-1771675500
+      MARKET_SLUG: sol-updown-5m-1771676700
       BOT_ID: analytic_bot_after_market_sol
     volumes:
       - ./data:/app/data
@@ -144,7 +144,7 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: xrp-updown-5m-1771675500
+      MARKET_SLUG: xrp-updown-5m-1771676700
       BOT_ID: analytic_bot_after_market_xrp
     volumes:
       - ./data:/app/data
