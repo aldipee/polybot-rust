@@ -40,7 +40,8 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: btc-updown-5m-1771655400
+      MARKET_SLUG: btc-updown-5m-1771669500
+      BOT_ID: data_collection_bot_btc_5m
     volumes:
       - ./data:/app/data
       - ./signals:/app/signals
