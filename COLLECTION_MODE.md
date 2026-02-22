@@ -8,7 +8,8 @@ These are the non-optional items for stable collection mode in this codebase:
 
 - `DRY_RUN=true`
 - `RTDS_ENABLED=true`
-- `MARKET_SLUG=<current market slug>` (for example `btc-updown-5m-1771642500`)
+- `MARKET_SLUG=<current market slug>` (for example `btc-updown-5m-1771642500`)  
+  or set `MARKET_SYMBOL=<asset>` (fallback to `RTDS_SYMBOL`) for auto-generation when slug is empty
 - `MARKET_SEGMENT=<5M|15M|1H|4H|1D>`
 - `EXEC_MODE=SNIPER` or `EXEC_MODE=MAKER` (do not use SIGNAL mode unless SIGNAL WS is configured)
 - `POLYMARKET_PRIVATE_KEY=<required by startup checks>`
@@ -16,7 +17,13 @@ These are the non-optional items for stable collection mode in this codebase:
 - `SIGNATURE_TYPE=1` (standard Polymarket setup)
 - `DB_URL=<postgres url>` (startup initializes DB schema even in dry run)
 
-If `MARKET_SLUG` is empty, startup fails unless using signal-follow mode (`SIGNAL_FOLLOW_SLUG=true` with signal WS configured).
+If `MARKET_SLUG` is empty, startup auto-generates one from current time using:
+
+- `MARKET_SYMBOL` (or `RTDS_SYMBOL`)
+- `MARKET_SEGMENT`
+- `MARKET_STEP_SECONDS` (or segment default step)
+
+If neither `MARKET_SLUG` nor symbol hint (`MARKET_SYMBOL`/`RTDS_SYMBOL`) is provided, startup fails (unless signal-follow provides slug first).
 
 ## Segment and Slug Behavior (Important)
 
@@ -34,6 +41,16 @@ You can override with:
 - `MARKET_STEP_SECONDS`
 
 Slug rollover uses `MARKET_STEP_SECONDS` on timestamp-based slugs.
+
+Auto-generated slug format:
+
+- `<asset>-updown-5m-<slot_ts>`
+- `<asset>-updown-15m-<slot_ts>`
+- `<asset>-updown-1h-<slot_ts>`
+- `<asset>-updown-4h-<slot_ts>`
+- `<asset>-updown-1d-<slot_ts>`
+
+`<slot_ts>` is the current Unix timestamp rounded down to the configured step.
 
 ## Full Collector Profile (5M Rolling)
 
@@ -164,7 +181,7 @@ tail -n 1 state/rtds_prices.jsonl
 
 ## Troubleshooting (Critical)
 
-- `Missing MARKET_SLUG`: set `MARKET_SLUG` or configure signal-follow correctly.
+- `Missing MARKET_SLUG`: set `MARKET_SLUG` or provide `MARKET_SYMBOL` (or `RTDS_SYMBOL`) with `MARKET_SEGMENT`; signal-follow also works if configured.
 - `Missing POLYMARKET_PRIVATE_KEY` / `Missing POLYMARKET_FUNDER`: these are required by startup checks even in dry run.
 - `DB Init Error`: fix `DB_URL` / Postgres availability.
 - No sink output: verify `RTDS_SINK` and sink-specific vars.

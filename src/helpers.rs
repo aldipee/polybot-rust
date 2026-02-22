@@ -73,6 +73,85 @@ pub fn segment(name: &str) -> String {
     }
 }
 
+fn normalize_market_asset_id(raw: &str) -> String {
+    let mut out = raw.trim().to_ascii_lowercase();
+    if out.is_empty() {
+        return String::new();
+    }
+    if out.contains(',') {
+        out = out.split(',').next().unwrap_or("").trim().to_string();
+    }
+    if out.contains('/') {
+        out = out.split('/').next().unwrap_or("").trim().to_string();
+    }
+    if out.ends_with("-usd") && out.len() > 4 {
+        out = out[..out.len() - 4].to_string();
+    } else if out.ends_with("usd") && out.len() > 3 {
+        out = out[..out.len() - 3].to_string();
+    }
+    if out.contains('-') {
+        out = out.split('-').next().unwrap_or("").trim().to_string();
+    }
+    out = match out.as_str() {
+        "bitcoin" => "btc".to_string(),
+        "ethereum" => "eth".to_string(),
+        "solana" => "sol".to_string(),
+        "ripple" => "xrp".to_string(),
+        "polygon" => "matic".to_string(),
+        _ => out,
+    };
+    out.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
+}
+
+pub fn infer_market_asset_id_from_env() -> Option<String> {
+    for key in ["MARKET_SYMBOL", "RTDS_SYMBOL"] {
+        if let Ok(raw) = env::var(key) {
+            let asset = normalize_market_asset_id(&raw);
+            if !asset.is_empty() {
+                return Some(asset);
+            }
+        }
+    }
+    None
+}
+
+pub fn generate_market_slug_from_now(
+    asset_hint: &str,
+    segment_name: &str,
+    step_seconds: i64,
+) -> Option<String> {
+    let asset = normalize_market_asset_id(asset_hint);
+    if asset.is_empty() {
+        return None;
+    }
+    let seg = segment(segment_name);
+    let seg_slug = match seg.as_str() {
+        "5M" => "5m",
+        "15M" => "15m",
+        "1H" => "1h",
+        "4H" => "4h",
+        "1D" => "1d",
+        _ => "15m",
+    };
+    let default_step = segment_defaults(&seg).step;
+    let step = if step_seconds > 0 {
+        step_seconds
+    } else {
+        default_step
+    };
+    if step <= 0 {
+        return None;
+    }
+    let now_ts = Utc::now().timestamp();
+    let slot_ts = now_ts - now_ts.rem_euclid(step);
+    Some(format!("{asset}-updown-{seg_slug}-{slot_ts}"))
+}
+
+pub fn generate_market_slug_from_env_now(segment_name: &str, step_seconds: i64) -> Option<String> {
+    let asset = infer_market_asset_id_from_env()?;
+    generate_market_slug_from_now(&asset, segment_name, step_seconds)
+}
+
 pub fn iso_to_epoch(s: &str) -> Option<i64> {
     if s.trim().is_empty() {
         return None;

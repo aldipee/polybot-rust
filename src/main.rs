@@ -20,7 +20,7 @@ use db::{
     week_start_date_jakarta, BotRepository, ConfigurationRow,
 };
 use env_utils::{env_bool, env_float};
-use helpers::{get_next_slug, segment, segment_defaults};
+use helpers::{generate_market_slug_from_env_now, get_next_slug, segment, segment_defaults};
 use logging::{setup_item_logger, LogLike};
 use r2_storage::upload_logs_before_rollover;
 use rtds::RtdsService;
@@ -278,16 +278,48 @@ fn run() -> Result<()> {
                 if let Some(sig) = first {
                     slug = sig.market_slug;
                     wait_logger.info(&format!("Using initial market_slug from signal: {slug}"));
+                } else if let Some(auto_slug) =
+                    generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
+                {
+                    wait_logger.warning(&format!(
+                        "No signal yet; auto-generated MARKET_SLUG from current time: {auto_slug}"
+                    ));
+                    slug = auto_slug;
                 } else {
                     return Err(anyhow!(
-                        "Missing MARKET_SLUG and no signal received from SIGNAL_WS_URL"
+                        "Missing MARKET_SLUG and no signal received from SIGNAL_WS_URL. \
+Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                     ));
                 }
+            } else if let Some(auto_slug) =
+                generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
+            {
+                let auto_logger = setup_item_logger("slug_auto");
+                auto_logger.warning(&format!(
+                    "SIGNAL_FOLLOW_SLUG enabled but signal hub unavailable; auto-generated MARKET_SLUG from current time: {auto_slug}"
+                ));
+                slug = auto_slug;
             } else {
-                return Err(anyhow!("Missing MARKET_SLUG"));
+                return Err(anyhow!(
+                    "Missing MARKET_SLUG. Set MARKET_SLUG or provide MARKET_SYMBOL \
+(or RTDS_SYMBOL) with MARKET_SEGMENT."
+                ));
             }
+        } else if let Some(auto_slug) =
+            generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
+        {
+            let auto_logger = setup_item_logger("slug_auto");
+            auto_logger.info(&format!(
+                "MARKET_SLUG is empty; auto-generated from current time: {auto_slug} \
+(segment={}, step={}s)",
+                cfg.market_segment, cfg.market_step_seconds
+            ));
+            slug = auto_slug;
         } else {
-            return Err(anyhow!("Missing MARKET_SLUG"));
+            return Err(anyhow!(
+                "Missing MARKET_SLUG. Set MARKET_SLUG or provide MARKET_SYMBOL \
+(or RTDS_SYMBOL) with MARKET_SEGMENT."
+            ));
         }
     }
 

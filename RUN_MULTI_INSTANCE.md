@@ -40,6 +40,12 @@ At minimum, set market/strategy per instance:
 - `/root/polybot-rust/instances/bot-a/.env`
 - `/root/polybot-rust/instances/bot-b/.env`
 
+Market targeting options:
+
+- Explicit slug: set `MARKET_SLUG=btc-updown-5m-1771642500`
+- Auto slug: leave `MARKET_SLUG` empty and set `MARKET_SYMBOL=btc` (or `RTDS_SYMBOL=btc/usd`) plus `MARKET_SEGMENT`  
+  Startup will generate `<asset>-updown-<segment>-<slot_ts>` from current time.
+
 ## 5) Install systemd unit
 
 ```bash
