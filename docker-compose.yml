@@ -27,7 +27,7 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: btc-updown-5m-1771696200
+      MARKET_SYMBOL: btc
       RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_btc.json
       RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_btc.json
       RTDS_LATEST_PATH: /app/state/state/rtds_latest_btc.json
@@ -41,47 +41,47 @@ services:
       - /app/logs:size=64m,mode=1777
     restart: unless-stopped
 
-  # polybot-eth-after-market:
-  #   container_name: polybot-eth-after-market
-  #   working_dir: /app/state
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #     target: runtime
-  #   network_mode: host
-  #   cpuset: "2"
-  #   ulimits:
-  #     nofile:
-  #       soft: 65535
-  #       hard: 65535
-  #   logging:
-  #     driver: local
-  #     options:
-  #       max-size: "10m"
-  #       max-file: "3"
-  #   init: true
-  #   env_file:
-  #     - after_market.env
-  #   environment:
-  #     LOG_DIR: /app/output
-  #     EXEC_LATENCY_LOG_DIR: /app/logs
-  #     SIGNAL_FILE_DIR: /app/signals
-  #     EXEC_LATENCY_FILE_LOG_ENABLED: "false"
-  #     EXEC_LATENCY_JSONL_ENABLED: "false"
-  #     EXEC_LATENCY_CSV_ENABLED: "false"
-  #     MARKET_SLUG: eth-updown-5m-1771696200
-  #     BOT_ID: analytic_bot_after_market_eth
-  #     RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_eth.json
-  #     RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_eth.json
-  #     RTDS_LATEST_PATH: /app/state/state/rtds_latest_eth.json
-  #   volumes:
-  #     - ./data:/app/data
-  #     - ./signals:/app/signals
-  #     - ./state:/app/state
-  #   tmpfs:
-  #     - /app/output:size=64m,mode=1777
-  #     - /app/logs:size=64m,mode=1777
-  #   restart: unless-stopped
+  polybot-eth-after-market:
+    container_name: polybot-eth-after-market
+    working_dir: /app/state
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    network_mode: host
+    cpuset: "2"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    init: true
+    env_file:
+      - after_market.env
+    environment:
+      LOG_DIR: /app/output
+      EXEC_LATENCY_LOG_DIR: /app/logs
+      SIGNAL_FILE_DIR: /app/signals
+      EXEC_LATENCY_FILE_LOG_ENABLED: "false"
+      EXEC_LATENCY_JSONL_ENABLED: "false"
+      EXEC_LATENCY_CSV_ENABLED: "false"
+      MARKET_SYMBOL: eth
+      BOT_ID: analytic_bot_after_market_eth
+      RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_eth.json
+      RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_eth.json
+      RTDS_LATEST_PATH: /app/state/state/rtds_latest_eth.json
+    volumes:
+      - ./data:/app/data
+      - ./signals:/app/signals
+      - ./state:/app/state
+    tmpfs:
+      - /app/output:size=64m,mode=1777
+      - /app/logs:size=64m,mode=1777
+    restart: unless-stopped
 
   polybot-sol-after-market:
     container_name: polybot-sol-after-market
@@ -111,7 +111,7 @@ services:
       EXEC_LATENCY_FILE_LOG_ENABLED: "false"
       EXEC_LATENCY_JSONL_ENABLED: "false"
       EXEC_LATENCY_CSV_ENABLED: "false"
-      MARKET_SLUG: sol-updown-5m-1771696200
+      MARKET_SYMBOL: sol
       BOT_ID: analytic_bot_after_market_sol
       RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_sol.json
       RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_sol.json
