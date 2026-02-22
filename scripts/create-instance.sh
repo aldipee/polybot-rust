@@ -32,6 +32,7 @@ if [[ ! -f "$instance_dir/.env" ]]; then
 # POLYMARKET_FUNDER=0x...
 # BOT_ID=instance-name
 # MARKET_SLUG=... (or MARKET_SYMBOL=btc with MARKET_SEGMENT)
+# MARKET_SLUG_STYLE=HUMAN_ET   # optional for 1H/1D ET human-style auto slug
 EOF
 fi
 

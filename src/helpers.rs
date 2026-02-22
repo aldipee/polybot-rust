@@ -73,6 +73,13 @@ pub fn segment(name: &str) -> String {
     }
 }
 
+fn normalize_market_slug_style(raw: &str) -> String {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "HUMAN" | "HUMAN_ET" | "ET" | "HUMAN-ET" | "HUMANET" => "HUMAN_ET".to_string(),
+        _ => "TIMESTAMP".to_string(),
+    }
+}
+
 fn normalize_market_asset_id(raw: &str) -> String {
     let mut out = raw.trim().to_ascii_lowercase();
     if out.is_empty() {
@@ -103,6 +110,17 @@ fn normalize_market_asset_id(raw: &str) -> String {
     out.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
 }
 
+fn market_asset_slug_name(asset_id: &str) -> String {
+    match asset_id {
+        "btc" => "bitcoin".to_string(),
+        "eth" => "ethereum".to_string(),
+        "sol" => "solana".to_string(),
+        "xrp" => "ripple".to_string(),
+        "matic" => "polygon".to_string(),
+        other => other.to_string(),
+    }
+}
+
 pub fn infer_market_asset_id_from_env() -> Option<String> {
     for key in ["MARKET_SYMBOL", "RTDS_SYMBOL"] {
         if let Ok(raw) = env::var(key) {
@@ -124,7 +142,44 @@ pub fn generate_market_slug_from_now(
     if asset.is_empty() {
         return None;
     }
+    generate_market_slug_from_now_with_style(&asset, segment_name, step_seconds, "TIMESTAMP")
+}
+
+pub fn generate_market_slug_from_now_with_style(
+    asset_hint: &str,
+    segment_name: &str,
+    step_seconds: i64,
+    slug_style: &str,
+) -> Option<String> {
+    let asset = normalize_market_asset_id(asset_hint);
+    if asset.is_empty() {
+        return None;
+    }
     let seg = segment(segment_name);
+    let style = normalize_market_slug_style(slug_style);
+
+    if style == "HUMAN_ET" {
+        let asset_name = market_asset_slug_name(&asset);
+        let now_et = Utc::now().with_timezone(&New_York);
+        if seg == "1H" {
+            let hour_start = now_et
+                .with_minute(0)?
+                .with_second(0)?
+                .with_nanosecond(0)?;
+            let prefix = format!("{asset_name}-up-or-down-");
+            return Some(format_1h_slug_et(&prefix, hour_start));
+        }
+        if seg == "1D" {
+            let day_start = now_et
+                .with_hour(0)?
+                .with_minute(0)?
+                .with_second(0)?
+                .with_nanosecond(0)?;
+            let prefix = format!("{asset_name}-up-or-down-on-");
+            return Some(format_1d_slug_et(&prefix, day_start));
+        }
+    }
+
     let seg_slug = match seg.as_str() {
         "5M" => "5m",
         "15M" => "15m",
@@ -149,7 +204,12 @@ pub fn generate_market_slug_from_now(
 
 pub fn generate_market_slug_from_env_now(segment_name: &str, step_seconds: i64) -> Option<String> {
     let asset = infer_market_asset_id_from_env()?;
-    generate_market_slug_from_now(&asset, segment_name, step_seconds)
+    let style = env::var("MARKET_SLUG_STYLE").unwrap_or_default();
+    if normalize_market_slug_style(&style) == "HUMAN_ET" {
+        generate_market_slug_from_now_with_style(&asset, segment_name, step_seconds, &style)
+    } else {
+        generate_market_slug_from_now(&asset, segment_name, step_seconds)
+    }
 }
 
 pub fn iso_to_epoch(s: &str) -> Option<i64> {

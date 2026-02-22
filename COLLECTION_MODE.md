@@ -22,6 +22,9 @@ If `MARKET_SLUG` is empty, startup auto-generates one from current time using:
 - `MARKET_SYMBOL` (or `RTDS_SYMBOL`)
 - `MARKET_SEGMENT`
 - `MARKET_STEP_SECONDS` (or segment default step)
+- Optional `MARKET_SLUG_STYLE`:
+  - `TIMESTAMP` (default)
+  - `HUMAN_ET` (ET-based human slug for `1H`/`1D`; other segments remain timestamp style)
 
 If neither `MARKET_SLUG` nor symbol hint (`MARKET_SYMBOL`/`RTDS_SYMBOL`) is provided, startup fails (unless signal-follow provides slug first).
 
@@ -51,6 +54,15 @@ Auto-generated slug format:
 - `<asset>-updown-1d-<slot_ts>`
 
 `<slot_ts>` is the current Unix timestamp rounded down to the configured step.
+
+When `MARKET_SLUG_STYLE=HUMAN_ET`:
+
+- `1H`: `<asset-name>-up-or-down-<month>-<day>-<hour><am|pm>-et`
+  - example: `bitcoin-up-or-down-february-22-10pm-et`
+- `1D`: `<asset-name>-up-or-down-on-<month>-<day>`
+  - example: `bitcoin-up-or-down-on-february-22`
+
+Human style is generated using current `America/New_York` (ET) time.
 
 ## Full Collector Profile (5M Rolling)
 

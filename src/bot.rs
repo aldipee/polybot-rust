@@ -838,13 +838,18 @@ impl MakerHedgeCapBot {
         }
     }
 
-    fn _rtds_entry_gate_allows_side(&self, side: &str, seconds_left: f64, context: &str) -> bool {
+    fn _rtds_entry_gate_eval_side(
+        &self,
+        side: &str,
+        seconds_left: f64,
+        context: &str,
+    ) -> (bool, bool) {
         if !env_bool("RTDS_ENTRY_GATE_ENABLED", false) {
-            return true;
+            return (true, false);
         }
         let side = side.trim().to_ascii_uppercase();
         if !matches!(side.as_str(), "YES" | "NO") {
-            return true;
+            return (true, false);
         }
 
         let allow_missing = env_bool("RTDS_ENTRY_GATE_ALLOW_MISSING", false);
@@ -870,7 +875,7 @@ impl MakerHedgeCapBot {
                     "snapshot_block",
                     &format!("[RTDS_GATE] {} blocked: {}", context, reason),
                 );
-                return allow_missing;
+                return (allow_missing, false);
             }
         };
 
@@ -888,7 +893,7 @@ impl MakerHedgeCapBot {
                     context, side, diff_price, min_req, seconds_left
                 ),
             );
-            return false;
+            return (false, true);
         }
 
         self._rtds_gate_log(
@@ -898,7 +903,11 @@ impl MakerHedgeCapBot {
                 context, side, diff_price, min_req, seconds_left
             ),
         );
-        true
+        (true, false)
+    }
+
+    fn _rtds_entry_gate_allows_side(&self, side: &str, seconds_left: f64, context: &str) -> bool {
+        self._rtds_entry_gate_eval_side(side, seconds_left, context).0
     }
 
     fn _sniper_endgame_side_from_rtds(&self, seconds_left: f64) -> Option<String> {
@@ -6548,16 +6557,21 @@ impl MakerHedgeCapBot {
         }
         self._runtime_ts_set("__sniper_last_signal_ts", now);
 
-        let ask = cand.get("ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let mut active_cand = cand.clone();
+        let mut ask = active_cand.get("ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
         if ask <= 0.0 {
             return false;
         }
-        let side = cand.get("side").and_then(|v| v.as_str()).unwrap_or("");
-        let seconds_left = cand
+        let mut side = active_cand
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let seconds_left = active_cand
             .get("seconds_left")
             .and_then(|v| v.as_f64())
             .unwrap_or(self.expiry_ts as f64 - now);
-        let entry_mode = cand
+        let entry_mode = active_cand
             .get("entry_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("NORMAL")
@@ -6567,14 +6581,65 @@ impl MakerHedgeCapBot {
         } else {
             "SNIPER_ENTRY"
         };
-        if !self._rtds_entry_gate_allows_side(side, seconds_left, gate_context) {
+        let (mut gate_ok, gate_threshold_blocked) =
+            self._rtds_entry_gate_eval_side(&side, seconds_left, gate_context);
+        if !gate_ok
+            && entry_mode == "FORCE"
+            && gate_threshold_blocked
+            && env_bool("SNIPER_FORCE_ENTRY_FALLBACK_TO_NORMAL_ON_RTDS_BLOCK", false)
+        {
+            let now_fallback = now_ts_f64();
+            let seconds_left_now = self.expiry_ts as f64 - now_fallback;
+            let entry_min = env_float("SNIPER_ENTRY_MIN_SECONDS", 30.0);
+            let entry_max = env_float("SNIPER_ENTRY_MAX_SECONDS", 240.0);
+            let in_normal_window =
+                seconds_left_now + 1e-9 >= entry_min && seconds_left_now <= entry_max + 1e-9;
+            let force_exit_window = env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)
+                && seconds_left_now <= env_float("SNIPER_FORCE_EXIT_SECONDS", 8.0) + 1.0;
+            if in_normal_window && !force_exit_window {
+                if let Some(normal_cand) = self._sniper_entry_candidate(
+                    seconds_left_now,
+                    env_bool("SNIPER_ENTRY_IGNORE_ROI_GATE", false),
+                ) {
+                    if self._sniper_entry_confirmed(&normal_cand, now_fallback) {
+                        let normal_side = normal_cand
+                            .get("side")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let (normal_gate_ok, _) = self._rtds_entry_gate_eval_side(
+                            normal_side,
+                            seconds_left_now,
+                            "SNIPER_ENTRY",
+                        );
+                        if normal_gate_ok {
+                            self.logger.info(&format!(
+                                "[SNIPER] FORCE->NORMAL fallback side={} t_left={seconds_left_now:.2}s entry_max={entry_max:.2}s",
+                                normal_side
+                            ));
+                            active_cand = normal_cand;
+                            ask = active_cand
+                                .get("ask")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+                            side = active_cand
+                                .get("side")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            gate_ok = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !gate_ok || ask <= 0.0 {
             return false;
         }
         let entry_type_name = std::env::var("SNIPER_ENTRY_ORDER_TYPE")
             .unwrap_or_else(|_| "FOK".to_string())
             .to_ascii_uppercase();
         let limit_entry = matches!(entry_type_name.as_str(), "GTC" | "LIMIT");
-        let mut px = cand
+        let mut px = active_cand
             .get("entry_px")
             .and_then(|v| v.as_f64())
             .unwrap_or_else(|| self._sniper_est_entry_price(ask));
@@ -6608,8 +6673,7 @@ impl MakerHedgeCapBot {
         let inflight_s = env_float("SNIPER_ENTRY_INFLIGHT_SECONDS", 1.5).max(0.25);
         self._runtime_ts_set("__taker_inflight_until", now + inflight_s);
 
-        let side = cand.get("side").and_then(|v| v.as_str()).unwrap_or("");
-        let mut asset_id = cand
+        let mut asset_id = active_cand
             .get("asset_id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -6681,7 +6745,7 @@ impl MakerHedgeCapBot {
             // but do not count it as a completed sniper trade until a fill exists.
             if let Ok(mut s) = self.state.lock() {
                 s.sniper_last_entry_ts = now_ts_f64();
-                s.sniper_last_side = side.to_string();
+                s.sniper_last_side = side.clone();
                 let _ = save_state(&self.state_file, &mut s);
             }
             return true;
@@ -6771,7 +6835,7 @@ impl MakerHedgeCapBot {
             }
             return false;
         }
-        self._mark_sniper_entry_state(side);
+        self._mark_sniper_entry_state(&side);
         true
     }
 
@@ -7840,7 +7904,7 @@ impl MakerHedgeCapBot {
 
     pub fn _run_sniper_loop(&self) -> String {
         self.logger.info(&format!(
-            "SNIPER mode enabled | price=[{:.2},{:.2}] TP={:.1}% SL={:.1}% entry_window=[{}s..{}s] force_exit={}s exit_before_expiry={} force_entry_min={:.2} force_entry_max_age={}s entry_confirm={:.2}s",
+            "SNIPER mode enabled | price=[{:.2},{:.2}] TP={:.1}% SL={:.1}% entry_window=[{}s..{}s] force_exit={}s exit_before_expiry={} force_entry_min={:.2} force_entry_max_age={}s force_rtds_fallback={} entry_confirm={:.2}s",
             env_float("SNIPER_PRICE_MIN", 0.91),
             env_float("SNIPER_PRICE_MAX", 0.99),
             env_float("SNIPER_TAKE_PROFIT_PCT", 0.01) * 100.0,
@@ -7851,6 +7915,7 @@ impl MakerHedgeCapBot {
             env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true),
             env_float("SNIPER_FORCE_ENTRY_MIN_PRICE", 0.0),
             env_int("SNIPER_FORCE_ENTRY_MAX_AGE_SECONDS", 0),
+            env_bool("SNIPER_FORCE_ENTRY_FALLBACK_TO_NORMAL_ON_RTDS_BLOCK", false),
             env_float("SNIPER_ENTRY_CONFIRM_SECONDS", 0.0),
         ));
         let repeat_mode = env_bool("SNIPER_REPEAT_MODE", false);
