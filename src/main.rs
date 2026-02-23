@@ -571,6 +571,8 @@ fn run() -> Result<()> {
     let daily_take_profit_usd = env_float("DAILY_PNL_TAKE_PROFIT_USD", 0.0).max(0.0);
     let daily_stop_loss_usd = env_float("DAILY_PNL_STOP_LOSS_USD", 0.0).abs();
     let trade_validation_enabled = env_bool("TRADE_VALIDATION_ENABLED", true);
+    let trade_validation_after_market_enabled =
+        env_bool("TRADE_VALIDATION_AFTER_MARKET_ENABLED", true);
     let trade_validation_poll_seconds = env_float("TRADE_VALIDATION_POLL_SECONDS", 90.0).max(5.0);
 
     let sig = env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "1".to_string());
@@ -889,6 +891,17 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4}",
                 metrics.lp, metrics.total_cost
             ));
+        }
+        if trade_validation_enabled && trade_validation_after_market_enabled {
+            if let Err(e) =
+                reconcile_unvalidated_trades_with_polymarket(&repo, &bot_id, &cfg, &bot_logger)
+            {
+                bot_logger.warning(&format!(
+                    "[TRADE_VALIDATE] post-market poll error trade_id={} err={e:#}",
+                    trade_id
+                ));
+            }
+            last_trade_validation_poll_ts = now_ts_f64();
         }
 
         thread::sleep(Duration::from_secs(2));
