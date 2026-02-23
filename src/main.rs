@@ -228,6 +228,10 @@ struct ClosedPositionsQuery<'a> {
     user: &'a str,
     limit: i64,
     offset: i64,
+    #[serde(rename = "sortBy")]
+    sort_by: &'a str,
+    #[serde(rename = "sortDirection")]
+    sort_direction: &'a str,
 }
 
 fn fetch_closed_positions_for_user(
@@ -245,6 +249,8 @@ fn fetch_closed_positions_for_user(
             user,
             limit: page_limit,
             offset,
+            sort_by: "TIMESTAMP",
+            sort_direction: "DESC",
         };
         let resp = http
             .get(&endpoint)
@@ -307,7 +313,7 @@ fn reconcile_unvalidated_trades_with_polymarket(
 ) -> Result<()> {
     let lookback_days = env_int("TRADE_VALIDATION_LOOKBACK_DAYS", 7).max(0) as i64;
     let max_trades = env_int("TRADE_VALIDATION_MAX_TRADES_PER_POLL", 100).max(1) as i64;
-    let page_limit = env_int("TRADE_VALIDATION_PAGE_LIMIT", 100).clamp(1, 500) as i64;
+    let page_limit = env_int("TRADE_VALIDATION_PAGE_LIMIT", 50).clamp(1, 50) as i64;
     let max_pages = env_int("TRADE_VALIDATION_MAX_PAGES", 10).clamp(1, 200) as i64;
     let timeout_s = env_float("TRADE_VALIDATION_API_TIMEOUT_SECONDS", 6.0).clamp(0.2, 30.0);
     let start_date = (Utc::now().with_timezone(&Jakarta).date_naive()
@@ -372,10 +378,18 @@ fn reconcile_unvalidated_trades_with_polymarket(
         let trade_slug = t.slug.trim().to_ascii_lowercase();
         let mut match_idx: Vec<usize> = by_slug.get(&trade_slug).cloned().unwrap_or_default();
         let mut match_key = format!("slug={}", t.slug);
+        let mut resolved_event_slug: Option<String> = None;
         if match_idx.is_empty() {
-            let event_slug = resolve_event_slug_for_market_slug(&t.slug, &mut event_slug_cache, logger)
-                .map(|s| s.to_ascii_lowercase());
-            if let Some(ev) = event_slug {
+            if let Some(v) = by_event_slug.get(&trade_slug) {
+                match_idx = v.clone();
+                match_key = format!("eventSlug_direct={}", t.slug);
+            }
+        }
+        if match_idx.is_empty() {
+            let event_slug =
+                resolve_event_slug_for_market_slug(&t.slug, &mut event_slug_cache, logger);
+            resolved_event_slug = event_slug.clone();
+            if let Some(ev) = event_slug.map(|s| s.to_ascii_lowercase()) {
                 if let Some(v) = by_event_slug.get(&ev) {
                     match_idx = v.clone();
                     match_key = format!("eventSlug={ev}");
@@ -386,6 +400,12 @@ fn reconcile_unvalidated_trades_with_polymarket(
         if match_idx.is_empty() {
             repo.touch_trade_validation_checked(&t.trade_id, &checked_at)?;
             touched_count += 1;
+            logger.info(&format!(
+                "[TRADE_VALIDATE] checked_only trade_id={} slug={} reason=no_closed_position_match event_slug={}",
+                t.trade_id,
+                t.slug,
+                resolved_event_slug.unwrap_or_else(|| "-".to_string())
+            ));
             continue;
         }
 
@@ -400,6 +420,10 @@ fn reconcile_unvalidated_trades_with_polymarket(
         if pnl_rows <= 0 {
             repo.touch_trade_validation_checked(&t.trade_id, &checked_at)?;
             touched_count += 1;
+            logger.info(&format!(
+                "[TRADE_VALIDATE] checked_only trade_id={} slug={} reason=match_without_realized_pnl source={}",
+                t.trade_id, t.slug, match_key
+            ));
             continue;
         }
 
