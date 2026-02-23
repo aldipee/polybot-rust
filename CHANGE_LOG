@@ -5,10 +5,12 @@ Date: 2026-02-23
 - Improved stop-loss hedge retry behavior after partial FAK fills so follow-up hedges are not blocked by long pending-order TTL.
 - Hedge pending-order guard now uses a short recent window tied to hedge inflight timing.
 - Increased default hedge price aggressiveness by setting fallback `SNIPER_EXIT_HEDGE_SLIPPAGE_TICKS` to `2` in code.
+- Updated FORCE-DIFF entry to aggressive mode: once `SNIPER_FORCE_ENTRY_MIN_DIFF_PRICE` triggers, sniper now bypasses quote quality and RTDS re-gate checks and submits taker entry immediately.
 
 ### Implementation Notes
 - Hedge re-submit blocking now checks `_has_pending_taker_order_recent(...)` instead of full TTL pending state.
 - Behavior is implemented in sniper hedge path (`src/bot.rs`) without changing non-hedge stop-loss modes.
+- FORCE-DIFF path is implemented in sniper entry flow (`src/bot.rs`) with `entry_reason=RTDS_DIFF_TIME_OVERRIDE` and now forces `FAK` execution with side-pinned quote usage.
 
 ## Version 0.1.2
 Date: 2026-02-23
