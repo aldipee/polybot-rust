@@ -1,6 +1,6 @@
 [package]
 name = "polybot_convert_rust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 build = "build.rs"
 
@@ -15,11 +15,14 @@ chrono-tz = "0.10"
 clickhouse = { version = "0.13", features = ["rustls-tls", "chrono"] }
 csv = "1.4"
 dotenvy = "0.15"
+hex = "0.4"
 rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rs-clob-client = "0.1.5"
+chainlink-data-streams-report = "1.2.1"
+chainlink-data-streams-sdk = { version = "1.2.1", default-features = false, features = ["websocket", "tracing"] }
 postgres = "0.19"
 rust_decimal = { version = "1.39", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -27,6 +30,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
+tracing = "0.1"
 uuid = { version = "1.11", features = ["v4"] }
 
 [patch.crates-io]

@@ -5,6 +5,24 @@ use crate::helpers::iso_to_epoch;
 use crate::logging::LogLike;
 use crate::signal::JsonlFileService;
 use anyhow::{anyhow, Result};
+use chainlink_data_streams_report::feed_id::ID as ChainlinkFeedId;
+use chainlink_data_streams_report::report::{
+    decode_full_report as chainlink_decode_full_report, v1::ReportDataV1 as ChainlinkReportDataV1,
+    v10::ReportDataV10 as ChainlinkReportDataV10, v11::ReportDataV11 as ChainlinkReportDataV11,
+    v12::ReportDataV12 as ChainlinkReportDataV12, v13::ReportDataV13 as ChainlinkReportDataV13,
+    v2::ReportDataV2 as ChainlinkReportDataV2, v3::ReportDataV3 as ChainlinkReportDataV3,
+    v4::ReportDataV4 as ChainlinkReportDataV4, v5::ReportDataV5 as ChainlinkReportDataV5,
+    v6::ReportDataV6 as ChainlinkReportDataV6, v7::ReportDataV7 as ChainlinkReportDataV7,
+    v8::ReportDataV8 as ChainlinkReportDataV8, v9::ReportDataV9 as ChainlinkReportDataV9,
+    Report as ChainlinkReport,
+};
+use chainlink_data_streams_sdk::config::{
+    Config as ChainlinkConfig, InsecureSkipVerify as ChainlinkInsecureSkipVerify,
+    WebSocketHighAvailability as ChainlinkWebSocketHighAvailability,
+};
+use chainlink_data_streams_sdk::stream::{
+    Stream as ChainlinkStream, WebSocketReport as ChainlinkWebSocketReport,
+};
 use chrono::{TimeZone, Utc};
 use rand::Rng;
 use reqwest::blocking::Client as HttpClient;
@@ -252,10 +270,7 @@ fn infer_unix_ms_for_key(key: &str, v: &Value) -> Option<i64> {
     {
         return Some(raw.saturating_mul(1000));
     }
-    if k == "ts_ms"
-        || k.ends_with("_ts_ms")
-        || k.ends_with("_at_ms")
-        || k.contains("timestamp_ms")
+    if k == "ts_ms" || k.ends_with("_ts_ms") || k.ends_with("_at_ms") || k.contains("timestamp_ms")
     {
         return Some(raw);
     }
@@ -296,10 +311,7 @@ fn validate_ident(raw: &str, key: &str) -> Result<String> {
     if name.is_empty() {
         return Err(anyhow!("{key} cannot be empty"));
     }
-    if name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         Ok(name.to_string())
     } else {
         Err(anyhow!(
@@ -364,6 +376,47 @@ fn parse_rtds_sink_selection() -> RtdsSinkSelection {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RtdsProvider {
+    Polymarket,
+    Chainlink,
+}
+
+impl RtdsProvider {
+    fn from_env() -> Self {
+        let raw = env::var("RTDS_PROVIDER")
+            .unwrap_or_else(|_| "POLYMARKET".to_string())
+            .trim()
+            .to_ascii_uppercase();
+        match raw.as_str() {
+            "CHAINLINK" | "CHAINLINK_WS" | "CHAINLINK_STREAM" => Self::Chainlink,
+            _ => Self::Polymarket,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Polymarket => "POLYMARKET",
+            Self::Chainlink => "CHAINLINK",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChainlinkRtdsConfig {
+    feed_id: ChainlinkFeedId,
+    feed_id_hex: String,
+    price_decimals: u32,
+    api_key: String,
+    api_secret: String,
+    rest_url: String,
+    ws_url: String,
+    ws_ha: bool,
+    ws_max_reconnect: usize,
+    insecure_skip_verify: bool,
+    read_timeout: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,8 +504,7 @@ impl RtdsClickhouseSink {
             "CLICKHOUSE_DATABASE",
         )?;
         let table_rtds_prices = validate_ident(
-            &env::var("CLICKHOUSE_TABLE_RTDS_PRICES")
-                .unwrap_or_else(|_| "rtds_prices".to_string()),
+            &env::var("CLICKHOUSE_TABLE_RTDS_PRICES").unwrap_or_else(|_| "rtds_prices".to_string()),
             "CLICKHOUSE_TABLE_RTDS_PRICES",
         )?;
         let table_price_to_beat = validate_ident(
@@ -503,10 +555,7 @@ impl RtdsClickhouseSink {
     fn execute_query(&self, query: &str, body: Option<String>, with_database: bool) -> Result<()> {
         let mut req = self.client.post(&self.url);
         if with_database {
-            req = req.query(&[
-                ("database", self.database.as_str()),
-                ("query", query),
-            ]);
+            req = req.query(&[("database", self.database.as_str()), ("query", query)]);
         } else {
             req = req.query(&[("query", query)]);
         }
@@ -651,7 +700,9 @@ impl RtdsClickhouseSink {
         let row_raw = match serde_json::to_string(row) {
             Ok(v) => v,
             Err(e) => {
-                self.warn_throttled(&format!("[RTDS][CH] serialize row failed table={table}: {e}"));
+                self.warn_throttled(&format!(
+                    "[RTDS][CH] serialize row failed table={table}: {e}"
+                ));
                 return;
             }
         };
@@ -939,6 +990,8 @@ pub struct RtdsService {
     symbol: String,
     asset_id: String,
     resolution_ts_ms: i64,
+    provider: RtdsProvider,
+    chainlink_cfg: Option<ChainlinkRtdsConfig>,
     ws_url: String,
     topic: String,
     sub_type: String,
@@ -972,6 +1025,90 @@ pub struct RtdsService {
 }
 
 impl RtdsService {
+    fn resolve_chainlink_feed_id(symbol: &str) -> Option<String> {
+        let mut keys = Vec::<String>::new();
+        let asset = to_asset_id(symbol).to_ascii_uppercase();
+        if !asset.trim().is_empty() {
+            keys.push(format!("RTDS_CHAINLINK_FEED_ID_{asset}"));
+        }
+        keys.push("RTDS_CHAINLINK_FEED_ID".to_string());
+        keys.into_iter().find_map(|key| {
+            env::var(&key)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+    }
+
+    fn build_chainlink_rtds_config(symbol: &str) -> Result<ChainlinkRtdsConfig> {
+        let feed_id_hex = Self::resolve_chainlink_feed_id(symbol).ok_or_else(|| {
+            anyhow!(
+                "RTDS_PROVIDER=CHAINLINK requires RTDS_CHAINLINK_FEED_ID or RTDS_CHAINLINK_FEED_ID_<ASSET>"
+            )
+        })?;
+        let feed_id = ChainlinkFeedId::from_hex_str(&feed_id_hex)
+            .map_err(|e| anyhow!("invalid Chainlink feed id '{feed_id_hex}': {e}"))?;
+        let api_key = env::var("RTDS_CHAINLINK_API_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if api_key.is_empty() {
+            return Err(anyhow!(
+                "RTDS_PROVIDER=CHAINLINK requires RTDS_CHAINLINK_API_KEY"
+            ));
+        }
+        let api_secret = env::var("RTDS_CHAINLINK_API_SECRET")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if api_secret.is_empty() {
+            return Err(anyhow!(
+                "RTDS_PROVIDER=CHAINLINK requires RTDS_CHAINLINK_API_SECRET"
+            ));
+        }
+        let rest_url = env::var("RTDS_CHAINLINK_REST_URL")
+            .unwrap_or_else(|_| "https://api.testnet-dataengine.chain.link".to_string())
+            .trim()
+            .to_string();
+        if rest_url.is_empty() {
+            return Err(anyhow!(
+                "RTDS_PROVIDER=CHAINLINK requires RTDS_CHAINLINK_REST_URL"
+            ));
+        }
+        let ws_url = env::var("RTDS_CHAINLINK_WS_URL")
+            .unwrap_or_else(|_| "wss://ws.testnet-dataengine.chain.link".to_string())
+            .trim()
+            .to_string();
+        if ws_url.is_empty() {
+            return Err(anyhow!(
+                "RTDS_PROVIDER=CHAINLINK requires RTDS_CHAINLINK_WS_URL"
+            ));
+        }
+        let price_decimals = env_int("RTDS_CHAINLINK_PRICE_DECIMALS", 8).clamp(0, 24) as u32;
+        let ws_ha = env_bool("RTDS_CHAINLINK_WS_HA", false);
+        let ws_max_reconnect = env_int("RTDS_CHAINLINK_WS_MAX_RECONNECT", 5).max(1) as usize;
+        let insecure_skip_verify = env_bool("RTDS_CHAINLINK_INSECURE_SKIP_VERIFY", false);
+        let read_timeout = env_float(
+            "RTDS_CHAINLINK_WS_READ_TIMEOUT_SECONDS",
+            env_float("RTDS_WS_READ_TIMEOUT_SECONDS", 1.0),
+        )
+        .max(0.1);
+
+        Ok(ChainlinkRtdsConfig {
+            feed_id,
+            feed_id_hex,
+            price_decimals,
+            api_key,
+            api_secret,
+            rest_url,
+            ws_url,
+            ws_ha,
+            ws_max_reconnect,
+            insecure_skip_verify,
+            read_timeout,
+        })
+    }
+
     pub fn for_market(
         market_slug: &str,
         cfg: &BotConfig,
@@ -1048,6 +1185,30 @@ impl RtdsService {
             }
         };
 
+        let provider = RtdsProvider::from_env();
+        let chainlink_cfg = if provider == RtdsProvider::Chainlink {
+            let cfg = Self::build_chainlink_rtds_config(&symbol)?;
+            logger.info(&format!(
+                "[RTDS] provider={} market={} symbol={} feed_id={} decimals={} ws_ha={} ws_max_reconnect={}",
+                provider.as_str(),
+                market_slug,
+                symbol,
+                cfg.feed_id_hex,
+                cfg.price_decimals,
+                cfg.ws_ha,
+                cfg.ws_max_reconnect
+            ));
+            Some(cfg)
+        } else {
+            logger.info(&format!(
+                "[RTDS] provider={} market={} symbol={}",
+                provider.as_str(),
+                market_slug,
+                symbol
+            ));
+            None
+        };
+
         let state_path = env::var("RTDS_STATE_PATH")
             .unwrap_or_else(|_| "state/rtds_resolution_state.json".to_string())
             .trim()
@@ -1076,8 +1237,7 @@ impl RtdsService {
             None
         };
         let write_latest_file = env_bool("RTDS_WRITE_LATEST_FILE", sink_selection.file);
-        let persist_state_to_file =
-            env_bool("RTDS_PERSIST_STATE_TO_FILE", sink_selection.file);
+        let persist_state_to_file = env_bool("RTDS_PERSIST_STATE_TO_FILE", sink_selection.file);
 
         let mut clickhouse_sink: Option<Arc<RtdsClickhouseSink>> = None;
         if sink_selection.clickhouse {
@@ -1130,14 +1290,13 @@ impl RtdsService {
             logger.warning("[RTDS] no tick sink is active (file and clickhouse are both disabled)");
         }
 
-        let (up_asset_id, down_asset_id) =
-            match market
-                .as_ref()
-                .and_then(|m| parse_tokens_and_condition(m).ok())
-            {
-                Some((up, down, _)) => (up, down),
-                None => (String::new(), String::new()),
-            };
+        let (up_asset_id, down_asset_id) = match market
+            .as_ref()
+            .and_then(|m| parse_tokens_and_condition(m).ok())
+        {
+            Some((up, down, _)) => (up, down),
+            None => (String::new(), String::new()),
+        };
 
         let clob_ws_url = env::var("RTDS_CLOB_WS_URL")
             .unwrap_or_else(|_| format!("{}/ws/market", cfg.ws_base.trim_end_matches('/')))
@@ -1205,6 +1364,8 @@ impl RtdsService {
             symbol: symbol.clone(),
             asset_id,
             resolution_ts_ms,
+            provider,
+            chainlink_cfg,
             ws_url: env::var("RTDS_WS_URL")
                 .unwrap_or_else(|_| "wss://ws-live-data.polymarket.com".to_string())
                 .trim()
@@ -1307,6 +1468,13 @@ impl RtdsService {
     }
 
     fn run_loop(self: Arc<Self>) {
+        match self.provider {
+            RtdsProvider::Polymarket => self.run_polymarket_loop(),
+            RtdsProvider::Chainlink => self.run_chainlink_loop(),
+        }
+    }
+
+    fn run_polymarket_loop(self: Arc<Self>) {
         if self.ws_url.trim().is_empty() {
             self.logger.error("[RTDS] missing RTDS_WS_URL");
             return;
@@ -1394,6 +1562,112 @@ impl RtdsService {
         }
     }
 
+    fn run_chainlink_loop(self: Arc<Self>) {
+        let Some(cfg) = self.chainlink_cfg.clone() else {
+            self.logger
+                .error("[RTDS][CHAINLINK] provider selected but config is missing");
+            return;
+        };
+
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                self.logger
+                    .error(&format!("[RTDS][CHAINLINK] runtime init error: {e}"));
+                return;
+            }
+        };
+
+        let mut backoff = self.reconnect_min.max(0.1);
+        while !self.stop_event.load(Ordering::SeqCst) {
+            let this = Arc::clone(&self);
+            let cfg_clone = cfg.clone();
+            let session_result =
+                runtime.block_on(async move { this.run_chainlink_session(cfg_clone).await });
+            if self.stop_event.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Err(e) = session_result {
+                self.logger
+                    .warning(&format!("[RTDS][CHAINLINK] stream error: {e:#}"));
+            } else {
+                self.logger
+                    .warning("[RTDS][CHAINLINK] stream closed, reconnecting");
+            }
+            let sleep_for =
+                (backoff.min(self.reconnect_max)) * (0.7 + rand::thread_rng().gen_range(0.0..0.6));
+            self.logger.warning(&format!(
+                "[RTDS][CHAINLINK] reconnecting in {sleep_for:.1}s"
+            ));
+            thread::sleep(Duration::from_secs_f64(sleep_for.max(0.1)));
+            backoff = (backoff * 2.0).min(self.reconnect_max);
+        }
+    }
+
+    async fn run_chainlink_session(self: Arc<Self>, cfg: ChainlinkRtdsConfig) -> Result<()> {
+        let mut builder = ChainlinkConfig::new(
+            cfg.api_key.clone(),
+            cfg.api_secret.clone(),
+            cfg.rest_url.clone(),
+            cfg.ws_url.clone(),
+        )
+        .with_ws_max_reconnect(cfg.ws_max_reconnect);
+        if cfg.ws_ha {
+            builder = builder.with_ws_ha(ChainlinkWebSocketHighAvailability::Enabled);
+        }
+        if cfg.insecure_skip_verify {
+            builder = builder.with_insecure_skip_verify(ChainlinkInsecureSkipVerify::Enabled);
+        }
+        let ds_cfg = builder
+            .build()
+            .map_err(|e| anyhow!("[RTDS][CHAINLINK] invalid config: {e}"))?;
+        let mut stream = ChainlinkStream::new(&ds_cfg, vec![cfg.feed_id])
+            .await
+            .map_err(|e| anyhow!("[RTDS][CHAINLINK] stream create failed: {e}"))?;
+        stream
+            .listen()
+            .await
+            .map_err(|e| anyhow!("[RTDS][CHAINLINK] stream listen failed: {e}"))?;
+        self.logger.info(&format!(
+            "[RTDS][CHAINLINK] connected market={} symbol={} feed_id={}",
+            self.market_slug, self.symbol, cfg.feed_id_hex
+        ));
+
+        let mut session_error: Option<anyhow::Error> = None;
+        while !self.stop_event.load(Ordering::SeqCst) {
+            let read_result =
+                tokio::time::timeout(Duration::from_secs_f64(cfg.read_timeout), stream.read())
+                    .await;
+            match read_result {
+                Ok(Ok(response)) => {
+                    if let Err(e) = self.process_chainlink_report_message(response, &cfg) {
+                        self.logger
+                            .warning(&format!("[RTDS][CHAINLINK] parse error: {e:#}"));
+                    }
+                }
+                Ok(Err(e)) => {
+                    session_error = Some(anyhow!("[RTDS][CHAINLINK] read failed: {e}"));
+                    break;
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
+
+        if let Err(e) = stream.close().await {
+            self.logger
+                .warning(&format!("[RTDS][CHAINLINK] close warning: {e}"));
+        }
+        if let Some(e) = session_error {
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn run_clob_loop(self: Arc<Self>) {
         if !self.clob_join_enabled {
             return;
@@ -1408,7 +1682,8 @@ impl RtdsService {
             let (mut ws, _) = match conn {
                 Ok(v) => v,
                 Err(e) => {
-                    self.logger.warning(&format!("[RTDS][CLOB] connect error: {e}"));
+                    self.logger
+                        .warning(&format!("[RTDS][CLOB] connect error: {e}"));
                     let sleep_for = (backoff.min(self.clob_reconnect_max))
                         * (0.7 + rand::thread_rng().gen_range(0.0..0.6));
                     thread::sleep(Duration::from_secs_f64(sleep_for.max(0.1)));
@@ -1449,7 +1724,8 @@ impl RtdsService {
                         continue
                     }
                     Err(e) => {
-                        self.logger.warning(&format!("[RTDS][CLOB] ws read error: {e}"));
+                        self.logger
+                            .warning(&format!("[RTDS][CLOB] ws read error: {e}"));
                         break;
                     }
                 };
@@ -1693,6 +1969,171 @@ impl RtdsService {
         }
     }
 
+    fn process_chainlink_report_message(
+        &self,
+        response: ChainlinkWebSocketReport,
+        cfg: &ChainlinkRtdsConfig,
+    ) -> Result<()> {
+        if self.log_raw {
+            self.append_tick_log(&json!({
+                "kind": "raw_chainlink",
+                "ts_ms": now_ms(),
+                "market_slug": self.market_slug,
+                "symbol": self.symbol,
+                "payload": &response,
+            }));
+        }
+        let tick = Self::chainlink_report_to_tick(
+            &response.report,
+            &self.symbol,
+            &self.asset_id,
+            cfg.price_decimals,
+        )?;
+        self.on_tick(tick);
+        Ok(())
+    }
+
+    fn chainlink_report_to_tick(
+        report: &ChainlinkReport,
+        symbol: &str,
+        asset_id: &str,
+        price_decimals: u32,
+    ) -> Result<PriceTick> {
+        let price = Self::chainlink_decode_price(report, price_decimals)?;
+        let ts_seconds = report
+            .observations_timestamp
+            .max(report.valid_from_timestamp);
+        let ts_ms = i64::try_from(ts_seconds)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        Ok(PriceTick {
+            symbol: symbol.to_string(),
+            asset_id: asset_id.to_string(),
+            price,
+            value: Some(price),
+            timestamp_ms: ts_ms,
+        })
+    }
+
+    fn chainlink_decode_price(report: &ChainlinkReport, price_decimals: u32) -> Result<f64> {
+        let raw_full_report = report.full_report.trim();
+        let raw_hex = raw_full_report
+            .strip_prefix("0x")
+            .or_else(|| raw_full_report.strip_prefix("0X"))
+            .unwrap_or(raw_full_report);
+        if raw_hex.is_empty() {
+            return Err(anyhow!("empty full_report payload"));
+        }
+        let full_report_payload =
+            hex::decode(raw_hex).map_err(|e| anyhow!("full_report hex decode failed: {e}"))?;
+        let (_, report_blob) = chainlink_decode_full_report(&full_report_payload)
+            .map_err(|e| anyhow!("full report decode failed: {e}"))?;
+        let version = Self::chainlink_feed_version(&report.feed_id);
+        let scaled_price = match version {
+            1 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV1::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v1 failed: {e}"))?
+                    .benchmark_price,
+                price_decimals,
+            ),
+            2 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV2::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v2 failed: {e}"))?
+                    .benchmark_price,
+                price_decimals,
+            ),
+            3 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV3::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v3 failed: {e}"))?
+                    .benchmark_price,
+                price_decimals,
+            ),
+            4 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV4::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v4 failed: {e}"))?
+                    .price,
+                price_decimals,
+            ),
+            5 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV5::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v5 failed: {e}"))?
+                    .rate,
+                price_decimals,
+            ),
+            6 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV6::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v6 failed: {e}"))?
+                    .price,
+                price_decimals,
+            ),
+            7 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV7::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v7 failed: {e}"))?
+                    .exchange_rate,
+                price_decimals,
+            ),
+            8 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV8::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v8 failed: {e}"))?
+                    .mid_price,
+                price_decimals,
+            ),
+            9 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV9::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v9 failed: {e}"))?
+                    .nav_per_share,
+                price_decimals,
+            ),
+            10 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV10::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v10 failed: {e}"))?
+                    .price,
+                price_decimals,
+            ),
+            11 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV11::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v11 failed: {e}"))?
+                    .mid,
+                price_decimals,
+            ),
+            12 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV12::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v12 failed: {e}"))?
+                    .nav_per_share,
+                price_decimals,
+            ),
+            13 => Self::scaled_price_from_bigint(
+                &ChainlinkReportDataV13::decode(&report_blob)
+                    .map_err(|e| anyhow!("decode v13 failed: {e}"))?
+                    .last_traded_price,
+                price_decimals,
+            ),
+            other => {
+                return Err(anyhow!(
+                    "unsupported Chainlink report schema version={other}"
+                ));
+            }
+        }
+        .ok_or_else(|| anyhow!("failed to scale Chainlink price"))?;
+        if !scaled_price.is_finite() {
+            return Err(anyhow!("scaled Chainlink price is not finite"));
+        }
+        Ok(scaled_price)
+    }
+
+    fn chainlink_feed_version(feed_id: &ChainlinkFeedId) -> u16 {
+        ((feed_id.0[0] as u16) << 8) | feed_id.0[1] as u16
+    }
+
+    fn scaled_price_from_bigint<T: ToString>(raw: &T, decimals: u32) -> Option<f64> {
+        let raw_f64 = raw.to_string().trim().parse::<f64>().ok()?;
+        let scale = 10f64.powi(decimals.min(24) as i32);
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        Some(raw_f64 / scale)
+    }
+
     fn tick_matches(&self, tick: &PriceTick) -> bool {
         if !tick.asset_id.is_empty() && tick.asset_id == self.asset_id {
             return true;
@@ -1849,7 +2290,9 @@ impl RtdsService {
             {
                 let _ = queue.pop_front();
             }
-            state.latest_by_asset.insert(snapshot.asset_id.clone(), snapshot);
+            state
+                .latest_by_asset
+                .insert(snapshot.asset_id.clone(), snapshot);
         }
     }
 
@@ -1866,19 +2309,13 @@ impl RtdsService {
                 if let Some(exchange_ts_ms) = sample.exchange_ts_ms {
                     if sample.exchange_ts_precision == "s" {
                         let delta_s = ((target_ts_ms / 1000) - (exchange_ts_ms / 1000)).abs();
-                        let replace = best_s
-                            .as_ref()
-                            .map(|(d, _)| delta_s < *d)
-                            .unwrap_or(true);
+                        let replace = best_s.as_ref().map(|(d, _)| delta_s < *d).unwrap_or(true);
                         if replace {
                             best_s = Some((delta_s, sample.clone()));
                         }
                     } else {
                         let delta_ms = (target_ts_ms - exchange_ts_ms).abs();
-                        let replace = best_ms
-                            .as_ref()
-                            .map(|(d, _)| delta_ms < *d)
-                            .unwrap_or(true);
+                        let replace = best_ms.as_ref().map(|(d, _)| delta_ms < *d).unwrap_or(true);
                         if replace {
                             best_ms = Some((delta_ms, sample.clone()));
                         }

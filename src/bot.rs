@@ -6839,6 +6839,157 @@ impl MakerHedgeCapBot {
         true
     }
 
+    fn _sniper_maybe_exit_hedge(&self, pos: &Value, reason: &str, trigger: &str) {
+        let reason_u = reason.trim().to_ascii_uppercase();
+        let stop_mode = std::env::var("SNIPER_STOP_LOSS_MODE")
+            .ok()
+            .or_else(|| std::env::var("SNIPER_STOP_LESS_MODE").ok())
+            .unwrap_or_else(|| "MARKET".to_string())
+            .to_ascii_uppercase();
+        let stop_mode_hedge =
+            reason_u == "STOP_LOSS" && matches!(stop_mode.as_str(), "HEDGE" | "STOP_HEDGE");
+        if !env_bool("SNIPER_EXIT_HEDGE_ENABLED", false) && !stop_mode_hedge {
+            return;
+        }
+        if env_bool("SNIPER_EXIT_HEDGE_STOP_LOSS_ONLY", true) && reason_u != "STOP_LOSS" {
+            return;
+        }
+        let side = pos
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !matches!(side.as_str(), "YES" | "NO") {
+            return;
+        }
+        let qty = pos.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+        let cost = pos.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+        let bid = pos.get("bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if qty <= 0.0 {
+            return;
+        }
+        let min_loss = env_float("SNIPER_EXIT_HEDGE_MIN_LOSS_PCT", 0.0).max(0.0);
+        if cost > 1e-12 {
+            let exit_px = self._sniper_est_exit_price(bid, 0.0);
+            let pnl_pct = (qty * exit_px - cost) / cost;
+            if pnl_pct + 1e-12 > -min_loss {
+                return;
+            }
+        }
+
+        let now = now_ts_f64();
+        let (q_yes, q_no) = self
+            .state
+            .lock()
+            .map(|s| (s.q_yes.max(0.0), s.q_no.max(0.0)))
+            .unwrap_or((0.0, 0.0));
+        let (primary_qty, opposite_qty, hedge_asset) = if side == "YES" {
+            (
+                q_yes,
+                q_no,
+                self.no_asset.clone().unwrap_or_default().to_string(),
+            )
+        } else {
+            (
+                q_no,
+                q_yes,
+                self.yes_asset.clone().unwrap_or_default().to_string(),
+            )
+        };
+        if hedge_asset.trim().is_empty() {
+            return;
+        }
+        let cooldown_s = env_float("SNIPER_EXIT_HEDGE_COOLDOWN_SECONDS", 1.0).max(0.1);
+        let cooldown_key = format!("__sniper_exit_hedge_cooldown_until_{hedge_asset}");
+        if now < self._runtime_ts_get(&cooldown_key) {
+            return;
+        }
+
+        let min_sh = self.cfg.min_shares.max(1.0);
+        let net_exposure = (primary_qty - opposite_qty).max(0.0);
+        if net_exposure + 1e-12 < min_sh {
+            self._runtime_ts_set(&cooldown_key, now + cooldown_s);
+            return;
+        }
+        if self.taker_strict_inflight && self._has_pending_taker_order("BUY", Some(&hedge_asset)) {
+            self._runtime_ts_set(&cooldown_key, now + cooldown_s.min(2.0));
+            return;
+        }
+
+        let (_bid_h, ask_h) = match self._best_bid_ask(&hedge_asset) {
+            Some(v) => v,
+            None => return,
+        };
+        if ask_h <= 0.0 {
+            return;
+        }
+        let tick = self.cfg.tick.max(0.0001);
+        let slip_ticks = env_int(
+            "SNIPER_EXIT_HEDGE_SLIPPAGE_TICKS",
+            env_int("SNIPER_ENTRY_SLIPPAGE_TICKS", 1),
+        )
+        .max(0);
+        let mut px = round_up(ask_h + slip_ticks as f64 * tick, tick);
+        px = clamp(px, tick, 0.99);
+        if px + 1e-9 < ask_h {
+            return;
+        }
+
+        let mut fraction = env_float("SNIPER_EXIT_HEDGE_SIZE_FRACTION", 1.0);
+        if !fraction.is_finite() {
+            fraction = 1.0;
+        }
+        fraction = fraction.clamp(0.0, 1.0);
+        if fraction <= 0.0 {
+            return;
+        }
+        let mut target_shares = net_exposure * fraction;
+        let max_shares = env_float("SNIPER_EXIT_HEDGE_MAX_SHARES", 0.0).max(0.0);
+        if max_shares > 0.0 {
+            target_shares = target_shares.min(max_shares);
+        }
+        let max_notional = env_float("SNIPER_EXIT_HEDGE_MAX_NOTIONAL_USD", 0.0).max(0.0);
+        if max_notional > 0.0 && px > 0.0 {
+            target_shares = target_shares.min(max_notional / px);
+        }
+        let per_order_cap = env_int("SNIPER_EXIT_HEDGE_MAX_SHARES_PER_ORDER", 0);
+        if per_order_cap > 0 {
+            target_shares = target_shares.min(per_order_cap as f64);
+        }
+        let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1);
+        let mut size_int = (target_shares + 1e-12).floor() as i64;
+        size_int = (size_int / min_int) * min_int;
+        if size_int < min_int {
+            self._runtime_ts_set(&cooldown_key, now + cooldown_s);
+            return;
+        }
+
+        let hedge_ot = std::env::var("SNIPER_EXIT_HEDGE_ORDER_TYPE")
+            .unwrap_or_else(|_| "FAK".to_string())
+            .to_ascii_uppercase();
+        let inflight_s = env_float("SNIPER_EXIT_HEDGE_INFLIGHT_SECONDS", 0.75).max(0.1);
+        self._runtime_ts_set("__taker_inflight_until", now + inflight_s);
+        let oid = self._place_taker_bid_fak(&hedge_asset, px, size_int as f64, Some(&hedge_ot));
+        let aid_tail: String = hedge_asset
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if oid.is_some() {
+            self.logger.warning(&format!(
+                "[SNIPER][HEDGE] trigger={trigger} reason={reason} side={side} buy_opp={aid_tail} ask={ask_h:.4} px={px:.4} sz={size_int} type={hedge_ot}"
+            ));
+        } else {
+            self.logger.warning(&format!(
+                "[SNIPER][HEDGE] trigger={trigger} reason={reason} submit_failed side={side} buy_opp={aid_tail} ask={ask_h:.4} px={px:.4} sz={size_int} type={hedge_ot}"
+            ));
+        }
+        self._runtime_ts_set(&cooldown_key, now + cooldown_s);
+    }
+
     pub fn _sniper_try_exit(&self, pos: &Value, reason: &str) -> bool {
         let now = now_ts_f64();
         if now < self._runtime_ts_get("__taker_fail_pause_until") {
@@ -6854,16 +7005,26 @@ impl MakerHedgeCapBot {
         }
         let reason_u = reason.trim().to_ascii_uppercase();
         let mut mode = std::env::var("SNIPER_STOP_LOSS_MODE")
-            .unwrap_or_else(|_| "MARKET".to_string())
+            .ok()
+            .or_else(|| std::env::var("SNIPER_STOP_LESS_MODE").ok())
+            .unwrap_or_else(|| "MARKET".to_string())
             .to_ascii_uppercase();
         if matches!(mode.as_str(), "STOP_LIMIT" | "STOPLIMIT") {
             mode = "LIMIT".to_string();
+        }
+        if matches!(mode.as_str(), "STOP_HEDGE" | "HEDGE_STOP") {
+            mode = "HEDGE".to_string();
         }
         if matches!(
             mode.as_str(),
             "STOP_MARKET" | "STOPMARKET" | "TAKER" | "AGGRESSIVE"
         ) {
             mode = "MARKET".to_string();
+        }
+        if reason_u == "STOP_LOSS" && mode == "HEDGE" {
+            self._sniper_maybe_exit_hedge(pos, &reason_u, "stop_loss_mode");
+            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 0.5);
+            return false;
         }
         let mut stop_limit_mode = reason_u == "STOP_LOSS" && mode == "LIMIT";
 
@@ -6896,6 +7057,7 @@ impl MakerHedgeCapBot {
                     ));
                     self._runtime_ts_set(&log_key, now + 2.0);
                 }
+                self._sniper_maybe_exit_hedge(pos, &reason_u, "wait_confirmed");
                 self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 0.5);
                 return false;
             }
@@ -7160,6 +7322,7 @@ impl MakerHedgeCapBot {
                     }
                 }
             }
+            self._sniper_maybe_exit_hedge(pos, &reason_u, "allowance_precheck");
             self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 60.0);
             return false;
         }
@@ -7221,6 +7384,8 @@ impl MakerHedgeCapBot {
                         self._mark_sniper_exit_state();
                         return true;
                     }
+                } else {
+                    self._sniper_maybe_exit_hedge(pos, &reason_u, "stop_limit_submit_reject");
                 }
                 return false;
             }
@@ -7316,6 +7481,7 @@ impl MakerHedgeCapBot {
                 }
             }
             if oid.is_none() {
+                self._sniper_maybe_exit_hedge(&cur, &reason_u, "exit_submit_reject");
                 if let Some((bal, allow)) =
                     self._get_balance_allowance_conditional_cached(&asset_id, 0.0)
                 {
