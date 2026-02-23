@@ -3662,6 +3662,34 @@ impl MakerHedgeCapBot {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_ascii_uppercase();
+        let trade_id = msg
+            .get("id")
+            .or_else(|| msg.get("trade_id"))
+            .or_else(|| msg.get("tradeId"))
+            .or_else(|| msg.get("tradeID"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let taker_oid = msg
+            .get("taker_order_id")
+            .or_else(|| msg.get("takerOrderId"))
+            .or_else(|| msg.get("taker_orderId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let taker_rec = if taker_oid.trim().is_empty() {
+            None
+        } else {
+            self.taker_orders
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&taker_oid).cloned())
+        };
+        let taker_ctx = if taker_oid.trim().is_empty() {
+            None
+        } else {
+            self._get_order_execution_context(&taker_oid)
+        };
         if !status.is_empty() && !token_id.trim().is_empty() {
             let key = format!(
                 "__sniper_trade_status_{}_{}",
@@ -3685,7 +3713,11 @@ impl MakerHedgeCapBot {
             }
         }
         if status == "CONFIRMED" {
-            if !token_id.trim().is_empty() && side_top == "BUY" {
+            // Top-level BUY is only trusted when the taker order maps to our local context.
+            if !token_id.trim().is_empty()
+                && side_top == "BUY"
+                && (taker_rec.is_some() || taker_ctx.is_some())
+            {
                 let confirmed_key = Self::_sniper_entry_confirmed_key(&token_id);
                 self._runtime_ts_set(&confirmed_key, now_ts_f64());
                 if env_bool("SNIPER_ORDER_STATUS_DEBUG", false) {
@@ -3717,7 +3749,8 @@ impl MakerHedgeCapBot {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if !wallet.trim().is_empty() && !mo_addr.is_empty() && mo_addr != wallet {
+                // Strict ownership gate: only our wallet's maker legs can confirm entry.
+                if wallet.trim().is_empty() || mo_addr.is_empty() || mo_addr != wallet {
                     continue;
                 }
                 let mo_side = mo
@@ -3759,36 +3792,6 @@ impl MakerHedgeCapBot {
         if !status.is_empty() && !matches!(status.as_str(), "MATCHED" | "MINED" | "CONFIRMED") {
             return;
         }
-
-        let trade_id = msg
-            .get("id")
-            .or_else(|| msg.get("trade_id"))
-            .or_else(|| msg.get("tradeId"))
-            .or_else(|| msg.get("tradeID"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let taker_oid = msg
-            .get("taker_order_id")
-            .or_else(|| msg.get("takerOrderId"))
-            .or_else(|| msg.get("taker_orderId"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let taker_rec = if taker_oid.trim().is_empty() {
-            None
-        } else {
-            self.taker_orders
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&taker_oid).cloned())
-        };
-        let taker_ctx = if taker_oid.trim().is_empty() {
-            None
-        } else {
-            self._get_order_execution_context(&taker_oid)
-        };
 
         // CASE A: Taker trade event that matches a recent locally-submitted taker order.
         if taker_rec.is_some() || taker_ctx.is_some() {
@@ -3972,60 +3975,8 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        // CASE A2: Direct taker payload with explicit token/side/price/size.
-        // This keeps parity with Python behavior and helps after process restarts
-        // where recent taker/order context may be empty.
-        if !taker_oid.trim().is_empty() {
-            let token_id = msg
-                .get("asset_id")
-                .or_else(|| msg.get("assetId"))
-                .or_else(|| msg.get("token_id"))
-                .or_else(|| msg.get("tokenId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let side = msg
-                .get("side")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_uppercase();
-            let qty = Self::_value_f64(
-                msg.get("size")
-                    .or_else(|| msg.get("matched_amount"))
-                    .or_else(|| msg.get("matchedAmount"))
-                    .or_else(|| msg.get("amount")),
-            )
-            .unwrap_or(0.0);
-            let px = Self::_value_f64(msg.get("price")).unwrap_or(0.0);
-            let yes = self.yes_asset.as_deref().unwrap_or("");
-            let no = self.no_asset.as_deref().unwrap_or("");
-            if !token_id.trim().is_empty()
-                && matches!(side.as_str(), "BUY" | "SELL")
-                && qty > 0.0
-                && px > 0.0
-                && (token_id == yes || token_id == no)
-            {
-                let key = if !trade_id.is_empty() {
-                    format!("{trade_id}:taker")
-                } else {
-                    format!("trade_fallback:taker:{taker_oid}:{token_id}:{side}:{qty:.8}:{px:.8}")
-                };
-                let applied = self._apply_fill(&token_id, px, qty, &key, &side);
-                if applied {
-                    self._log_execution_latency_on_fill(&taker_oid, now_ts_f64());
-                }
-                return;
-            }
-        }
-
         // CASE B: Maker trade event. Apply only if maker leg matches our wallet.
         let wallet = self.wallet_address.to_ascii_lowercase();
-        let trader_side = msg
-            .get("trader_side")
-            .or_else(|| msg.get("traderSide"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_uppercase();
         let maker_orders = msg
             .get("maker_orders")
             .or_else(|| msg.get("makerOrders"))
@@ -4047,9 +3998,6 @@ impl MakerHedgeCapBot {
                         break;
                     }
                 }
-            }
-            if maker_leg.is_none() && trader_side == "MAKER" && maker_orders.len() == 1 {
-                maker_leg = maker_orders.first().cloned();
             }
             if let Some(mo) = maker_leg {
                 let asset = mo

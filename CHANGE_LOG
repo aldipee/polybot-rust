@@ -1,3 +1,18 @@
+## Version 0.1.6
+Date: 2026-02-23
+
+### Changes
+- Fixed user trade-event attribution to prevent foreign taker trades from being applied to local position state.
+- Removed direct taker payload fallback path (`CASE A2`) in `src/bot.rs` that could misclassify maker/taker events.
+- Tightened entry confirmation gating:
+  - top-level `BUY` confirmation now requires local taker context
+  - maker-leg confirmation now requires strict wallet match on `maker_address`
+- Removed permissive maker fallback (`trader_side=MAKER` + single maker leg) that could attribute non-owned fills.
+
+### Behavior Impact
+- Safer position accounting under mixed maker/taker streams (prevents phantom exposure jumps).
+- After restart/reconnect, unknown taker fills without local context may be ignored instead of heuristically applied.
+
 ## Version 0.1.5
 Date: 2026-02-23
 
