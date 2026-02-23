@@ -59,10 +59,42 @@ fn db_url_hint(db_url: &str) -> String {
 
 #[derive(Debug, Clone, Default)]
 struct PnlWindowStats {
+    h1: BotTradeStats,
+    h3: BotTradeStats,
+    h6: BotTradeStats,
+    h12: BotTradeStats,
     day: BotTradeStats,
     week: BotTradeStats,
     month: BotTradeStats,
     all: BotTradeStats,
+}
+
+#[derive(Debug, Clone)]
+struct StatsBounds {
+    today: String,
+    week_start: String,
+    month_start: String,
+    cutoff_1h: String,
+    cutoff_3h: String,
+    cutoff_6h: String,
+    cutoff_12h: String,
+}
+
+fn stats_bounds_now() -> StatsBounds {
+    let now_jkt = Utc::now().with_timezone(&Jakarta);
+    StatsBounds {
+        today: date_jakarta(),
+        week_start: week_start_date_jakarta(),
+        month_start: month_start_date_jakarta(),
+        cutoff_1h: (now_jkt - ChronoDuration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        cutoff_3h: (now_jkt - ChronoDuration::hours(3))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        cutoff_6h: (now_jkt - ChronoDuration::hours(6))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        cutoff_12h: (now_jkt - ChronoDuration::hours(12))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    }
 }
 
 fn pct(part: i64, total: i64) -> f64 {
@@ -90,37 +122,55 @@ fn pnl_line(label: &str, s: &BotTradeStats) -> String {
     )
 }
 
-fn bot_window_stats(repo: &BotRepository, bot_id: &str) -> PnlWindowStats {
-    let today = date_jakarta();
-    let week_start = week_start_date_jakarta();
-    let month_start = month_start_date_jakarta();
+fn bot_window_stats(repo: &BotRepository, bot_id: &str, b: &StatsBounds) -> PnlWindowStats {
     PnlWindowStats {
+        h1: repo
+            .trade_stats_for_bot_recent_hours(bot_id, &b.cutoff_1h)
+            .unwrap_or_default(),
+        h3: repo
+            .trade_stats_for_bot_recent_hours(bot_id, &b.cutoff_3h)
+            .unwrap_or_default(),
+        h6: repo
+            .trade_stats_for_bot_recent_hours(bot_id, &b.cutoff_6h)
+            .unwrap_or_default(),
+        h12: repo
+            .trade_stats_for_bot_recent_hours(bot_id, &b.cutoff_12h)
+            .unwrap_or_default(),
         day: repo
-            .trade_stats_for_bot_period(bot_id, &today, &today)
+            .trade_stats_for_bot_period(bot_id, &b.today, &b.today)
             .unwrap_or_default(),
         week: repo
-            .trade_stats_for_bot_period(bot_id, &week_start, &today)
+            .trade_stats_for_bot_period(bot_id, &b.week_start, &b.today)
             .unwrap_or_default(),
         month: repo
-            .trade_stats_for_bot_period(bot_id, &month_start, &today)
+            .trade_stats_for_bot_period(bot_id, &b.month_start, &b.today)
             .unwrap_or_default(),
         all: repo.trade_stats_for_bot_all_time(bot_id).unwrap_or_default(),
     }
 }
 
-fn all_bots_window_stats(repo: &BotRepository) -> PnlWindowStats {
-    let today = date_jakarta();
-    let week_start = week_start_date_jakarta();
-    let month_start = month_start_date_jakarta();
+fn all_bots_window_stats(repo: &BotRepository, b: &StatsBounds) -> PnlWindowStats {
     PnlWindowStats {
+        h1: repo
+            .trade_stats_all_bots_recent_hours(&b.cutoff_1h)
+            .unwrap_or_default(),
+        h3: repo
+            .trade_stats_all_bots_recent_hours(&b.cutoff_3h)
+            .unwrap_or_default(),
+        h6: repo
+            .trade_stats_all_bots_recent_hours(&b.cutoff_6h)
+            .unwrap_or_default(),
+        h12: repo
+            .trade_stats_all_bots_recent_hours(&b.cutoff_12h)
+            .unwrap_or_default(),
         day: repo
-            .trade_stats_all_bots_period(&today, &today)
+            .trade_stats_all_bots_period(&b.today, &b.today)
             .unwrap_or_default(),
         week: repo
-            .trade_stats_all_bots_period(&week_start, &today)
+            .trade_stats_all_bots_period(&b.week_start, &b.today)
             .unwrap_or_default(),
         month: repo
-            .trade_stats_all_bots_period(&month_start, &today)
+            .trade_stats_all_bots_period(&b.month_start, &b.today)
             .unwrap_or_default(),
         all: repo.trade_stats_all_bots_all_time().unwrap_or_default(),
     }
@@ -128,7 +178,11 @@ fn all_bots_window_stats(repo: &BotRepository) -> PnlWindowStats {
 
 fn pnl_section(label: &str, s: &PnlWindowStats) -> String {
     format!(
-        "{label}\n{}\n{}\n{}\n{}",
+        "{label}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        pnl_line("1h", &s.h1),
+        pnl_line("3h", &s.h3),
+        pnl_line("6h", &s.h6),
+        pnl_line("12h", &s.h12),
         pnl_line("Daily", &s.day),
         pnl_line("Weekly", &s.week),
         pnl_line("Monthly", &s.month),
@@ -146,7 +200,11 @@ fn telegram_pnl_line(label: &str, s: &BotTradeStats) -> String {
 
 fn telegram_pnl_section(title: &str, s: &PnlWindowStats) -> String {
     format!(
-        "{title}\n{}\n{}\n{}\n{}",
+        "{title}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        telegram_pnl_line("H1", &s.h1),
+        telegram_pnl_line("H3", &s.h3),
+        telegram_pnl_line("H6", &s.h6),
+        telegram_pnl_line("H12", &s.h12),
         telegram_pnl_line("D", &s.day),
         telegram_pnl_line("W", &s.week),
         telegram_pnl_line("M", &s.month),
@@ -155,8 +213,9 @@ fn telegram_pnl_section(title: &str, s: &PnlWindowStats) -> String {
 }
 
 fn print_pnl_metrics(repo: &BotRepository, bot_id: &str, logger: &Arc<dyn LogLike>) -> String {
-    let bot_stats = bot_window_stats(repo, bot_id);
-    let all_stats = all_bots_window_stats(repo);
+    let bounds = stats_bounds_now();
+    let bot_stats = bot_window_stats(repo, bot_id, &bounds);
+    let all_stats = all_bots_window_stats(repo, &bounds);
     let msg = format!(
         "PNL Summary (Asia/Jakarta, DRAW excluded)\n{}\n{}",
         pnl_section(&format!("Bot {bot_id}"), &bot_stats),
@@ -171,8 +230,9 @@ fn build_telegram_pnl_summary(
     current_bot_id: &str,
     logger: &Arc<dyn LogLike>,
 ) -> String {
-    let bot_stats = bot_window_stats(repo, current_bot_id);
-    let all_stats = all_bots_window_stats(repo);
+    let bounds = stats_bounds_now();
+    let bot_stats = bot_window_stats(repo, current_bot_id, &bounds);
+    let all_stats = all_bots_window_stats(repo, &bounds);
     let mut bot_ids = match repo.list_all_bot_ids() {
         Ok(v) => v,
         Err(e) => {
@@ -209,12 +269,14 @@ fn build_telegram_pnl_summary(
             bot_ids.len()
         ));
         for id in bot_ids {
-            let s = bot_window_stats(repo, &id);
+            let s = bot_window_stats(repo, &id, &bounds);
             parts.push(telegram_pnl_section(&format!("Bot: {id}"), &s));
             parts.push(String::new());
         }
     }
-    parts.push("Legend: D=Daily W=Weekly M=Monthly A=All-time".to_string());
+    parts.push(
+        "Legend: H1=1h H3=3h H6=6h H12=12h D=Daily W=Weekly M=Monthly A=All-time".to_string(),
+    );
     parts.join("\n")
 }
 

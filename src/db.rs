@@ -533,6 +533,36 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
         })
     }
 
+    pub fn trade_stats_for_bot_recent_hours(
+        &self,
+        bot_id: &str,
+        cutoff_iso: &str,
+    ) -> Result<BotTradeStats> {
+        let mut conn = open_conn(&self.engine)?;
+        let row = conn.query_one(
+            "SELECT
+                COALESCE(SUM(lp), 0.0) AS net_pnl,
+                COALESCE(SUM(CASE WHEN status = 'WON' THEN lp ELSE 0.0 END), 0.0) AS total_profit,
+                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN -lp ELSE 0.0 END), 0.0) AS total_loss,
+                COALESCE(SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END), 0)::BIGINT AS win_count,
+                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN 1 ELSE 0 END), 0)::BIGINT AS loss_count,
+                COUNT(trade_id)::BIGINT AS total_count
+             FROM trade
+             WHERE bot_id = $1
+               AND end_trade >= $2
+               AND status IN ('WON','LOSS')",
+            &[&bot_id, &cutoff_iso],
+        )?;
+        Ok(BotTradeStats {
+            net_pnl: row.get(0),
+            total_profit: row.get(1),
+            total_loss: row.get(2),
+            win_count: row.get(3),
+            loss_count: row.get(4),
+            total_count: row.get(5),
+        })
+    }
+
     pub fn trade_stats_for_bot_all_time(&self, bot_id: &str) -> Result<BotTradeStats> {
         let mut conn = open_conn(&self.engine)?;
         let row = conn.query_one(
@@ -601,6 +631,31 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
              FROM trade
              WHERE status IN ('WON','LOSS')",
             &[],
+        )?;
+        Ok(BotTradeStats {
+            net_pnl: row.get(0),
+            total_profit: row.get(1),
+            total_loss: row.get(2),
+            win_count: row.get(3),
+            loss_count: row.get(4),
+            total_count: row.get(5),
+        })
+    }
+
+    pub fn trade_stats_all_bots_recent_hours(&self, cutoff_iso: &str) -> Result<BotTradeStats> {
+        let mut conn = open_conn(&self.engine)?;
+        let row = conn.query_one(
+            "SELECT
+                COALESCE(SUM(lp), 0.0) AS net_pnl,
+                COALESCE(SUM(CASE WHEN status = 'WON' THEN lp ELSE 0.0 END), 0.0) AS total_profit,
+                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN -lp ELSE 0.0 END), 0.0) AS total_loss,
+                COALESCE(SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END), 0)::BIGINT AS win_count,
+                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN 1 ELSE 0 END), 0)::BIGINT AS loss_count,
+                COUNT(trade_id)::BIGINT AS total_count
+             FROM trade
+             WHERE end_trade >= $1
+               AND status IN ('WON','LOSS')",
+            &[&cutoff_iso],
         )?;
         Ok(BotTradeStats {
             net_pnl: row.get(0),

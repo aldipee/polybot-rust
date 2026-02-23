@@ -12,6 +12,7 @@ Date: 2026-02-23
 - Telegram summary now includes per-bot breakdown for all bot IDs (in addition to current bot + ALL aggregate).
 - Added Telegram startup restart-test ping sent once per process start when Telegram is configured.
 - Per-bot Telegram breakdown query now prefers bots from `bot` table with `bot_type='TRADING'` (with fallback for schemas without `bot_type`).
+- Added rolling-window PnL metrics to summaries: last 1h, 3h, 6h, and 12h.
 
 ### Behavior Impact
 - Safer position accounting under mixed maker/taker streams (prevents phantom exposure jumps).
