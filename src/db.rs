@@ -109,6 +109,16 @@ pub struct TradeRow {
     pub claim_status: Option<String>,
     pub meta_data: Option<String>,
     pub exit_reason: String,
+    pub validation_status: String,
+    pub validation_checked_at: Option<String>,
+    pub validation_validated_at: Option<String>,
+    pub validation_source: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnvalidatedTradeRow {
+    pub trade_id: String,
+    pub slug: String,
 }
 
 pub fn now_iso_jakarta() -> String {
@@ -234,7 +244,11 @@ CREATE TABLE IF NOT EXISTS trade (
   cpp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
   status TEXT NULL,
   claim_status TEXT NULL,
-  meta_data TEXT NULL
+  meta_data TEXT NULL,
+  validation_status TEXT NOT NULL DEFAULT 'PENDING',
+  validation_checked_at TEXT NULL,
+  validation_validated_at TEXT NULL,
+  validation_source TEXT NULL
 );
 "#,
         )
@@ -263,6 +277,13 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
         WHEN dry_run::TEXT IN ('1', 't', 'true', 'TRUE') THEN TRUE
         ELSE FALSE
     END;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'PENDING';
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_checked_at TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_validated_at TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_source TEXT NULL;
+UPDATE trade
+SET validation_status = 'PENDING'
+WHERE validation_status IS NULL OR trim(validation_status) = '';
 "#,
         )
         .context("failed migrating configuration schema for PostgreSQL compatibility")?;
@@ -538,6 +559,39 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
         Ok((tid, initialized))
     }
 
+    pub fn list_unvalidated_trades_for_bot(
+        &self,
+        bot_id: &str,
+        start_date: &str,
+        limit: i64,
+    ) -> Result<Vec<UnvalidatedTradeRow>> {
+        let mut conn = open_conn(&self.engine)?;
+        let rows = conn.query(
+            "SELECT trade_id, slug
+             FROM trade
+             WHERE bot_id = $1
+               AND date >= $2
+               AND status IN ('WON','LOSS','DRAW')
+               AND NOT (
+                    status = 'DRAW'
+                    AND COALESCE(total_cost, 0.0) <= 1e-9
+                    AND COALESCE(q_yes, 0.0) <= 1e-9
+                    AND COALESCE(q_no, 0.0) <= 1e-9
+               )
+               AND COALESCE(validation_status, 'PENDING') <> 'VALIDATED'
+             ORDER BY end_trade ASC, start_trade ASC
+             LIMIT $3",
+            &[&bot_id, &start_date, &limit],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|r| UnvalidatedTradeRow {
+                trade_id: r.get(0),
+                slug: r.get(1),
+            })
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_trade_result(
         &self,
@@ -557,6 +611,10 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
         } else {
             "DRAW"
         };
+        let validation_pending = "PENDING".to_string();
+        let validation_checked_at: Option<String> = None;
+        let validation_validated_at: Option<String> = None;
+        let validation_source: Option<String> = None;
         let mut conn = open_conn(&self.engine)?;
         conn.execute(
             "UPDATE trade SET
@@ -567,8 +625,12 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
                 q_yes = $5,
                 q_no = $6,
                 exit_reason = $7,
-                status = $8
-             WHERE trade_id = $9",
+                status = $8,
+                validation_status = $9,
+                validation_checked_at = $10,
+                validation_validated_at = $11,
+                validation_source = $12
+             WHERE trade_id = $13",
             &[
                 &end_trade_iso,
                 &lp,
@@ -578,6 +640,63 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
                 &q_no,
                 &exit_reason,
                 &status,
+                &validation_pending,
+                &validation_checked_at,
+                &validation_validated_at,
+                &validation_source,
+                &trade_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_trade_validation_checked(
+        &self,
+        trade_id: &str,
+        checked_at_iso: &str,
+    ) -> Result<()> {
+        let mut conn = open_conn(&self.engine)?;
+        conn.execute(
+            "UPDATE trade
+             SET validation_checked_at = $1
+             WHERE trade_id = $2",
+            &[&checked_at_iso, &trade_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_trade_validated_from_polymarket(
+        &self,
+        trade_id: &str,
+        lp: f64,
+        checked_at_iso: &str,
+        source: &str,
+    ) -> Result<()> {
+        let status = if lp > 0.0 {
+            "WON"
+        } else if lp < 0.0 {
+            "LOSS"
+        } else {
+            "DRAW"
+        };
+        let validated = "VALIDATED".to_string();
+        let mut conn = open_conn(&self.engine)?;
+        conn.execute(
+            "UPDATE trade
+             SET lp = $1,
+                 status = $2,
+                 validation_status = $3,
+                 validation_checked_at = $4,
+                 validation_validated_at = $5,
+                 validation_source = $6
+             WHERE trade_id = $7",
+            &[
+                &lp,
+                &status,
+                &validated,
+                &checked_at_iso,
+                &checked_at_iso,
+                &source,
                 &trade_id,
             ],
         )?;

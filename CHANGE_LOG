@@ -5,6 +5,10 @@ Date: 2026-02-23
 - Fixed realized trade PnL finalization to use RTDS persisted resolution snapshot before writing `trade.lp`.
 - Added no-trade cleanup: pending trade row is deleted when a market run has no fills/activity.
 - Fixed PnL summary stats queries to count only completed trades and ignore legacy no-activity `DRAW` rows.
+- Added Polymarket closed-position validation flow for finalized trades:
+  - new trade validation fields persisted in DB
+  - periodic polling of `GET /closed-positions` for unvalidated rows
+  - when match is found (by market slug or `eventSlug`), trade `lp`/status are updated from Polymarket realized PnL and marked `VALIDATED`
 - Added per-bot daily PnL guardrails:
   - `DAILY_PNL_TAKE_PROFIT_USD`
   - `DAILY_PNL_STOP_LOSS_USD`

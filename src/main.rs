@@ -14,22 +14,29 @@ mod signal;
 
 use anyhow::{anyhow, Context, Result};
 use bot::MakerHedgeCapBot;
+use chrono::{Duration as ChronoDuration, Utc};
+use chrono_tz::Asia::Jakarta;
 use config::BotConfig;
 use db::{
     date_jakarta, make_engine, make_session_factory, month_start_date_jakarta, now_iso_jakarta,
     week_start_date_jakarta, BotRepository, ConfigurationRow,
 };
-use env_utils::{env_bool, env_float};
+use env_utils::{env_bool, env_float, env_int};
+use gamma::fetch_market_by_slug;
 use helpers::{generate_market_slug_from_env_now, get_next_slug, segment, segment_defaults};
 use logging::{setup_item_logger, LogLike};
 use r2_storage::upload_logs_before_rollover;
 use rtds::{get_resolution_snapshot_for_market, RtdsService};
+use reqwest::blocking::Client;
+use serde::Serialize;
+use serde_json::Value;
 use signal::{JsonlFileService, SignalHub, SignalInbox};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -134,6 +141,288 @@ fn realized_lp_from_resolution_snapshot(
     realized_lp
 }
 
+fn now_ts_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn value_as_f64(v: Option<&Value>) -> Option<f64> {
+    match v {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn closed_position_slug(row: &Value) -> Option<String> {
+    row.get("slug")
+        .or_else(|| row.get("marketSlug"))
+        .or_else(|| row.get("market_slug"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn closed_position_event_slug(row: &Value) -> Option<String> {
+    row.get("eventSlug")
+        .or_else(|| row.get("event_slug"))
+        .or_else(|| row.get("event").and_then(|v| v.get("slug")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn closed_position_realized_pnl(row: &Value) -> Option<f64> {
+    for key in [
+        "realizedPnl",
+        "realized_pnl",
+        "cashPnl",
+        "cash_pnl",
+        "pnl",
+        "profit",
+    ] {
+        if let Some(v) = value_as_f64(row.get(key)).filter(|v| v.is_finite()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn trade_validation_users(cfg: &BotConfig) -> Vec<String> {
+    let mut users: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let csv = env::var("TRADE_VALIDATION_USERS").unwrap_or_default();
+    for part in csv.split(',') {
+        let u = part.trim();
+        if u.is_empty() {
+            continue;
+        }
+        let key = u.to_ascii_lowercase();
+        if seen.insert(key) {
+            users.push(u.to_string());
+        }
+    }
+    let single = env::var("TRADE_VALIDATION_USER").unwrap_or_default();
+    for cand in [
+        single,
+        cfg.funder.clone().unwrap_or_default(),
+        env::var("POLYMARKET_WALLET_ADDRESS").unwrap_or_default(),
+        env::var("WALLET_ADDRESS").unwrap_or_default(),
+    ] {
+        let u = cand.trim();
+        if u.is_empty() {
+            continue;
+        }
+        let key = u.to_ascii_lowercase();
+        if seen.insert(key) {
+            users.push(u.to_string());
+        }
+    }
+    users
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClosedPositionsQuery<'a> {
+    user: &'a str,
+    limit: i64,
+    offset: i64,
+}
+
+fn fetch_closed_positions_for_user(
+    http: &Client,
+    base_url: &str,
+    user: &str,
+    page_limit: i64,
+    max_pages: i64,
+) -> Result<Vec<Value>> {
+    let mut out: Vec<Value> = Vec::new();
+    let endpoint = format!("{}/closed-positions", base_url.trim_end_matches('/'));
+    let mut offset = 0_i64;
+    for _ in 0..max_pages {
+        let query = ClosedPositionsQuery {
+            user,
+            limit: page_limit,
+            offset,
+        };
+        let resp = http
+            .get(&endpoint)
+            .query(&query)
+            .send()
+            .with_context(|| format!("closed-positions request failed user={user}"))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "closed-positions non-success status={} user={}",
+                resp.status(),
+                user
+            ));
+        }
+        let payload: Value = resp
+            .json()
+            .with_context(|| format!("closed-positions invalid JSON user={user}"))?;
+        let rows = payload
+            .as_array()
+            .cloned()
+            .or_else(|| payload.get("data").and_then(|v| v.as_array()).cloned())
+            .unwrap_or_default();
+        let row_len = rows.len() as i64;
+        out.extend(rows);
+        if row_len < page_limit {
+            break;
+        }
+        offset += page_limit;
+    }
+    Ok(out)
+}
+
+fn resolve_event_slug_for_market_slug(
+    market_slug: &str,
+    cache: &mut HashMap<String, Option<String>>,
+    logger: &Arc<dyn LogLike>,
+) -> Option<String> {
+    if let Some(v) = cache.get(market_slug) {
+        return v.clone();
+    }
+    let resolved = fetch_market_by_slug(market_slug, Some(logger))
+        .ok()
+        .flatten()
+        .and_then(|m| {
+            m.get("eventSlug")
+                .or_else(|| m.get("event_slug"))
+                .or_else(|| m.get("event").and_then(|v| v.get("slug")))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    cache.insert(market_slug.to_string(), resolved.clone());
+    resolved
+}
+
+fn reconcile_unvalidated_trades_with_polymarket(
+    repo: &BotRepository,
+    bot_id: &str,
+    cfg: &BotConfig,
+    logger: &Arc<dyn LogLike>,
+) -> Result<()> {
+    let lookback_days = env_int("TRADE_VALIDATION_LOOKBACK_DAYS", 7).max(0) as i64;
+    let max_trades = env_int("TRADE_VALIDATION_MAX_TRADES_PER_POLL", 100).max(1) as i64;
+    let page_limit = env_int("TRADE_VALIDATION_PAGE_LIMIT", 100).clamp(1, 500) as i64;
+    let max_pages = env_int("TRADE_VALIDATION_MAX_PAGES", 10).clamp(1, 200) as i64;
+    let timeout_s = env_float("TRADE_VALIDATION_API_TIMEOUT_SECONDS", 6.0).clamp(0.2, 30.0);
+    let start_date = (Utc::now().with_timezone(&Jakarta).date_naive()
+        - ChronoDuration::days(lookback_days))
+    .format("%Y-%m-%d")
+    .to_string();
+
+    let candidates = repo.list_unvalidated_trades_for_bot(bot_id, &start_date, max_trades)?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let users = trade_validation_users(cfg);
+    if users.is_empty() {
+        logger.warning("[TRADE_VALIDATE] skip: no user address configured");
+        return Ok(());
+    }
+
+    let base = env::var("POLY_DATA_API_BASE_URL")
+        .unwrap_or_else(|_| "https://data-api.polymarket.com".to_string());
+    let http = Client::builder()
+        .timeout(Duration::from_secs_f64(timeout_s))
+        .build()
+        .context("failed creating HTTP client for trade validation")?;
+
+    let mut all_rows: Vec<Value> = Vec::new();
+    let mut any_success = false;
+    for user in users {
+        match fetch_closed_positions_for_user(&http, &base, &user, page_limit, max_pages) {
+            Ok(rows) => {
+                any_success = true;
+                all_rows.extend(rows);
+            }
+            Err(e) => logger.warning(&format!(
+                "[TRADE_VALIDATE] closed-positions fetch failed user={} err={e}",
+                user
+            )),
+        }
+    }
+    if !any_success {
+        logger.warning("[TRADE_VALIDATE] no successful closed-positions responses");
+        return Ok(());
+    }
+
+    let mut by_slug: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_event_slug: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, row) in all_rows.iter().enumerate() {
+        if let Some(slug) = closed_position_slug(row).map(|s| s.to_ascii_lowercase()) {
+            by_slug.entry(slug).or_default().push(idx);
+        }
+        if let Some(ev) = closed_position_event_slug(row).map(|s| s.to_ascii_lowercase()) {
+            by_event_slug.entry(ev).or_default().push(idx);
+        }
+    }
+
+    let mut event_slug_cache: HashMap<String, Option<String>> = HashMap::new();
+    let checked_at = now_iso_jakarta();
+    let mut validated_count = 0_i64;
+    let mut touched_count = 0_i64;
+
+    for t in candidates {
+        let trade_slug = t.slug.trim().to_ascii_lowercase();
+        let mut match_idx: Vec<usize> = by_slug.get(&trade_slug).cloned().unwrap_or_default();
+        let mut match_key = format!("slug={}", t.slug);
+        if match_idx.is_empty() {
+            let event_slug = resolve_event_slug_for_market_slug(&t.slug, &mut event_slug_cache, logger)
+                .map(|s| s.to_ascii_lowercase());
+            if let Some(ev) = event_slug {
+                if let Some(v) = by_event_slug.get(&ev) {
+                    match_idx = v.clone();
+                    match_key = format!("eventSlug={ev}");
+                }
+            }
+        }
+
+        if match_idx.is_empty() {
+            repo.touch_trade_validation_checked(&t.trade_id, &checked_at)?;
+            touched_count += 1;
+            continue;
+        }
+
+        let mut pnl_sum = 0.0_f64;
+        let mut pnl_rows = 0_i64;
+        for idx in match_idx {
+            if let Some(pnl) = closed_position_realized_pnl(&all_rows[idx]) {
+                pnl_sum += pnl;
+                pnl_rows += 1;
+            }
+        }
+        if pnl_rows <= 0 {
+            repo.touch_trade_validation_checked(&t.trade_id, &checked_at)?;
+            touched_count += 1;
+            continue;
+        }
+
+        let source = format!("POLYMARKET_CLOSED_POSITIONS({match_key},rows={pnl_rows})");
+        repo.mark_trade_validated_from_polymarket(&t.trade_id, pnl_sum, &checked_at, &source)?;
+        validated_count += 1;
+        logger.info(&format!(
+            "[TRADE_VALIDATE] validated trade_id={} slug={} pnl={:+.6} source={}",
+            t.trade_id, t.slug, pnl_sum, source
+        ));
+    }
+
+    logger.info(&format!(
+        "[TRADE_VALIDATE] poll done bot={} candidates={} validated={} checked_only={} rows={}",
+        bot_id,
+        validated_count + touched_count,
+        validated_count,
+        touched_count,
+        all_rows.len()
+    ));
+    Ok(())
+}
+
 fn cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
     BotConfig {
         clob_host: cfg_row.clob_host.clone(),
@@ -236,6 +525,8 @@ fn run() -> Result<()> {
     let account_name = env::var("ACCOUNT_NAME").unwrap_or_else(|_| "default".to_string());
     let daily_take_profit_usd = env_float("DAILY_PNL_TAKE_PROFIT_USD", 0.0).max(0.0);
     let daily_stop_loss_usd = env_float("DAILY_PNL_STOP_LOSS_USD", 0.0).abs();
+    let trade_validation_enabled = env_bool("TRADE_VALIDATION_ENABLED", true);
+    let trade_validation_poll_seconds = env_float("TRADE_VALIDATION_POLL_SECONDS", 90.0).max(5.0);
 
     let sig = env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "1".to_string());
     let funder = env::var("POLYMARKET_FUNDER").unwrap_or_default();
@@ -367,11 +658,23 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
 
     cfg.apply_safe_defaults();
     let mut current_slug = slug;
+    let mut last_trade_validation_poll_ts = 0.0_f64;
 
     loop {
         let bot_logger = setup_item_logger(&current_slug);
         bot_logger.info(&format!("\nSTARTING MARKET: {current_slug}"));
         let repo = session_factory.repository();
+        let now_poll_ts = now_ts_f64();
+        if trade_validation_enabled
+            && now_poll_ts - last_trade_validation_poll_ts >= trade_validation_poll_seconds
+        {
+            if let Err(e) =
+                reconcile_unvalidated_trades_with_polymarket(&repo, &bot_id, &cfg, &bot_logger)
+            {
+                bot_logger.warning(&format!("[TRADE_VALIDATE] poll error: {e:#}"));
+            }
+            last_trade_validation_poll_ts = now_ts_f64();
+        }
         if daily_take_profit_usd > 0.0 || daily_stop_loss_usd > 0.0 {
             let today = date_jakarta();
             let (today_pnl, today_trades) = repo
