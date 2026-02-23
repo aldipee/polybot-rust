@@ -9,6 +9,10 @@ Date: 2026-02-23
   - new trade validation fields persisted in DB
   - periodic polling of `GET /closed-positions` for unvalidated rows
   - when match is found (by market slug or `eventSlug`), trade `lp`/status are updated from Polymarket realized PnL and marked `VALIDATED`
+- Updated printed bot stats to exclude `DRAW` entirely and include:
+  - total profit/loss/net (daily/weekly/monthly/all)
+  - WON/LOSS counts with percentages
+  - win-rate percentages (daily/weekly/monthly/all)
 - Added per-bot daily PnL guardrails:
   - `DAILY_PNL_TAKE_PROFIT_USD`
   - `DAILY_PNL_STOP_LOSS_USD`

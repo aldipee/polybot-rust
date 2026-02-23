@@ -115,6 +115,16 @@ pub struct TradeRow {
     pub validation_source: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BotTradeStats {
+    pub net_pnl: f64,
+    pub total_profit: f64,
+    pub total_loss: f64,
+    pub win_count: i64,
+    pub loss_count: i64,
+    pub total_count: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct UnvalidatedTradeRow {
     pub trade_id: String,
@@ -462,13 +472,7 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
              WHERE bot_id = $1
                AND date >= $2
                AND date <= $3
-               AND status IN ('WON','LOSS','DRAW')
-               AND NOT (
-                    status = 'DRAW'
-                    AND COALESCE(total_cost, 0.0) <= 1e-9
-                    AND COALESCE(q_yes, 0.0) <= 1e-9
-                    AND COALESCE(q_no, 0.0) <= 1e-9
-               )",
+               AND status IN ('WON','LOSS')",
             &[&bot_id, &start_date, &end_date],
         )?;
 
@@ -488,19 +492,70 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
              FROM trade
              WHERE date >= $1
                AND date <= $2
-               AND status IN ('WON','LOSS','DRAW')
-               AND NOT (
-                    status = 'DRAW'
-                    AND COALESCE(total_cost, 0.0) <= 1e-9
-                    AND COALESCE(q_yes, 0.0) <= 1e-9
-                    AND COALESCE(q_no, 0.0) <= 1e-9
-               )",
+               AND status IN ('WON','LOSS')",
             &[&start_date, &end_date],
         )?;
 
         let pnl: f64 = row.get(0);
         let cnt: i64 = row.get(1);
         Ok((pnl, cnt))
+    }
+
+    pub fn trade_stats_for_bot_period(
+        &self,
+        bot_id: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<BotTradeStats> {
+        let mut conn = open_conn(&self.engine)?;
+        let row = conn.query_one(
+            "SELECT
+                COALESCE(SUM(lp), 0.0) AS net_pnl,
+                COALESCE(SUM(CASE WHEN status = 'WON' THEN lp ELSE 0.0 END), 0.0) AS total_profit,
+                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN -lp ELSE 0.0 END), 0.0) AS total_loss,
+                COALESCE(SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END), 0)::BIGINT AS win_count,
+                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN 1 ELSE 0 END), 0)::BIGINT AS loss_count,
+                COUNT(trade_id)::BIGINT AS total_count
+             FROM trade
+             WHERE bot_id = $1
+               AND date >= $2
+               AND date <= $3
+               AND status IN ('WON','LOSS')",
+            &[&bot_id, &start_date, &end_date],
+        )?;
+        Ok(BotTradeStats {
+            net_pnl: row.get(0),
+            total_profit: row.get(1),
+            total_loss: row.get(2),
+            win_count: row.get(3),
+            loss_count: row.get(4),
+            total_count: row.get(5),
+        })
+    }
+
+    pub fn trade_stats_for_bot_all_time(&self, bot_id: &str) -> Result<BotTradeStats> {
+        let mut conn = open_conn(&self.engine)?;
+        let row = conn.query_one(
+            "SELECT
+                COALESCE(SUM(lp), 0.0) AS net_pnl,
+                COALESCE(SUM(CASE WHEN status = 'WON' THEN lp ELSE 0.0 END), 0.0) AS total_profit,
+                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN -lp ELSE 0.0 END), 0.0) AS total_loss,
+                COALESCE(SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END), 0)::BIGINT AS win_count,
+                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN 1 ELSE 0 END), 0)::BIGINT AS loss_count,
+                COUNT(trade_id)::BIGINT AS total_count
+             FROM trade
+             WHERE bot_id = $1
+               AND status IN ('WON','LOSS')",
+            &[&bot_id],
+        )?;
+        Ok(BotTradeStats {
+            net_pnl: row.get(0),
+            total_profit: row.get(1),
+            total_loss: row.get(2),
+            win_count: row.get(3),
+            loss_count: row.get(4),
+            total_count: row.get(5),
+        })
     }
 
     pub fn create_pending_trade(

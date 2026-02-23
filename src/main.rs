@@ -19,7 +19,7 @@ use chrono_tz::Asia::Jakarta;
 use config::BotConfig;
 use db::{
     date_jakarta, make_engine, make_session_factory, month_start_date_jakarta, now_iso_jakarta,
-    week_start_date_jakarta, BotRepository, ConfigurationRow,
+    week_start_date_jakarta, BotRepository, BotTradeStats, ConfigurationRow,
 };
 use env_utils::{env_bool, env_float, env_int};
 use gamma::fetch_market_by_slug;
@@ -58,44 +58,51 @@ fn db_url_hint(db_url: &str) -> String {
 }
 
 fn print_pnl_metrics(repo: &BotRepository, bot_id: &str, logger: &Arc<dyn LogLike>) -> String {
+    fn pct(part: i64, total: i64) -> f64 {
+        if total <= 0 {
+            0.0
+        } else {
+            (part as f64 * 100.0) / total as f64
+        }
+    }
+    fn line(label: &str, s: &BotTradeStats) -> String {
+        let win_rate = pct(s.win_count, s.total_count);
+        format!(
+            "  {label:<7}: NET={:+.4} PROFIT={:+.4} LOSS={:+.4} | WON={} ({:.2}%) LOSS={} ({:.2}%) | WIN_RATE={:.2}% ({}/{})",
+            s.net_pnl,
+            s.total_profit,
+            s.total_loss,
+            s.win_count,
+            pct(s.win_count, s.total_count),
+            s.loss_count,
+            pct(s.loss_count, s.total_count),
+            win_rate,
+            s.win_count,
+            s.total_count
+        )
+    }
+
     let today = date_jakarta();
     let week_start = week_start_date_jakarta();
     let month_start = month_start_date_jakarta();
 
-    let b_today = repo
-        .pnl_and_trade_count_for_bot(bot_id, &today, &today)
-        .unwrap_or((0.0, 0));
-    let b_week = repo
-        .pnl_and_trade_count_for_bot(bot_id, &week_start, &today)
-        .unwrap_or((0.0, 0));
-    let b_month = repo
-        .pnl_and_trade_count_for_bot(bot_id, &month_start, &today)
-        .unwrap_or((0.0, 0));
-
-    let a_today = repo
-        .pnl_and_trade_count_all_bots(&today, &today)
-        .unwrap_or((0.0, 0));
-    let a_week = repo
-        .pnl_and_trade_count_all_bots(&week_start, &today)
-        .unwrap_or((0.0, 0));
-    let a_month = repo
-        .pnl_and_trade_count_all_bots(&month_start, &today)
-        .unwrap_or((0.0, 0));
+    let s_day = repo
+        .trade_stats_for_bot_period(bot_id, &today, &today)
+        .unwrap_or_default();
+    let s_week = repo
+        .trade_stats_for_bot_period(bot_id, &week_start, &today)
+        .unwrap_or_default();
+    let s_month = repo
+        .trade_stats_for_bot_period(bot_id, &month_start, &today)
+        .unwrap_or_default();
+    let s_all = repo.trade_stats_for_bot_all_time(bot_id).unwrap_or_default();
 
     let msg = format!(
-        "PNL Summary (Asia/Jakarta)\n  Bot {bot_id} Today  : PNL={:+.4} | Trades={}\n  Bot {bot_id} Weekly : PNL={:+.4} | Trades={}\n  Bot {bot_id} Monthly: PNL={:+.4} | Trades={}\n  ALL bots Today      : PNL={:+.4} | Trades={}\n  ALL bots Weekly     : PNL={:+.4} | Trades={}\n  ALL bots Monthly    : PNL={:+.4} | Trades={}",
-        b_today.0,
-        b_today.1,
-        b_week.0,
-        b_week.1,
-        b_month.0,
-        b_month.1,
-        a_today.0,
-        a_today.1,
-        a_week.0,
-        a_week.1,
-        a_month.0,
-        a_month.1
+        "PNL Summary (Asia/Jakarta, DRAW excluded)\nBot {bot_id}\n{}\n{}\n{}\n{}",
+        line("Daily", &s_day),
+        line("Weekly", &s_week),
+        line("Monthly", &s_month),
+        line("All", &s_all)
     );
     logger.info(&msg);
     msg
