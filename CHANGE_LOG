@@ -1,3 +1,15 @@
+## Version 0.1.5
+Date: 2026-02-23
+
+### Changes
+- Fixed realized trade PnL finalization to use RTDS persisted resolution snapshot before writing `trade.lp`.
+- Added no-trade cleanup: pending trade row is deleted when a market run has no fills/activity.
+- Fixed PnL summary stats queries to count only completed trades and ignore legacy no-activity `DRAW` rows.
+- Added per-bot daily PnL guardrails:
+  - `DAILY_PNL_TAKE_PROFIT_USD`
+  - `DAILY_PNL_STOP_LOSS_USD`
+  bot skips new markets for the day after threshold hit.
+
 ## Version 0.1.4
 Date: 2026-02-23
 

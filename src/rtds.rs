@@ -985,6 +985,31 @@ pub fn get_live_snapshot_for_market(market_slug: &str) -> Option<RtdsLiveSnapsho
         .and_then(|m| m.get(market_slug.trim()).cloned())
 }
 
+pub fn get_resolution_snapshot_for_market(market_slug: &str) -> Option<ResolutionSnapshot> {
+    let slug = market_slug.trim();
+    if slug.is_empty() {
+        return None;
+    }
+    let state_path = env::var("RTDS_STATE_PATH")
+        .unwrap_or_else(|_| "state/rtds_resolution_state.json".to_string());
+    let raw = fs::read_to_string(&state_path).ok()?;
+    let state = serde_json::from_str::<ResolutionStateFile>(&raw).ok()?;
+    state
+        .records
+        .iter()
+        .filter(|r| r.market_slug == slug)
+        .max_by_key(|r| (r.resolution_ts_ms, r.source_ts_ms, r.captured_at_ms))
+        .cloned()
+        .or_else(|| {
+            state
+                .last_by_symbol
+                .values()
+                .filter(|r| r.market_slug == slug)
+                .max_by_key(|r| (r.resolution_ts_ms, r.source_ts_ms, r.captured_at_ms))
+                .cloned()
+        })
+}
+
 pub struct RtdsService {
     market_slug: String,
     symbol: String,

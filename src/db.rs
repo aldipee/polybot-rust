@@ -436,7 +436,18 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
     ) -> Result<(f64, i64)> {
         let mut conn = open_conn(&self.engine)?;
         let row = conn.query_one(
-            "SELECT COALESCE(SUM(lp), 0.0), COUNT(trade_id) FROM trade WHERE bot_id = $1 AND date >= $2 AND date <= $3",
+            "SELECT COALESCE(SUM(lp), 0.0), COUNT(trade_id)
+             FROM trade
+             WHERE bot_id = $1
+               AND date >= $2
+               AND date <= $3
+               AND status IN ('WON','LOSS','DRAW')
+               AND NOT (
+                    status = 'DRAW'
+                    AND COALESCE(total_cost, 0.0) <= 1e-9
+                    AND COALESCE(q_yes, 0.0) <= 1e-9
+                    AND COALESCE(q_no, 0.0) <= 1e-9
+               )",
             &[&bot_id, &start_date, &end_date],
         )?;
 
@@ -452,7 +463,17 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
     ) -> Result<(f64, i64)> {
         let mut conn = open_conn(&self.engine)?;
         let row = conn.query_one(
-            "SELECT COALESCE(SUM(lp), 0.0), COUNT(trade_id) FROM trade WHERE date >= $1 AND date <= $2",
+            "SELECT COALESCE(SUM(lp), 0.0), COUNT(trade_id)
+             FROM trade
+             WHERE date >= $1
+               AND date <= $2
+               AND status IN ('WON','LOSS','DRAW')
+               AND NOT (
+                    status = 'DRAW'
+                    AND COALESCE(total_cost, 0.0) <= 1e-9
+                    AND COALESCE(q_yes, 0.0) <= 1e-9
+                    AND COALESCE(q_no, 0.0) <= 1e-9
+               )",
             &[&start_date, &end_date],
         )?;
 
@@ -560,6 +581,12 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
                 &trade_id,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn delete_trade(&self, trade_id: &str) -> Result<()> {
+        let mut conn = open_conn(&self.engine)?;
+        conn.execute("DELETE FROM trade WHERE trade_id = $1", &[&trade_id])?;
         Ok(())
     }
 }

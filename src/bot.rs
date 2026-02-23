@@ -63,6 +63,7 @@ pub struct TradeMetrics {
     pub q_no: f64,
     pub cpp: f64,
     pub exit_reason: String,
+    pub fill_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -8810,6 +8811,7 @@ impl MakerHedgeCapBot {
             q_no: state.q_no,
             cpp: cost_per_pair(&state),
             exit_reason: self._get_exit_reason(),
+            fill_count: state.seen_trade_keys.len(),
         }
     }
 

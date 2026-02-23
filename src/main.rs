@@ -23,7 +23,7 @@ use env_utils::{env_bool, env_float};
 use helpers::{generate_market_slug_from_env_now, get_next_slug, segment, segment_defaults};
 use logging::{setup_item_logger, LogLike};
 use r2_storage::upload_logs_before_rollover;
-use rtds::RtdsService;
+use rtds::{get_resolution_snapshot_for_market, RtdsService};
 use signal::{JsonlFileService, SignalHub, SignalInbox};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +92,46 @@ fn print_pnl_metrics(repo: &BotRepository, bot_id: &str, logger: &Arc<dyn LogLik
     );
     logger.info(&msg);
     msg
+}
+
+fn realized_lp_from_resolution_snapshot(
+    market_slug: &str,
+    q_yes: f64,
+    q_no: f64,
+    total_cost: f64,
+    fallback_lp: f64,
+    logger: &Arc<dyn LogLike>,
+) -> f64 {
+    let Some(snapshot) = get_resolution_snapshot_for_market(market_slug) else {
+        return fallback_lp;
+    };
+    if snapshot.source_ts_ms + 1 < snapshot.resolution_ts_ms {
+        return fallback_lp;
+    }
+    let diff_price = snapshot
+        .diff_vs_price_to_beat
+        .or_else(|| snapshot.price_to_beat.map(|ptb| snapshot.resolution_price - ptb))
+        .filter(|v| v.is_finite());
+    let Some(diff_price) = diff_price else {
+        return fallback_lp;
+    };
+
+    let yes_payout = if diff_price > 0.0 { q_yes.max(0.0) } else { 0.0 };
+    let no_payout = if diff_price > 0.0 { 0.0 } else { q_no.max(0.0) };
+    let realized_lp = yes_payout + no_payout - total_cost;
+    logger.info(&format!(
+        "[TRADE][REALIZED] market={} lp={:+.6} fallback_lp={:+.6} q_yes={:.4} q_no={:.4} total_cost={:.6} diff_vs_price_to_beat={:+.6} source_ts_ms={} resolution_ts_ms={}",
+        market_slug,
+        realized_lp,
+        fallback_lp,
+        q_yes,
+        q_no,
+        total_cost,
+        diff_price,
+        snapshot.source_ts_ms,
+        snapshot.resolution_ts_ms
+    ));
+    realized_lp
 }
 
 fn cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
@@ -194,6 +234,8 @@ fn run() -> Result<()> {
     let bot_description =
         env::var("BOT_DESCRIPTION").unwrap_or_else(|_| "Maker+HedgeCap Polymarket bot".to_string());
     let account_name = env::var("ACCOUNT_NAME").unwrap_or_else(|_| "default".to_string());
+    let daily_take_profit_usd = env_float("DAILY_PNL_TAKE_PROFIT_USD", 0.0).max(0.0);
+    let daily_stop_loss_usd = env_float("DAILY_PNL_STOP_LOSS_USD", 0.0).abs();
 
     let sig = env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "1".to_string());
     let funder = env::var("POLYMARKET_FUNDER").unwrap_or_default();
@@ -330,6 +372,38 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
         let bot_logger = setup_item_logger(&current_slug);
         bot_logger.info(&format!("\nSTARTING MARKET: {current_slug}"));
         let repo = session_factory.repository();
+        if daily_take_profit_usd > 0.0 || daily_stop_loss_usd > 0.0 {
+            let today = date_jakarta();
+            let (today_pnl, today_trades) = repo
+                .pnl_and_trade_count_for_bot(&bot_id, &today, &today)
+                .unwrap_or((0.0, 0));
+            let hit_take_profit = daily_take_profit_usd > 0.0 && today_pnl >= daily_take_profit_usd;
+            let hit_stop_loss = daily_stop_loss_usd > 0.0 && today_pnl <= -daily_stop_loss_usd;
+            if hit_take_profit || hit_stop_loss {
+                let reason = if hit_take_profit {
+                    "DAILY_TAKE_PROFIT_HIT"
+                } else {
+                    "DAILY_STOP_LOSS_HIT"
+                };
+                bot_logger.warning(&format!(
+                    "[DAILY_LIMIT] skip trading bot={} date={} reason={} pnl={:+.4} trades={} take_profit_usd={:.4} stop_loss_usd={:.4}",
+                    bot_id,
+                    today,
+                    reason,
+                    today_pnl,
+                    today_trades,
+                    daily_take_profit_usd,
+                    daily_stop_loss_usd
+                ));
+                thread::sleep(Duration::from_secs(60));
+                if let Some(auto_slug) =
+                    generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
+                {
+                    current_slug = auto_slug;
+                }
+                continue;
+            }
+        }
 
         let mut bot_row = repo.get_bot(&bot_id)?;
         if bot_row.is_none() {
@@ -431,23 +505,43 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
         };
         bot_logger.info(&format!("Run finished with reason={run_reason}"));
 
-        let metrics = bot.trade_metrics_snapshot();
-        let end_trade_iso = now_iso_jakarta();
-        repo.update_trade_result(
-            &trade_id,
-            &end_trade_iso,
-            metrics.lp,
-            metrics.total_cost,
-            metrics.cpp,
-            metrics.q_yes,
-            metrics.q_no,
-            "FINALIZED",
-        )?;
-        bot.persist_state();
-        bot_logger.info(&format!(
-            "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4}",
-            metrics.lp, metrics.total_cost
-        ));
+        let mut metrics = bot.trade_metrics_snapshot();
+        let has_trade_activity = metrics.fill_count > 0
+            || metrics.total_cost > 1e-9
+            || metrics.q_yes > 1e-9
+            || metrics.q_no > 1e-9;
+        if !has_trade_activity {
+            repo.delete_trade(&trade_id)?;
+            bot.persist_state();
+            bot_logger.info(&format!(
+                "Deleted pending trade row {trade_id}. reason=NO_TRADE_ACTIVITY"
+            ));
+        } else {
+            metrics.lp = realized_lp_from_resolution_snapshot(
+                &current_slug,
+                metrics.q_yes,
+                metrics.q_no,
+                metrics.total_cost,
+                metrics.lp,
+                &bot_logger,
+            );
+            let end_trade_iso = now_iso_jakarta();
+            repo.update_trade_result(
+                &trade_id,
+                &end_trade_iso,
+                metrics.lp,
+                metrics.total_cost,
+                metrics.cpp,
+                metrics.q_yes,
+                metrics.q_no,
+                "FINALIZED",
+            )?;
+            bot.persist_state();
+            bot_logger.info(&format!(
+                "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4}",
+                metrics.lp, metrics.total_cost
+            ));
+        }
 
         thread::sleep(Duration::from_secs(2));
         bot_logger.info(&format!("Ending this market {current_slug}"));

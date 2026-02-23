@@ -113,6 +113,15 @@ class BotRepository:
             .where(Trade.bot_id == bot_id)
             .where(Trade.date >= start_date)
             .where(Trade.date <= end_date)
+            .where(Trade.status.in_(["WON", "LOSS", "DRAW"]))
+            .where(
+                ~(
+                    (Trade.status == "DRAW")
+                    & (func.coalesce(Trade.total_cost, 0.0) <= 1e-9)
+                    & (func.coalesce(Trade.q_yes, 0.0) <= 1e-9)
+                    & (func.coalesce(Trade.q_no, 0.0) <= 1e-9)
+                )
+            )
         )
         pnl, cnt = self.s.execute(stmt).one()
         return float(pnl), int(cnt)
@@ -130,6 +139,15 @@ class BotRepository:
             )
             .where(Trade.date >= start_date)
             .where(Trade.date <= end_date)
+            .where(Trade.status.in_(["WON", "LOSS", "DRAW"]))
+            .where(
+                ~(
+                    (Trade.status == "DRAW")
+                    & (func.coalesce(Trade.total_cost, 0.0) <= 1e-9)
+                    & (func.coalesce(Trade.q_yes, 0.0) <= 1e-9)
+                    & (func.coalesce(Trade.q_no, 0.0) <= 1e-9)
+                )
+            )
         )
         pnl, cnt = self.s.execute(stmt).one()
         return float(pnl), int(cnt)
