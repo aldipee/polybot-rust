@@ -201,14 +201,14 @@ fn telegram_pnl_line(label: &str, s: &BotTradeStats) -> String {
 fn telegram_pnl_section(title: &str, s: &PnlWindowStats) -> String {
     format!(
         "{title}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        telegram_pnl_line("H1", &s.h1),
-        telegram_pnl_line("H3", &s.h3),
-        telegram_pnl_line("H6", &s.h6),
-        telegram_pnl_line("H12", &s.h12),
-        telegram_pnl_line("D", &s.day),
-        telegram_pnl_line("W", &s.week),
-        telegram_pnl_line("M", &s.month),
-        telegram_pnl_line("A", &s.all)
+        telegram_pnl_line("1h", &s.h1),
+        telegram_pnl_line("3h", &s.h3),
+        telegram_pnl_line("6h", &s.h6),
+        telegram_pnl_line("12h", &s.h12),
+        telegram_pnl_line("1d", &s.day),
+        telegram_pnl_line("1w", &s.week),
+        telegram_pnl_line("1m", &s.month),
+        telegram_pnl_line("all", &s.all)
     )
 }
 
@@ -255,6 +255,7 @@ fn build_telegram_pnl_summary(
     let mut parts = vec![
         "PNL SUMMARY (Asia/Jakarta, DRAW excluded)".to_string(),
         format!("Generated: {}", now_iso_jakarta()),
+        "Windows: 1h 3h 6h 12h 1d 1w 1m all".to_string(),
         String::new(),
         "CURRENT BOT".to_string(),
         telegram_pnl_section(&format!("Bot: {current_bot_id}"), &bot_stats),
@@ -274,9 +275,11 @@ fn build_telegram_pnl_summary(
             parts.push(String::new());
         }
     }
-    parts.push(
-        "Legend: H1=1h H3=3h H6=6h H12=12h D=Daily W=Weekly M=Monthly A=All-time".to_string(),
-    );
+    parts.push(String::new());
+    parts.push("ALL BOTS (RECAP)".to_string());
+    parts.push(telegram_pnl_section("Aggregate", &all_stats));
+    parts.push(String::new());
+    parts.push("Legend: 1h=last 1 hour, 3h=last 3 hours, 6h=last 6 hours, 12h=last 12 hours, 1d=daily, 1w=weekly, 1m=monthly, all=all-time".to_string());
     parts.join("\n")
 }
 
