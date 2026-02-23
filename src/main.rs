@@ -96,13 +96,27 @@ fn print_pnl_metrics(repo: &BotRepository, bot_id: &str, logger: &Arc<dyn LogLik
         .trade_stats_for_bot_period(bot_id, &month_start, &today)
         .unwrap_or_default();
     let s_all = repo.trade_stats_for_bot_all_time(bot_id).unwrap_or_default();
+    let a_day = repo
+        .trade_stats_all_bots_period(&today, &today)
+        .unwrap_or_default();
+    let a_week = repo
+        .trade_stats_all_bots_period(&week_start, &today)
+        .unwrap_or_default();
+    let a_month = repo
+        .trade_stats_all_bots_period(&month_start, &today)
+        .unwrap_or_default();
+    let a_all = repo.trade_stats_all_bots_all_time().unwrap_or_default();
 
     let msg = format!(
-        "PNL Summary (Asia/Jakarta, DRAW excluded)\nBot {bot_id}\n{}\n{}\n{}\n{}",
+        "PNL Summary (Asia/Jakarta, DRAW excluded)\nBot {bot_id}\n{}\n{}\n{}\n{}\nALL bots\n{}\n{}\n{}\n{}",
         line("Daily", &s_day),
         line("Weekly", &s_week),
         line("Monthly", &s_month),
-        line("All", &s_all)
+        line("All", &s_all),
+        line("Daily", &a_day),
+        line("Weekly", &a_week),
+        line("Monthly", &a_month),
+        line("All", &a_all)
     );
     logger.info(&msg);
     msg
