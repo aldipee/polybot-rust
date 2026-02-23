@@ -612,6 +612,26 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
         })
     }
 
+    pub fn list_all_bot_ids(&self) -> Result<Vec<String>> {
+        let mut conn = open_conn(&self.engine)?;
+        let rows = conn.query(
+            "SELECT DISTINCT bot_id
+             FROM (
+                SELECT bot_id FROM bot
+                UNION
+                SELECT bot_id FROM trade
+             ) AS ids
+             WHERE bot_id IS NOT NULL
+               AND trim(bot_id) <> ''
+             ORDER BY bot_id ASC",
+            &[],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<usize, String>(0))
+            .collect())
+    }
+
     pub fn create_pending_trade(
         &self,
         bot_id: &str,

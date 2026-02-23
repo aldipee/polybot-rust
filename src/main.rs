@@ -26,8 +26,8 @@ use gamma::fetch_market_by_slug;
 use helpers::{generate_market_slug_from_env_now, get_next_slug, segment, segment_defaults};
 use logging::{setup_item_logger, LogLike};
 use r2_storage::upload_logs_before_rollover;
-use rtds::{get_resolution_snapshot_for_market, RtdsService};
 use reqwest::blocking::Client;
+use rtds::{get_resolution_snapshot_for_market, RtdsService};
 use serde::Serialize;
 use serde_json::Value;
 use signal::{JsonlFileService, SignalHub, SignalInbox};
@@ -57,69 +57,380 @@ fn db_url_hint(db_url: &str) -> String {
     "<invalid-db-url>".to_string()
 }
 
-fn print_pnl_metrics(repo: &BotRepository, bot_id: &str, logger: &Arc<dyn LogLike>) -> String {
-    fn pct(part: i64, total: i64) -> f64 {
-        if total <= 0 {
-            0.0
-        } else {
-            (part as f64 * 100.0) / total as f64
-        }
-    }
-    fn line(label: &str, s: &BotTradeStats) -> String {
-        let win_rate = pct(s.win_count, s.total_count);
-        format!(
-            "  {label:<7}: NET={:+.4} PROFIT={:+.4} LOSS={:+.4} | WON={} ({:.2}%) LOSS={} ({:.2}%) | WIN_RATE={:.2}% ({}/{})",
-            s.net_pnl,
-            s.total_profit,
-            s.total_loss,
-            s.win_count,
-            pct(s.win_count, s.total_count),
-            s.loss_count,
-            pct(s.loss_count, s.total_count),
-            win_rate,
-            s.win_count,
-            s.total_count
-        )
-    }
+#[derive(Debug, Clone, Default)]
+struct PnlWindowStats {
+    day: BotTradeStats,
+    week: BotTradeStats,
+    month: BotTradeStats,
+    all: BotTradeStats,
+}
 
+fn pct(part: i64, total: i64) -> f64 {
+    if total <= 0 {
+        0.0
+    } else {
+        (part as f64 * 100.0) / total as f64
+    }
+}
+
+fn pnl_line(label: &str, s: &BotTradeStats) -> String {
+    let win_rate = pct(s.win_count, s.total_count);
+    format!(
+        "  {label:<7}: NET={:+.4} PROFIT={:+.4} LOSS={:+.4} | WON={} ({:.2}%) LOSS={} ({:.2}%) | WIN_RATE={:.2}% ({}/{})",
+        s.net_pnl,
+        s.total_profit,
+        s.total_loss,
+        s.win_count,
+        pct(s.win_count, s.total_count),
+        s.loss_count,
+        pct(s.loss_count, s.total_count),
+        win_rate,
+        s.win_count,
+        s.total_count
+    )
+}
+
+fn bot_window_stats(repo: &BotRepository, bot_id: &str) -> PnlWindowStats {
     let today = date_jakarta();
     let week_start = week_start_date_jakarta();
     let month_start = month_start_date_jakarta();
+    PnlWindowStats {
+        day: repo
+            .trade_stats_for_bot_period(bot_id, &today, &today)
+            .unwrap_or_default(),
+        week: repo
+            .trade_stats_for_bot_period(bot_id, &week_start, &today)
+            .unwrap_or_default(),
+        month: repo
+            .trade_stats_for_bot_period(bot_id, &month_start, &today)
+            .unwrap_or_default(),
+        all: repo.trade_stats_for_bot_all_time(bot_id).unwrap_or_default(),
+    }
+}
 
-    let s_day = repo
-        .trade_stats_for_bot_period(bot_id, &today, &today)
-        .unwrap_or_default();
-    let s_week = repo
-        .trade_stats_for_bot_period(bot_id, &week_start, &today)
-        .unwrap_or_default();
-    let s_month = repo
-        .trade_stats_for_bot_period(bot_id, &month_start, &today)
-        .unwrap_or_default();
-    let s_all = repo.trade_stats_for_bot_all_time(bot_id).unwrap_or_default();
-    let a_day = repo
-        .trade_stats_all_bots_period(&today, &today)
-        .unwrap_or_default();
-    let a_week = repo
-        .trade_stats_all_bots_period(&week_start, &today)
-        .unwrap_or_default();
-    let a_month = repo
-        .trade_stats_all_bots_period(&month_start, &today)
-        .unwrap_or_default();
-    let a_all = repo.trade_stats_all_bots_all_time().unwrap_or_default();
+fn all_bots_window_stats(repo: &BotRepository) -> PnlWindowStats {
+    let today = date_jakarta();
+    let week_start = week_start_date_jakarta();
+    let month_start = month_start_date_jakarta();
+    PnlWindowStats {
+        day: repo
+            .trade_stats_all_bots_period(&today, &today)
+            .unwrap_or_default(),
+        week: repo
+            .trade_stats_all_bots_period(&week_start, &today)
+            .unwrap_or_default(),
+        month: repo
+            .trade_stats_all_bots_period(&month_start, &today)
+            .unwrap_or_default(),
+        all: repo.trade_stats_all_bots_all_time().unwrap_or_default(),
+    }
+}
 
+fn pnl_section(label: &str, s: &PnlWindowStats) -> String {
+    format!(
+        "{label}\n{}\n{}\n{}\n{}",
+        pnl_line("Daily", &s.day),
+        pnl_line("Weekly", &s.week),
+        pnl_line("Monthly", &s.month),
+        pnl_line("All", &s.all)
+    )
+}
+
+fn print_pnl_metrics(repo: &BotRepository, bot_id: &str, logger: &Arc<dyn LogLike>) -> String {
+    let bot_stats = bot_window_stats(repo, bot_id);
+    let all_stats = all_bots_window_stats(repo);
     let msg = format!(
-        "PNL Summary (Asia/Jakarta, DRAW excluded)\nBot {bot_id}\n{}\n{}\n{}\n{}\nALL bots\n{}\n{}\n{}\n{}",
-        line("Daily", &s_day),
-        line("Weekly", &s_week),
-        line("Monthly", &s_month),
-        line("All", &s_all),
-        line("Daily", &a_day),
-        line("Weekly", &a_week),
-        line("Monthly", &a_month),
-        line("All", &a_all)
+        "PNL Summary (Asia/Jakarta, DRAW excluded)\n{}\n{}",
+        pnl_section(&format!("Bot {bot_id}"), &bot_stats),
+        pnl_section("ALL bots", &all_stats)
     );
     logger.info(&msg);
     msg
+}
+
+fn build_telegram_pnl_summary(
+    repo: &BotRepository,
+    current_bot_id: &str,
+    logger: &Arc<dyn LogLike>,
+) -> String {
+    let bot_stats = bot_window_stats(repo, current_bot_id);
+    let all_stats = all_bots_window_stats(repo);
+    let mut bot_ids = match repo.list_all_bot_ids() {
+        Ok(v) => v,
+        Err(e) => {
+            logger.warning(&format!(
+                "[TELEGRAM] failed loading bot id list for per-bot breakdown: {e:#}"
+            ));
+            Vec::new()
+        }
+    };
+    if !bot_ids
+        .iter()
+        .any(|id| id.trim().eq_ignore_ascii_case(current_bot_id))
+    {
+        bot_ids.push(current_bot_id.to_string());
+    }
+    bot_ids.retain(|id| !id.trim().is_empty());
+    bot_ids.sort();
+    bot_ids.dedup();
+
+    let mut parts = vec![
+        "PNL Summary (Asia/Jakarta, DRAW excluded)".to_string(),
+        pnl_section(&format!("Bot {current_bot_id}"), &bot_stats),
+        pnl_section("ALL bots", &all_stats),
+    ];
+    if !bot_ids.is_empty() {
+        parts.push(format!("Per-bot breakdown ({} bots)", bot_ids.len()));
+        for id in bot_ids {
+            let s = bot_window_stats(repo, &id);
+            parts.push(pnl_section(&format!("Bot {id}"), &s));
+        }
+    }
+    parts.join("\n")
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TelegramSendMessage<'a> {
+    chat_id: &'a str,
+    text: &'a str,
+    disable_web_page_preview: bool,
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let input_chars = input.chars().count();
+    if input_chars <= max_chars {
+        return input.to_string();
+    }
+    let suffix = "...(truncated)";
+    let keep = max_chars.saturating_sub(suffix.chars().count());
+    let mut out: String = input.chars().take(keep).collect();
+    out.push_str(suffix);
+    out
+}
+
+fn telegram_enabled() -> bool {
+    !env::var("TELEGRAM_BOT_ID")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+}
+
+fn split_text_chunks_by_lines(input: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 {
+        return vec![String::new()];
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+
+    for line in input.lines() {
+        let candidate = if cur.is_empty() {
+            line.to_string()
+        } else {
+            format!("{cur}\n{line}")
+        };
+        if candidate.chars().count() <= max_chars {
+            cur = candidate;
+            continue;
+        }
+
+        if !cur.is_empty() {
+            chunks.push(cur);
+            cur = String::new();
+        }
+
+        let line_len = line.chars().count();
+        if line_len <= max_chars {
+            cur = line.to_string();
+            continue;
+        }
+
+        let mut segment = String::new();
+        for ch in line.chars() {
+            if segment.chars().count() >= max_chars {
+                chunks.push(segment);
+                segment = String::new();
+            }
+            segment.push(ch);
+        }
+        if !segment.is_empty() {
+            cur = segment;
+        }
+    }
+
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+fn resolve_telegram_target() -> Option<(String, String)> {
+    let telegram_bot_id = env::var("TELEGRAM_BOT_ID")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if telegram_bot_id.is_empty() {
+        return None;
+    }
+
+    let token_env = env::var("TELEGRAM_BOT_TOKEN")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let chat_env = env::var("TELEGRAM_CHAT_ID")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let looks_like_token = telegram_bot_id.contains(':');
+    let token = if !token_env.is_empty() {
+        token_env
+    } else if looks_like_token {
+        telegram_bot_id.clone()
+    } else {
+        String::new()
+    };
+    let chat_id = if !chat_env.is_empty() {
+        chat_env
+    } else if !looks_like_token {
+        telegram_bot_id
+    } else {
+        String::new()
+    };
+
+    Some((token, chat_id))
+}
+
+fn resolve_telegram_chat_id_from_updates(client: &Client, token: &str) -> Option<String> {
+    let endpoint = format!("https://api.telegram.org/bot{token}/getUpdates");
+    let resp = client.get(&endpoint).query(&[("limit", 20)]).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let payload = resp.json::<Value>().ok()?;
+    let rows = payload.get("result")?.as_array()?;
+    rows.iter().rev().find_map(|u| {
+        u.get("message")
+            .or_else(|| u.get("channel_post"))
+            .or_else(|| u.get("edited_message"))
+            .or_else(|| u.get("edited_channel_post"))
+            .and_then(|m| m.get("chat"))
+            .and_then(|c| c.get("id"))
+            .and_then(|id| match id {
+                Value::String(s) => {
+                    let v = s.trim();
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    }
+                }
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+    })
+}
+
+fn send_telegram_stats_if_enabled(summary: &str, logger: &Arc<dyn LogLike>) {
+    let Some((token, mut chat_id)) = resolve_telegram_target() else {
+        return;
+    };
+    if token.trim().is_empty() {
+        logger.warning(
+            "[TELEGRAM] TELEGRAM_BOT_ID is set but bot token is missing. Set TELEGRAM_BOT_TOKEN \
+or use TELEGRAM_BOT_ID as full bot token.",
+        );
+        return;
+    }
+
+    let timeout_s = env_float("TELEGRAM_TIMEOUT_SECONDS", 6.0).clamp(1.0, 30.0);
+    let client = match Client::builder()
+        .timeout(Duration::from_secs_f64(timeout_s))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            logger.warning(&format!(
+                "[TELEGRAM] skip send: failed creating HTTP client err={e}"
+            ));
+            return;
+        }
+    };
+
+    if chat_id.trim().is_empty() {
+        if let Some(found) = resolve_telegram_chat_id_from_updates(&client, &token) {
+            chat_id = found;
+        }
+    }
+    if chat_id.trim().is_empty() {
+        logger.warning(
+            "[TELEGRAM] skip send: chat id missing. Set TELEGRAM_CHAT_ID, or open a chat with \
+the bot so getUpdates can discover one.",
+        );
+        return;
+    }
+
+    let endpoint = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let body_limit = 3900usize;
+    let raw_chunks = split_text_chunks_by_lines(summary, body_limit);
+    let total = raw_chunks.len();
+    for (idx, raw) in raw_chunks.into_iter().enumerate() {
+        let text = if total > 1 {
+            let prefix = format!("[{}/{}]\n", idx + 1, total);
+            let allow = body_limit.saturating_sub(prefix.chars().count());
+            format!("{prefix}{}", truncate_chars(&raw, allow))
+        } else {
+            raw
+        };
+
+        let payload = TelegramSendMessage {
+            chat_id: &chat_id,
+            text: &text,
+            disable_web_page_preview: true,
+        };
+        let resp = match client.post(&endpoint).json(&payload).send() {
+            Ok(r) => r,
+            Err(e) => {
+                logger.warning(&format!(
+                    "[TELEGRAM] sendMessage request failed chunk={}/{} err={e}",
+                    idx + 1,
+                    total
+                ));
+                return;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            logger.warning(&format!(
+                "[TELEGRAM] sendMessage failed chunk={}/{} status={} body={}",
+                idx + 1,
+                total,
+                status,
+                truncate_chars(&body, 220)
+            ));
+            return;
+        }
+        let ok = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+            .unwrap_or(true);
+        if !ok {
+            logger.warning(&format!(
+                "[TELEGRAM] sendMessage returned ok=false chunk={}/{} body={}",
+                idx + 1,
+                total,
+                truncate_chars(&body, 220)
+            ));
+            return;
+        }
+    }
 }
 
 fn realized_lp_from_resolution_snapshot(
@@ -138,13 +449,21 @@ fn realized_lp_from_resolution_snapshot(
     }
     let diff_price = snapshot
         .diff_vs_price_to_beat
-        .or_else(|| snapshot.price_to_beat.map(|ptb| snapshot.resolution_price - ptb))
+        .or_else(|| {
+            snapshot
+                .price_to_beat
+                .map(|ptb| snapshot.resolution_price - ptb)
+        })
         .filter(|v| v.is_finite());
     let Some(diff_price) = diff_price else {
         return fallback_lp;
     };
 
-    let yes_payout = if diff_price > 0.0 { q_yes.max(0.0) } else { 0.0 };
+    let yes_payout = if diff_price > 0.0 {
+        q_yes.max(0.0)
+    } else {
+        0.0
+    };
     let no_payout = if diff_price > 0.0 { 0.0 } else { q_no.max(0.0) };
     let realized_lp = yes_payout + no_payout - total_cost;
     logger.info(&format!(
@@ -934,6 +1253,10 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
 
         let repo = session_factory.repository();
         let _ = print_pnl_metrics(&repo, &bot_id, &bot_logger);
+        if telegram_enabled() {
+            let telegram_summary = build_telegram_pnl_summary(&repo, &bot_id, &bot_logger);
+            send_telegram_stats_if_enabled(&telegram_summary, &bot_logger);
+        }
         bot_logger.info(&format!("Waiting 2s before next market... {current_slug}"));
         thread::sleep(Duration::from_secs(2));
     }
