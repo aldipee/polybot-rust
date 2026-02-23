@@ -189,6 +189,26 @@ fn build_telegram_pnl_summary(
     parts.join("\n")
 }
 
+fn build_telegram_startup_message(bot_id: &str, exec_mode: &str) -> String {
+    let host = env::var("HOSTNAME")
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+    let host = if host.is_empty() {
+        "unknown".to_string()
+    } else {
+        host
+    };
+    format!(
+        "Polybot restart test\nBot: {}\nVersion: {}\nMode: {}\nTime (Asia/Jakarta): {}\nHost: {}",
+        bot_id,
+        build_version(),
+        exec_mode,
+        now_iso_jakarta(),
+        host
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct TelegramSendMessage<'a> {
     chat_id: &'a str,
@@ -912,6 +932,11 @@ fn run() -> Result<()> {
         exec_mode.as_str(),
         "SIGNAL_SNIPPER" | "SIGNAL_SNIPER" | "SIGNAL_SNIPE" | "SIGNAL"
     );
+    if telegram_enabled() {
+        let startup_logger = setup_item_logger("startup");
+        let startup_msg = build_telegram_startup_message(&bot_id, &exec_mode);
+        send_telegram_stats_if_enabled(&startup_msg, &startup_logger);
+    }
 
     let mut signal_hub: Option<Arc<SignalHub>> = None;
     let signal_stop_event = Arc::new(AtomicBool::new(false));
