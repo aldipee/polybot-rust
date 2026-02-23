@@ -687,6 +687,83 @@ impl MakerHedgeCapBot {
         }
     }
 
+    fn _sniper_hedge_oid_key(order_id: &str) -> String {
+        format!("__sniper_hedge_oid_{order_id}")
+    }
+
+    fn _sniper_hedge_last_remaining_key(order_id: &str) -> String {
+        format!("__sniper_hedge_last_remaining_{order_id}")
+    }
+
+    fn _sniper_is_hedge_order(&self, order_id: &str) -> bool {
+        if order_id.trim().is_empty() {
+            return false;
+        }
+        self._runtime_ts_get(&Self::_sniper_hedge_oid_key(order_id)) > 0.0
+    }
+
+    fn _sniper_mark_hedge_order(&self, order_id: &str) {
+        if order_id.trim().is_empty() {
+            return;
+        }
+        self._runtime_ts_set(&Self::_sniper_hedge_oid_key(order_id), now_ts_f64());
+        self._runtime_ts_set(&Self::_sniper_hedge_last_remaining_key(order_id), -1.0);
+    }
+
+    fn _sniper_clear_hedge_order(&self, order_id: &str) {
+        if order_id.trim().is_empty() {
+            return;
+        }
+        self._runtime_ts_set(&Self::_sniper_hedge_oid_key(order_id), 0.0);
+        self._runtime_ts_set(&Self::_sniper_hedge_last_remaining_key(order_id), 0.0);
+    }
+
+    fn _sniper_log_hedge_order_progress(
+        &self,
+        order_id: &str,
+        asset_id: &str,
+        side: &str,
+        filled: f64,
+        remaining: f64,
+        total: f64,
+        source: &str,
+        status: &str,
+    ) {
+        if !self._sniper_is_hedge_order(order_id) {
+            return;
+        }
+        let rem = remaining.max(0.0);
+        let key = Self::_sniper_hedge_last_remaining_key(order_id);
+        let last_rem = self._runtime_ts_get(&key);
+        if last_rem >= 0.0 && (last_rem - rem).abs() <= 1e-9 {
+            return;
+        }
+        self._runtime_ts_set(&key, rem);
+        let aid_tail: String = asset_id
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let fill_pct = if total > 1e-9 {
+            (filled.max(0.0) / total.max(1e-9)) * 100.0
+        } else {
+            0.0
+        };
+        self.logger.info(&format!(
+            "[SNIPER][HEDGE][{source}] oid={}.. asset={aid_tail} side={} filled={:.6} remaining={:.6} total={:.6} fill_pct={:.2}% status={}",
+            order_id.chars().take(10).collect::<String>(),
+            side,
+            filled.max(0.0),
+            rem,
+            total.max(0.0),
+            fill_pct,
+            status
+        ));
+    }
+
     fn _rtds_gate_log(&self, bucket: &str, msg: &str) {
         let every_s = env_float("RTDS_ENTRY_GATE_LOG_EVERY_SECONDS", 0.0);
         if every_s <= 0.0 {
@@ -3418,17 +3495,43 @@ impl MakerHedgeCapBot {
             "CANCELED" | "CANCELLED" | "REJECTED" | "FILLED"
         );
 
+        let mut hedge_progress: Option<(String, String, f64, f64, f64)> = None;
+        let mut remove_oid = false;
         if let Ok(mut m) = self.taker_orders.lock() {
-            let mut remove = false;
             if let Some(rec) = m.get_mut(order_id) {
                 rec.applied = rec.applied.max(matched_total);
                 rec.ts = now_ts_f64();
+                let remaining = (rec.size - rec.applied).max(0.0);
+                if self._sniper_is_hedge_order(order_id) {
+                    hedge_progress = Some((
+                        rec.asset_id.clone(),
+                        rec.side.clone(),
+                        rec.applied.max(0.0),
+                        remaining,
+                        rec.size.max(0.0),
+                    ));
+                }
                 if done_hint || (rec.size > 0.0 && rec.applied >= rec.size - 1e-9) {
-                    remove = true;
+                    remove_oid = true;
                 }
             }
-            if remove {
+            if remove_oid {
                 m.remove(order_id);
+            }
+        }
+        if let Some((asset, side, filled, remaining, total)) = hedge_progress {
+            self._sniper_log_hedge_order_progress(
+                order_id,
+                &asset,
+                &side,
+                filled,
+                remaining,
+                total,
+                "ORDER_EVT",
+                &status,
+            );
+            if remove_oid || remaining <= 1e-9 {
+                self._sniper_clear_hedge_order(order_id);
             }
         }
     }
@@ -3729,17 +3832,43 @@ impl MakerHedgeCapBot {
             let applied = self._apply_fill(&asset, price, size, &key, &side);
             if applied {
                 self._log_execution_latency_on_fill(&taker_oid, now_ts_f64());
+                let mut hedge_progress: Option<(String, String, f64, f64, f64)> = None;
+                let mut remove_oid = false;
                 if let Ok(mut m) = self.taker_orders.lock() {
-                    let mut remove = false;
                     if let Some(r) = m.get_mut(&taker_oid) {
                         r.applied += size.max(0.0);
                         r.ts = now_ts_f64();
+                        let remaining = (r.size - r.applied).max(0.0);
+                        if self._sniper_is_hedge_order(&taker_oid) {
+                            hedge_progress = Some((
+                                r.asset_id.clone(),
+                                r.side.clone(),
+                                r.applied.max(0.0),
+                                remaining,
+                                r.size.max(0.0),
+                            ));
+                        }
                         if r.size > 0.0 && r.applied >= r.size - 1e-9 {
-                            remove = true;
+                            remove_oid = true;
                         }
                     }
-                    if remove {
+                    if remove_oid {
                         m.remove(&taker_oid);
+                    }
+                }
+                if let Some((h_asset, h_side, h_filled, h_remaining, h_total)) = hedge_progress {
+                    self._sniper_log_hedge_order_progress(
+                        &taker_oid,
+                        &h_asset,
+                        &h_side,
+                        h_filled,
+                        h_remaining,
+                        h_total,
+                        "TRADE_EVT",
+                        &status,
+                    );
+                    if remove_oid || h_remaining <= 1e-9 {
+                        self._sniper_clear_hedge_order(&taker_oid);
                     }
                 }
             }
@@ -6971,6 +7100,8 @@ impl MakerHedgeCapBot {
         if now < self._runtime_ts_get(&cooldown_key) {
             return;
         }
+        let inflight_s = env_float("SNIPER_EXIT_HEDGE_INFLIGHT_SECONDS", 0.75).max(0.1);
+        let pending_guard_s = (inflight_s * 2.0).clamp(0.5, 5.0);
 
         let min_sh = self.cfg.min_shares.max(1.0);
         let net_exposure = (primary_qty - opposite_qty).max(0.0);
@@ -6978,7 +7109,9 @@ impl MakerHedgeCapBot {
             self._runtime_ts_set(&cooldown_key, now + cooldown_s);
             return;
         }
-        if self.taker_strict_inflight && self._has_pending_taker_order("BUY", Some(&hedge_asset)) {
+        if self.taker_strict_inflight
+            && self._has_pending_taker_order_recent("BUY", Some(&hedge_asset), pending_guard_s)
+        {
             self._runtime_ts_set(&cooldown_key, now + cooldown_s.min(2.0));
             return;
         }
@@ -6991,11 +7124,7 @@ impl MakerHedgeCapBot {
             return;
         }
         let tick = self.cfg.tick.max(0.0001);
-        let slip_ticks = env_int(
-            "SNIPER_EXIT_HEDGE_SLIPPAGE_TICKS",
-            env_int("SNIPER_ENTRY_SLIPPAGE_TICKS", 1),
-        )
-        .max(0);
+        let slip_ticks = env_int("SNIPER_EXIT_HEDGE_SLIPPAGE_TICKS", 2).max(0);
         let mut px = round_up(ask_h + slip_ticks as f64 * tick, tick);
         px = clamp(px, tick, 0.99);
         if px + 1e-9 < ask_h {
@@ -7034,7 +7163,6 @@ impl MakerHedgeCapBot {
         let hedge_ot = std::env::var("SNIPER_EXIT_HEDGE_ORDER_TYPE")
             .unwrap_or_else(|_| "FAK".to_string())
             .to_ascii_uppercase();
-        let inflight_s = env_float("SNIPER_EXIT_HEDGE_INFLIGHT_SECONDS", 0.75).max(0.1);
         self._runtime_ts_set("__taker_inflight_until", now + inflight_s);
         let oid = self._place_taker_bid_fak(&hedge_asset, px, size_int as f64, Some(&hedge_ot));
         let aid_tail: String = hedge_asset
@@ -7049,6 +7177,19 @@ impl MakerHedgeCapBot {
             self.logger.warning(&format!(
                 "[SNIPER][HEDGE] trigger={trigger} reason={reason} side={side} buy_opp={aid_tail} ask={ask_h:.4} px={px:.4} sz={size_int} type={hedge_ot}"
             ));
+            if let Some(oid_s) = oid.as_ref() {
+                self._sniper_mark_hedge_order(oid_s);
+                self._sniper_log_hedge_order_progress(
+                    oid_s,
+                    &hedge_asset,
+                    "BUY",
+                    0.0,
+                    size_int as f64,
+                    size_int as f64,
+                    "SUBMIT",
+                    "SUBMITTED",
+                );
+            }
         } else {
             self.logger.warning(&format!(
                 "[SNIPER][HEDGE] trigger={trigger} reason={reason} submit_failed side={side} buy_opp={aid_tail} ask={ask_h:.4} px={px:.4} sz={size_int} type={hedge_ot}"

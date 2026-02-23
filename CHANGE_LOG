@@ -1,3 +1,15 @@
+## Version 0.1.3
+Date: 2026-02-23
+
+### Changes
+- Improved stop-loss hedge retry behavior after partial FAK fills so follow-up hedges are not blocked by long pending-order TTL.
+- Hedge pending-order guard now uses a short recent window tied to hedge inflight timing.
+- Increased default hedge price aggressiveness by setting fallback `SNIPER_EXIT_HEDGE_SLIPPAGE_TICKS` to `2` in code.
+
+### Implementation Notes
+- Hedge re-submit blocking now checks `_has_pending_taker_order_recent(...)` instead of full TTL pending state.
+- Behavior is implemented in sniper hedge path (`src/bot.rs`) without changing non-hedge stop-loss modes.
+
 ## Version 0.1.2
 Date: 2026-02-23
 
