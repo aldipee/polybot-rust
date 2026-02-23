@@ -764,6 +764,102 @@ impl MakerHedgeCapBot {
         ));
     }
 
+    fn _sniper_stop_loss_fail_key(asset_id: &str) -> String {
+        format!("__sniper_stop_loss_sell_failures_{asset_id}")
+    }
+
+    fn _sniper_normalize_stop_loss_mode(mode: &str) -> String {
+        let mut m = mode.trim().to_ascii_uppercase();
+        if matches!(m.as_str(), "STOP_LIMIT" | "STOPLIMIT") {
+            m = "LIMIT".to_string();
+        }
+        if matches!(m.as_str(), "STOP_HEDGE" | "HEDGE_STOP") {
+            m = "HEDGE".to_string();
+        }
+        if matches!(
+            m.as_str(),
+            "STOP_MARKET" | "STOPMARKET" | "TAKER" | "AGGRESSIVE"
+        ) {
+            m = "MARKET".to_string();
+        }
+        m
+    }
+
+    fn _sniper_stop_loss_mode(&self) -> String {
+        let raw = std::env::var("SNIPER_STOP_LOSS_MODE")
+            .ok()
+            .or_else(|| std::env::var("SNIPER_STOP_LESS_MODE").ok())
+            .unwrap_or_else(|| "MARKET".to_string());
+        Self::_sniper_normalize_stop_loss_mode(&raw)
+    }
+
+    fn _sniper_stop_loss_fallback_mode(&self) -> String {
+        let mut raw = std::env::var("SNIPER_STOP_LOSS_MODE_FALLBACK")
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if raw.trim().is_empty() && env_bool("SNIPER_STOP_LOSS_MODE_FALLBACK_HEDGE", false) {
+            raw = "HEDGE".to_string();
+        }
+        Self::_sniper_normalize_stop_loss_mode(&raw)
+    }
+
+    fn _sniper_stop_loss_fallback_fails(&self) -> f64 {
+        env_int("SNIPER_STOP_LOSS_MODE_FALLBACK_FAILS", 5).max(1) as f64
+    }
+
+    fn _sniper_stop_loss_reset_failures(&self, asset_id: &str) {
+        if asset_id.trim().is_empty() {
+            return;
+        }
+        let key = Self::_sniper_stop_loss_fail_key(asset_id);
+        self._runtime_ts_set(&key, 0.0);
+    }
+
+    fn _sniper_stop_loss_record_sell_failure(
+        &self,
+        pos: &Value,
+        asset_id: &str,
+        current_mode: &str,
+        reason_u: &str,
+        trigger: &str,
+    ) {
+        if reason_u != "STOP_LOSS" || asset_id.trim().is_empty() {
+            return;
+        }
+        let mode = Self::_sniper_normalize_stop_loss_mode(current_mode);
+        if mode == "HEDGE" {
+            return;
+        }
+        let threshold = self._sniper_stop_loss_fallback_fails();
+        let fallback_mode = self._sniper_stop_loss_fallback_mode();
+        let fail_key = Self::_sniper_stop_loss_fail_key(asset_id);
+        let prev_fails = self._runtime_ts_get(&fail_key).max(0.0);
+        if !fallback_mode.trim().is_empty() && prev_fails + 1e-9 >= threshold {
+            // Once fallback is active, stop counting "sell failures" to avoid inflating the counter.
+            return;
+        }
+        let fails = prev_fails + 1.0;
+        self._runtime_ts_set(&fail_key, fails);
+        let now = now_ts_f64();
+        let log_key = format!("__sniper_stop_loss_fallback_log_until_{asset_id}");
+        if now >= self._runtime_ts_get(&log_key) {
+            self.logger.warning(&format!(
+                "[SNIPER][STOP_LOSS] sell_failed trigger={trigger} mode={mode} fails={:.0}/{:.0} fallback_mode={}",
+                fails,
+                threshold,
+                if fallback_mode.is_empty() {
+                    "<none>"
+                } else {
+                    fallback_mode.as_str()
+                }
+            ));
+            self._runtime_ts_set(&log_key, now + 2.0);
+        }
+        if !fallback_mode.is_empty() && fails + 1e-9 >= threshold && fallback_mode == "HEDGE" {
+            self._sniper_maybe_exit_hedge(pos, reason_u, "stop_loss_fallback_threshold");
+        }
+    }
+
     fn _rtds_gate_log(&self, bucket: &str, msg: &str) {
         let every_s = env_float("RTDS_ENTRY_GATE_LOG_EVERY_SECONDS", 0.0);
         if every_s <= 0.0 {
@@ -7079,13 +7175,10 @@ impl MakerHedgeCapBot {
 
     fn _sniper_maybe_exit_hedge(&self, pos: &Value, reason: &str, trigger: &str) {
         let reason_u = reason.trim().to_ascii_uppercase();
-        let stop_mode = std::env::var("SNIPER_STOP_LOSS_MODE")
-            .ok()
-            .or_else(|| std::env::var("SNIPER_STOP_LESS_MODE").ok())
-            .unwrap_or_else(|| "MARKET".to_string())
-            .to_ascii_uppercase();
-        let stop_mode_hedge =
-            reason_u == "STOP_LOSS" && matches!(stop_mode.as_str(), "HEDGE" | "STOP_HEDGE");
+        let stop_mode = self._sniper_stop_loss_mode();
+        let fallback_mode = self._sniper_stop_loss_fallback_mode();
+        let stop_mode_hedge = reason_u == "STOP_LOSS"
+            && (stop_mode == "HEDGE" || fallback_mode == "HEDGE");
         if !env_bool("SNIPER_EXIT_HEDGE_ENABLED", false) && !stop_mode_hedge {
             return;
         }
@@ -7254,22 +7347,31 @@ impl MakerHedgeCapBot {
             return false;
         }
         let reason_u = reason.trim().to_ascii_uppercase();
-        let mut mode = std::env::var("SNIPER_STOP_LOSS_MODE")
-            .ok()
-            .or_else(|| std::env::var("SNIPER_STOP_LESS_MODE").ok())
-            .unwrap_or_else(|| "MARKET".to_string())
-            .to_ascii_uppercase();
-        if matches!(mode.as_str(), "STOP_LIMIT" | "STOPLIMIT") {
-            mode = "LIMIT".to_string();
+        if reason_u != "STOP_LOSS" {
+            self._sniper_stop_loss_reset_failures(&asset_id);
         }
-        if matches!(mode.as_str(), "STOP_HEDGE" | "HEDGE_STOP") {
-            mode = "HEDGE".to_string();
-        }
-        if matches!(
-            mode.as_str(),
-            "STOP_MARKET" | "STOPMARKET" | "TAKER" | "AGGRESSIVE"
-        ) {
-            mode = "MARKET".to_string();
+        let mut mode = self._sniper_stop_loss_mode();
+        if reason_u == "STOP_LOSS" {
+            let fallback_mode = self._sniper_stop_loss_fallback_mode();
+            let fallback_fails = self._sniper_stop_loss_fallback_fails();
+            if !fallback_mode.is_empty() {
+                let fail_key = Self::_sniper_stop_loss_fail_key(&asset_id);
+                let fails = self._runtime_ts_get(&fail_key).max(0.0);
+                if fails + 1e-9 >= fallback_fails {
+                    if mode != fallback_mode {
+                        let now = now_ts_f64();
+                        let log_key = format!("__sniper_stop_loss_fallback_active_log_until_{asset_id}");
+                        if now >= self._runtime_ts_get(&log_key) {
+                            self.logger.warning(&format!(
+                                "[SNIPER][STOP_LOSS] fallback_active fails={:.0}/{:.0} mode={} -> {}",
+                                fails, fallback_fails, mode, fallback_mode
+                            ));
+                            self._runtime_ts_set(&log_key, now + 2.0);
+                        }
+                    }
+                    mode = fallback_mode;
+                }
+            }
         }
         if reason_u == "STOP_LOSS" && mode == "HEDGE" {
             self._sniper_maybe_exit_hedge(pos, &reason_u, "stop_loss_mode");
@@ -8296,14 +8398,34 @@ impl MakerHedgeCapBot {
                         }
                         let confirm_s = env_float("SNIPER_STOP_CONFIRM_SECONDS", 0.0).max(0.0);
                         if now - sniper_stop_breach_since.unwrap_or(now) >= confirm_s {
+                            let aid = pos
+                                .get("asset_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let sl_mode = self._sniper_stop_loss_mode();
                             if self._sniper_try_exit(&pos, "STOP_LOSS") {
+                                self._sniper_stop_loss_reset_failures(&aid);
                                 break;
                             }
+                            self._sniper_stop_loss_record_sell_failure(
+                                &pos,
+                                &aid,
+                                &sl_mode,
+                                "STOP_LOSS",
+                                "stop_loss_loop_signal",
+                            );
                             continue;
                         }
                     }
                 } else {
                     sniper_stop_breach_since = None;
+                    let aid = pos
+                        .get("asset_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self._sniper_stop_loss_reset_failures(&aid);
                 }
             }
             if env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)
@@ -8612,17 +8734,37 @@ impl MakerHedgeCapBot {
                         if now - sniper_stop_breach_since.unwrap_or(now)
                             >= env_float("SNIPER_STOP_CONFIRM_SECONDS", 0.0).max(0.0)
                         {
+                            let aid = pos
+                                .get("asset_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let sl_mode = self._sniper_stop_loss_mode();
                             if self._sniper_try_exit(&pos, "STOP_LOSS") {
+                                self._sniper_stop_loss_reset_failures(&aid);
                                 if repeat_mode && !repeat_stop_after_sl {
                                     continue;
                                 }
                                 break;
                             }
+                            self._sniper_stop_loss_record_sell_failure(
+                                &pos,
+                                &aid,
+                                &sl_mode,
+                                "STOP_LOSS",
+                                "stop_loss_loop",
+                            );
                             continue;
                         }
                     }
                 } else {
                     sniper_stop_breach_since = None;
+                    let aid = pos
+                        .get("asset_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self._sniper_stop_loss_reset_failures(&aid);
                 }
             }
             if env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)

@@ -1,3 +1,19 @@
+## Version 0.1.4
+Date: 2026-02-23
+
+### Changes
+- Added stop-loss fallback mode controls:
+  - `SNIPER_STOP_LOSS_MODE_FALLBACK`
+  - `SNIPER_STOP_LOSS_MODE_FALLBACK_FAILS` (default `5`)
+  - optional alias trigger `SNIPER_STOP_LOSS_MODE_FALLBACK_HEDGE=true`
+- Implemented automatic fallback activation after repeated stop-loss sell failures.
+- Added dedicated hedge progress logs that report filled vs remaining hedge size by order id.
+
+### Implementation Notes
+- Stop-loss failure counters are tracked per asset and reset on successful stop-loss exit or when stop-loss condition clears.
+- Fallback mode is normalized with the same mode aliases as primary stop-loss mode handling.
+- Hedge progress logs are emitted on submit, order-event updates, and trade-event updates.
+
 ## Version 0.1.3
 Date: 2026-02-23
 
