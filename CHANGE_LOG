@@ -1,11 +1,21 @@
-Version 0.1.1 - 2026-02-23
+## Version 0.1.2
+Date: 2026-02-23
 
-Changes
+### Changes
+- Added FORCE-DIFF sniper entry trigger via `SNIPER_FORCE_ENTRY_MIN_DIFF_PRICE` (with max-age override) that can bypass normal entry min/max time windows.
+
+### Implementation Notes
+- FORCE-DIFF trigger uses RTDS snapshot diff sign to select side and still reuses FORCE entry RTDS gate checks before submit.
+
+## Version 0.1.1
+Date: 2026-02-23
+
+### Changes
 - Added stop-loss hedge mode support using `SNIPER_STOP_LOSS_MODE=HEDGE`.
 - Added compatibility alias `SNIPER_STOP_LESS_MODE` for stop-loss mode lookup.
 - Simplified runtime config flow so stop-loss hedge can be enabled with one mode flag.
 - Updated `stable.env` to use `SNIPER_STOP_LOSS_MODE=HEDGE`.
 
-Implementation Notes
+### Implementation Notes
 - Stop-loss hedge trigger is wired in sniper exit logic (`src/bot.rs`), with behavior selected by stop-loss mode.
 - Build/version string automatically reflects the crate version via `CARGO_PKG_VERSION`.

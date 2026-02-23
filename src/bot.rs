@@ -910,6 +910,55 @@ impl MakerHedgeCapBot {
         self._rtds_entry_gate_eval_side(side, seconds_left, context).0
     }
 
+    fn _sniper_force_entry_diff_signal(&self, seconds_left: f64) -> Option<(String, f64)> {
+        let min_abs = env_float("SNIPER_FORCE_ENTRY_MIN_DIFF_PRICE", 0.0).max(0.0);
+        if min_abs <= 0.0 {
+            return None;
+        }
+
+        let require_market_match = env_bool("RTDS_ENTRY_GATE_REQUIRE_MARKET_MATCH", true);
+        let max_age_seconds = env_float(
+            "SNIPER_FORCE_ENTRY_MIN_DIFF_PRICE_MAX_AGE_SECONDS",
+            env_float("RTDS_ENTRY_GATE_MAX_AGE_SECONDS", 2.0),
+        )
+        .max(0.05);
+        let context = "SNIPER_FORCE_DIFF_ENTRY";
+        let (diff_price, age_ms, ts_ms) =
+            match self._rtds_gate_snapshot(context, max_age_seconds, require_market_match) {
+                Ok(v) => v,
+                Err(reason) => {
+                    self._rtds_gate_log(
+                        "force_diff_snapshot_block",
+                        &format!("[RTDS_GATE] {context} blocked: {reason}"),
+                    );
+                    return None;
+                }
+            };
+
+        if diff_price.abs() + 1e-12 < min_abs {
+            self._rtds_gate_log(
+                "force_diff_threshold",
+                &format!(
+                    "[RTDS_GATE] {context} blocked: |diff_price|={:.6} < required={:.6} t_left={:.2}s",
+                    diff_price.abs(),
+                    min_abs,
+                    seconds_left
+                ),
+            );
+            return None;
+        }
+
+        let side = if diff_price >= 0.0 { "YES" } else { "NO" };
+        self._rtds_gate_log(
+            "force_diff_pass",
+            &format!(
+                "[RTDS_GATE] {context} trigger: side={} diff_price={:+.6} required={:.6} ts_ms={} age_ms={} t_left={:.2}s",
+                side, diff_price, min_abs, ts_ms, age_ms, seconds_left
+            ),
+        );
+        Some((side.to_string(), diff_price))
+    }
+
     fn _sniper_endgame_side_from_rtds(&self, seconds_left: f64) -> Option<String> {
         let snap = match get_live_snapshot_for_market(&self.market_slug) {
             Some(s) => s,
@@ -6381,10 +6430,11 @@ impl MakerHedgeCapBot {
         true
     }
 
-    pub fn _sniper_entry_candidate(
+    fn _sniper_entry_candidate_for_side(
         &self,
         seconds_left: f64,
         ignore_roi_gate: bool,
+        preferred_side: Option<&str>,
     ) -> Option<Value> {
         let (yb, ya, nb, na) = self._sniper_best_snapshot();
         if yb <= 0.0 || ya <= 0.0 || nb <= 0.0 || na <= 0.0 {
@@ -6399,7 +6449,16 @@ impl MakerHedgeCapBot {
             return None;
         }
         let tick = self.cfg.tick.max(0.0001);
-        let side = if y_mid >= n_mid { "YES" } else { "NO" };
+        let inferred_side = if y_mid >= n_mid { "YES" } else { "NO" };
+        let preferred_side = preferred_side
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        let side = if matches!(preferred_side.as_str(), "YES" | "NO") {
+            preferred_side
+        } else {
+            inferred_side.to_string()
+        };
         let bid = if side == "YES" { yb } else { nb };
         let ask = if side == "YES" { ya } else { na };
         let spread_ticks = ((ask - bid) / tick).round() as i64;
@@ -6467,6 +6526,14 @@ impl MakerHedgeCapBot {
             "parity": parity,
             "seconds_left": seconds_left,
         }))
+    }
+
+    pub fn _sniper_entry_candidate(
+        &self,
+        seconds_left: f64,
+        ignore_roi_gate: bool,
+    ) -> Option<Value> {
+        self._sniper_entry_candidate_for_side(seconds_left, ignore_roi_gate, None)
     }
 
     pub fn _sniper_entry_confirmed(&self, cand: &Value, now_ts: f64) -> bool {
@@ -8070,7 +8137,7 @@ impl MakerHedgeCapBot {
 
     pub fn _run_sniper_loop(&self) -> String {
         self.logger.info(&format!(
-            "SNIPER mode enabled | price=[{:.2},{:.2}] TP={:.1}% SL={:.1}% entry_window=[{}s..{}s] force_exit={}s exit_before_expiry={} force_entry_min={:.2} force_entry_max_age={}s force_rtds_fallback={} entry_confirm={:.2}s",
+            "SNIPER mode enabled | price=[{:.2},{:.2}] TP={:.1}% SL={:.1}% entry_window=[{}s..{}s] force_exit={}s exit_before_expiry={} force_entry_min={:.2} force_entry_min_diff={:.2} force_entry_max_age={}s force_entry_diff_max_age={:.2}s force_rtds_fallback={} entry_confirm={:.2}s",
             env_float("SNIPER_PRICE_MIN", 0.91),
             env_float("SNIPER_PRICE_MAX", 0.99),
             env_float("SNIPER_TAKE_PROFIT_PCT", 0.01) * 100.0,
@@ -8080,7 +8147,12 @@ impl MakerHedgeCapBot {
             env_float("SNIPER_FORCE_EXIT_SECONDS", 8.0),
             env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true),
             env_float("SNIPER_FORCE_ENTRY_MIN_PRICE", 0.0),
+            env_float("SNIPER_FORCE_ENTRY_MIN_DIFF_PRICE", 0.0),
             env_int("SNIPER_FORCE_ENTRY_MAX_AGE_SECONDS", 0),
+            env_float(
+                "SNIPER_FORCE_ENTRY_MIN_DIFF_PRICE_MAX_AGE_SECONDS",
+                env_float("RTDS_ENTRY_GATE_MAX_AGE_SECONDS", 2.0),
+            ),
             env_bool("SNIPER_FORCE_ENTRY_FALLBACK_TO_NORMAL_ON_RTDS_BLOCK", false),
             env_float("SNIPER_ENTRY_CONFIRM_SECONDS", 0.0),
         ));
@@ -8166,6 +8238,8 @@ impl MakerHedgeCapBot {
                     self._set_exit_reason("SNIPER_MAX_TRADES_REACHED");
                     break;
                 }
+                let force_diff_signal = self._sniper_force_entry_diff_signal(seconds_left);
+                let force_diff_triggered = force_diff_signal.is_some();
                 if repeat_mode {
                     if seconds_left <= self.cfg.stop_buffer_seconds as f64 {
                         self._set_exit_reason("SNIPER_STOP_BUFFER");
@@ -8177,7 +8251,9 @@ impl MakerHedgeCapBot {
                         self._set_exit_reason("SNIPER_FORCE_EXIT_WINDOW");
                         break;
                     }
-                    if seconds_left < env_float("SNIPER_ENTRY_MIN_SECONDS", 30.0) {
+                    if !force_diff_triggered
+                        && seconds_left < env_float("SNIPER_ENTRY_MIN_SECONDS", 30.0)
+                    {
                         self._set_exit_reason("SNIPER_ENTRY_WINDOW_CLOSED");
                         break;
                     }
@@ -8191,6 +8267,45 @@ impl MakerHedgeCapBot {
                             continue;
                         }
                     }
+                }
+
+                if let Some((force_side, force_diff_price)) = force_diff_signal {
+                    let cand = self._sniper_entry_candidate_for_side(
+                        seconds_left,
+                        env_bool("SNIPER_FORCE_ENTRY_IGNORE_ROI_GATE", false),
+                        Some(&force_side),
+                    );
+                    if cand.is_none() {
+                        if env_float("SNIPER_ENTRY_CONFIRM_SECONDS", 0.0) > 0.0 {
+                            self._runtime_ts_set("__sniper_entry_gate_since", 0.0);
+                        }
+                    } else if let Some(mut cand) = cand {
+                        if let Value::Object(ref mut o) = cand {
+                            o.insert("entry_mode".to_string(), json!("FORCE"));
+                            o.insert(
+                                "entry_reason".to_string(),
+                                json!("RTDS_DIFF_TIME_OVERRIDE"),
+                            );
+                        }
+                        if !self._sniper_entry_confirmed(&cand, now) {
+                            continue;
+                        }
+                        if self._sniper_has_resting_entry_order() {
+                            continue;
+                        }
+                        let min_diff = env_float("SNIPER_FORCE_ENTRY_MIN_DIFF_PRICE", 0.0);
+                        self.logger.info(&format!(
+                            "[SNIPER] FORCE-DIFF entry triggered side={} diff_price={:+.3}>=min={min_diff:.3} ask={:.3} entry_px={:.3} t_left={seconds_left:.1}s spread_ticks={} parity={:.4}",
+                            cand.get("side").and_then(|v| v.as_str()).unwrap_or(""),
+                            force_diff_price,
+                            cand.get("ask").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            cand.get("entry_px").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            cand.get("spread_ticks").and_then(|v| v.as_i64()).unwrap_or(0),
+                            cand.get("parity").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        ));
+                        let _ = self._sniper_try_enter(&cand);
+                    }
+                    continue;
                 }
 
                 if seconds_left > env_float("SNIPER_ENTRY_MAX_SECONDS", 240.0) {
