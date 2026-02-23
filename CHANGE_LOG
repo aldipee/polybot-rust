@@ -11,6 +11,7 @@ Date: 2026-02-23
 - Added Telegram PnL summary push after each market rollover when `TELEGRAM_BOT_ID` is configured.
 - Telegram summary now includes per-bot breakdown for all bot IDs (in addition to current bot + ALL aggregate).
 - Added Telegram startup restart-test ping sent once per process start when Telegram is configured.
+- Per-bot Telegram breakdown query now prefers bots from `bot` table with `bot_type='TRADING'` (with fallback for schemas without `bot_type`).
 
 ### Behavior Impact
 - Safer position accounting under mixed maker/taker streams (prevents phantom exposure jumps).

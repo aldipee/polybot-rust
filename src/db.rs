@@ -614,18 +614,43 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
 
     pub fn list_all_bot_ids(&self) -> Result<Vec<String>> {
         let mut conn = open_conn(&self.engine)?;
-        let rows = conn.query(
-            "SELECT DISTINCT bot_id
-             FROM (
-                SELECT bot_id FROM bot
-                UNION
-                SELECT bot_id FROM trade
-             ) AS ids
-             WHERE bot_id IS NOT NULL
-               AND trim(bot_id) <> ''
-             ORDER BY bot_id ASC",
-            &[],
-        )?;
+        let has_bot_type = conn
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'bot'
+                      AND column_name = 'bot_type'
+                )",
+                &[],
+            )
+            .map(|r| r.get::<usize, bool>(0))
+            .unwrap_or(false);
+        let rows = if has_bot_type {
+            conn.query(
+                "SELECT DISTINCT bot_id
+                 FROM bot
+                 WHERE bot_id IS NOT NULL
+                   AND trim(bot_id) <> ''
+                   AND upper(coalesce(bot_type, '')) = 'TRADING'
+                 ORDER BY bot_id ASC",
+                &[],
+            )?
+        } else {
+            conn.query(
+                "SELECT DISTINCT bot_id
+                 FROM (
+                    SELECT bot_id FROM bot
+                    UNION
+                    SELECT bot_id FROM trade
+                 ) AS ids
+                 WHERE bot_id IS NOT NULL
+                   AND trim(bot_id) <> ''
+                 ORDER BY bot_id ASC",
+                &[],
+            )?
+        };
         Ok(rows
             .into_iter()
             .map(|r| r.get::<usize, String>(0))

@@ -136,6 +136,24 @@ fn pnl_section(label: &str, s: &PnlWindowStats) -> String {
     )
 }
 
+fn telegram_pnl_line(label: &str, s: &BotTradeStats) -> String {
+    let win_rate = pct(s.win_count, s.total_count);
+    format!(
+        "  {label}: NET {:+.4} | W {} L {} | WR {:.2}% | P {:+.4} L {:+.4}",
+        s.net_pnl, s.win_count, s.loss_count, win_rate, s.total_profit, s.total_loss
+    )
+}
+
+fn telegram_pnl_section(title: &str, s: &PnlWindowStats) -> String {
+    format!(
+        "{title}\n{}\n{}\n{}\n{}",
+        telegram_pnl_line("D", &s.day),
+        telegram_pnl_line("W", &s.week),
+        telegram_pnl_line("M", &s.month),
+        telegram_pnl_line("A", &s.all)
+    )
+}
+
 fn print_pnl_metrics(repo: &BotRepository, bot_id: &str, logger: &Arc<dyn LogLike>) -> String {
     let bot_stats = bot_window_stats(repo, bot_id);
     let all_stats = all_bots_window_stats(repo);
@@ -175,17 +193,28 @@ fn build_telegram_pnl_summary(
     bot_ids.dedup();
 
     let mut parts = vec![
-        "PNL Summary (Asia/Jakarta, DRAW excluded)".to_string(),
-        pnl_section(&format!("Bot {current_bot_id}"), &bot_stats),
-        pnl_section("ALL bots", &all_stats),
+        "PNL SUMMARY (Asia/Jakarta, DRAW excluded)".to_string(),
+        format!("Generated: {}", now_iso_jakarta()),
+        String::new(),
+        "CURRENT BOT".to_string(),
+        telegram_pnl_section(&format!("Bot: {current_bot_id}"), &bot_stats),
+        String::new(),
+        "ALL BOTS".to_string(),
+        telegram_pnl_section("Aggregate", &all_stats),
     ];
     if !bot_ids.is_empty() {
-        parts.push(format!("Per-bot breakdown ({} bots)", bot_ids.len()));
+        parts.push(String::new());
+        parts.push(format!(
+            "PER-BOT BREAKDOWN (bot_type=TRADING, {} bots)",
+            bot_ids.len()
+        ));
         for id in bot_ids {
             let s = bot_window_stats(repo, &id);
-            parts.push(pnl_section(&format!("Bot {id}"), &s));
+            parts.push(telegram_pnl_section(&format!("Bot: {id}"), &s));
+            parts.push(String::new());
         }
     }
+    parts.push("Legend: D=Daily W=Weekly M=Monthly A=All-time".to_string());
     parts.join("\n")
 }
 
@@ -200,12 +229,8 @@ fn build_telegram_startup_message(bot_id: &str, exec_mode: &str) -> String {
         host
     };
     format!(
-        "Polybot restart test\nBot: {}\nVersion: {}\nMode: {}\nTime (Asia/Jakarta): {}\nHost: {}",
-        bot_id,
-        build_version(),
-        exec_mode,
-        now_iso_jakarta(),
-        host
+        "POLYBOT RESTART TEST\nBot: {}\nVersion: {}\nMode: {}\nTime (Asia/Jakarta): {}\nHost: {}",
+        bot_id, build_version(), exec_mode, now_iso_jakarta(), host
     )
 }
 
