@@ -2,7 +2,9 @@ use crate::config::BotConfig;
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, Duration, Utc};
 use chrono_tz::Asia::Jakarta;
-use postgres::{Client, NoTls};
+use native_tls::TlsConnector;
+use postgres::Client;
+use postgres_native_tls::MakeTlsConnector;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -44,7 +46,12 @@ fn open_conn(engine: &Engine) -> Result<Client> {
         ));
     }
 
-    Client::connect(&engine.db_url, NoTls)
+    let tls = TlsConnector::builder()
+        .build()
+        .context("failed creating postgres TLS connector")?;
+    let tls = MakeTlsConnector::new(tls);
+
+    Client::connect(&engine.db_url, tls)
         .with_context(|| format!("failed opening postgres db {}", engine.db_url))
 }
 
