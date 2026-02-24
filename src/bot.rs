@@ -91,6 +91,7 @@ pub struct MakerHedgeCapBot {
     pub first_entry_fill_iso: Arc<Mutex<Option<String>>>,
     pub first_entry_reason: Arc<Mutex<Option<String>>>,
     pub pending_entry_reason: Arc<Mutex<Option<String>>>,
+    pub active_entry_reason: Arc<Mutex<Option<String>>>,
     pub stop_loss_category: Arc<Mutex<Option<String>>>,
     pub exit_reason: Arc<Mutex<String>>,
     pub stop_flag: Arc<AtomicBool>,
@@ -229,6 +230,7 @@ impl MakerHedgeCapBot {
             first_entry_fill_iso: Arc::new(Mutex::new(None)),
             first_entry_reason: Arc::new(Mutex::new(None)),
             pending_entry_reason: Arc::new(Mutex::new(None)),
+            active_entry_reason: Arc::new(Mutex::new(None)),
             stop_loss_category: Arc::new(Mutex::new(None)),
             exit_reason: Arc::new(Mutex::new("RUNNING".to_string())),
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -1418,6 +1420,50 @@ impl MakerHedgeCapBot {
         }
     }
 
+    fn _active_entry_reason_or_default(&self) -> String {
+        self.active_entry_reason
+            .lock()
+            .ok()
+            .and_then(|v| v.clone())
+            .or_else(|| self.first_entry_reason.lock().ok().and_then(|v| v.clone()))
+            .unwrap_or_else(|| self._default_entry_reason())
+    }
+
+    fn _env_positive_float_if_set(name: &str) -> Option<f64> {
+        let val = env_float(name, f64::NAN);
+        if val.is_finite() && val > 0.0 {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    fn _sniper_tp_sl_overrides_for_entry_reason(entry_reason: &str) -> (Option<f64>, Option<f64>) {
+        let reason = entry_reason.trim().to_ascii_uppercase();
+        match reason.as_str() {
+            "SNIPER_FORCE_DIFF_ENTRY" | "RTDS_DIFF_TIME_OVERRIDE" => (
+                Self::_env_positive_float_if_set("SNIPER_FORCE_DIFF_ENTRY_TAKE_PROFIT_PCT"),
+                Self::_env_positive_float_if_set("SNIPER_FORCE_DIFF_ENTRY_STOP_LOSS_PCT"),
+            ),
+            "SNIPER_ENTRY_FORCE" | "SNIPER_FORCE_ENTRY" => (
+                Self::_env_positive_float_if_set("SNIPER_FORCE_ENTRY_TAKE_PROFIT_PCT").or_else(
+                    || Self::_env_positive_float_if_set("SNIPER_ENTRY_FORCE_TAKE_PROFIT_PCT"),
+                ),
+                Self::_env_positive_float_if_set("SNIPER_FORCE_ENTRY_STOP_LOSS_PCT").or_else(
+                    || Self::_env_positive_float_if_set("SNIPER_ENTRY_FORCE_STOP_LOSS_PCT"),
+                ),
+            ),
+            _ => (None, None),
+        }
+    }
+
+    fn _sniper_tp_sl_for_entry_reason(&self, entry_reason: &str) -> (f64, f64) {
+        let base_tp = env_float("SNIPER_TAKE_PROFIT_PCT", 0.01).max(0.0);
+        let base_sl = env_float("SNIPER_STOP_LOSS_PCT", 0.02).max(0.0);
+        let (tp_override, sl_override) = Self::_sniper_tp_sl_overrides_for_entry_reason(entry_reason);
+        (tp_override.unwrap_or(base_tp), sl_override.unwrap_or(base_sl))
+    }
+
     fn _entry_reason_from_candidate(&self, cand: &Value) -> String {
         let entry_reason = cand
             .get("entry_reason")
@@ -1477,6 +1523,7 @@ impl MakerHedgeCapBot {
             return;
         }
         let mut changed = false;
+        let mut now_flat = false;
         if let Ok(mut s) = self.state.lock() {
             if self.yes_asset.as_deref() == Some(asset_id) {
                 if s.q_yes > 1e-12 || s.c_yes > 1e-12 {
@@ -1497,8 +1544,14 @@ impl MakerHedgeCapBot {
             if changed {
                 let _ = save_state(&self.state_file, &mut s);
             }
+            now_flat = (s.q_yes + s.q_no) <= 1e-12;
         }
         if changed {
+            if now_flat {
+                if let Ok(mut active_reason) = self.active_entry_reason.lock() {
+                    *active_reason = None;
+                }
+            }
             self._cancel_open_order_local(asset_id, "desync reconcile");
             let assets = vec![asset_id.to_string()];
             self._cancel_exchange_orders_for_assets(&assets, "desync reconcile");
@@ -2667,9 +2720,27 @@ impl MakerHedgeCapBot {
             return false;
         }
         let qty_after = guard.q_yes + guard.q_no;
+        let opened_position = side_u == "BUY" && qty_before <= 1e-12 && qty_after > 1e-12;
+        let closed_position = qty_after <= 1e-12;
         let mark_first_entry_fill = side_u == "BUY" && qty_after > qty_before + 1e-12;
         let _ = save_state(&self.state_file, &mut guard);
         drop(guard);
+
+        let mut opened_reason: Option<String> = None;
+        if opened_position {
+            let reason = self
+                ._take_pending_entry_reason()
+                .unwrap_or_else(|| self._default_entry_reason());
+            if let Ok(mut active_reason) = self.active_entry_reason.lock() {
+                *active_reason = Some(reason.clone());
+            }
+            opened_reason = Some(reason);
+        } else if closed_position {
+            if let Ok(mut active_reason) = self.active_entry_reason.lock() {
+                *active_reason = None;
+            }
+        }
+
         if mark_first_entry_fill {
             let fill_ts = crate::db::now_iso_jakarta();
             if let Ok(mut first) = self.first_entry_fill_iso.lock() {
@@ -2679,9 +2750,8 @@ impl MakerHedgeCapBot {
             }
             if let Ok(mut first_reason) = self.first_entry_reason.lock() {
                 if first_reason.is_none() {
-                    let reason = self
-                        ._take_pending_entry_reason()
-                        .unwrap_or_else(|| self._default_entry_reason());
+                    let reason = opened_reason
+                        .unwrap_or_else(|| self._take_pending_entry_reason().unwrap_or_else(|| self._default_entry_reason()));
                     *first_reason = Some(reason);
                 }
             }
@@ -7726,7 +7796,10 @@ impl MakerHedgeCapBot {
         }
 
         if stop_limit_mode {
-            let stop_pct = env_float("SNIPER_STOP_LOSS_PCT", 0.0);
+            let active_entry_reason = self._active_entry_reason_or_default();
+            let (_, stop_override_pct) =
+                Self::_sniper_tp_sl_overrides_for_entry_reason(&active_entry_reason);
+            let stop_pct = stop_override_pct.unwrap_or(env_float("SNIPER_STOP_LOSS_PCT", 0.0));
             let mut ref_px = self._runtime_ts_get("__sniper_entry_ref_price");
             if ref_px <= 0.0 {
                 ref_px = pos.get("avg").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -8421,6 +8494,9 @@ impl MakerHedgeCapBot {
                 sniper_stop_breach_since = None;
                 continue;
             }
+            let active_entry_reason = self._active_entry_reason_or_default();
+            let (take_profit_pct, stop_pct) =
+                self._sniper_tp_sl_for_entry_reason(&active_entry_reason);
 
             if env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)
                 && seconds_left <= env_float("SNIPER_FORCE_EXIT_SECONDS", 8.0)
@@ -8430,13 +8506,12 @@ impl MakerHedgeCapBot {
                 }
                 continue;
             }
-            if cost > 1e-12 && pnl_pct >= env_float("SNIPER_TAKE_PROFIT_PCT", 0.01) {
+            if cost > 1e-12 && pnl_pct >= take_profit_pct {
                 if self._sniper_try_exit(&pos, "TAKE_PROFIT") {
                     break;
                 }
                 continue;
             }
-            let stop_pct = env_float("SNIPER_STOP_LOSS_PCT", 0.02).max(0.0);
             if cost > 1e-12 && stop_pct > 0.0 {
                 if pnl_pct <= -stop_pct {
                     let held_s = now - sniper_pos_open_ts.max(0.0);
@@ -8757,6 +8832,9 @@ impl MakerHedgeCapBot {
                 sniper_stop_breach_since = None;
                 continue;
             }
+            let active_entry_reason = self._active_entry_reason_or_default();
+            let (take_profit_pct, stop_pct) =
+                self._sniper_tp_sl_for_entry_reason(&active_entry_reason);
 
             if env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)
                 && seconds_left <= env_float("SNIPER_FORCE_EXIT_SECONDS", 8.0)
@@ -8766,7 +8844,7 @@ impl MakerHedgeCapBot {
                 }
                 continue;
             }
-            if cost > 1e-12 && pnl_pct >= env_float("SNIPER_TAKE_PROFIT_PCT", 0.01) {
+            if cost > 1e-12 && pnl_pct >= take_profit_pct {
                 if self._sniper_try_exit(&pos, "TAKE_PROFIT") {
                     if repeat_mode {
                         continue;
@@ -8775,7 +8853,6 @@ impl MakerHedgeCapBot {
                 }
                 continue;
             }
-            let stop_pct = env_float("SNIPER_STOP_LOSS_PCT", 0.02).max(0.0);
             if cost > 1e-12 && stop_pct > 0.0 {
                 if pnl_pct <= -stop_pct {
                     let held_s = now - sniper_pos_open_ts.max(0.0);

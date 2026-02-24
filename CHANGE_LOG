@@ -1,3 +1,22 @@
+## Version 0.1.8
+Date: 2026-02-24
+
+### Changes
+- Added entry-reason specific sniper TP/SL overrides with fallback to global values:
+  - `SNIPER_FORCE_DIFF_ENTRY_TAKE_PROFIT_PCT`
+  - `SNIPER_FORCE_DIFF_ENTRY_STOP_LOSS_PCT`
+  - `SNIPER_FORCE_ENTRY_TAKE_PROFIT_PCT`
+  - `SNIPER_FORCE_ENTRY_STOP_LOSS_PCT`
+  - alias keys supported: `SNIPER_ENTRY_FORCE_TAKE_PROFIT_PCT`, `SNIPER_ENTRY_FORCE_STOP_LOSS_PCT`
+- TP/SL evaluation now resolves by active entry reason (`SNIPER_FORCE_DIFF_ENTRY`, `SNIPER_ENTRY_FORCE`), then falls back to `SNIPER_TAKE_PROFIT_PCT` / `SNIPER_STOP_LOSS_PCT` when overrides are unset or non-positive.
+- Stop-limit stop-loss floor calculation now uses the same reason-aware stop-loss percent resolver.
+- Added runtime tracking for active entry reason so repeat-mode trades use the correct TP/SL profile per new position.
+- Added new override env keys to `ENV_CONTRACT_KEYS`.
+
+### Behavior Impact
+- Forced-diff entries and force entries can now run different risk targets from normal sniper entries without changing global TP/SL.
+- Existing behavior is unchanged unless one of the new override env vars is configured.
+
 ## Version 0.1.7
 Date: 2026-02-24
 

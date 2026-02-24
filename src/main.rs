@@ -1175,10 +1175,14 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
             last_trade_validation_poll_ts = now_ts_f64();
         }
         if daily_take_profit_usd > 0.0 || daily_stop_loss_usd > 0.0 {
-            let today = date_jakarta();
-            let (today_pnl, today_trades) = repo
-                .pnl_and_trade_count_for_bot(&bot_id, &today, &today)
-                .unwrap_or((0.0, 0));
+            // Keep daily guardrail window exactly aligned with summary daily window bounds.
+            let bounds = stats_bounds_now();
+            let today = bounds.today;
+            let today_stats = repo
+                .trade_stats_for_bot_period(&bot_id, &today, &today)
+                .unwrap_or_default();
+            let today_pnl = today_stats.net_pnl;
+            let today_trades = today_stats.total_count;
             let hit_take_profit = daily_take_profit_usd > 0.0 && today_pnl >= daily_take_profit_usd;
             let hit_stop_loss = daily_stop_loss_usd > 0.0 && today_pnl <= -daily_stop_loss_usd;
             if hit_take_profit || hit_stop_loss {
