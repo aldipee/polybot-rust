@@ -100,6 +100,14 @@ pub struct TradeRow {
     pub date: String,
     pub start_trade: String,
     pub end_trade: String,
+    pub entry_time: Option<String>,
+    pub holding_duration_seconds: Option<f64>,
+    pub entry_reason: Option<String>,
+    pub exit_time: Option<String>,
+    pub exit_reason_category: Option<String>,
+    pub stop_loss_category: Option<String>,
+    pub entry_price: Option<f64>,
+    pub exit_price: Option<f64>,
     pub lp: f64,
     pub total_cost: f64,
     pub q_yes: f64,
@@ -247,6 +255,14 @@ CREATE TABLE IF NOT EXISTS trade (
   date TEXT NOT NULL,
   start_trade TEXT NOT NULL,
   end_trade TEXT NOT NULL,
+  entry_time TEXT NULL,
+  holding_duration_seconds DOUBLE PRECISION NULL,
+  entry_reason TEXT NULL,
+  exit_time TEXT NULL,
+  exit_reason_category TEXT NULL,
+  stop_loss_category TEXT NULL,
+  entry_price DOUBLE PRECISION NULL,
+  exit_price DOUBLE PRECISION NULL,
   lp DOUBLE PRECISION NOT NULL,
   total_cost DOUBLE PRECISION NOT NULL,
   q_yes DOUBLE PRECISION NOT NULL,
@@ -291,9 +307,44 @@ ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAU
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_checked_at TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_validated_at TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_source TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS entry_time TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS holding_duration_seconds DOUBLE PRECISION NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS entry_reason TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS exit_time TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS exit_reason_category TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS stop_loss DOUBLE PRECISION NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS stop_loss_category TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS entry_price DOUBLE PRECISION NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION NULL;
 UPDATE trade
 SET validation_status = 'PENDING'
 WHERE validation_status IS NULL OR trim(validation_status) = '';
+UPDATE trade
+SET entry_time = start_trade
+WHERE COALESCE(trim(entry_time), '') = ''
+  AND COALESCE(trim(start_trade), '') <> '';
+UPDATE trade
+SET exit_time = end_trade
+WHERE COALESCE(trim(exit_time), '') = ''
+  AND COALESCE(trim(end_trade), '') <> '';
+UPDATE trade
+SET entry_reason = 'INITIALIZED'
+WHERE entry_reason IS NULL OR trim(entry_reason) = '';
+UPDATE trade
+SET exit_reason_category = CASE
+    WHEN upper(COALESCE(exit_reason, '')) LIKE '%STOP_LOSS%' THEN 'STOP_LOSS'
+    WHEN upper(COALESCE(exit_reason, '')) LIKE '%TAKE_PROFIT%'
+      OR upper(COALESCE(exit_reason, '')) LIKE '%TARGET_HIT%' THEN 'TAKE_PROFIT'
+    ELSE 'RESOLUTION'
+END
+WHERE exit_reason_category IS NULL OR trim(exit_reason_category) = '';
+UPDATE trade
+SET stop_loss_category = 'MARKET'
+WHERE (stop_loss_category IS NULL OR trim(stop_loss_category) = '')
+  AND (
+    upper(COALESCE(exit_reason, '')) LIKE '%STOP_LOSS%'
+    OR upper(COALESCE(exit_reason, '')) LIKE '%CAP_LOCKED_LOSS%'
+  );
 "#,
         )
         .context("failed migrating configuration schema for PostgreSQL compatibility")?;
@@ -735,16 +786,23 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
         let initialized = "INITIALIZED".to_string();
         let none_claim: Option<String> = None;
         let none_meta: Option<String> = None;
+        let none_duration: Option<f64> = None;
+        let none_text: Option<String> = None;
+        let none_price: Option<f64> = None;
 
         conn.execute(
             "INSERT INTO trade (
                 trade_id, exit_reason, bot_id, slug, configuration_id,
                 date, start_trade, end_trade,
+                entry_time, holding_duration_seconds, entry_reason, exit_time, exit_reason_category,
+                stop_loss_category, entry_price, exit_price,
                 lp, total_cost, q_yes, q_no, cpp, status, claim_status, meta_data
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
-                $9, $10, $11, $12, $13, $14, $15, $16
+                $9, $10, $11, $12, $13,
+                $14, $15, $16,
+                $17, $18, $19, $20, $21, $22, $23, $24
             )",
             &[
                 &tid,
@@ -755,6 +813,14 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
                 &date_jakarta(),
                 &start_trade_iso,
                 &empty,
+                &start_trade_iso,
+                &none_duration,
+                &initialized,
+                &none_text,
+                &none_text,
+                &none_text,
+                &none_price,
+                &none_price,
                 &0.0_f64,
                 &0.0_f64,
                 &0.0_f64,
@@ -812,6 +878,13 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
         q_yes: f64,
         q_no: f64,
         exit_reason: &str,
+        entry_time_iso: Option<&str>,
+        holding_duration_seconds: Option<f64>,
+        entry_reason: Option<&str>,
+        exit_reason_category: Option<&str>,
+        stop_loss_category: Option<&str>,
+        entry_price: Option<f64>,
+        exit_price: Option<f64>,
     ) -> Result<()> {
         let status = if lp > 0.0 {
             "WON"
@@ -824,24 +897,41 @@ WHERE validation_status IS NULL OR trim(validation_status) = '';
         let validation_checked_at: Option<String> = None;
         let validation_validated_at: Option<String> = None;
         let validation_source: Option<String> = None;
+        let exit_time_iso: Option<&str> = Some(end_trade_iso);
         let mut conn = open_conn(&self.engine)?;
         conn.execute(
             "UPDATE trade SET
                 end_trade = $1,
-                lp = $2,
-                total_cost = $3,
-                cpp = $4,
-                q_yes = $5,
-                q_no = $6,
-                exit_reason = $7,
-                status = $8,
-                validation_status = $9,
-                validation_checked_at = $10,
-                validation_validated_at = $11,
-                validation_source = $12
-             WHERE trade_id = $13",
+                exit_time = $2,
+                entry_time = COALESCE($3, entry_time),
+                holding_duration_seconds = COALESCE($4, holding_duration_seconds),
+                entry_reason = COALESCE($5, entry_reason),
+                exit_reason_category = COALESCE($6, exit_reason_category),
+                stop_loss_category = COALESCE($7, stop_loss_category),
+                entry_price = COALESCE($8, entry_price),
+                exit_price = COALESCE($9, exit_price),
+                lp = $10,
+                total_cost = $11,
+                cpp = $12,
+                q_yes = $13,
+                q_no = $14,
+                exit_reason = $15,
+                status = $16,
+                validation_status = $17,
+                validation_checked_at = $18,
+                validation_validated_at = $19,
+                validation_source = $20
+             WHERE trade_id = $21",
             &[
                 &end_trade_iso,
+                &exit_time_iso,
+                &entry_time_iso,
+                &holding_duration_seconds,
+                &entry_reason,
+                &exit_reason_category,
+                &stop_loss_category,
+                &entry_price,
+                &exit_price,
                 &lp,
                 &total_cost,
                 &cpp,

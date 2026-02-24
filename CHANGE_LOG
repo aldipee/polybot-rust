@@ -1,3 +1,25 @@
+## Version 0.1.7
+Date: 2026-02-24
+
+### Changes
+- Added trade analytics fields in DB schema and persistence flow:
+  - `entry_time`
+  - `holding_duration_seconds`
+  - `entry_reason`
+  - `exit_time`
+  - `exit_reason_category`
+  - `stop_loss_category`
+  - `entry_price`
+  - `exit_price`
+- Updated holding duration to use first actual entry fill timestamp (not bot start).
+- Updated `entry_reason` to use log-style entry context values from execution paths (for example `SNIPER_FORCE_DIFF_ENTRY`, `SNIPER_ENTRY_FORCE`, `SNIPER_ENTRY`, `SIGNAL_ENTRY`, and endgame variants).
+- Added `stop_loss_category` classification based on actual stop-loss execution mode (`MARKET`, `LIMIT`, `HEDGE`) captured from runtime behavior.
+- Added schema migration/backfill for new analytics columns with safe defaults for historical rows.
+
+### Behavior Impact
+- Trade analytics rows now reflect real entry timing and entry trigger context.
+- Stop-loss analytics can be segmented by execution mode (`MARKET` vs `LIMIT` vs `HEDGE`) without inferring from raw logs.
+
 ## Version 0.1.6
 Date: 2026-02-23
 

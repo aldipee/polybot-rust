@@ -62,6 +62,9 @@ pub struct TradeMetrics {
     pub q_yes: f64,
     pub q_no: f64,
     pub cpp: f64,
+    pub entry_time_iso: Option<String>,
+    pub entry_reason: Option<String>,
+    pub stop_loss_category: Option<String>,
     pub exit_reason: String,
     pub fill_count: usize,
 }
@@ -85,6 +88,10 @@ pub struct MakerHedgeCapBot {
     pub state_file: PathBuf,
     pub state: Arc<Mutex<BotState>>,
     pub start_trade_iso: String,
+    pub first_entry_fill_iso: Arc<Mutex<Option<String>>>,
+    pub first_entry_reason: Arc<Mutex<Option<String>>>,
+    pub pending_entry_reason: Arc<Mutex<Option<String>>>,
+    pub stop_loss_category: Arc<Mutex<Option<String>>>,
     pub exit_reason: Arc<Mutex<String>>,
     pub stop_flag: Arc<AtomicBool>,
     pub wallet_address: String,
@@ -219,6 +226,10 @@ impl MakerHedgeCapBot {
             state_file,
             state: Arc::new(Mutex::new(state)),
             start_trade_iso,
+            first_entry_fill_iso: Arc::new(Mutex::new(None)),
+            first_entry_reason: Arc::new(Mutex::new(None)),
+            pending_entry_reason: Arc::new(Mutex::new(None)),
+            stop_loss_category: Arc::new(Mutex::new(None)),
             exit_reason: Arc::new(Mutex::new("RUNNING".to_string())),
             stop_flag: Arc::new(AtomicBool::new(false)),
             wallet_address,
@@ -1393,6 +1404,56 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_else(|_| "UNKNOWN".to_string())
+    }
+
+    fn _default_entry_reason(&self) -> String {
+        match self.exec_mode.as_str() {
+            "SIGNAL_SNIPPER" | "SIGNAL_SNIPER" | "SIGNAL_SNIPE" | "SIGNAL" => {
+                "SIGNAL_ENTRY".to_string()
+            }
+            "SNIPER" | "PROB_SNIPER" | "HIGH_PROB" | "HIGH_PROB_SNIPER" | "FIXED_PROFIT" => {
+                "SNIPER_ENTRY".to_string()
+            }
+            _ => "MAKER_ENTRY".to_string(),
+        }
+    }
+
+    fn _entry_reason_from_candidate(&self, cand: &Value) -> String {
+        let entry_reason = cand
+            .get("entry_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        if !entry_reason.is_empty() {
+            return entry_reason;
+        }
+        let entry_mode = cand
+            .get("entry_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        if entry_mode == "FORCE" {
+            return "SNIPER_ENTRY_FORCE".to_string();
+        }
+        if entry_mode == "SIGNAL" {
+            return "SIGNAL_ENTRY".to_string();
+        }
+        self._default_entry_reason()
+    }
+
+    fn _set_pending_entry_reason(&self, reason: &str) {
+        if let Ok(mut pending) = self.pending_entry_reason.lock() {
+            *pending = Some(reason.to_string());
+        }
+    }
+
+    fn _take_pending_entry_reason(&self) -> Option<String> {
+        self.pending_entry_reason
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
     }
 
     fn _mark_sniper_entry_state(&self, side: &str) {
@@ -2595,6 +2656,7 @@ impl MakerHedgeCapBot {
         let yes_asset = self.yes_asset.as_deref().unwrap_or_default();
         let sign = if side_u == "BUY" { 1.0 } else { -1.0 };
         let qty = sign * filled;
+        let qty_before = guard.q_yes + guard.q_no;
         if asset_id == yes_asset {
             guard.q_yes = (guard.q_yes + qty).max(0.0);
             guard.c_yes = (guard.c_yes + price * qty).max(0.0);
@@ -2604,7 +2666,26 @@ impl MakerHedgeCapBot {
         } else {
             return false;
         }
+        let qty_after = guard.q_yes + guard.q_no;
+        let mark_first_entry_fill = side_u == "BUY" && qty_after > qty_before + 1e-12;
         let _ = save_state(&self.state_file, &mut guard);
+        drop(guard);
+        if mark_first_entry_fill {
+            let fill_ts = crate::db::now_iso_jakarta();
+            if let Ok(mut first) = self.first_entry_fill_iso.lock() {
+                if first.is_none() {
+                    *first = Some(fill_ts);
+                }
+            }
+            if let Ok(mut first_reason) = self.first_entry_reason.lock() {
+                if first_reason.is_none() {
+                    let reason = self
+                        ._take_pending_entry_reason()
+                        .unwrap_or_else(|| self._default_entry_reason());
+                    *first_reason = Some(reason);
+                }
+            }
+        }
         true
     }
 
@@ -6578,6 +6659,12 @@ impl MakerHedgeCapBot {
         if oid.is_none() {
             return false;
         }
+        let endgame_entry_reason = if trigger_mode == "RESOLUTION" {
+            "SNIPER_ENDGAME_RESOLUTION"
+        } else {
+            "SNIPER_ENDGAME_WINDOW"
+        };
+        self._set_pending_entry_reason(endgame_entry_reason);
         let pending_key = Self::_sniper_entry_pending_key(&asset_id);
         let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
         self._runtime_ts_set(&pending_key, now_ts_f64());
@@ -6715,6 +6802,8 @@ impl MakerHedgeCapBot {
             "spread_ticks": spread_ticks,
             "parity": parity,
             "seconds_left": seconds_left,
+            "entry_mode": "SIGNAL",
+            "entry_reason": "SIGNAL_ENTRY",
         }))
     }
 
@@ -6838,7 +6927,9 @@ impl MakerHedgeCapBot {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_ascii_uppercase();
-        let force_diff_override = entry_mode == "FORCE" && entry_reason == "RTDS_DIFF_TIME_OVERRIDE";
+        let force_diff_override = entry_mode == "FORCE"
+            && (entry_reason == "SNIPER_FORCE_DIFF_ENTRY"
+                || entry_reason == "RTDS_DIFF_TIME_OVERRIDE");
         let gate_context = if entry_mode == "FORCE" {
             "SNIPER_ENTRY_FORCE"
         } else {
@@ -6901,6 +6992,7 @@ impl MakerHedgeCapBot {
         if !gate_ok || ask <= 0.0 {
             return false;
         }
+        let resolved_entry_reason = self._entry_reason_from_candidate(&active_cand);
         let entry_type_name = if force_diff_override {
             "FAK".to_string()
         } else {
@@ -7020,6 +7112,7 @@ impl MakerHedgeCapBot {
             if oid.is_none() {
                 return false;
             }
+            self._set_pending_entry_reason(&resolved_entry_reason);
             let pending_key = Self::_sniper_entry_pending_key(&asset_id);
             let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
             self._runtime_ts_set(&pending_key, now_ts_f64());
@@ -7103,6 +7196,7 @@ impl MakerHedgeCapBot {
         if !any_submitted {
             return false;
         }
+        self._set_pending_entry_reason(&resolved_entry_reason);
 
         let pending_key = Self::_sniper_entry_pending_key(&asset_id);
         let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
@@ -7320,6 +7414,9 @@ impl MakerHedgeCapBot {
                     }
                     mode = fallback_mode;
                 }
+            }
+            if let Ok(mut cat) = self.stop_loss_category.lock() {
+                *cat = Some(mode.clone());
             }
         }
         if reason_u == "STOP_LOSS" && mode == "HEDGE" {
@@ -8091,6 +8188,8 @@ impl MakerHedgeCapBot {
             "spread_ticks": spread_ticks,
             "parity": parity,
             "seconds_left": seconds_left,
+            "entry_mode": "NORMAL",
+            "entry_reason": "SNIPER_ENTRY",
         }))
     }
 
@@ -8543,7 +8642,7 @@ impl MakerHedgeCapBot {
                             o.insert("entry_mode".to_string(), json!("FORCE"));
                             o.insert(
                                 "entry_reason".to_string(),
-                                json!("RTDS_DIFF_TIME_OVERRIDE"),
+                                json!("SNIPER_FORCE_DIFF_ENTRY"),
                             );
                         }
                         if !self._sniper_entry_confirmed(&cand, now) {
@@ -8587,6 +8686,10 @@ impl MakerHedgeCapBot {
                             } else if let Some(mut cand) = cand {
                                 if let Value::Object(ref mut o) = cand {
                                     o.insert("entry_mode".to_string(), json!("FORCE"));
+                                    o.insert(
+                                        "entry_reason".to_string(),
+                                        json!("SNIPER_ENTRY_FORCE"),
+                                    );
                                 }
                                 if !self._sniper_entry_confirmed(&cand, now) {
                                     continue;
@@ -8758,6 +8861,21 @@ impl MakerHedgeCapBot {
             q_yes: state.q_yes,
             q_no: state.q_no,
             cpp: cost_per_pair(&state),
+            entry_time_iso: self
+                .first_entry_fill_iso
+                .lock()
+                .ok()
+                .and_then(|v| v.clone()),
+            entry_reason: self
+                .first_entry_reason
+                .lock()
+                .ok()
+                .and_then(|v| v.clone()),
+            stop_loss_category: self
+                .stop_loss_category
+                .lock()
+                .ok()
+                .and_then(|v| v.clone()),
             exit_reason: self._get_exit_reason(),
             fill_count: state.seen_trade_keys.len(),
         }

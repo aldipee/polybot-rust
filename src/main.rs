@@ -57,6 +57,24 @@ fn db_url_hint(db_url: &str) -> String {
     "<invalid-db-url>".to_string()
 }
 
+fn holding_duration_seconds(entry_iso: &str, exit_iso: &str) -> Option<f64> {
+    let start = chrono::DateTime::parse_from_rfc3339(entry_iso).ok()?;
+    let end = chrono::DateTime::parse_from_rfc3339(exit_iso).ok()?;
+    let ms = (end - start).num_milliseconds();
+    Some((ms.max(0) as f64) / 1000.0)
+}
+
+fn analytics_exit_reason(raw_reason: &str) -> String {
+    let reason = raw_reason.trim().to_ascii_uppercase();
+    if reason.contains("STOP_LOSS") || reason.contains("CAP_LOCKED_LOSS") {
+        "STOP_LOSS".to_string()
+    } else if reason.contains("TAKE_PROFIT") || reason.contains("TARGET_HIT") {
+        "TAKE_PROFIT".to_string()
+    } else {
+        "RESOLUTION".to_string()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct PnlWindowStats {
     h1: BotTradeStats,
@@ -1310,6 +1328,40 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 &bot_logger,
             );
             let end_trade_iso = now_iso_jakarta();
+            let raw_exit_reason = if metrics.exit_reason.trim().is_empty()
+                || metrics.exit_reason.eq_ignore_ascii_case("RUNNING")
+            {
+                run_reason.clone()
+            } else {
+                metrics.exit_reason.clone()
+            };
+            let exit_reason_category = analytics_exit_reason(&raw_exit_reason);
+            let effective_entry_iso = metrics
+                .entry_time_iso
+                .as_deref()
+                .unwrap_or(bot.start_trade_iso.as_str());
+            let holding_secs = holding_duration_seconds(effective_entry_iso, &end_trade_iso);
+            let total_qty = metrics.q_yes + metrics.q_no;
+            let entry_price = if total_qty > 1e-9 {
+                Some(metrics.total_cost / total_qty)
+            } else {
+                None
+            };
+            let exit_price = if total_qty > 1e-9 {
+                Some((metrics.total_cost + metrics.lp) / total_qty)
+            } else {
+                None
+            };
+            let stop_loss_category = if exit_reason_category == "STOP_LOSS" {
+                Some(
+                    metrics
+                        .stop_loss_category
+                        .clone()
+                        .unwrap_or_else(|| "MARKET".to_string()),
+                )
+            } else {
+                None
+            };
             repo.update_trade_result(
                 &trade_id,
                 &end_trade_iso,
@@ -1318,7 +1370,14 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 metrics.cpp,
                 metrics.q_yes,
                 metrics.q_no,
-                "FINALIZED",
+                &raw_exit_reason,
+                metrics.entry_time_iso.as_deref(),
+                holding_secs,
+                metrics.entry_reason.as_deref(),
+                Some(exit_reason_category.as_str()),
+                stop_loss_category.as_deref(),
+                entry_price,
+                exit_price,
             )?;
             bot.persist_state();
             bot_logger.info(&format!(
