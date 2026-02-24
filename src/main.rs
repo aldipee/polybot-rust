@@ -1159,6 +1159,7 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
     cfg.apply_safe_defaults();
     let mut current_slug = slug;
     let mut last_trade_validation_poll_ts = 0.0_f64;
+    let mut last_daily_limit_telegram_key = String::new();
 
     loop {
         let bot_logger = setup_item_logger(&current_slug);
@@ -1202,6 +1203,25 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                     daily_take_profit_usd,
                     daily_stop_loss_usd
                 ));
+                if telegram_enabled() {
+                    let notify_key = format!("{today}:{reason}");
+                    if last_daily_limit_telegram_key != notify_key {
+                        let telegram_summary = build_telegram_pnl_summary(&repo, &bot_id, &bot_logger);
+                        let telegram_message = format!(
+                            "DAILY LIMIT {}\nbot={} date={} pnl={:+.4} trades={} take_profit_usd={:.4} stop_loss_usd={:.4}\n\n{}",
+                            reason,
+                            bot_id,
+                            today,
+                            today_pnl,
+                            today_trades,
+                            daily_take_profit_usd,
+                            daily_stop_loss_usd,
+                            telegram_summary
+                        );
+                        send_telegram_stats_if_enabled(&telegram_message, &bot_logger);
+                        last_daily_limit_telegram_key = notify_key;
+                    }
+                }
                 thread::sleep(Duration::from_secs(60));
                 if let Some(auto_slug) =
                     generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
