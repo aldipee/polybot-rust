@@ -1017,6 +1017,7 @@ fn run() -> Result<()> {
     let account_name = env::var("ACCOUNT_NAME").unwrap_or_else(|_| "default".to_string());
     let daily_take_profit_usd = env_float("DAILY_PNL_TAKE_PROFIT_USD", 0.0).max(0.0);
     let daily_stop_loss_usd = env_float("DAILY_PNL_STOP_LOSS_USD", 0.0).abs();
+    let next_market_delay_seconds = env_float("NEXT_MARKET_DELAY_SECONDS", 2.0).max(0.0);
     let trade_validation_enabled = env_bool("TRADE_VALIDATION_ENABLED", true);
     let trade_validation_after_market_enabled =
         env_bool("TRADE_VALIDATION_AFTER_MARKET_ENABLED", true);
@@ -1435,8 +1436,11 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
             let telegram_summary = build_telegram_pnl_summary(&repo, &bot_id, &bot_logger);
             send_telegram_stats_if_enabled(&telegram_summary, &bot_logger);
         }
-        bot_logger.info(&format!("Waiting 2s before next market... {current_slug}"));
-        thread::sleep(Duration::from_secs(2));
+        bot_logger.info(&format!(
+            "Waiting {:.2}s before next market... {current_slug}",
+            next_market_delay_seconds
+        ));
+        thread::sleep(Duration::from_secs_f64(next_market_delay_seconds));
     }
 
     signal_stop_event.store(true, Ordering::SeqCst);
