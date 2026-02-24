@@ -2621,9 +2621,15 @@ impl RtdsService {
             }
             let chosen = if let Some(t) = rt.first_after_resolution.clone() {
                 (Some(t), "first_after_resolution".to_string())
+            } else if let Some(t) = rt.before_resolution.clone() {
+                self.logger.warning(&format!(
+                    "[RTDS] fallback persist market={} symbol={} reason=missing_post_resolution_tick source_ts_ms={} mode=last_before_resolution_fallback",
+                    self.market_slug, self.symbol, t.timestamp_ms
+                ));
+                (Some(t), "last_before_resolution_fallback".to_string())
             } else {
                 self.logger.warning(&format!(
-                    "[RTDS] skip persist market={} symbol={} reason=missing_post_resolution_tick",
+                    "[RTDS] skip persist market={} symbol={} reason=missing_post_resolution_tick_and_pre_resolution_tick",
                     self.market_slug, self.symbol
                 ));
                 rt.finalized = true;

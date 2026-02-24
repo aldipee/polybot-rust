@@ -12,10 +12,12 @@ Date: 2026-02-24
 - Added runtime tracking for active entry reason so repeat-mode trades use the correct TP/SL profile per new position. (commit: `8d29844`)
 - Added new override env keys to `ENV_CONTRACT_KEYS`. (commit: `8d29844`)
 - Added configurable rollover wait before entering next market via `NEXT_MARKET_DELAY_SECONDS` (default `2.0`).
+- Fixed RTDS resolution persistence when no post-resolution tick arrives: service now falls back to the latest pre-resolution tick (`capture_mode=last_before_resolution_fallback`) instead of skipping snapshot persist.
 
 ### Behavior Impact
 - Forced-diff entries and force entries can now run different risk targets from normal sniper entries without changing global TP/SL.
 - Existing behavior is unchanged unless one of the new override env vars is configured.
+- `price_to_beat` rollover is now more stable across market boundaries during sparse tick windows, reducing stale carry-forward values.
 
 ## Version 0.1.7
 Date: 2026-02-24
