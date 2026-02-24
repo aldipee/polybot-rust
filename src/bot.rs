@@ -1464,6 +1464,27 @@ impl MakerHedgeCapBot {
         (tp_override.unwrap_or(base_tp), sl_override.unwrap_or(base_sl))
     }
 
+    fn _force_diff_entry_reason(reason: &str) -> bool {
+        matches!(
+            reason.trim().to_ascii_uppercase().as_str(),
+            "SNIPER_FORCE_DIFF_ENTRY" | "RTDS_DIFF_TIME_OVERRIDE"
+        )
+    }
+
+    fn _should_bypass_rtds_hold_for_take_profit(
+        &self,
+        entry_reason: &str,
+        cost: f64,
+        pnl_pct: f64,
+        take_profit_pct: f64,
+    ) -> bool {
+        if cost <= 1e-12 || !Self::_force_diff_entry_reason(entry_reason) {
+            return false;
+        }
+        let (tp_override, _) = Self::_sniper_tp_sl_overrides_for_entry_reason(entry_reason);
+        tp_override.is_some() && pnl_pct + 1e-12 >= take_profit_pct
+    }
+
     fn _entry_reason_from_candidate(&self, cand: &Value) -> String {
         let entry_reason = cand
             .get("entry_reason")
@@ -8490,13 +8511,30 @@ impl MakerHedgeCapBot {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_ascii_uppercase();
-            if self._rtds_hold_till_resolution_active(&pos_side, seconds_left, "SIGNAL_HOLD") {
-                sniper_stop_breach_since = None;
-                continue;
-            }
             let active_entry_reason = self._active_entry_reason_or_default();
             let (take_profit_pct, stop_pct) =
                 self._sniper_tp_sl_for_entry_reason(&active_entry_reason);
+            let bypass_hold_for_tp = self._should_bypass_rtds_hold_for_take_profit(
+                &active_entry_reason,
+                cost,
+                pnl_pct,
+                take_profit_pct,
+            );
+            let hold_active =
+                self._rtds_hold_till_resolution_active(&pos_side, seconds_left, "SIGNAL_HOLD");
+            if hold_active && !bypass_hold_for_tp {
+                sniper_stop_breach_since = None;
+                continue;
+            }
+            if hold_active && bypass_hold_for_tp {
+                self._rtds_gate_log(
+                    "hold_bypass_force_diff_tp",
+                    &format!(
+                        "[RTDS_HOLD] SIGNAL_HOLD bypass: reason={} pnl_pct={:+.6} tp={:.6} t_left={:.2}s",
+                        active_entry_reason, pnl_pct, take_profit_pct, seconds_left
+                    ),
+                );
+            }
 
             if env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)
                 && seconds_left <= env_float("SNIPER_FORCE_EXIT_SECONDS", 8.0)
@@ -8828,13 +8866,30 @@ impl MakerHedgeCapBot {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_ascii_uppercase();
-            if self._rtds_hold_till_resolution_active(&pos_side, seconds_left, "SNIPER_HOLD") {
-                sniper_stop_breach_since = None;
-                continue;
-            }
             let active_entry_reason = self._active_entry_reason_or_default();
             let (take_profit_pct, stop_pct) =
                 self._sniper_tp_sl_for_entry_reason(&active_entry_reason);
+            let bypass_hold_for_tp = self._should_bypass_rtds_hold_for_take_profit(
+                &active_entry_reason,
+                cost,
+                pnl_pct,
+                take_profit_pct,
+            );
+            let hold_active =
+                self._rtds_hold_till_resolution_active(&pos_side, seconds_left, "SNIPER_HOLD");
+            if hold_active && !bypass_hold_for_tp {
+                sniper_stop_breach_since = None;
+                continue;
+            }
+            if hold_active && bypass_hold_for_tp {
+                self._rtds_gate_log(
+                    "hold_bypass_force_diff_tp",
+                    &format!(
+                        "[RTDS_HOLD] SNIPER_HOLD bypass: reason={} pnl_pct={:+.6} tp={:.6} t_left={:.2}s",
+                        active_entry_reason, pnl_pct, take_profit_pct, seconds_left
+                    ),
+                );
+            }
 
             if env_bool("SNIPER_EXIT_BEFORE_EXPIRY", true)
                 && seconds_left <= env_float("SNIPER_FORCE_EXIT_SECONDS", 8.0)
