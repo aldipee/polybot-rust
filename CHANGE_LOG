@@ -1,3 +1,35 @@
+## Version 0.1.10
+Date: 2026-02-25
+### Changes
+- Added sniper stop-certainty flow for stop-loss exits: sell-first stage with wall-clock budget and max submits, then same-call hedge fallback when sell fails/no-derisk/timeout.
+- Added typed stop-certainty config parsing with clamping and init-time caching in bot runtime:
+  - `SNIPER_STOP_CERTAINTY_ENABLED`
+  - `SNIPER_STOP_CERTAINTY_SELL_BUDGET_MS`
+  - `SNIPER_STOP_CERTAINTY_SELL_MAX_SUBMITS`
+  - `SNIPER_STOP_CERTAINTY_SELL_POST_WAIT_MS`
+  - `SNIPER_STOP_CERTAINTY_NO_DERISK_EPS_SHARES`
+  - `SNIPER_STOP_CERTAINTY_HEDGE_BUDGET_MS`
+  - `SNIPER_STOP_CERTAINTY_HEDGE_MAX_SUBMITS`
+  - `SNIPER_STOP_CERTAINTY_HEDGE_CAP_EXTRA_TICKS`
+  - `SNIPER_STOP_CERTAINTY_HEDGE_SLIP_BASE_TICKS`
+  - `SNIPER_STOP_CERTAINTY_HEDGE_SLIP_STEP_TICKS`
+  - `SNIPER_POST_HEDGE_POLICY`
+  - `SNIPER_POST_HEDGE_RECOVER_WINDOW_SECONDS`
+  - `SNIPER_POST_HEDGE_MAX_UNWIND_SUBMITS`
+  - `SNIPER_STOP_LOSS_STALE_CYCLES_TO_HEDGE`
+  - `SNIPER_STOP_LOSS_OPEN_EXPOSURE_MAX_PAUSE_MS`
+  - `SNIPER_HEDGED_BLOCK_NEW_ENTRIES`
+- Added post-hedge policy state handling (`HYBRID_TIMED`, `HOLD_TO_RESOLUTION`, `IMMEDIATE_UNWIND`) and entry blocking while hedged-protection state is active.
+- Added stale-feed emergency hedge trigger during active stop-loss after configurable stale cycles.
+- Added forced stop-loss hedge retry ladder (slippage step-up + extra cap ticks) for higher neutralization certainty.
+- Registered all new stop-certainty keys in `ENV_CONTRACT_KEYS`.
+- Added stop-certainty default profile blocks to `stable.env` and `after_market.env`.
+
+### Behavior Impact
+- Stop-loss behavior now prioritizes certainty of de-risking over execution cost.
+- Sell-only stop-loss failures can transition to hedge fallback in the same call path (faster neutralization under fast adverse moves).
+- Non-stop-loss exit paths remain unchanged.
+
 ## Version 0.1.9
 Date: 2026-02-25
 ### Changes
