@@ -1,3 +1,16 @@
+## Version 0.1.9
+Date: 2026-02-25
+### Changes
+- Added simple stop-loss retry delay control in `_sniper_try_exit`:
+  - new env: `SNIPER_STOP_LOSS_RETRY_DELAY_SECONDS` (default `0.0`)
+  - when reason is `STOP_LOSS`, this single value overrides internal retry sleeps (`200ms`, `150ms`, `1s`) and fail-pause backoffs (`0.5s`, `1s`, `2s`, `5s`, `60s`)
+  - non-stop-loss paths keep existing timing behavior unchanged.
+- Registered `SNIPER_STOP_LOSS_RETRY_DELAY_SECONDS` in `ENV_CONTRACT_KEYS`.
+
+### Behavior Impact
+- Stop-loss exit retries are immediate by default (`SNIPER_STOP_LOSS_RETRY_DELAY_SECONDS=0`), reducing delay in fast moves.
+- You can increase this single value if needed to reduce retry aggressiveness under poor allowance/balance conditions.
+
 ## Version 0.1.8
 Date: 2026-02-24
 ### Changes

@@ -7481,6 +7481,29 @@ impl MakerHedgeCapBot {
             return false;
         }
         let reason_u = reason.trim().to_ascii_uppercase();
+        let stop_loss_retry_delay_override = if reason_u == "STOP_LOSS" {
+            Some(env_float("SNIPER_STOP_LOSS_RETRY_DELAY_SECONDS", 0.0).max(0.0))
+        } else {
+            None
+        };
+        let retry_pause_s = |base: f64| -> f64 {
+            if let Some(v) = stop_loss_retry_delay_override {
+                v
+            } else if base.is_finite() && base > 0.0 {
+                base
+            } else {
+                0.0
+            }
+        };
+        let retry_sleep_s = |base: f64| -> f64 {
+            if let Some(v) = stop_loss_retry_delay_override {
+                v
+            } else if base.is_finite() && base > 0.0 {
+                base
+            } else {
+                0.0
+            }
+        };
         if reason_u != "STOP_LOSS" {
             self._sniper_stop_loss_reset_failures(&asset_id);
         }
@@ -7512,7 +7535,7 @@ impl MakerHedgeCapBot {
         }
         if reason_u == "STOP_LOSS" && mode == "HEDGE" {
             self._sniper_maybe_exit_hedge(pos, &reason_u, "stop_loss_mode");
-            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 0.5);
+            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(0.5));
             return false;
         }
         let mut stop_limit_mode = reason_u == "STOP_LOSS" && mode == "LIMIT";
@@ -7547,7 +7570,7 @@ impl MakerHedgeCapBot {
                     self._runtime_ts_set(&log_key, now + 2.0);
                 }
                 self._sniper_maybe_exit_hedge(pos, &reason_u, "wait_confirmed");
-                self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 0.5);
+                self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(0.5));
                 return false;
             }
         }
@@ -7806,13 +7829,13 @@ impl MakerHedgeCapBot {
                         self._runtime_ts_set(&first_key, 0.0);
                         self._clear_local_position_for_asset(&asset_id, "zero balance+allowance");
                         // Keep run alive; just clear stale local state and continue.
-                        self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+                        self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(1.0));
                         return false;
                     }
                 }
             }
             self._sniper_maybe_exit_hedge(pos, &reason_u, "allowance_precheck");
-            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 60.0);
+            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(60.0));
             return false;
         }
 
@@ -7845,7 +7868,10 @@ impl MakerHedgeCapBot {
                     std::slice::from_ref(&asset_id),
                     &format!("sniper stop-limit {reason_u}"),
                 );
-                thread::sleep(Duration::from_millis(150));
+                let cancel_settle_s = retry_sleep_s(0.150);
+                if cancel_settle_s > 0.0 {
+                    thread::sleep(Duration::from_secs_f64(cancel_settle_s));
+                }
 
                 let mut sell_sz = remaining.min(balance_avail_sh).min(allow_sh);
                 if exit_size_subtract > 0.0 {
@@ -7871,7 +7897,10 @@ impl MakerHedgeCapBot {
                 if oid.is_some() {
                     self._runtime_ts_set("__sniper_stop_limit_order_ts", now_ts_f64());
                     self._runtime_ts_set("__sniper_stop_limit_order_px", floor_px);
-                    thread::sleep(Duration::from_secs_f64(1.0));
+                    let post_submit_s = retry_sleep_s(1.0);
+                    if post_submit_s > 0.0 {
+                        thread::sleep(Duration::from_secs_f64(post_submit_s));
+                    }
                     if self._sniper_position().is_none() {
                         self._mark_sniper_exit_state();
                         return true;
@@ -7889,7 +7918,10 @@ impl MakerHedgeCapBot {
                 std::slice::from_ref(&asset_id),
                 &format!("sniper exit {reason_u}"),
             );
-            thread::sleep(Duration::from_millis(200));
+            let cancel_settle_s = retry_sleep_s(0.200);
+            if cancel_settle_s > 0.0 {
+                thread::sleep(Duration::from_secs_f64(cancel_settle_s));
+            }
         }
         let mut chunk = env_float("SNIPER_EXIT_CHUNK_SHARES", min_int as f64);
         if chunk <= 0.0 {
@@ -7940,7 +7972,7 @@ impl MakerHedgeCapBot {
                 }
                 sell_sz = q_down(sell_sz, exit_size_dp);
                 if sell_sz + 1e-12 < min_exit_size {
-                    self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+                    self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(1.0));
                     return false;
                 }
             } else {
@@ -7998,7 +8030,7 @@ impl MakerHedgeCapBot {
                             self.logger.warning(&format!(
                                 "[SNIPER] balance snapshot below min after recent/partial exit for asset={aid_tail}; deferring local-state reconcile and retrying."
                             ));
-                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 2.0);
+                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(2.0));
                             return false;
                         }
                         if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true) {
@@ -8021,7 +8053,7 @@ impl MakerHedgeCapBot {
                                     ));
                                     self._runtime_ts_set(
                                         "__taker_fail_pause_until",
-                                        now_ts_f64() + 2.0,
+                                        now_ts_f64() + retry_pause_s(2.0),
                                     );
                                     return false;
                                 }
@@ -8048,7 +8080,7 @@ impl MakerHedgeCapBot {
                                 "[SNIPER] exit rejected (bal<min) for asset={aid_tail}; keeping local state and retrying (no immediate market stop)."
                             ));
                         }
-                        self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 2.0);
+                        self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(2.0));
                         return false;
                     }
                     let allow_below_min = (exit_allow_fractional
@@ -8056,7 +8088,7 @@ impl MakerHedgeCapBot {
                         || (!exit_allow_fractional && allow_int_fresh < min_int);
                     if allow_below_min {
                         if sold_any || recent_submit {
-                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 5.0);
+                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(5.0));
                             return false;
                         }
                         let aid_tail: String = asset_id
@@ -8073,7 +8105,7 @@ impl MakerHedgeCapBot {
                         self.logger.info(&format!(
                             "[SNIPER] allowance snapshot asset={aid_tail} bal={bal_sh:.6} allow={allow_sh_fresh:.6} min_required={min_exit_size:.6}"
                         ));
-                        self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 60.0);
+                        self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(60.0));
                         return false;
                     }
                     if exit_allow_fractional {
@@ -8084,7 +8116,7 @@ impl MakerHedgeCapBot {
                             allow_sh = sellable_sh;
                             balance_avail_int = (sellable_sh + 1e-12).floor() as i64;
                             allow_int = balance_avail_int;
-                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(1.0));
                             continue;
                         }
                     } else {
@@ -8093,17 +8125,20 @@ impl MakerHedgeCapBot {
                         if sellable_int >= min_int && sellable_int < remaining_int {
                             balance_avail_int = sellable_int;
                             allow_int = sellable_int;
-                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+                            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(1.0));
                             continue;
                         }
                     }
                 }
-                self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 5.0);
+                self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(5.0));
                 return false;
             }
             submitted_any = true;
             last_submit_ts = now_ts_f64();
-            thread::sleep(Duration::from_secs_f64(1.0));
+            let post_submit_s = retry_sleep_s(1.0);
+            if post_submit_s > 0.0 {
+                thread::sleep(Duration::from_secs_f64(post_submit_s));
+            }
             let cur2 = self._sniper_position();
             if cur2.is_none() {
                 self._mark_sniper_exit_state();
@@ -8124,7 +8159,7 @@ impl MakerHedgeCapBot {
                     &format!("sniper exit {reason_u} no-fill cancel"),
                 );
             }
-            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + 1.0);
+            self._runtime_ts_set("__taker_fail_pause_until", now_ts_f64() + retry_pause_s(1.0));
             break;
         }
         if sold_any {
