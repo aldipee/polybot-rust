@@ -11,7 +11,16 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY vendor ./vendor
 COPY src ./src
-RUN cargo build --release --locked --bin polybot_convert_rust --bin copy_collect --bin clickhouse_push
+ARG BUILD_BINS="polybot_convert_rust copy_collect clickhouse_push"
+RUN --mount=type=cache,id=polybot-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=polybot-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=polybot-target,target=/app/target \
+    set -eux; \
+    bins=""; \
+    for bin in ${BUILD_BINS}; do bins="$bins --bin ${bin}"; done; \
+    cargo build --release --locked ${bins}; \
+    mkdir -p /artifacts; \
+    for bin in ${BUILD_BINS}; do cp "/app/target/release/${bin}" "/artifacts/${bin}"; done
 
 FROM debian:bookworm-slim AS runtime
 
@@ -25,9 +34,7 @@ RUN useradd --system --create-home --home-dir /home/polybot --uid 10001 polybot 
     && mkdir -p /app/data /app/output /app/logs /app/signals /app/state \
     && chown -R polybot:polybot /app
 
-COPY --from=builder /app/target/release/polybot_convert_rust /usr/local/bin/polybot_convert_rust
-COPY --from=builder /app/target/release/copy_collect /usr/local/bin/copy_collect
-COPY --from=builder /app/target/release/clickhouse_push /usr/local/bin/clickhouse_push
+COPY --from=builder /artifacts/ /usr/local/bin/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

@@ -1,11 +1,14 @@
 services:
   polybot-btc-1:
+    image: polybot-convert-rust:local
     container_name: polybot-btc-1
     working_dir: /app/state
     build:
       context: .
       dockerfile: Dockerfile
       target: runtime
+      args:
+        BUILD_BINS: "polybot_convert_rust"
     network_mode: host
     cpuset: "2"
     ulimits:
@@ -42,12 +45,9 @@ services:
     restart: unless-stopped
 
   polybot-btc-2:
+    image: polybot-convert-rust:local
     container_name: polybot-btc-2
     working_dir: /app/state
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: runtime
     network_mode: host
     cpuset: "2"
     ulimits:
