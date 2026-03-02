@@ -16,7 +16,7 @@ RUN cargo build --release --locked --bin polybot_convert_rust --bin copy_collect
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata libssl3 gosu \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -28,7 +28,7 @@ RUN useradd --system --create-home --home-dir /home/polybot --uid 10001 polybot 
 COPY --from=builder /app/target/release/polybot_convert_rust /usr/local/bin/polybot_convert_rust
 COPY --from=builder /app/target/release/copy_collect /usr/local/bin/copy_collect
 COPY --from=builder /app/target/release/clickhouse_push /usr/local/bin/clickhouse_push
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER polybot
-
-ENTRYPOINT ["/usr/local/bin/polybot_convert_rust"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
