@@ -8836,6 +8836,14 @@ impl MakerHedgeCapBot {
                 0.0
             }
         };
+        let stop_loss_fast_retry_on_positions =
+            reason_u == "STOP_LOSS"
+                && env_bool("SNIPER_STOP_LOSS_FAST_RETRY_ON_POSITIONS_FALLBACK", true);
+        let stop_loss_fast_retry_pause_s = env_float(
+            "SNIPER_STOP_LOSS_FAST_RETRY_PAUSE_SECONDS",
+            0.05,
+        )
+        .clamp(0.0, 1.0);
         if reason_u != "STOP_LOSS" {
             self._sniper_stop_loss_reset_failures(&asset_id);
         }
@@ -9396,7 +9404,17 @@ impl MakerHedgeCapBot {
                             self.logger.warning(&format!(
                                 "[SNIPER] balance snapshot below min after recent/partial exit for asset={aid_tail}; deferring local-state reconcile and retrying."
                             ));
-                            self._sniper_set_fail_pause(&reason_u, retry_pause_s(2.0));
+                            let pause_s = if stop_loss_fast_retry_on_positions {
+                                stop_loss_fast_retry_pause_s
+                            } else {
+                                retry_pause_s(2.0)
+                            };
+                            if stop_loss_fast_retry_on_positions {
+                                self.logger.warning(&format!(
+                                    "[SNIPER][STOP_LOSS] fast_retry positions_fallback asset={aid_tail} pause_s={pause_s:.3}"
+                                ));
+                            }
+                            self._sniper_set_fail_pause(&reason_u, pause_s);
                             return false;
                         }
                         if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true) {
@@ -9417,7 +9435,17 @@ impl MakerHedgeCapBot {
                                     self.logger.warning(&format!(
                                         "[SNIPER] balance snapshot below min but positions API still shows shares for asset={aid_tail} (pos={live_int}); deferring local-state reconcile."
                                     ));
-                                    self._sniper_set_fail_pause(&reason_u, retry_pause_s(2.0));
+                                    let pause_s = if stop_loss_fast_retry_on_positions {
+                                        stop_loss_fast_retry_pause_s
+                                    } else {
+                                        retry_pause_s(2.0)
+                                    };
+                                    if stop_loss_fast_retry_on_positions {
+                                        self.logger.warning(&format!(
+                                            "[SNIPER][STOP_LOSS] fast_retry positions_live asset={aid_tail} pos={live_int} pause_s={pause_s:.3}"
+                                        ));
+                                    }
+                                    self._sniper_set_fail_pause(&reason_u, pause_s);
                                     return false;
                                 }
                             }
@@ -9443,7 +9471,17 @@ impl MakerHedgeCapBot {
                                 "[SNIPER] exit rejected (bal<min) for asset={aid_tail}; keeping local state and retrying (no immediate market stop)."
                             ));
                         }
-                        self._sniper_set_fail_pause(&reason_u, retry_pause_s(2.0));
+                        let pause_s = if stop_loss_fast_retry_on_positions {
+                            stop_loss_fast_retry_pause_s
+                        } else {
+                            retry_pause_s(2.0)
+                        };
+                        if stop_loss_fast_retry_on_positions {
+                            self.logger.warning(&format!(
+                                "[SNIPER][STOP_LOSS] fast_retry bal_below_min asset={aid_tail} pause_s={pause_s:.3}"
+                            ));
+                        }
+                        self._sniper_set_fail_pause(&reason_u, pause_s);
                         return false;
                     }
                     let allow_below_min = (exit_allow_fractional
@@ -9451,7 +9489,12 @@ impl MakerHedgeCapBot {
                         || (!exit_allow_fractional && allow_int_fresh < min_int);
                     if allow_below_min {
                         if sold_any || recent_submit {
-                            self._sniper_set_fail_pause(&reason_u, retry_pause_s(5.0));
+                            let pause_s = if stop_loss_fast_retry_on_positions {
+                                (stop_loss_fast_retry_pause_s * 4.0).clamp(0.0, 1.0)
+                            } else {
+                                retry_pause_s(5.0)
+                            };
+                            self._sniper_set_fail_pause(&reason_u, pause_s);
                             return false;
                         }
                         let aid_tail: String = asset_id

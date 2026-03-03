@@ -1,3 +1,25 @@
+## Version 0.1.14
+Date: 2026-03-03
+### Changes
+- Breakout-invalidation stop now uses entry-time frozen breakout anchors from the exact `[BREAKOUT] PASS` decision, instead of recomputing levels on later position-open checks.
+- Added persisted pending/active breakout entry anchor state in bot state, with promotion on `flat -> in_position` and cleanup on close.
+- Added stop-arm diagnostics to detect anchor timing mismatch:
+  - `armed_price`
+  - `entry_buffer_dn` / `entry_buffer_up`
+  - `distance_bps`
+  - `armed_already_invalidated`
+  - `trigger_dir`, `triggered_at_ms`, `decided_at_ms`
+- Added stop-loss fast-retry path for balance/allowance desync cases when positions API still confirms shares:
+  - new env `SNIPER_STOP_LOSS_FAST_RETRY_ON_POSITIONS_FALLBACK` (default `true`)
+  - new env `SNIPER_STOP_LOSS_FAST_RETRY_PAUSE_SECONDS` (default `0.05`)
+  - reduces STOP_LOSS retry pause in positions-fallback branches (previously 2s/5s) to near-immediate retries.
+- Registered new fast-retry env keys in `ENV_CONTRACT_KEYS` and added examples to `.env` and `btc_2.env`.
+- Added/updated unit coverage for arming breakout invalidation stop from explicit entry anchors.
+
+### Behavior Impact
+- Stop-loss invalidation checks are now aligned with the exact entry trigger context, reducing anchor drift/mismatch.
+- In stop-loss desync scenarios (`balance/allowance=0` but positions API still shows size), retries are significantly faster and can reduce delayed exits.
+
 ## Version 0.1.13
 Date: 2026-03-03
 ### Changes
