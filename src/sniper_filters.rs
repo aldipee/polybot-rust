@@ -252,6 +252,8 @@ pub struct BreakoutDecision {
     pub reason: String,
     pub triggered: bool,
     pub direction: BreakoutDirection,
+    pub triggered_at_ms: Option<i64>,
+    pub spot_price: Option<f64>,
     pub hk: Option<f64>,
     pub lk: Option<f64>,
     pub buffer_up: Option<f64>,
@@ -270,6 +272,8 @@ impl Default for BreakoutDecision {
             reason: String::new(),
             triggered: false,
             direction: BreakoutDirection::None,
+            triggered_at_ms: None,
+            spot_price: None,
             hk: None,
             lk: None,
             buffer_up: None,
@@ -299,6 +303,7 @@ pub struct BreakoutInvalidationStopDecision {
     pub fired: bool,
     pub reason: String,
     pub side: String,
+    pub spot_price: Option<f64>,
     pub hk: Option<f64>,
     pub lk: Option<f64>,
     pub buffer_up: Option<f64>,
@@ -316,6 +321,7 @@ impl Default for BreakoutInvalidationStopDecision {
             fired: false,
             reason: String::new(),
             side: String::new(),
+            spot_price: None,
             hk: None,
             lk: None,
             buffer_up: None,
@@ -703,6 +709,11 @@ impl SniperFilterEngine {
             applied: true,
             persist_ms: self.breakout_invalidation_stop_cfg.persistence_ms,
             side: side.trim().to_ascii_uppercase(),
+            spot_price: if self.last_tick_price > 0.0 {
+                Some(self.last_tick_price)
+            } else {
+                None
+            },
             ..BreakoutInvalidationStopDecision::default()
         };
         if !self
@@ -755,6 +766,68 @@ impl SniperFilterEngine {
         out
     }
 
+    pub fn arm_breakout_invalidation_stop_from_anchor(
+        &mut self,
+        side: &str,
+        hk: f64,
+        lk: f64,
+        buffer_up: f64,
+        buffer_dn: f64,
+        now_ms_value: i64,
+    ) -> BreakoutInvalidationStopDecision {
+        let mut out = BreakoutInvalidationStopDecision {
+            applied: true,
+            persist_ms: self.breakout_invalidation_stop_cfg.persistence_ms,
+            side: side.trim().to_ascii_uppercase(),
+            spot_price: if self.last_tick_price > 0.0 {
+                Some(self.last_tick_price)
+            } else {
+                None
+            },
+            ..BreakoutInvalidationStopDecision::default()
+        };
+        if !self
+            .breakout_invalidation_stop_cfg
+            .enabled_for_symbol(&self.symbol_asset)
+        {
+            out.reason = "disabled".to_string();
+            return out;
+        }
+        let Some(_req_dir) = BreakoutDirection::from_side(side) else {
+            out.reason = "side_not_directional".to_string();
+            return out;
+        };
+        if !(hk > 0.0
+            && lk > 0.0
+            && buffer_up > 0.0
+            && buffer_dn > 0.0
+            && hk.is_finite()
+            && lk.is_finite()
+            && buffer_up.is_finite()
+            && buffer_dn.is_finite())
+        {
+            out.reason = "invalid_anchor".to_string();
+            return out;
+        }
+        let anchor = BreakoutInvalidationAnchor {
+            side: out.side.clone(),
+            hk,
+            lk,
+            buffer_up,
+            buffer_dn,
+            armed_at_ms: now_ms_value.max(0),
+        };
+        self.breakout_invalidation_anchor = Some(anchor.clone());
+        self.breakout_invalidation_started_at_ms = None;
+        out.hk = Some(anchor.hk);
+        out.lk = Some(anchor.lk);
+        out.buffer_up = Some(anchor.buffer_up);
+        out.buffer_dn = Some(anchor.buffer_dn);
+        out.armed = true;
+        out.reason = "armed".to_string();
+        out
+    }
+
     pub fn clear_breakout_invalidation_stop(&mut self) {
         self.breakout_invalidation_anchor = None;
         self.breakout_invalidation_started_at_ms = None;
@@ -769,6 +842,11 @@ impl SniperFilterEngine {
             applied: true,
             persist_ms: self.breakout_invalidation_stop_cfg.persistence_ms,
             side: side.trim().to_ascii_uppercase(),
+            spot_price: if self.last_tick_price > 0.0 {
+                Some(self.last_tick_price)
+            } else {
+                None
+            },
             ..BreakoutInvalidationStopDecision::default()
         };
         if !self
@@ -1019,6 +1097,11 @@ impl SniperFilterEngine {
     fn evaluate_breakout(&self, req_dir: BreakoutDirection, now_ms_value: i64) -> BreakoutDecision {
         let mut out = BreakoutDecision {
             applied: true,
+            spot_price: if self.last_tick_price > 0.0 {
+                Some(self.last_tick_price)
+            } else {
+                None
+            },
             persist_ms: self.breakout_cfg.persistence_ms,
             hk: self.level_hk,
             lk: self.level_lk,
@@ -1068,6 +1151,11 @@ impl SniperFilterEngine {
         }
         out.direction = active;
         out.triggered = active != BreakoutDirection::None;
+        out.triggered_at_ms = if out.triggered {
+            self.last_triggered_at_ms
+        } else {
+            None
+        };
         let started_at = if req_dir == BreakoutDirection::Up {
             self.up_break_started_at_ms
         } else if req_dir == BreakoutDirection::Down {
@@ -1635,5 +1723,55 @@ mod tests {
         assert!(eng2.import_state(st));
         assert!(eng2.breakout_invalidation_anchor.is_some());
         assert!(eng2.breakout_invalidation_started_at_ms.is_some());
+    }
+
+    #[test]
+    fn breakout_stop_arm_from_entry_anchor_uses_exact_levels() {
+        let mut stop_cfg = base_breakout_stop_cfg();
+        stop_cfg.persistence_ms = 1_000;
+        stop_cfg.max_snapshot_age_seconds = 10.0;
+        let mut eng = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            stop_cfg,
+        );
+        push_linear_ticks(&mut eng, 0, 8, 100.0, 0.1);
+        let custom_hk = 70000.0;
+        let custom_lk = 69000.0;
+        let custom_up = 70035.0;
+        let custom_dn = 68965.0;
+        let arm = eng.arm_breakout_invalidation_stop_from_anchor(
+            "NO",
+            custom_hk,
+            custom_lk,
+            custom_up,
+            custom_dn,
+            eng.last_tick_ts_ms + 1,
+        );
+        assert!(arm.armed);
+        let stored = eng.breakout_invalidation_anchor.clone().unwrap();
+        assert!((stored.hk - custom_hk).abs() < 1e-9);
+        assert!((stored.lk - custom_lk).abs() < 1e-9);
+        assert!((stored.buffer_up - custom_up).abs() < 1e-9);
+        assert!((stored.buffer_dn - custom_dn).abs() < 1e-9);
+
+        let t0 = eng.last_tick_ts_ms + 100;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: custom_dn + 5.0,
+            ts_ms: t0,
+            received_at_ms: t0,
+        });
+        let _ = eng.evaluate_breakout_invalidation_stop("NO", t0);
+        let t1 = t0 + 1_100;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: custom_dn + 6.0,
+            ts_ms: t1,
+            received_at_ms: t1,
+        });
+        let fired = eng.evaluate_breakout_invalidation_stop("NO", t1);
+        assert!(fired.fired);
     }
 }

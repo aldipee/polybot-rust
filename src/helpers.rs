@@ -382,6 +382,20 @@ pub struct OpenOrderState {
     pub ts: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SniperEntryBreakoutAnchorState {
+    pub side: String,
+    pub trigger_dir: String,
+    pub entry_hk: f64,
+    pub entry_lk: f64,
+    pub entry_buffer_up: f64,
+    pub entry_buffer_dn: f64,
+    pub triggered_at_ms: i64,
+    pub decided_at_ms: i64,
+    pub decision_spot_price: f64,
+    pub order_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotState {
     pub q_yes: f64,
@@ -395,6 +409,10 @@ pub struct BotState {
     pub sniper_last_entry_ts: f64,
     pub sniper_last_exit_ts: f64,
     pub sniper_last_side: String,
+    #[serde(default)]
+    pub sniper_pending_breakout_anchor: Option<SniperEntryBreakoutAnchorState>,
+    #[serde(default)]
+    pub sniper_active_breakout_anchor: Option<SniperEntryBreakoutAnchorState>,
 }
 
 impl Default for BotState {
@@ -411,6 +429,8 @@ impl Default for BotState {
             sniper_last_entry_ts: 0.0,
             sniper_last_exit_ts: 0.0,
             sniper_last_side: String::new(),
+            sniper_pending_breakout_anchor: None,
+            sniper_active_breakout_anchor: None,
         }
     }
 }

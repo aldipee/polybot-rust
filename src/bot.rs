@@ -6,6 +6,7 @@ use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
 use crate::helpers::{
     clamp, cost_per_pair, iso_to_epoch, load_state, locked_profit, q_down, q_up, round_down,
     round_up, save_state, segment_defaults, BotState, OpenOrderState,
+    SniperEntryBreakoutAnchorState,
 };
 use crate::logging::LogLike;
 use crate::rtds::get_live_snapshot_for_market;
@@ -1113,9 +1114,96 @@ impl MakerHedgeCapBot {
             .unwrap_or(true)
     }
 
-    fn _sniper_filters_arm_breakout_invalidation_stop(
+    fn _sniper_build_breakout_entry_anchor(
         &self,
         side: &str,
+        filter_decision: Option<&SniperFilterDecision>,
+        decided_at_ms: i64,
+        order_id: Option<String>,
+    ) -> Option<SniperEntryBreakoutAnchorState> {
+        let d = filter_decision?;
+        let b = &d.breakout;
+        if !(b.applied && b.passed && b.triggered) {
+            return None;
+        }
+        let (Some(hk), Some(lk), Some(buffer_up), Some(buffer_dn)) = (b.hk, b.lk, b.buffer_up, b.buffer_dn) else {
+            return None;
+        };
+        if b.direction.as_str() == "NONE" {
+            return None;
+        }
+        Some(SniperEntryBreakoutAnchorState {
+            side: side.trim().to_ascii_uppercase(),
+            trigger_dir: b.direction.as_str().to_string(),
+            entry_hk: hk,
+            entry_lk: lk,
+            entry_buffer_up: buffer_up,
+            entry_buffer_dn: buffer_dn,
+            triggered_at_ms: b.triggered_at_ms.unwrap_or(0).max(0),
+            decided_at_ms: decided_at_ms.max(0),
+            decision_spot_price: b.spot_price.unwrap_or(0.0).max(0.0),
+            order_id,
+        })
+    }
+
+    fn _sniper_set_pending_breakout_entry_anchor(
+        &self,
+        anchor: Option<SniperEntryBreakoutAnchorState>,
+    ) {
+        if let Ok(mut s) = self.state.lock() {
+            s.sniper_pending_breakout_anchor = anchor;
+            let _ = save_state(&self.state_file, &mut s);
+        }
+    }
+
+    fn _sniper_clear_breakout_entry_anchor_state(&self, clear_pending: bool, clear_active: bool) {
+        if !clear_pending && !clear_active {
+            return;
+        }
+        if let Ok(mut s) = self.state.lock() {
+            if clear_pending {
+                s.sniper_pending_breakout_anchor = None;
+            }
+            if clear_active {
+                s.sniper_active_breakout_anchor = None;
+            }
+            let _ = save_state(&self.state_file, &mut s);
+        }
+    }
+
+    fn _sniper_activate_breakout_entry_anchor(
+        &self,
+        side: &str,
+    ) -> Option<SniperEntryBreakoutAnchorState> {
+        let mut out: Option<SniperEntryBreakoutAnchorState> = None;
+        let pos_side = side.trim().to_ascii_uppercase();
+        if let Ok(mut s) = self.state.lock() {
+            if let Some(active) = s.sniper_active_breakout_anchor.clone() {
+                if active.side.trim().to_ascii_uppercase() == pos_side {
+                    out = Some(active);
+                } else {
+                    s.sniper_active_breakout_anchor = None;
+                }
+            }
+            if out.is_none() {
+                if let Some(pending) = s.sniper_pending_breakout_anchor.clone() {
+                    if pending.side.trim().to_ascii_uppercase() == pos_side {
+                        s.sniper_active_breakout_anchor = Some(pending.clone());
+                        s.sniper_pending_breakout_anchor = None;
+                        out = Some(pending);
+                    } else {
+                        s.sniper_pending_breakout_anchor = None;
+                    }
+                }
+            }
+            let _ = save_state(&self.state_file, &mut s);
+        }
+        out
+    }
+
+    fn _sniper_filters_arm_breakout_invalidation_stop_from_anchor(
+        &self,
+        anchor: &SniperEntryBreakoutAnchorState,
         context: &str,
         seconds_left: f64,
     ) -> Option<BreakoutInvalidationStopDecision> {
@@ -1123,7 +1211,14 @@ impl MakerHedgeCapBot {
         let now_ms = (now_ts_f64() * 1000.0) as i64;
         let (decision, every_s) = match self.sniper_filters.lock() {
             Ok(mut f) => (
-                f.arm_breakout_invalidation_stop(side, now_ms),
+                f.arm_breakout_invalidation_stop_from_anchor(
+                    &anchor.side,
+                    anchor.entry_hk,
+                    anchor.entry_lk,
+                    anchor.entry_buffer_up,
+                    anchor.entry_buffer_dn,
+                    now_ms,
+                ),
                 f.breakout_invalidation_stop_log_every_seconds(),
             ),
             Err(_) => return None,
@@ -1131,11 +1226,41 @@ impl MakerHedgeCapBot {
         if decision.armed {
             self._sniper_filters_save_state(false);
         }
+        let armed_price = decision
+            .spot_price
+            .or_else(|| {
+                if anchor.decision_spot_price > 0.0 {
+                    Some(anchor.decision_spot_price)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0);
+        let (distance_bps, armed_already_invalidated, entry_buffer_dn, entry_buffer_up) =
+            if anchor.side.trim().eq_ignore_ascii_case("NO") && anchor.entry_buffer_dn > 0.0 {
+                let d = ((armed_price - anchor.entry_buffer_dn) / anchor.entry_buffer_dn) * 10_000.0;
+                (
+                    Some(d),
+                    Some(d > 0.0),
+                    Some(anchor.entry_buffer_dn),
+                    None,
+                )
+            } else if anchor.side.trim().eq_ignore_ascii_case("YES") && anchor.entry_buffer_up > 0.0 {
+                let d = ((anchor.entry_buffer_up - armed_price) / anchor.entry_buffer_up) * 10_000.0;
+                (
+                    Some(d),
+                    Some(d > 0.0),
+                    None,
+                    Some(anchor.entry_buffer_up),
+                )
+            } else {
+                (None, None, None, None)
+            };
         let msg = format!(
-            "[STOP_BREAKOUT] {} context={} side={} reason={} Hk={} Lk={} buf_up={} buf_dn={} persist_ms={} elapsed_ms={} tick_age_ms={} t_left={:.2}s",
+            "[STOP_BREAKOUT] {} context={} side={} reason={} Hk={} Lk={} buf_up={} buf_dn={} persist_ms={} elapsed_ms={} tick_age_ms={} armed_price={} entry_buffer_dn={} entry_buffer_up={} distance_bps={} armed_already_invalidated={} trigger_dir={} triggered_at_ms={} decided_at_ms={} t_left={:.2}s",
             if decision.armed { "ARM" } else { "SKIP" },
             context,
-            side,
+            anchor.side,
             decision.reason,
             decision
                 .hk
@@ -1156,6 +1281,26 @@ impl MakerHedgeCapBot {
             decision.persist_ms,
             decision.elapsed_ms,
             decision.tick_age_ms,
+            if armed_price > 0.0 {
+                format!("{armed_price:.6}")
+            } else {
+                "na".to_string()
+            },
+            entry_buffer_dn
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            entry_buffer_up
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            distance_bps
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "na".to_string()),
+            armed_already_invalidated
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "na".to_string()),
+            anchor.trigger_dir,
+            anchor.triggered_at_ms,
+            anchor.decided_at_ms,
             seconds_left
         );
         if decision.armed {
@@ -1171,6 +1316,36 @@ impl MakerHedgeCapBot {
             f.clear_breakout_invalidation_stop();
         }
         self._sniper_filters_save_state(false);
+    }
+
+    fn _sniper_arm_breakout_invalidation_stop_for_position(
+        &self,
+        side: &str,
+        context: &str,
+        seconds_left: f64,
+    ) {
+        let Some(anchor) = self._sniper_activate_breakout_entry_anchor(side) else {
+            self._sniper_filters_clear_breakout_invalidation_stop();
+            let every_s = self
+                .sniper_filters
+                .lock()
+                .map(|f| f.breakout_invalidation_stop_log_every_seconds())
+                .unwrap_or(1.0);
+            self._sniper_filter_log(
+                "stop_breakout",
+                every_s,
+                &format!(
+                    "[STOP_BREAKOUT] SKIP context={} side={} reason=no_entry_anchor t_left={:.2}s",
+                    context, side, seconds_left
+                ),
+            );
+            return;
+        };
+        let _ = self._sniper_filters_arm_breakout_invalidation_stop_from_anchor(
+            &anchor,
+            context,
+            seconds_left,
+        );
     }
 
     fn _sniper_filters_eval_breakout_invalidation_stop(
@@ -7402,6 +7577,13 @@ impl MakerHedgeCapBot {
                 return false;
             }
         }
+        let decided_at_ms = (now_ts * 1000.0) as i64;
+        let mut pending_breakout_anchor = self._sniper_build_breakout_entry_anchor(
+            &side,
+            endgame_filter_decision.as_ref(),
+            decided_at_ms,
+            None,
+        );
         let asset_id = if side == "YES" {
             self.yes_asset.clone().unwrap_or_default()
         } else {
@@ -7516,7 +7698,12 @@ impl MakerHedgeCapBot {
                 size_target as f64,
                 endgame_filter_decision.as_ref(),
             );
+            if let Some(a) = pending_breakout_anchor.as_mut() {
+                a.order_id = Some(oid);
+            }
         }
+        self._sniper_clear_breakout_entry_anchor_state(false, true);
+        self._sniper_set_pending_breakout_entry_anchor(pending_breakout_anchor.clone());
         let endgame_entry_reason = if trigger_mode == "RESOLUTION" {
             "SNIPER_ENDGAME_RESOLUTION"
         } else {
@@ -7922,6 +8109,13 @@ impl MakerHedgeCapBot {
                 return false;
             }
         }
+        let decided_at_ms = (now * 1000.0) as i64;
+        let mut pending_breakout_anchor = self._sniper_build_breakout_entry_anchor(
+            &side,
+            filter_decision.as_ref(),
+            decided_at_ms,
+            None,
+        );
         let resolved_entry_reason = self._entry_reason_from_candidate(&active_cand);
         let entry_type_name = if force_diff_override {
             "FAK".to_string()
@@ -8058,6 +8252,11 @@ impl MakerHedgeCapBot {
                 desired_chunk as f64,
                 filter_decision.as_ref(),
             );
+            if let Some(a) = pending_breakout_anchor.as_mut() {
+                a.order_id = Some(oid.clone());
+            }
+            self._sniper_clear_breakout_entry_anchor_state(false, true);
+            self._sniper_set_pending_breakout_entry_anchor(pending_breakout_anchor.clone());
             self._set_pending_entry_reason(&resolved_entry_reason);
             let pending_key = Self::_sniper_entry_pending_key(&asset_id);
             let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
@@ -8164,7 +8363,12 @@ impl MakerHedgeCapBot {
                 submitted_qty.max(0.0),
                 filter_decision.as_ref(),
             );
+            if let Some(a) = pending_breakout_anchor.as_mut() {
+                a.order_id = Some(oid.clone());
+            }
         }
+        self._sniper_clear_breakout_entry_anchor_state(false, true);
+        self._sniper_set_pending_breakout_entry_anchor(pending_breakout_anchor.clone());
         self._set_pending_entry_reason(&resolved_entry_reason);
 
         let pending_key = Self::_sniper_entry_pending_key(&asset_id);
@@ -9659,6 +9863,7 @@ impl MakerHedgeCapBot {
                     sniper_stop_breach_since = None;
                     self._runtime_ts_set("__sniper_entry_ref_price", 0.0);
                     self._sniper_filters_clear_breakout_invalidation_stop();
+                    self._sniper_clear_breakout_entry_anchor_state(true, true);
                 }
                 self._sniper_clear_post_hedge_state();
             } else if !sniper_in_pos {
@@ -9676,7 +9881,7 @@ impl MakerHedgeCapBot {
                     .and_then(|p| p.get("side"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let _ = self._sniper_filters_arm_breakout_invalidation_stop(
+                self._sniper_arm_breakout_invalidation_stop_for_position(
                     pos_side,
                     "SIGNAL_POS_OPEN",
                     seconds_left,
@@ -10058,6 +10263,7 @@ impl MakerHedgeCapBot {
                     self._runtime_ts_set("__sniper_entry_ref_price", 0.0);
                     self._runtime_ts_set("__sniper_entry_gate_since", 0.0);
                     self._sniper_filters_clear_breakout_invalidation_stop();
+                    self._sniper_clear_breakout_entry_anchor_state(true, true);
                 }
                 self._sniper_clear_post_hedge_state();
             } else if !sniper_in_pos {
@@ -10076,7 +10282,7 @@ impl MakerHedgeCapBot {
                     .and_then(|p| p.get("side"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let _ = self._sniper_filters_arm_breakout_invalidation_stop(
+                self._sniper_arm_breakout_invalidation_stop_for_position(
                     pos_side,
                     "SNIPER_POS_OPEN",
                     seconds_left,
