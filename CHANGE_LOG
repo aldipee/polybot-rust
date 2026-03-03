@@ -1,3 +1,38 @@
+## Version 0.1.13
+Date: 2026-03-03
+### Changes
+- Added Binance breakout-invalidation stop-loss strategy with independent toggle and BTC symbol scoping:
+  - `SNIPER_BREAKOUT_INVALIDATION_STOP_ENABLED`
+  - `SNIPER_BREAKOUT_INVALIDATION_STOP_SYMBOLS`
+  - `SNIPER_BREAKOUT_INVALIDATION_STOP_PERSISTENCE_MS`
+  - `SNIPER_BREAKOUT_INVALIDATION_STOP_MAX_SNAPSHOT_AGE_SECONDS`
+  - `SNIPER_BREAKOUT_INVALIDATION_STOP_LOG_EVERY_SECONDS`
+- Added entry-frozen stop anchor support in `SniperFilterEngine`:
+  - new persisted anchor (`side`, `Hk`, `Lk`, `buffer_up`, `buffer_dn`, `armed_at_ms`)
+  - invalidation timer state persisted for restart continuity
+- Added breakout-invalidation stop APIs:
+  - `arm_breakout_invalidation_stop(...)`
+  - `evaluate_breakout_invalidation_stop(...)`
+  - `clear_breakout_invalidation_stop()`
+- Integrated breakout-invalidation stop checks into both sniper loops:
+  - `_run_sniper_loop`
+  - `_run_signal_sniper_loop`
+- Stop trigger precedence now supports “same-reason” stop:
+  - evaluate breakout invalidation first while in position
+  - fire existing `_sniper_try_exit(..., \"STOP_LOSS\")` path on trigger
+  - keep existing PnL stop-loss as backup and stale-feed hedge behavior unchanged
+- Added throttled breakout-stop observability logs:
+  - `[STOP_BREAKOUT] ARM`
+  - `[STOP_BREAKOUT] TRACK`
+  - `[STOP_BREAKOUT] FIRE`
+  - `[STOP_BREAKOUT] SKIP reason=stale|no_anchor|disabled|...`
+- Extended JSON filter persistence schema with backward-compatible defaults for new stop fields.
+- Added/updated unit tests for breakout-invalidation stop arming, stale/no-level handling, timer start/reset/fire, clear/reset, and state roundtrip.
+
+### Behavior Impact
+- When enabled and anchored successfully, in-position exits can trigger early on Binance breakout invalidation (buffer re-entry + persistence), before PnL stop-loss.
+- If Binance stop data is stale/missing/no-anchor, this stop path is suppressed and existing stop-loss framework remains active.
+
 ## Version 0.1.12
 Date: 2026-03-03
 ### Changes

@@ -193,6 +193,41 @@ impl BreakoutConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BreakoutInvalidationStopConfig {
+    pub enabled: bool,
+    pub symbols: HashSet<String>,
+    pub persistence_ms: i64,
+    pub max_snapshot_age_seconds: f64,
+    pub log_every_seconds: f64,
+}
+
+impl BreakoutInvalidationStopConfig {
+    pub fn from_env() -> Self {
+        let default_max_age = env_float(
+            "SNIPER_BREAKOUT_MAX_SNAPSHOT_AGE_SECONDS",
+            env_float("RTDS_ENTRY_GATE_MAX_AGE_SECONDS", 2.0),
+        );
+        Self {
+            enabled: env_bool("SNIPER_BREAKOUT_INVALIDATION_STOP_ENABLED", false),
+            symbols: parse_symbol_set("SNIPER_BREAKOUT_INVALIDATION_STOP_SYMBOLS", "btc"),
+            persistence_ms: env_int("SNIPER_BREAKOUT_INVALIDATION_STOP_PERSISTENCE_MS", 2000)
+                .clamp(100, 120_000),
+            max_snapshot_age_seconds: env_float(
+                "SNIPER_BREAKOUT_INVALIDATION_STOP_MAX_SNAPSHOT_AGE_SECONDS",
+                default_max_age,
+            )
+            .max(0.05),
+            log_every_seconds: env_float("SNIPER_BREAKOUT_INVALIDATION_STOP_LOG_EVERY_SECONDS", 1.0)
+                .max(0.0),
+        }
+    }
+
+    pub fn enabled_for_symbol(&self, symbol_asset: &str) -> bool {
+        self.enabled && self.symbols.contains(&normalize_asset_symbol(symbol_asset))
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MomentumDecision {
     pub applied: bool,
@@ -247,6 +282,51 @@ impl Default for BreakoutDecision {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreakoutInvalidationAnchor {
+    pub side: String,
+    pub hk: f64,
+    pub lk: f64,
+    pub buffer_up: f64,
+    pub buffer_dn: f64,
+    pub armed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreakoutInvalidationStopDecision {
+    pub applied: bool,
+    pub armed: bool,
+    pub fired: bool,
+    pub reason: String,
+    pub side: String,
+    pub hk: Option<f64>,
+    pub lk: Option<f64>,
+    pub buffer_up: Option<f64>,
+    pub buffer_dn: Option<f64>,
+    pub persist_ms: i64,
+    pub elapsed_ms: i64,
+    pub tick_age_ms: i64,
+}
+
+impl Default for BreakoutInvalidationStopDecision {
+    fn default() -> Self {
+        Self {
+            applied: false,
+            armed: false,
+            fired: false,
+            reason: String::new(),
+            side: String::new(),
+            hk: None,
+            lk: None,
+            buffer_up: None,
+            buffer_dn: None,
+            persist_ms: 0,
+            elapsed_ms: 0,
+            tick_age_ms: i64::MAX,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FilterDecision {
     pub allowed: bool,
@@ -275,12 +355,17 @@ pub struct SniperFilterPersistedState {
     pub momentum_yes: Option<MomentumDecision>,
     #[serde(default)]
     pub momentum_no: Option<MomentumDecision>,
+    #[serde(default)]
+    pub breakout_invalidation_anchor: Option<BreakoutInvalidationAnchor>,
+    #[serde(default)]
+    pub breakout_invalidation_started_at_ms: Option<i64>,
 }
 
 pub struct SniperFilterEngine {
     symbol_asset: String,
     momentum_cfg: MomentumConfig,
     breakout_cfg: BreakoutConfig,
+    breakout_invalidation_stop_cfg: BreakoutInvalidationStopConfig,
     completed_candles: VecDeque<Candle1m>,
     current_candle: Option<Candle1m>,
     last_tick_ts_ms: i64,
@@ -294,6 +379,8 @@ pub struct SniperFilterEngine {
     dn_break_started_at_ms: Option<i64>,
     last_triggered_at_ms: Option<i64>,
     active_trigger: BreakoutDirection,
+    breakout_invalidation_anchor: Option<BreakoutInvalidationAnchor>,
+    breakout_invalidation_started_at_ms: Option<i64>,
 }
 
 impl SniperFilterEngine {
@@ -301,6 +388,7 @@ impl SniperFilterEngine {
         let symbol_asset = normalize_asset_symbol(symbol_asset_hint);
         let momentum_cfg = MomentumConfig::from_env();
         let breakout_cfg = BreakoutConfig::from_env();
+        let breakout_invalidation_stop_cfg = BreakoutInvalidationStopConfig::from_env();
         let history = momentum_cfg
             .candle_history
             .max(breakout_cfg.level_lookback_candles + 8);
@@ -308,6 +396,7 @@ impl SniperFilterEngine {
             symbol_asset,
             momentum_cfg,
             breakout_cfg,
+            breakout_invalidation_stop_cfg,
             completed_candles: VecDeque::with_capacity(history),
             current_candle: None,
             last_tick_ts_ms: 0,
@@ -321,6 +410,8 @@ impl SniperFilterEngine {
             dn_break_started_at_ms: None,
             last_triggered_at_ms: None,
             active_trigger: BreakoutDirection::None,
+            breakout_invalidation_anchor: None,
+            breakout_invalidation_started_at_ms: None,
         }
     }
 
@@ -328,6 +419,20 @@ impl SniperFilterEngine {
         symbol_asset_hint: &str,
         momentum_cfg: MomentumConfig,
         breakout_cfg: BreakoutConfig,
+    ) -> Self {
+        Self::new_with_all_configs(
+            symbol_asset_hint,
+            momentum_cfg,
+            breakout_cfg,
+            BreakoutInvalidationStopConfig::from_env(),
+        )
+    }
+
+    pub fn new_with_all_configs(
+        symbol_asset_hint: &str,
+        momentum_cfg: MomentumConfig,
+        breakout_cfg: BreakoutConfig,
+        breakout_invalidation_stop_cfg: BreakoutInvalidationStopConfig,
     ) -> Self {
         let symbol_asset = normalize_asset_symbol(symbol_asset_hint);
         let history = momentum_cfg
@@ -337,6 +442,7 @@ impl SniperFilterEngine {
             symbol_asset,
             momentum_cfg,
             breakout_cfg,
+            breakout_invalidation_stop_cfg,
             completed_candles: VecDeque::with_capacity(history),
             current_candle: None,
             last_tick_ts_ms: 0,
@@ -350,12 +456,17 @@ impl SniperFilterEngine {
             dn_break_started_at_ms: None,
             last_triggered_at_ms: None,
             active_trigger: BreakoutDirection::None,
+            breakout_invalidation_anchor: None,
+            breakout_invalidation_started_at_ms: None,
         }
     }
 
     pub fn uses_binance_feed(&self) -> bool {
         self.momentum_cfg.enabled_for_symbol(&self.symbol_asset)
             || self.breakout_cfg.enabled_for_symbol(&self.symbol_asset)
+            || self
+                .breakout_invalidation_stop_cfg
+                .enabled_for_symbol(&self.symbol_asset)
     }
 
     pub fn momentum_log_every_seconds(&self) -> f64 {
@@ -364,6 +475,10 @@ impl SniperFilterEngine {
 
     pub fn breakout_log_every_seconds(&self) -> f64 {
         self.breakout_cfg.log_every_seconds
+    }
+
+    pub fn breakout_invalidation_stop_log_every_seconds(&self) -> f64 {
+        self.breakout_invalidation_stop_cfg.log_every_seconds
     }
 
     pub fn export_state(&self) -> SniperFilterPersistedState {
@@ -403,6 +518,8 @@ impl SniperFilterEngine {
             active_trigger: self.active_trigger,
             momentum_yes,
             momentum_no,
+            breakout_invalidation_anchor: self.breakout_invalidation_anchor.clone(),
+            breakout_invalidation_started_at_ms: self.breakout_invalidation_started_at_ms,
         }
     }
 
@@ -431,6 +548,8 @@ impl SniperFilterEngine {
         self.dn_break_started_at_ms = st.dn_break_started_at_ms;
         self.last_triggered_at_ms = st.last_triggered_at_ms;
         self.active_trigger = st.active_trigger;
+        self.breakout_invalidation_anchor = st.breakout_invalidation_anchor;
+        self.breakout_invalidation_started_at_ms = st.breakout_invalidation_started_at_ms;
         true
     }
 
@@ -572,6 +691,151 @@ impl SniperFilterEngine {
         }
         out.allowed = true;
         out.reason = "ok".to_string();
+        out
+    }
+
+    pub fn arm_breakout_invalidation_stop(
+        &mut self,
+        side: &str,
+        now_ms_value: i64,
+    ) -> BreakoutInvalidationStopDecision {
+        let mut out = BreakoutInvalidationStopDecision {
+            applied: true,
+            persist_ms: self.breakout_invalidation_stop_cfg.persistence_ms,
+            side: side.trim().to_ascii_uppercase(),
+            ..BreakoutInvalidationStopDecision::default()
+        };
+        if !self
+            .breakout_invalidation_stop_cfg
+            .enabled_for_symbol(&self.symbol_asset)
+        {
+            out.reason = "disabled".to_string();
+            return out;
+        }
+        let Some(_req_dir) = BreakoutDirection::from_side(side) else {
+            out.reason = "side_not_directional".to_string();
+            return out;
+        };
+        out.tick_age_ms = if self.last_tick_ts_ms > 0 {
+            now_ms_value.saturating_sub(self.last_tick_ts_ms).max(0)
+        } else {
+            i64::MAX
+        };
+        let max_age_ms = (self.breakout_invalidation_stop_cfg.max_snapshot_age_seconds * 1000.0) as i64;
+        if self.last_tick_ts_ms <= 0 || out.tick_age_ms > max_age_ms {
+            out.reason = "stale".to_string();
+            return out;
+        }
+        if self.completed_candles.len() < self.breakout_cfg.level_lookback_candles {
+            out.reason = "insufficient_candles".to_string();
+            return out;
+        }
+        let (Some(hk), Some(lk), Some(buffer_up), Some(buffer_dn)) =
+            (self.level_hk, self.level_lk, self.buffer_up, self.buffer_dn)
+        else {
+            out.reason = "no_levels".to_string();
+            return out;
+        };
+        let anchor = BreakoutInvalidationAnchor {
+            side: out.side.clone(),
+            hk,
+            lk,
+            buffer_up,
+            buffer_dn,
+            armed_at_ms: now_ms_value.max(0),
+        };
+        self.breakout_invalidation_anchor = Some(anchor.clone());
+        self.breakout_invalidation_started_at_ms = None;
+        out.hk = Some(anchor.hk);
+        out.lk = Some(anchor.lk);
+        out.buffer_up = Some(anchor.buffer_up);
+        out.buffer_dn = Some(anchor.buffer_dn);
+        out.armed = true;
+        out.reason = "armed".to_string();
+        out
+    }
+
+    pub fn clear_breakout_invalidation_stop(&mut self) {
+        self.breakout_invalidation_anchor = None;
+        self.breakout_invalidation_started_at_ms = None;
+    }
+
+    pub fn evaluate_breakout_invalidation_stop(
+        &mut self,
+        side: &str,
+        now_ms_value: i64,
+    ) -> BreakoutInvalidationStopDecision {
+        let mut out = BreakoutInvalidationStopDecision {
+            applied: true,
+            persist_ms: self.breakout_invalidation_stop_cfg.persistence_ms,
+            side: side.trim().to_ascii_uppercase(),
+            ..BreakoutInvalidationStopDecision::default()
+        };
+        if !self
+            .breakout_invalidation_stop_cfg
+            .enabled_for_symbol(&self.symbol_asset)
+        {
+            out.reason = "disabled".to_string();
+            return out;
+        }
+        let Some(req_dir) = BreakoutDirection::from_side(side) else {
+            out.reason = "side_not_directional".to_string();
+            return out;
+        };
+        let Some(anchor) = self.breakout_invalidation_anchor.clone() else {
+            out.reason = "no_anchor".to_string();
+            return out;
+        };
+        out.armed = true;
+        out.side = anchor.side.clone();
+        out.hk = Some(anchor.hk);
+        out.lk = Some(anchor.lk);
+        out.buffer_up = Some(anchor.buffer_up);
+        out.buffer_dn = Some(anchor.buffer_dn);
+        if anchor.side.trim().to_ascii_uppercase() != side.trim().to_ascii_uppercase() {
+            out.reason = "side_mismatch".to_string();
+            return out;
+        }
+
+        out.tick_age_ms = if self.last_tick_ts_ms > 0 {
+            now_ms_value.saturating_sub(self.last_tick_ts_ms).max(0)
+        } else {
+            i64::MAX
+        };
+        let max_age_ms = (self.breakout_invalidation_stop_cfg.max_snapshot_age_seconds * 1000.0) as i64;
+        if self.last_tick_ts_ms <= 0 || out.tick_age_ms > max_age_ms {
+            out.reason = "stale".to_string();
+            return out;
+        }
+
+        let invalid_now = if req_dir == BreakoutDirection::Up {
+            self.last_tick_price < anchor.buffer_up
+        } else if req_dir == BreakoutDirection::Down {
+            self.last_tick_price > anchor.buffer_dn
+        } else {
+            false
+        };
+
+        if invalid_now {
+            if self.breakout_invalidation_started_at_ms.is_none() {
+                self.breakout_invalidation_started_at_ms = Some(self.last_tick_ts_ms);
+            }
+            let started = self
+                .breakout_invalidation_started_at_ms
+                .unwrap_or(self.last_tick_ts_ms);
+            out.elapsed_ms = self.last_tick_ts_ms.saturating_sub(started).max(0);
+            if out.elapsed_ms >= self.breakout_invalidation_stop_cfg.persistence_ms {
+                out.fired = true;
+                out.reason = "triggered".to_string();
+                return out;
+            }
+            out.reason = "tracking".to_string();
+            return out;
+        }
+
+        self.breakout_invalidation_started_at_ms = None;
+        out.elapsed_ms = 0;
+        out.reason = "breakout_valid".to_string();
         out
     }
 
@@ -970,6 +1234,16 @@ mod tests {
         }
     }
 
+    fn base_breakout_stop_cfg() -> BreakoutInvalidationStopConfig {
+        BreakoutInvalidationStopConfig {
+            enabled: true,
+            symbols: vec!["btc".to_string()].into_iter().collect(),
+            persistence_ms: 2_000,
+            max_snapshot_age_seconds: 2.0,
+            log_every_seconds: 0.0,
+        }
+    }
+
     fn push_linear_ticks(
         engine: &mut SniperFilterEngine,
         start_ts_ms: i64,
@@ -1166,5 +1440,200 @@ mod tests {
         assert!(eng2.import_state(st));
         assert_eq!(eng.completed_candles.len(), eng2.completed_candles.len());
         assert_eq!(eng.last_tick_ts_ms, eng2.last_tick_ts_ms);
+    }
+
+    #[test]
+    fn breakout_stop_arm_anchor_yes_and_no() {
+        let mut eng = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            base_breakout_stop_cfg(),
+        );
+        push_linear_ticks(&mut eng, 0, 8, 100.0, 0.1);
+        let now = eng.last_tick_ts_ms + 50;
+        let yes = eng.arm_breakout_invalidation_stop("YES", now);
+        assert!(yes.armed);
+        assert_eq!(yes.reason, "armed");
+        assert_eq!(eng.breakout_invalidation_anchor.as_ref().map(|a| a.side.as_str()), Some("YES"));
+        eng.clear_breakout_invalidation_stop();
+        let no = eng.arm_breakout_invalidation_stop("NO", now);
+        assert!(no.armed);
+        assert_eq!(no.reason, "armed");
+        assert_eq!(eng.breakout_invalidation_anchor.as_ref().map(|a| a.side.as_str()), Some("NO"));
+    }
+
+    #[test]
+    fn breakout_stop_arm_rejects_stale_or_missing_levels() {
+        let mut stop_cfg = base_breakout_stop_cfg();
+        stop_cfg.max_snapshot_age_seconds = 1.0;
+        let mut eng = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            stop_cfg.clone(),
+        );
+        push_linear_ticks(&mut eng, 0, 8, 100.0, 0.1);
+        let stale = eng.arm_breakout_invalidation_stop("YES", eng.last_tick_ts_ms + 2_000);
+        assert_eq!(stale.reason, "stale");
+        let mut eng2 = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            stop_cfg,
+        );
+        let no_levels = eng2.arm_breakout_invalidation_stop("YES", 1_000);
+        assert!(matches!(
+            no_levels.reason.as_str(),
+            "stale" | "insufficient_candles" | "no_levels"
+        ));
+    }
+
+    #[test]
+    fn breakout_stop_yes_timer_start_reset_and_fire() {
+        let mut stop_cfg = base_breakout_stop_cfg();
+        stop_cfg.persistence_ms = 1_500;
+        stop_cfg.max_snapshot_age_seconds = 10.0;
+        let mut eng = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            stop_cfg,
+        );
+        push_linear_ticks(&mut eng, 0, 8, 100.0, 0.2);
+        let _ = eng.arm_breakout_invalidation_stop("YES", eng.last_tick_ts_ms + 10);
+        let anchor = eng.breakout_invalidation_anchor.clone().unwrap();
+        let base = eng.last_tick_ts_ms + 100;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: anchor.buffer_up - 2.0,
+            ts_ms: base,
+            received_at_ms: base,
+        });
+        let d1 = eng.evaluate_breakout_invalidation_stop("YES", base);
+        assert_eq!(d1.reason, "tracking");
+        assert!(!d1.fired);
+
+        let reset_ts = base + 500;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: anchor.buffer_up + 2.0,
+            ts_ms: reset_ts,
+            received_at_ms: reset_ts,
+        });
+        let d_reset = eng.evaluate_breakout_invalidation_stop("YES", reset_ts);
+        assert_eq!(d_reset.reason, "breakout_valid");
+        assert_eq!(eng.breakout_invalidation_started_at_ms, None);
+
+        let start2 = reset_ts + 500;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: anchor.buffer_up - 3.0,
+            ts_ms: start2,
+            received_at_ms: start2,
+        });
+        let _ = eng.evaluate_breakout_invalidation_stop("YES", start2);
+        let fire_ts = start2 + 1_600;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: anchor.buffer_up - 3.0,
+            ts_ms: fire_ts,
+            received_at_ms: fire_ts,
+        });
+        let d2 = eng.evaluate_breakout_invalidation_stop("YES", fire_ts);
+        assert!(d2.fired);
+        assert_eq!(d2.reason, "triggered");
+    }
+
+    #[test]
+    fn breakout_stop_no_timer_start_reset_and_fire() {
+        let mut stop_cfg = base_breakout_stop_cfg();
+        stop_cfg.persistence_ms = 1_200;
+        stop_cfg.max_snapshot_age_seconds = 10.0;
+        let mut eng = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            stop_cfg,
+        );
+        push_linear_ticks(&mut eng, 0, 8, 120.0, -0.2);
+        let _ = eng.arm_breakout_invalidation_stop("NO", eng.last_tick_ts_ms + 10);
+        let anchor = eng.breakout_invalidation_anchor.clone().unwrap();
+        let t0 = eng.last_tick_ts_ms + 100;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: anchor.buffer_dn + 2.0,
+            ts_ms: t0,
+            received_at_ms: t0,
+        });
+        let d1 = eng.evaluate_breakout_invalidation_stop("NO", t0);
+        assert_eq!(d1.reason, "tracking");
+        let t1 = t0 + 1_300;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: anchor.buffer_dn + 2.5,
+            ts_ms: t1,
+            received_at_ms: t1,
+        });
+        let d2 = eng.evaluate_breakout_invalidation_stop("NO", t1);
+        assert!(d2.fired);
+        assert_eq!(d2.reason, "triggered");
+    }
+
+    #[test]
+    fn breakout_stop_stale_does_not_fire_and_clear_resets() {
+        let mut stop_cfg = base_breakout_stop_cfg();
+        stop_cfg.max_snapshot_age_seconds = 0.5;
+        let mut eng = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            stop_cfg,
+        );
+        push_linear_ticks(&mut eng, 0, 8, 100.0, 0.1);
+        let _ = eng.arm_breakout_invalidation_stop("YES", eng.last_tick_ts_ms + 10);
+        let stale = eng.evaluate_breakout_invalidation_stop("YES", eng.last_tick_ts_ms + 1_000);
+        assert_eq!(stale.reason, "stale");
+        assert!(!stale.fired);
+        eng.clear_breakout_invalidation_stop();
+        let no_anchor = eng.evaluate_breakout_invalidation_stop("YES", eng.last_tick_ts_ms + 1_050);
+        assert_eq!(no_anchor.reason, "no_anchor");
+        assert!(!no_anchor.fired);
+    }
+
+    #[test]
+    fn breakout_stop_persisted_state_roundtrip_includes_anchor_and_timer() {
+        let mut stop_cfg = base_breakout_stop_cfg();
+        stop_cfg.persistence_ms = 1_000;
+        stop_cfg.max_snapshot_age_seconds = 10.0;
+        let mut eng = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            stop_cfg,
+        );
+        push_linear_ticks(&mut eng, 0, 8, 100.0, 0.2);
+        let _ = eng.arm_breakout_invalidation_stop("YES", eng.last_tick_ts_ms + 1);
+        let anchor = eng.breakout_invalidation_anchor.clone().unwrap();
+        let t0 = eng.last_tick_ts_ms + 100;
+        let _ = eng.on_tick(&BinanceTick {
+            symbol: "BTCUSDT".to_string(),
+            price: anchor.buffer_up - 1.0,
+            ts_ms: t0,
+            received_at_ms: t0,
+        });
+        let _ = eng.evaluate_breakout_invalidation_stop("YES", t0);
+        let st = eng.export_state();
+        assert!(st.breakout_invalidation_anchor.is_some());
+        assert!(st.breakout_invalidation_started_at_ms.is_some());
+        let mut eng2 = SniperFilterEngine::new_with_all_configs(
+            "btc",
+            base_momentum_cfg(),
+            base_breakout_cfg(),
+            base_breakout_stop_cfg(),
+        );
+        assert!(eng2.import_state(st));
+        assert!(eng2.breakout_invalidation_anchor.is_some());
+        assert!(eng2.breakout_invalidation_started_at_ms.is_some());
     }
 }

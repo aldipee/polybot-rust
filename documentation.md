@@ -6,6 +6,7 @@ This project now supports Binance spot-driven sniper entry filters for BTC:
 
 - Momentum confirmation filter
 - Micro-breakout trigger filter
+- Breakout-invalidation stop-loss filter (entry-frozen anchor)
 - JSON state persistence for candle/filter runtime state
 
 The filters are enforced in sniper entry paths before order submit.
@@ -15,6 +16,7 @@ The filters are enforced in sniper entry paths before order submit.
 - Data source: Binance spot (`BTCUSDT`) via REST warmup + WS trades
 - Initial asset scope: BTC only (controlled by symbol lists in env)
 - Existing RTDS gates remain active and independent
+- Exit invalidation stop uses Binance data independently from entry breakout toggle
 
 ## Entry Decision Order
 
@@ -80,6 +82,23 @@ Fail-closed conditions when enabled:
 - Stale Binance tick snapshot
 - Insufficient candles / missing breakout levels
 
+## Breakout-Invalidation Stop (Primary)
+
+This stop exits when the original breakout thesis fails using entry-frozen breakout levels.
+
+- YES position invalidation: Binance price `< buffer_up` continuously for configured persistence
+- NO position invalidation: Binance price `> buffer_dn` continuously for configured persistence
+- Trigger path reuses existing `_sniper_try_exit(..., "STOP_LOSS")` execution flow
+
+Behavior and scope:
+
+- Independent toggle from entry breakout gate (`SNIPER_BREAKOUT_ENABLED`)
+- Anchor is frozen when position opens (not rolling with new candles)
+- Applied in both loops:
+  - `_run_sniper_loop`
+  - `_run_signal_sniper_loop`
+- If Binance data is stale/no-anchor while in-position, this stop is suppressed and existing PnL/force-exit logic remains active
+
 ## JSON State Persistence
 
 Persistence is controlled by:
@@ -97,6 +116,9 @@ Persisted data includes:
 - Momentum snapshots for both directions:
   - `momentum_yes`
   - `momentum_no`
+- Breakout invalidation stop context:
+  - `breakout_invalidation_anchor`
+  - `breakout_invalidation_started_at_ms`
 
 State is loaded at bot startup (when enabled) and saved on state changes + bot stop.
 
@@ -106,6 +128,7 @@ Filter decision logs:
 
 - `[MOMENTUM] ...`
 - `[BREAKOUT] ...`
+- `[STOP_BREAKOUT] ARM|TRACK|FIRE|SKIP ...`
 
 Flat sniper status line now includes compact filter metrics suffix, for example:
 
@@ -136,6 +159,12 @@ SNIPER_BREAKOUT_REARM_MS=15000
 SNIPER_BREAKOUT_MAX_SNAPSHOT_AGE_SECONDS=1.0
 SNIPER_BREAKOUT_MODE=required
 SNIPER_BREAKOUT_ASSIST_MOMENTUM_REQUIRED_CHECKS=3
+
+SNIPER_BREAKOUT_INVALIDATION_STOP_ENABLED=false
+SNIPER_BREAKOUT_INVALIDATION_STOP_SYMBOLS=btc
+SNIPER_BREAKOUT_INVALIDATION_STOP_PERSISTENCE_MS=2000
+SNIPER_BREAKOUT_INVALIDATION_STOP_MAX_SNAPSHOT_AGE_SECONDS=1.0
+SNIPER_BREAKOUT_INVALIDATION_STOP_LOG_EVERY_SECONDS=1.0
 
 SNIPER_FILTERS_PERSIST_STATE=true
 SNIPER_FILTERS_STATE_PATH=state/sniper_filters_state_polybot_btc.json

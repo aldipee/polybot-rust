@@ -11,8 +11,8 @@ use crate::logging::LogLike;
 use crate::rtds::get_live_snapshot_for_market;
 use crate::signal::{LatencyLogService, SignalHub};
 use crate::sniper_filters::{
-    FilterDecision as SniperFilterDecision, normalize_asset_symbol, SniperFilterEngine,
-    SniperFilterPersistedState,
+    BreakoutInvalidationStopDecision, FilterDecision as SniperFilterDecision, normalize_asset_symbol,
+    SniperFilterEngine, SniperFilterPersistedState,
 };
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Result};
@@ -1111,6 +1111,134 @@ impl MakerHedgeCapBot {
         self._sniper_filters_eval_entry(side, context, seconds_left)
             .map(|d| d.allowed)
             .unwrap_or(true)
+    }
+
+    fn _sniper_filters_arm_breakout_invalidation_stop(
+        &self,
+        side: &str,
+        context: &str,
+        seconds_left: f64,
+    ) -> Option<BreakoutInvalidationStopDecision> {
+        self._sniper_filters_ingest_latest_tick();
+        let now_ms = (now_ts_f64() * 1000.0) as i64;
+        let (decision, every_s) = match self.sniper_filters.lock() {
+            Ok(mut f) => (
+                f.arm_breakout_invalidation_stop(side, now_ms),
+                f.breakout_invalidation_stop_log_every_seconds(),
+            ),
+            Err(_) => return None,
+        };
+        if decision.armed {
+            self._sniper_filters_save_state(false);
+        }
+        let msg = format!(
+            "[STOP_BREAKOUT] {} context={} side={} reason={} Hk={} Lk={} buf_up={} buf_dn={} persist_ms={} elapsed_ms={} tick_age_ms={} t_left={:.2}s",
+            if decision.armed { "ARM" } else { "SKIP" },
+            context,
+            side,
+            decision.reason,
+            decision
+                .hk
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            decision
+                .lk
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            decision
+                .buffer_up
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            decision
+                .buffer_dn
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            decision.persist_ms,
+            decision.elapsed_ms,
+            decision.tick_age_ms,
+            seconds_left
+        );
+        if decision.armed {
+            self.logger.info(&msg);
+        } else {
+            self._sniper_filter_log("stop_breakout", every_s, &msg);
+        }
+        Some(decision)
+    }
+
+    fn _sniper_filters_clear_breakout_invalidation_stop(&self) {
+        if let Ok(mut f) = self.sniper_filters.lock() {
+            f.clear_breakout_invalidation_stop();
+        }
+        self._sniper_filters_save_state(false);
+    }
+
+    fn _sniper_filters_eval_breakout_invalidation_stop(
+        &self,
+        side: &str,
+        context: &str,
+        seconds_left: f64,
+    ) -> Option<BreakoutInvalidationStopDecision> {
+        self._sniper_filters_ingest_latest_tick();
+        let now_ms = (now_ts_f64() * 1000.0) as i64;
+        let (decision, every_s) = match self.sniper_filters.lock() {
+            Ok(mut f) => (
+                f.evaluate_breakout_invalidation_stop(side, now_ms),
+                f.breakout_invalidation_stop_log_every_seconds(),
+            ),
+            Err(_) => return None,
+        };
+        if matches!(
+            decision.reason.as_str(),
+            "tracking" | "triggered" | "breakout_valid"
+        ) {
+            self._sniper_filters_save_state(false);
+        }
+
+        let msg = format!(
+            "[STOP_BREAKOUT] {} context={} side={} reason={} armed={} fired={} Hk={} Lk={} buf_up={} buf_dn={} persist_ms={} elapsed_ms={} tick_age_ms={} t_left={:.2}s",
+            if decision.fired {
+                "FIRE"
+            } else if matches!(
+                decision.reason.as_str(),
+                "disabled" | "no_anchor" | "stale" | "side_not_directional" | "side_mismatch"
+            ) {
+                "SKIP"
+            } else {
+                "TRACK"
+            },
+            context,
+            side,
+            decision.reason,
+            decision.armed,
+            decision.fired,
+            decision
+                .hk
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            decision
+                .lk
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            decision
+                .buffer_up
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            decision
+                .buffer_dn
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "na".to_string()),
+            decision.persist_ms,
+            decision.elapsed_ms,
+            decision.tick_age_ms,
+            seconds_left
+        );
+        if decision.fired {
+            self.logger.info(&msg);
+        } else {
+            self._sniper_filter_log("stop_breakout", every_s, &msg);
+        }
+        Some(decision)
     }
 
     fn _sniper_submit_order_type_from_origin(origin: &str) -> String {
@@ -9530,6 +9658,7 @@ impl MakerHedgeCapBot {
                     sniper_pos_open_ts = 0.0;
                     sniper_stop_breach_since = None;
                     self._runtime_ts_set("__sniper_entry_ref_price", 0.0);
+                    self._sniper_filters_clear_breakout_invalidation_stop();
                 }
                 self._sniper_clear_post_hedge_state();
             } else if !sniper_in_pos {
@@ -9542,6 +9671,16 @@ impl MakerHedgeCapBot {
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
                 self._runtime_ts_set("__sniper_entry_ref_price", avg.max(0.0));
+                let pos_side = pos
+                    .as_ref()
+                    .and_then(|p| p.get("side"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let _ = self._sniper_filters_arm_breakout_invalidation_stop(
+                    pos_side,
+                    "SIGNAL_POS_OPEN",
+                    seconds_left,
+                );
             }
 
             if pos.is_none() {
@@ -9713,6 +9852,36 @@ impl MakerHedgeCapBot {
                     break;
                 }
                 continue;
+            }
+            if let Some(stop_decision) = self._sniper_filters_eval_breakout_invalidation_stop(
+                &pos_side,
+                "SIGNAL_POS",
+                seconds_left,
+            ) {
+                if stop_decision.fired {
+                    sniper_stop_breach_since = None;
+                    let aid = pos
+                        .get("asset_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let sl_mode = self._sniper_stop_loss_mode();
+                    self._runtime_ts_set("__sniper_stop_loss_active", 1.0);
+                    if self._sniper_try_exit(&pos, "STOP_LOSS") {
+                        self._sniper_stop_loss_reset_failures(&aid);
+                        break;
+                    }
+                    if !self._sniper_post_hedge_active() {
+                        self._sniper_stop_loss_record_sell_failure(
+                            &pos,
+                            &aid,
+                            &sl_mode,
+                            "STOP_LOSS",
+                            "stop_loss_breakout_loop_signal",
+                        );
+                    }
+                    continue;
+                }
             }
             if cost > 1e-12 && stop_pct > 0.0 {
                 let mut stop_loss_active_now = false;
@@ -9888,6 +10057,7 @@ impl MakerHedgeCapBot {
                     sniper_stop_breach_since = None;
                     self._runtime_ts_set("__sniper_entry_ref_price", 0.0);
                     self._runtime_ts_set("__sniper_entry_gate_since", 0.0);
+                    self._sniper_filters_clear_breakout_invalidation_stop();
                 }
                 self._sniper_clear_post_hedge_state();
             } else if !sniper_in_pos {
@@ -9901,6 +10071,16 @@ impl MakerHedgeCapBot {
                     .unwrap_or(0.0);
                 self._runtime_ts_set("__sniper_entry_ref_price", avg.max(0.0));
                 self._runtime_ts_set("__sniper_entry_gate_since", 0.0);
+                let pos_side = pos
+                    .as_ref()
+                    .and_then(|p| p.get("side"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let _ = self._sniper_filters_arm_breakout_invalidation_stop(
+                    pos_side,
+                    "SNIPER_POS_OPEN",
+                    seconds_left,
+                );
             } else if self._runtime_ts_get("__sniper_entry_ref_price") <= 0.0 {
                 let avg = pos
                     .as_ref()
@@ -10132,6 +10312,39 @@ impl MakerHedgeCapBot {
                     break;
                 }
                 continue;
+            }
+            if let Some(stop_decision) = self._sniper_filters_eval_breakout_invalidation_stop(
+                &pos_side,
+                "SNIPER_POS",
+                seconds_left,
+            ) {
+                if stop_decision.fired {
+                    sniper_stop_breach_since = None;
+                    let aid = pos
+                        .get("asset_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let sl_mode = self._sniper_stop_loss_mode();
+                    self._runtime_ts_set("__sniper_stop_loss_active", 1.0);
+                    if self._sniper_try_exit(&pos, "STOP_LOSS") {
+                        self._sniper_stop_loss_reset_failures(&aid);
+                        if repeat_mode && !repeat_stop_after_sl {
+                            continue;
+                        }
+                        break;
+                    }
+                    if !self._sniper_post_hedge_active() {
+                        self._sniper_stop_loss_record_sell_failure(
+                            &pos,
+                            &aid,
+                            &sl_mode,
+                            "STOP_LOSS",
+                            "stop_loss_breakout_loop",
+                        );
+                    }
+                    continue;
+                }
             }
             if cost > 1e-12 && stop_pct > 0.0 {
                 let mut stop_loss_active_now = false;
