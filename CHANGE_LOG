@@ -1,3 +1,15 @@
+## Version 0.1.15
+Date: 2026-03-03
+### Changes
+- Switched sniper exit execution to event-driven position state (`MATCHED`/`MINED`/`CONFIRMED`) in `_sniper_try_exit`.
+- Removed `get_balance_allowance` precheck and positions-fallback gating from the sniper exit loop.
+- Stop-limit exit sizing now uses local remaining position size directly (no balance/allowance cap in the exit path).
+- On sell submit rejection, exit loop now fast-retries directly (STOP_LOSS: 0.25s pause, non-STOP_LOSS: 1.0s pause) instead of balance/allowance reconciliation waits.
+
+### Behavior Impact
+- Reduces stop-loss exit latency by removing balance/allowance round-trips from the sell decision path.
+- Exit execution now relies on local state that is updated from trade events, so event-stream health is more critical for state freshness.
+
 ## Version 0.1.14
 Date: 2026-03-03
 ### Changes

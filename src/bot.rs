@@ -8836,14 +8836,6 @@ impl MakerHedgeCapBot {
                 0.0
             }
         };
-        let stop_loss_fast_retry_on_positions =
-            reason_u == "STOP_LOSS"
-                && env_bool("SNIPER_STOP_LOSS_FAST_RETRY_ON_POSITIONS_FALLBACK", true);
-        let stop_loss_fast_retry_pause_s = env_float(
-            "SNIPER_STOP_LOSS_FAST_RETRY_PAUSE_SECONDS",
-            0.05,
-        )
-        .clamp(0.0, 1.0);
         if reason_u != "STOP_LOSS" {
             self._sniper_stop_loss_reset_failures(&asset_id);
         }
@@ -8955,249 +8947,8 @@ impl MakerHedgeCapBot {
             return true;
         }
 
-        let mut balance_avail_int = remaining_int;
-        let mut allow_int = remaining_int;
-        let mut balance_avail_sh = remaining;
-        let mut allow_sh = remaining;
-        let mut pos_api_size = -1.0f64;
-        if let Some((bal, allow)) = self._get_balance_allowance_conditional_cached(&asset_id, 0.0) {
-            balance_avail_int = (bal + 1e-12).floor() as i64;
-            allow_int = (allow + 1e-12).floor() as i64;
-            balance_avail_sh = bal.max(0.0);
-            allow_sh = allow.max(0.0);
-        }
-        if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true)
-            && ((exit_allow_fractional
-                && (balance_avail_sh < min_exit_size || allow_sh < min_exit_size))
-                || (!exit_allow_fractional && (balance_avail_int < min_int || allow_int < min_int)))
-        {
-            if let Some(sz) = self._get_position_size_data_api(&asset_id) {
-                pos_api_size = sz;
-                let pos_int = (sz + 1e-12).floor() as i64;
-                if pos_int > balance_avail_int {
-                    balance_avail_int = pos_int;
-                }
-                if sz > balance_avail_sh {
-                    balance_avail_sh = sz;
-                }
-                // Soft-guard: if we can see shares from positions API, don't hard-block on
-                // potentially stale allowance snapshot; let exchange decide on submit.
-                if env_bool("SNIPER_EXIT_ALLOWANCE_SOFT_CHECK", true)
-                    && ((exit_allow_fractional
-                        && allow_sh < min_exit_size
-                        && balance_avail_sh >= min_exit_size)
-                        || (!exit_allow_fractional
-                            && allow_int < min_int
-                            && balance_avail_int >= min_int))
-                {
-                    allow_int = balance_avail_int;
-                    allow_sh = balance_avail_sh;
-                    if now >= self._runtime_ts_get("__sniper_soft_allow_log_until") {
-                        let aid_tail: String = asset_id
-                            .chars()
-                            .rev()
-                            .take(6)
-                            .collect::<String>()
-                            .chars()
-                            .rev()
-                            .collect();
-                        self.logger.warning(&format!(
-                            "[SNIPER] soft-allowance enabled: positions API shows shares for asset={aid_tail}; trying exit despite allowance snapshot."
-                        ));
-                        self._runtime_ts_set("__sniper_soft_allow_log_until", now + 10.0);
-                    }
-                }
-            }
-        }
-        let precheck_allow_low = (exit_allow_fractional && allow_sh + 1e-12 < min_exit_size)
-            || (!exit_allow_fractional && allow_int < min_int);
-        if env_bool("SNIPER_EXIT_PRECHECK_BALANCE_ALLOWANCE", false) && precheck_allow_low {
-            let aid_tail: String = asset_id
-                .chars()
-                .rev()
-                .take(6)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            self.logger.warning(
-                "[SNIPER] exit failed: allowance too low. Approve conditional tokens for selling, then the bot will retry.",
-            );
-            self.logger.info(&format!(
-                "[SNIPER] allowance snapshot asset={aid_tail} bal={balance_avail_sh:.6} allow={allow_sh:.6} min_required={min_exit_size:.6}"
-            ));
-            if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true) {
-                self.logger.info(&format!(
-                    "[SNIPER][DBG_POS] asset={aid_tail} pos_api_size={pos_api_size:.6}"
-                ));
-            }
-            let ba_last_ts = self._runtime_ts_get("__ba_last_fetch_ts");
-            let ba_age_s = if ba_last_ts > 0.0 {
-                (now - ba_last_ts).max(0.0)
-            } else {
-                -1.0
-            };
-            let ba_raw_bal = self._runtime_ts_get("__ba_last_raw_balance");
-            let ba_raw_allow = self._runtime_ts_get("__ba_last_raw_allowance");
-            let ba_units = self._runtime_ts_get("__ba_last_units_per_share");
-            let ba_bal_sh = self._runtime_ts_get("__ba_last_balance_shares");
-            let ba_allow_sh = self._runtime_ts_get("__ba_last_allowance_shares");
-            let side_dbg = pos.get("side").and_then(|v| v.as_str()).unwrap_or("");
-            let avg_dbg = pos.get("avg").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let (q_yes, q_no, c_yes, c_no, oo_count) = self
-                .state
-                .lock()
-                .map(|s| (s.q_yes, s.q_no, s.c_yes, s.c_no, s.open_orders.len() as i64))
-                .unwrap_or((0.0, 0.0, 0.0, 0.0, 0));
-            let wallet_tail: String = self
-                .wallet_address
-                .chars()
-                .rev()
-                .take(8)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            let funder_tail: String = self
-                .cfg
-                .funder
-                .as_deref()
-                .unwrap_or("")
-                .chars()
-                .rev()
-                .take(8)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            let yes_tail: String = self
-                .yes_asset
-                .as_deref()
-                .unwrap_or("")
-                .chars()
-                .rev()
-                .take(6)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            let no_tail: String = self
-                .no_asset
-                .as_deref()
-                .unwrap_or("")
-                .chars()
-                .rev()
-                .take(6)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            self.logger.info(&format!(
-                "[SNIPER][DBG_ALLOW] side={side_dbg} qty={remaining:.4} avg={avg_dbg:.4} asset={aid_tail} yes={yes_tail} no={no_tail} ba_age={ba_age_s:.3}s raw_bal={ba_raw_bal:.0} raw_allow={ba_raw_allow:.0} units={ba_units:.0} sh_bal={ba_bal_sh:.6} sh_allow={ba_allow_sh:.6} wallet=*{wallet_tail} funder=*{funder_tail} state(qy={q_yes:.6},qn={q_no:.6},cy={c_yes:.6},cn={c_no:.6},open_orders={oo_count})"
-            ));
-            if env_bool("SNIPER_DEBUG_BALANCE_BOTH", false) {
-                let yes_id = self.yes_asset.clone().unwrap_or_default();
-                let no_id = self.no_asset.clone().unwrap_or_default();
-                let (yes_bal, yes_allow) = if !yes_id.trim().is_empty() {
-                    self._get_balance_allowance_conditional_cached(&yes_id, 0.0)
-                        .unwrap_or((0.0, 0.0))
-                } else {
-                    (0.0, 0.0)
-                };
-                let (no_bal, no_allow) = if !no_id.trim().is_empty() {
-                    self._get_balance_allowance_conditional_cached(&no_id, 0.0)
-                        .unwrap_or((0.0, 0.0))
-                } else {
-                    (0.0, 0.0)
-                };
-                let yes_tail2: String = yes_id
-                    .chars()
-                    .rev()
-                    .take(6)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect();
-                let no_tail2: String = no_id
-                    .chars()
-                    .rev()
-                    .take(6)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect();
-                self.logger.info(&format!(
-                    "[SNIPER][DBG_BOTH] yes={yes_tail2} bal={yes_bal:.6} allow={yes_allow:.6} | no={no_tail2} bal={no_bal:.6} allow={no_allow:.6}"
-                ));
-            }
-            // Safety-first: auto reconcile is opt-in and conservative.
-            // Default is disabled to avoid clearing positions due to transient API/cache issues.
-            if balance_avail_int <= 0
-                && allow_int <= 0
-                && remaining_int >= min_int
-                && env_bool("SNIPER_ZERO_BALANCE_AUTO_RECONCILE", true)
-            {
-                let has_local_order_for_asset = self
-                    .state
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.open_orders.get(&asset_id).cloned())
-                    .and_then(|o| o.order_id)
-                    .map(|oid| !oid.trim().is_empty())
-                    .unwrap_or(false);
-                let has_exchange_order_for_asset =
-                    self._list_open_orders_exchange().iter().any(|o| {
-                        self._extract_order_token_id(o).as_deref() == Some(asset_id.as_str())
-                            && self
-                                ._extract_order_id(o)
-                                .map(|oid| !oid.trim().is_empty())
-                                .unwrap_or(false)
-                    });
-                if has_exchange_order_for_asset {
-                    if now >= self._runtime_ts_get("__sniper_zero_ba_guard_log_until") {
-                        self.logger.warning(&format!(
-                            "[SNIPER] desync reconcile skipped: exchange open order still exists for this asset (local_open_order={has_local_order_for_asset})."
-                        ));
-                        self._runtime_ts_set("__sniper_zero_ba_guard_log_until", now + 10.0);
-                    }
-                } else {
-                    let hit_key = format!("__sniper_zero_ba_hits_{asset_id}");
-                    let first_key = format!("__sniper_zero_ba_first_ts_{asset_id}");
-                    let window_s =
-                        env_float("SNIPER_ZERO_BALANCE_RECONCILE_WINDOW_SECONDS", 45.0).max(5.0);
-                    let mut hits = self._runtime_ts_get(&hit_key);
-                    let first_ts = self._runtime_ts_get(&first_key);
-                    if first_ts <= 0.0 || (now - first_ts) > window_s {
-                        self._runtime_ts_set(&first_key, now);
-                        hits = 1.0;
-                    } else {
-                        hits += 1.0;
-                    }
-                    self._runtime_ts_set(&hit_key, hits);
-                    let need_hits = env_int("SNIPER_ZERO_BALANCE_RECONCILE_HITS", 3).max(3) as f64;
-                    if hits >= need_hits {
-                        self.logger.warning(&format!(
-                            "[SNIPER] desync suspected (zero balance/allowance for local qty). auto-reconcile hits={hits:.0}/{need_hits:.0}"
-                        ));
-                        self._runtime_ts_set(&hit_key, 0.0);
-                        self._runtime_ts_set(&first_key, 0.0);
-                        self._clear_local_position_for_asset(&asset_id, "zero balance+allowance");
-                        // Keep run alive; just clear stale local state and continue.
-                        self._sniper_set_fail_pause(&reason_u, retry_pause_s(1.0));
-                        return false;
-                    }
-                }
-            }
-            if stop_certainty_active {
-                let done =
-                    self._sniper_stop_certainty_hedge_phase(pos, &reason_u, "allowance_precheck");
-                self._sniper_set_fail_pause(&reason_u, retry_pause_s(60.0));
-                return done;
-            }
-            self._sniper_maybe_exit_hedge(pos, &reason_u, "allowance_precheck");
-            self._sniper_set_fail_pause(&reason_u, retry_pause_s(60.0));
-            return false;
-        }
+        // Event-driven exit sizing: rely on local position that is updated by
+        // MATCHED/MINED/CONFIRMED events, not balance/allowance snapshots.
 
         if stop_limit_mode {
             let active_entry_reason = self._active_entry_reason_or_default();
@@ -9231,7 +8982,7 @@ impl MakerHedgeCapBot {
                     thread::sleep(Duration::from_secs_f64(cancel_settle_s));
                 }
 
-                let mut sell_sz = remaining.min(balance_avail_sh).min(allow_sh);
+                let mut sell_sz = remaining;
                 if exit_size_subtract > 0.0 {
                     sell_sz = (sell_sz - exit_size_subtract).max(0.0);
                 }
@@ -9290,13 +9041,10 @@ impl MakerHedgeCapBot {
             chunk = min_exit_size.max(exit_size_step);
         }
         let full_size_first = env_bool("SNIPER_EXIT_FULL_SIZE_FIRST", true);
-        let recent_submit_guard_s =
-            env_float("SNIPER_EXIT_RECENT_SUBMIT_GUARD_SECONDS", 8.0).max(1.0);
         let exit_slip_ticks = env_int("SNIPER_EXIT_SLIPPAGE_TICKS", 1).max(0);
         let max_passes = stop_certainty_sell_max_submits.max(1);
         let mut sold_any = false;
         let mut submitted_any = false;
-        let mut last_submit_ts = 0.0f64;
         let mut stop_certainty_progress = 0.0f64;
         for pass_i in 0..max_passes {
             if stop_certainty_active && now_ts_f64() > stop_certainty_sell_deadline {
@@ -9328,11 +9076,6 @@ impl MakerHedgeCapBot {
             }
             if exit_allow_fractional {
                 sell_sz = q_down(sell_sz, exit_size_dp);
-                let cap = balance_avail_sh.min(allow_sh);
-                if cap > 0.0 {
-                    sell_sz = sell_sz.min(cap);
-                }
-                sell_sz = q_down(sell_sz, exit_size_dp);
                 if sell_sz + 1e-12 < min_exit_size {
                     self._sniper_set_fail_pause(&reason_u, retry_pause_s(1.0));
                     return false;
@@ -9341,15 +9084,12 @@ impl MakerHedgeCapBot {
                 let mut sell_int = (sell_sz + 1e-12).floor() as i64;
                 sell_int = (sell_int / min_int) * min_int;
                 if sell_int < min_int {
-                    sell_int = min_int;
-                }
-                if balance_avail_int >= min_int {
-                    sell_int = sell_int.min(balance_avail_int);
-                    sell_int = (sell_int / min_int) * min_int;
-                }
-                if sell_int < min_int {
                     let chunk_i = (chunk + 1e-12).floor() as i64;
                     sell_int = remaining_int.min(chunk_i.max(min_int));
+                }
+                if sell_int < min_int {
+                    self._sniper_set_fail_pause(&reason_u, retry_pause_s(1.0));
+                    return false;
                 }
                 sell_sz = sell_int as f64;
             }
@@ -9380,167 +9120,15 @@ impl MakerHedgeCapBot {
                     return done;
                 }
                 self._sniper_maybe_exit_hedge(&cur, &reason_u, "exit_submit_reject");
-                if let Some((bal, allow)) =
-                    self._get_balance_allowance_conditional_cached(&asset_id, 0.0)
-                {
-                    let bal_int = (bal + 1e-12).floor() as i64;
-                    let allow_int_fresh = (allow + 1e-12).floor() as i64;
-                    let bal_sh = bal.max(0.0);
-                    let allow_sh_fresh = allow.max(0.0);
-                    let recent_submit =
-                        submitted_any && (now_ts_f64() - last_submit_ts) <= recent_submit_guard_s;
-                    let bal_below_min = (exit_allow_fractional && bal_sh + 1e-12 < min_exit_size)
-                        || (!exit_allow_fractional && bal_int < min_int);
-                    if bal_below_min {
-                        if sold_any || recent_submit {
-                            let aid_tail: String = asset_id
-                                .chars()
-                                .rev()
-                                .take(6)
-                                .collect::<String>()
-                                .chars()
-                                .rev()
-                                .collect();
-                            self.logger.warning(&format!(
-                                "[SNIPER] balance snapshot below min after recent/partial exit for asset={aid_tail}; deferring local-state reconcile and retrying."
-                            ));
-                            let pause_s = if stop_loss_fast_retry_on_positions {
-                                stop_loss_fast_retry_pause_s
-                            } else {
-                                retry_pause_s(2.0)
-                            };
-                            if stop_loss_fast_retry_on_positions {
-                                self.logger.warning(&format!(
-                                    "[SNIPER][STOP_LOSS] fast_retry positions_fallback asset={aid_tail} pause_s={pause_s:.3}"
-                                ));
-                            }
-                            self._sniper_set_fail_pause(&reason_u, pause_s);
-                            return false;
-                        }
-                        if env_bool("SNIPER_EXIT_POSITIONS_FALLBACK", true) {
-                            if let Some(sz_live) = self._get_position_size_data_api(&asset_id) {
-                                let live_int = (sz_live + 1e-12).floor() as i64;
-                                let live_ok = (exit_allow_fractional
-                                    && sz_live + 1e-12 >= min_exit_size)
-                                    || (!exit_allow_fractional && live_int >= min_int);
-                                if live_ok {
-                                    let aid_tail: String = asset_id
-                                        .chars()
-                                        .rev()
-                                        .take(6)
-                                        .collect::<String>()
-                                        .chars()
-                                        .rev()
-                                        .collect();
-                                    self.logger.warning(&format!(
-                                        "[SNIPER] balance snapshot below min but positions API still shows shares for asset={aid_tail} (pos={live_int}); deferring local-state reconcile."
-                                    ));
-                                    let pause_s = if stop_loss_fast_retry_on_positions {
-                                        stop_loss_fast_retry_pause_s
-                                    } else {
-                                        retry_pause_s(2.0)
-                                    };
-                                    if stop_loss_fast_retry_on_positions {
-                                        self.logger.warning(&format!(
-                                            "[SNIPER][STOP_LOSS] fast_retry positions_live asset={aid_tail} pos={live_int} pause_s={pause_s:.3}"
-                                        ));
-                                    }
-                                    self._sniper_set_fail_pause(&reason_u, pause_s);
-                                    return false;
-                                }
-                            }
-                        }
-                        let aid_tail: String = asset_id
-                            .chars()
-                            .rev()
-                            .take(6)
-                            .collect::<String>()
-                            .chars()
-                            .rev()
-                            .collect();
-                        if env_bool("SNIPER_EXIT_CLEAR_LOCAL_ON_REJECT_ZERO_BALANCE", false) {
-                            self.logger.warning(&format!(
-                                "[SNIPER] exit rejected (bal<min). Clearing local position state for asset={aid_tail} due to SNIPER_EXIT_CLEAR_LOCAL_ON_REJECT_ZERO_BALANCE=true."
-                            ));
-                            self._clear_local_position_for_asset(
-                                &asset_id,
-                                "exit rejected but clob balance below min_shares",
-                            );
-                        } else {
-                            self.logger.warning(&format!(
-                                "[SNIPER] exit rejected (bal<min) for asset={aid_tail}; keeping local state and retrying (no immediate market stop)."
-                            ));
-                        }
-                        let pause_s = if stop_loss_fast_retry_on_positions {
-                            stop_loss_fast_retry_pause_s
-                        } else {
-                            retry_pause_s(2.0)
-                        };
-                        if stop_loss_fast_retry_on_positions {
-                            self.logger.warning(&format!(
-                                "[SNIPER][STOP_LOSS] fast_retry bal_below_min asset={aid_tail} pause_s={pause_s:.3}"
-                            ));
-                        }
-                        self._sniper_set_fail_pause(&reason_u, pause_s);
-                        return false;
-                    }
-                    let allow_below_min = (exit_allow_fractional
-                        && allow_sh_fresh + 1e-12 < min_exit_size)
-                        || (!exit_allow_fractional && allow_int_fresh < min_int);
-                    if allow_below_min {
-                        if sold_any || recent_submit {
-                            let pause_s = if stop_loss_fast_retry_on_positions {
-                                (stop_loss_fast_retry_pause_s * 4.0).clamp(0.0, 1.0)
-                            } else {
-                                retry_pause_s(5.0)
-                            };
-                            self._sniper_set_fail_pause(&reason_u, pause_s);
-                            return false;
-                        }
-                        let aid_tail: String = asset_id
-                            .chars()
-                            .rev()
-                            .take(6)
-                            .collect::<String>()
-                            .chars()
-                            .rev()
-                            .collect();
-                        self.logger.warning(
-                            "[SNIPER] exit failed: allowance too low. Approve conditional tokens for selling, then the bot will retry.",
-                        );
-                        self.logger.info(&format!(
-                            "[SNIPER] allowance snapshot asset={aid_tail} bal={bal_sh:.6} allow={allow_sh_fresh:.6} min_required={min_exit_size:.6}"
-                        ));
-                        self._sniper_set_fail_pause(&reason_u, retry_pause_s(60.0));
-                        return false;
-                    }
-                    if exit_allow_fractional {
-                        let mut sellable_sh = bal_sh.min(allow_sh_fresh);
-                        sellable_sh = q_down(sellable_sh, exit_size_dp);
-                        if sellable_sh + 1e-12 >= min_exit_size && sellable_sh + 1e-9 < remaining {
-                            balance_avail_sh = sellable_sh;
-                            allow_sh = sellable_sh;
-                            balance_avail_int = (sellable_sh + 1e-12).floor() as i64;
-                            allow_int = balance_avail_int;
-                            self._sniper_set_fail_pause(&reason_u, retry_pause_s(1.0));
-                            continue;
-                        }
-                    } else {
-                        let mut sellable_int = bal_int.min(allow_int_fresh);
-                        sellable_int = (sellable_int / min_int) * min_int;
-                        if sellable_int >= min_int && sellable_int < remaining_int {
-                            balance_avail_int = sellable_int;
-                            allow_int = sellable_int;
-                            self._sniper_set_fail_pause(&reason_u, retry_pause_s(1.0));
-                            continue;
-                        }
-                    }
-                }
-                self._sniper_set_fail_pause(&reason_u, retry_pause_s(5.0));
+                let fast_retry_s = if reason_u == "STOP_LOSS" {
+                    retry_pause_s(0.25)
+                } else {
+                    retry_pause_s(1.0)
+                };
+                self._sniper_set_fail_pause(&reason_u, fast_retry_s);
                 return false;
             }
             submitted_any = true;
-            last_submit_ts = now_ts_f64();
             let post_submit_s = if stop_certainty_active {
                 stop_certainty_post_wait_s
             } else {
