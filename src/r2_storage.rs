@@ -1,8 +1,8 @@
 use crate::env_utils::env_bool;
 use crate::logging::LogLike;
 use anyhow::{anyhow, Context, Result};
-use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
+use aws_config::BehaviorVersion;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::error::DisplayErrorContext;
@@ -227,17 +227,15 @@ async fn upload_items_async(
             Err(e) => {
                 stats.failed_files += 1;
                 let err_ctx = DisplayErrorContext(&e).to_string();
-                stats
-                    .failed_reasons
-                    .push(format!(
-                        "upload {} key={} bucket={} endpoint={}: {} | debug={:?}",
-                        item.local_path.display(),
-                        key,
-                        cfg.bucket,
-                        cfg.endpoint,
-                        err_ctx,
-                        e
-                    ));
+                stats.failed_reasons.push(format!(
+                    "upload {} key={} bucket={} endpoint={}: {} | debug={:?}",
+                    item.local_path.display(),
+                    key,
+                    cfg.bucket,
+                    cfg.endpoint,
+                    err_ctx,
+                    e
+                ));
             }
         }
     }
@@ -273,7 +271,10 @@ pub fn upload_logs_before_rollover(market_slug: &str, bot_id: &str, logger: &Arc
                 if stats.uploaded_files > 0 {
                     logger.info(&format!(
                         "[R2] uploaded {} files ({} bytes, {} skipped) for market {}",
-                        stats.uploaded_files, stats.uploaded_bytes, stats.skipped_files, market_slug
+                        stats.uploaded_files,
+                        stats.uploaded_bytes,
+                        stats.skipped_files,
+                        market_slug
                     ));
                 }
                 if stats.failed_files > 0 {

@@ -1,3 +1,28 @@
+## Version 0.1.11
+Date: 2026-03-03
+### Changes
+- Added Binance spot feed integration for sniper filters (REST 1m warmup + WS trade ticks) with reconnect/backoff behavior.
+- Added BTC sniper filter engine for:
+  - momentum confirmation (EMA trend/slope + candle body checks)
+  - micro-breakout trigger (buffer + persistence + rearm latch via `active_trigger`)
+- Enforced Binance filter gating on sniper entry paths:
+  - normal/signal/force flows in `_sniper_try_enter`
+  - endgame blind-post flow in `_sniper_maybe_endgame_blind_post`
+- Added fail-closed handling for enabled filters on stale Binance data, insufficient candles, and missing breakout levels.
+- Added JSON persistence for sniper filter runtime state:
+  - completed/current candles
+  - breakout levels/timers + `active_trigger`
+  - momentum snapshots `momentum_yes` and `momentum_no`
+- Added periodic + shutdown save/load lifecycle for sniper filter state file.
+- Added flat-mode sniper status metrics suffix on `[SNIPER] ... (flat)` logs to show current momentum/breakout status.
+- Added env contract entries and `.env` examples for Binance feed, momentum, breakout, and filter-state persistence options.
+- Added/updated unit coverage for filter behavior and persistence roundtrip.
+
+### Behavior Impact
+- When breakout/momentum filters are enabled, entries require Binance-confirmed directional context and may be blocked despite candidate price eligibility.
+- Restart continuity improves because candle/filter state and trigger context are restored from JSON.
+- Flat-mode observability improves with inline momentum/breakout status in sniper status logs.
+
 ## Version 0.1.10
 Date: 2026-02-25
 ### Changes

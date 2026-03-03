@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod binance_feed;
 mod bot;
 mod config;
 mod db;
@@ -11,6 +12,7 @@ mod logging;
 mod r2_storage;
 mod rtds;
 mod signal;
+mod sniper_filters;
 
 use anyhow::{anyhow, Context, Result};
 use bot::MakerHedgeCapBot;
@@ -163,7 +165,9 @@ fn bot_window_stats(repo: &BotRepository, bot_id: &str, b: &StatsBounds) -> PnlW
         month: repo
             .trade_stats_for_bot_period(bot_id, &b.month_start, &b.today)
             .unwrap_or_default(),
-        all: repo.trade_stats_for_bot_all_time(bot_id).unwrap_or_default(),
+        all: repo
+            .trade_stats_for_bot_all_time(bot_id)
+            .unwrap_or_default(),
     }
 }
 
@@ -313,7 +317,11 @@ fn build_telegram_startup_message(bot_id: &str, exec_mode: &str) -> String {
     };
     format!(
         "POLYBOT RESTART TEST\nBot: {}\nVersion: {}\nMode: {}\nTime (Asia/Jakarta): {}\nHost: {}",
-        bot_id, build_version(), exec_mode, now_iso_jakarta(), host
+        bot_id,
+        build_version(),
+        exec_mode,
+        now_iso_jakarta(),
+        host
     )
 }
 
@@ -1206,7 +1214,8 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 if telegram_enabled() {
                     let notify_key = format!("{today}:{reason}");
                     if last_daily_limit_telegram_key != notify_key {
-                        let telegram_summary = build_telegram_pnl_summary(&repo, &bot_id, &bot_logger);
+                        let telegram_summary =
+                            build_telegram_pnl_summary(&repo, &bot_id, &bot_logger);
                         let telegram_message = format!(
                             "DAILY LIMIT {}\nbot={} date={} pnl={:+.4} trades={} take_profit_usd={:.4} stop_loss_usd={:.4}\n\n{}",
                             reason,

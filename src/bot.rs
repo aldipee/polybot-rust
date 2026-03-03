@@ -1,3 +1,4 @@
+use crate::binance_feed::{BinanceFeedConfig, BinanceFeedService};
 use crate::config::BotConfig;
 use crate::env_utils::{env_bool, env_float, env_int};
 use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
@@ -8,6 +9,9 @@ use crate::helpers::{
 use crate::logging::LogLike;
 use crate::rtds::get_live_snapshot_for_market;
 use crate::signal::{LatencyLogService, SignalHub};
+use crate::sniper_filters::{
+    normalize_asset_symbol, SniperFilterEngine, SniperFilterPersistedState,
+};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Result};
 use chrono::{TimeZone, Utc};
@@ -235,6 +239,11 @@ pub struct MakerHedgeCapBot {
     clob_api_creds: Option<ApiKeyCreds>,
     balance_allowance_cache: Arc<Mutex<HashMap<String, (f64, f64, f64)>>>,
     pub exchange_orders_cache: Arc<Mutex<Vec<Value>>>,
+    pub binance_feed: Option<Arc<BinanceFeedService>>,
+    pub sniper_filters: Arc<Mutex<SniperFilterEngine>>,
+    sniper_filters_persist_enabled: bool,
+    sniper_filters_state_path: Option<PathBuf>,
+    sniper_filters_persist_min_interval_ms: i64,
 }
 
 impl MakerHedgeCapBot {
@@ -314,6 +323,44 @@ impl MakerHedgeCapBot {
             .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
         let (clob_rt, clob_client, clob_api_creds) =
             Self::_init_native_clob_client(&cfg, &bot_logger, &clob_gamma_host)?;
+        let market_symbol_hint = std::env::var("MARKET_SYMBOL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                market_slug
+                    .split('-')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            });
+        let sniper_filters = Arc::new(Mutex::new(SniperFilterEngine::new(&market_symbol_hint)));
+        let sniper_filters_persist_enabled = env_bool("SNIPER_FILTERS_PERSIST_STATE", true);
+        let sniper_filters_persist_min_interval_ms =
+            env_int("SNIPER_FILTERS_STATE_WRITE_MIN_INTERVAL_MS", 250).clamp(0, 60_000);
+        let sniper_filters_state_path = if sniper_filters_persist_enabled {
+            let p = std::env::var("SNIPER_FILTERS_STATE_PATH")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    let sym = normalize_asset_symbol(&market_symbol_hint);
+                    let bot_id = std::env::var("BOT_ID")
+                        .unwrap_or_else(|_| "polybot".to_string())
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                        .collect::<String>();
+                    format!("state/sniper_filters_state_{}_{}.json", bot_id, sym)
+                });
+            let path = PathBuf::from(p);
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            Some(path)
+        } else {
+            None
+        };
 
         let mut out = Self {
             cfg,
@@ -394,6 +441,11 @@ impl MakerHedgeCapBot {
             clob_api_creds,
             balance_allowance_cache: Arc::new(Mutex::new(HashMap::new())),
             exchange_orders_cache: Arc::new(Mutex::new(Vec::new())),
+            binance_feed: None,
+            sniper_filters,
+            sniper_filters_persist_enabled,
+            sniper_filters_state_path,
+            sniper_filters_persist_min_interval_ms,
         };
 
         runtime_flags.insert(
@@ -441,6 +493,8 @@ impl MakerHedgeCapBot {
             }
         }
         out._warm_clob_order_meta_cache();
+        out._sniper_filters_load_state();
+        out._init_binance_feed_if_needed();
 
         Ok(out)
     }
@@ -796,6 +850,238 @@ impl MakerHedgeCapBot {
         if let Ok(mut m) = self.debug_last_ts.lock() {
             m.insert(key.to_string(), value);
         }
+    }
+
+    fn _is_sniper_like_mode(exec_mode: &str) -> bool {
+        matches!(
+            exec_mode,
+            "SNIPER"
+                | "PROB_SNIPER"
+                | "HIGH_PROB"
+                | "HIGH_PROB_SNIPER"
+                | "FIXED_PROFIT"
+                | "SIGNAL_SNIPPER"
+                | "SIGNAL_SNIPER"
+                | "SIGNAL_SNIPE"
+                | "SIGNAL"
+        )
+    }
+
+    fn _init_binance_feed_if_needed(&mut self) {
+        let needs_feed = self
+            .sniper_filters
+            .lock()
+            .map(|f| f.uses_binance_feed())
+            .unwrap_or(false);
+        if !needs_feed {
+            return;
+        }
+        if !Self::_is_sniper_like_mode(&self.exec_mode) {
+            return;
+        }
+        let cfg = BinanceFeedConfig::from_env();
+        self.logger.info(&format!(
+            "[BINANCE] feed init venue={:?} symbol={} rest={} ws={}",
+            cfg.venue,
+            cfg.symbol,
+            cfg.rest_base_url,
+            cfg.ws_url()
+        ));
+        let feed = Arc::new(BinanceFeedService::new(
+            cfg,
+            self.logger.clone(),
+            self.stop_flag.clone(),
+        ));
+        feed.start();
+        self.binance_feed = Some(feed);
+    }
+
+    fn _sniper_filters_load_state(&self) {
+        if !self.sniper_filters_persist_enabled {
+            return;
+        }
+        let Some(path) = &self.sniper_filters_state_path else {
+            return;
+        };
+        let raw = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let parsed = match serde_json::from_str::<SniperFilterPersistedState>(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                self.logger.warning(&format!(
+                    "[SNIPER_FILTERS] state load parse failed path={} err={e}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        if let Ok(mut f) = self.sniper_filters.lock() {
+            if f.import_state(parsed) {
+                self.logger.info(&format!(
+                    "[SNIPER_FILTERS] state loaded from {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    fn _sniper_filters_save_state(&self, force: bool) {
+        if !self.sniper_filters_persist_enabled {
+            return;
+        }
+        let Some(path) = &self.sniper_filters_state_path else {
+            return;
+        };
+        if !force {
+            let min_s = (self.sniper_filters_persist_min_interval_ms as f64 / 1000.0).max(0.0);
+            let now = now_ts_f64();
+            let key = "__sniper_filters_state_next_write_ts";
+            if now + 1e-12 < self._runtime_ts_get(key) {
+                return;
+            }
+            self._runtime_ts_set(key, now + min_s);
+        }
+
+        let payload = match self.sniper_filters.lock() {
+            Ok(f) => f.export_state(),
+            Err(_) => return,
+        };
+        let raw = match serde_json::to_string_pretty(&payload) {
+            Ok(v) => v,
+            Err(e) => {
+                self.logger.warning(&format!(
+                    "[SNIPER_FILTERS] state serialize failed path={} err={e}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(path, raw) {
+            self.logger.warning(&format!(
+                "[SNIPER_FILTERS] state write failed path={} err={e}",
+                path.display()
+            ));
+        }
+    }
+
+    fn _sniper_filters_ingest_latest_tick(&self) {
+        let Some(feed) = &self.binance_feed else {
+            return;
+        };
+        let snap = feed.snapshot();
+        let mut changed = false;
+        if let Ok(mut f) = self.sniper_filters.lock() {
+            if !snap.seed_klines.is_empty()
+                && self._runtime_ts_get("__sniper_filters_seed_applied") < 0.5
+            {
+                f.seed_completed_klines(&snap.seed_klines);
+                self._runtime_ts_set("__sniper_filters_seed_applied", 1.0);
+                changed = true;
+            }
+            if let Some(tick) = snap.last_tick {
+                if f.on_tick(&tick) {
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self._sniper_filters_save_state(false);
+        }
+    }
+
+    fn _sniper_filter_log(&self, bucket: &str, every_s: f64, msg: &str) {
+        if every_s <= 0.0 {
+            self.logger.info(msg);
+            return;
+        }
+        let key = format!("__sniper_filter_log_{bucket}");
+        let now = now_ts_f64();
+        if now >= self._runtime_ts_get(&key) {
+            self.logger.info(msg);
+            self._runtime_ts_set(&key, now + every_s);
+        }
+    }
+
+    fn _sniper_filters_allow_entry(&self, side: &str, context: &str, seconds_left: f64) -> bool {
+        self._sniper_filters_ingest_latest_tick();
+        let now_ms = (now_ts_f64() * 1000.0) as i64;
+        let (decision, momentum_log_every, breakout_log_every) = match self.sniper_filters.lock() {
+            Ok(f) => (
+                f.evaluate_entry(side, now_ms),
+                f.momentum_log_every_seconds(),
+                f.breakout_log_every_seconds(),
+            ),
+            Err(_) => return true,
+        };
+
+        if decision.breakout.applied {
+            let b = &decision.breakout;
+            self._sniper_filter_log(
+                "breakout",
+                breakout_log_every,
+                &format!(
+                    "[BREAKOUT] {} context={} side={} dir={} trig={} reason={} Hk={} Lk={} buf_up={} buf_dn={} persist_ms={} elapsed_ms={} cooldown_ms={} tick_age_ms={} t_left={:.2}s",
+                    if decision.allowed { "PASS" } else { "BLOCK" },
+                    context,
+                    side,
+                    b.direction.as_str(),
+                    b.triggered,
+                    b.reason,
+                    b.hk.map(|v| format!("{v:.6}")).unwrap_or_else(|| "na".to_string()),
+                    b.lk.map(|v| format!("{v:.6}")).unwrap_or_else(|| "na".to_string()),
+                    b.buffer_up
+                        .map(|v| format!("{v:.6}"))
+                        .unwrap_or_else(|| "na".to_string()),
+                    b.buffer_dn
+                        .map(|v| format!("{v:.6}"))
+                        .unwrap_or_else(|| "na".to_string()),
+                    b.persist_ms,
+                    b.elapsed_ms,
+                    b.cooldown_remaining_ms,
+                    b.tick_age_ms,
+                    seconds_left
+                ),
+            );
+        }
+        if decision.momentum.applied {
+            let m = &decision.momentum;
+            self._sniper_filter_log(
+                "momentum",
+                momentum_log_every,
+                &format!(
+                    "[MOMENTUM] {} context={} side={} reason={} checks={}/{} trend={} slope={} candles={} fast={} slow={} fast_prev={} body_count={} tick_age_ms={} t_left={:.2}s",
+                    if decision.allowed { "PASS" } else { "BLOCK" },
+                    context,
+                    side,
+                    m.reason,
+                    m.checks_passed,
+                    m.required_checks,
+                    m.trend_ok,
+                    m.slope_ok,
+                    m.candles_ok,
+                    m.ema_fast_last
+                        .map(|v| format!("{v:.6}"))
+                        .unwrap_or_else(|| "na".to_string()),
+                    m.ema_slow_last
+                        .map(|v| format!("{v:.6}"))
+                        .unwrap_or_else(|| "na".to_string()),
+                    m.ema_fast_prev
+                        .map(|v| format!("{v:.6}"))
+                        .unwrap_or_else(|| "na".to_string()),
+                    m.bullish_or_bearish_count
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "na".to_string()),
+                    m.tick_age_ms,
+                    seconds_left
+                ),
+            );
+        }
+        decision.allowed
     }
 
     fn _sniper_hedge_oid_key(order_id: &str) -> String {
@@ -1191,7 +1477,8 @@ impl MakerHedgeCapBot {
     }
 
     fn _rtds_entry_gate_allows_side(&self, side: &str, seconds_left: f64, context: &str) -> bool {
-        self._rtds_entry_gate_eval_side(side, seconds_left, context).0
+        self._rtds_entry_gate_eval_side(side, seconds_left, context)
+            .0
     }
 
     fn _sniper_force_entry_diff_signal(&self, seconds_left: f64) -> Option<(String, f64)> {
@@ -1557,8 +1844,12 @@ impl MakerHedgeCapBot {
     fn _sniper_tp_sl_for_entry_reason(&self, entry_reason: &str) -> (f64, f64) {
         let base_tp = env_float("SNIPER_TAKE_PROFIT_PCT", 0.01).max(0.0);
         let base_sl = env_float("SNIPER_STOP_LOSS_PCT", 0.02).max(0.0);
-        let (tp_override, sl_override) = Self::_sniper_tp_sl_overrides_for_entry_reason(entry_reason);
-        (tp_override.unwrap_or(base_tp), sl_override.unwrap_or(base_sl))
+        let (tp_override, sl_override) =
+            Self::_sniper_tp_sl_overrides_for_entry_reason(entry_reason);
+        (
+            tp_override.unwrap_or(base_tp),
+            sl_override.unwrap_or(base_sl),
+        )
     }
 
     fn _force_diff_entry_reason(reason: &str) -> bool {
@@ -2868,8 +3159,10 @@ impl MakerHedgeCapBot {
             }
             if let Ok(mut first_reason) = self.first_entry_reason.lock() {
                 if first_reason.is_none() {
-                    let reason = opened_reason
-                        .unwrap_or_else(|| self._take_pending_entry_reason().unwrap_or_else(|| self._default_entry_reason()));
+                    let reason = opened_reason.unwrap_or_else(|| {
+                        self._take_pending_entry_reason()
+                            .unwrap_or_else(|| self._default_entry_reason())
+                    });
                     *first_reason = Some(reason);
                 }
             }
@@ -6729,15 +7022,13 @@ impl MakerHedgeCapBot {
             let side = if good.len() == 1 {
                 Some(good[0].0.to_string())
             } else if good.len() > 1 {
-                good
-                    .iter()
+                good.iter()
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(s, _)| s.to_string())
             } else if require_min && price_min > 0.0 {
                 return false;
             } else {
-                opts
-                    .iter()
+                opts.iter()
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(s, _)| s.to_string())
             };
@@ -6749,6 +7040,9 @@ impl MakerHedgeCapBot {
         if env_bool("RTDS_ENTRY_GATE_APPLY_ENDGAME", true)
             && !self._rtds_entry_gate_allows_side(&side, seconds_left, "SNIPER_ENDGAME")
         {
+            return false;
+        }
+        if !self._sniper_filters_allow_entry(&side, "SNIPER_ENDGAME", seconds_left) {
             return false;
         }
         let asset_id = if side == "YES" {
@@ -6887,10 +7181,7 @@ impl MakerHedgeCapBot {
         bypass_quality_filters: bool,
     ) -> Option<Value> {
         let (yb, ya, nb, na) = self._sniper_best_snapshot();
-        let preferred_side = preferred_side
-            .unwrap_or("")
-            .trim()
-            .to_ascii_uppercase();
+        let preferred_side = preferred_side.unwrap_or("").trim().to_ascii_uppercase();
         let side_pinned = matches!(preferred_side.as_str(), "YES" | "NO");
         if !side_pinned && (yb <= 0.0 || ya <= 0.0 || nb <= 0.0 || na <= 0.0) {
             return None;
@@ -7057,8 +7348,64 @@ impl MakerHedgeCapBot {
             .map(|s| s.sniper_trade_count)
             .unwrap_or_default();
         if pos.is_none() {
+            let now_ms = (now_ts_f64() * 1000.0) as i64;
+            let metrics_suffix = self
+                .sniper_filters
+                .lock()
+                .ok()
+                .map(|f| {
+                    let st = f.export_state();
+                    let yes = f.evaluate_entry("YES", now_ms);
+                    let no = f.evaluate_entry("NO", now_ms);
+                    let mom_yes = st
+                        .momentum_yes
+                        .as_ref()
+                        .map(|m| {
+                            format!(
+                                "{}/{}:{}",
+                                m.checks_passed, m.required_checks, m.reason
+                            )
+                        })
+                        .unwrap_or_else(|| "na".to_string());
+                    let mom_no = st
+                        .momentum_no
+                        .as_ref()
+                        .map(|m| {
+                            format!(
+                                "{}/{}:{}",
+                                m.checks_passed, m.required_checks, m.reason
+                            )
+                        })
+                        .unwrap_or_else(|| "na".to_string());
+                    let breakout_summary = if yes.breakout.applied || no.breakout.applied {
+                        let dir = if yes.breakout.direction != crate::sniper_filters::BreakoutDirection::None {
+                            yes.breakout.direction.as_str().to_string()
+                        } else if no.breakout.direction != crate::sniper_filters::BreakoutDirection::None {
+                            no.breakout.direction.as_str().to_string()
+                        } else {
+                            st.active_trigger.as_str().to_string()
+                        };
+                        format!(
+                            "dir={} y:{} n:{} trig={} cd={}ms",
+                            dir,
+                            yes.breakout.reason,
+                            no.breakout.reason,
+                            yes.breakout.triggered || no.breakout.triggered,
+                            yes.breakout
+                                .cooldown_remaining_ms
+                                .max(no.breakout.cooldown_remaining_ms)
+                        )
+                    } else {
+                        "off".to_string()
+                    };
+                    format!(
+                        " | mom[y={},n={}] brk[{}]",
+                        mom_yes, mom_no, breakout_summary
+                    )
+                })
+                .unwrap_or_default();
             self.logger.info(&format!(
-                "[SNIPER] t_left={seconds_left:6.1}s trades={tc} pnl(mtm)={pnl:+.4} (flat)"
+                "[SNIPER] t_left={seconds_left:6.1}s trades={tc} pnl(mtm)={pnl:+.4} (flat){metrics_suffix}"
             ));
             return;
         }
@@ -7102,7 +7449,10 @@ impl MakerHedgeCapBot {
         self._runtime_ts_set("__sniper_last_signal_ts", now);
 
         let mut active_cand = cand.clone();
-        let mut ask = active_cand.get("ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let mut ask = active_cand
+            .get("ask")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         if ask <= 0.0 {
             return false;
         }
@@ -7188,6 +7538,9 @@ impl MakerHedgeCapBot {
             }
         }
         if !gate_ok || ask <= 0.0 {
+            return false;
+        }
+        if !self._sniper_filters_allow_entry(&side, gate_context, seconds_left) {
             return false;
         }
         let resolved_entry_reason = self._entry_reason_from_candidate(&active_cand);
@@ -7478,9 +7831,15 @@ impl MakerHedgeCapBot {
         if reason_u == "STOP_LOSS"
             && has_open_exposure
             && self.sniper_stop_certainty.enabled
-            && self.sniper_stop_certainty.stop_loss_open_exposure_max_pause_ms > 0
+            && self
+                .sniper_stop_certainty
+                .stop_loss_open_exposure_max_pause_ms
+                > 0
         {
-            let cap = self.sniper_stop_certainty.stop_loss_open_exposure_max_pause_ms as f64 / 1000.0;
+            let cap = self
+                .sniper_stop_certainty
+                .stop_loss_open_exposure_max_pause_ms as f64
+                / 1000.0;
             out = out.min(cap.max(0.0));
         }
         out.max(0.0)
@@ -7494,7 +7853,12 @@ impl MakerHedgeCapBot {
         }
     }
 
-    fn _sniper_stop_certainty_hedge_phase(&self, pos: &Value, reason_u: &str, trigger: &str) -> bool {
+    fn _sniper_stop_certainty_hedge_phase(
+        &self,
+        pos: &Value,
+        reason_u: &str,
+        trigger: &str,
+    ) -> bool {
         if !(self.sniper_stop_certainty.enabled && reason_u == "STOP_LOSS") {
             self._sniper_maybe_exit_hedge(pos, reason_u, trigger);
             return self._sniper_position().is_none();
@@ -7507,7 +7871,11 @@ impl MakerHedgeCapBot {
                 self._sniper_clear_post_hedge_state();
                 return true;
             };
-            let _before_qty = cur.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+            let _before_qty = cur
+                .get("qty")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .max(0.0);
             let _ = self._sniper_maybe_exit_hedge_with_opts(&cur, reason_u, trigger, true, submits);
             submits += 1;
             let wait_s = (self.sniper_stop_certainty.sell_post_wait_ms.max(1) as f64 / 1000.0)
@@ -7594,9 +7962,10 @@ impl MakerHedgeCapBot {
         let reason_u = reason.trim().to_ascii_uppercase();
         let stop_mode = self._sniper_stop_loss_mode();
         let fallback_mode = self._sniper_stop_loss_fallback_mode();
-        let stop_mode_hedge = reason_u == "STOP_LOSS"
-            && (stop_mode == "HEDGE" || fallback_mode == "HEDGE");
-        let forced_stop_loss = force && reason_u == "STOP_LOSS" && self.sniper_stop_certainty.enabled;
+        let stop_mode_hedge =
+            reason_u == "STOP_LOSS" && (stop_mode == "HEDGE" || fallback_mode == "HEDGE");
+        let forced_stop_loss =
+            force && reason_u == "STOP_LOSS" && self.sniper_stop_certainty.enabled;
         if !forced_stop_loss && !env_bool("SNIPER_EXIT_HEDGE_ENABLED", false) && !stop_mode_hedge {
             return false;
         }
@@ -7614,8 +7983,16 @@ impl MakerHedgeCapBot {
         if !matches!(side.as_str(), "YES" | "NO") {
             return false;
         }
-        let qty = pos.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
-        let cost = pos.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+        let qty = pos
+            .get("qty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0);
+        let cost = pos
+            .get("cost")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0);
         let bid = pos.get("bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
         if qty <= 0.0 {
             return false;
@@ -7850,7 +8227,8 @@ impl MakerHedgeCapBot {
                 if fails + 1e-9 >= fallback_fails {
                     if mode != fallback_mode {
                         let now = now_ts_f64();
-                        let log_key = format!("__sniper_stop_loss_fallback_active_log_until_{asset_id}");
+                        let log_key =
+                            format!("__sniper_stop_loss_fallback_active_log_until_{asset_id}");
                         if now >= self._runtime_ts_get(&log_key) {
                             self.logger.warning(&format!(
                                 "[SNIPER][STOP_LOSS] fallback_active fails={:.0}/{:.0} mode={} -> {}",
@@ -7868,7 +8246,8 @@ impl MakerHedgeCapBot {
         }
         if reason_u == "STOP_LOSS" && mode == "HEDGE" {
             if stop_certainty_active {
-                let done = self._sniper_stop_certainty_hedge_phase(pos, &reason_u, "stop_loss_mode");
+                let done =
+                    self._sniper_stop_certainty_hedge_phase(pos, &reason_u, "stop_loss_mode");
                 self._sniper_set_fail_pause(&reason_u, retry_pause_s(0.5));
                 return done;
             }
@@ -8362,8 +8741,11 @@ impl MakerHedgeCapBot {
             }
             if oid.is_none() {
                 if stop_certainty_active {
-                    let done =
-                        self._sniper_stop_certainty_hedge_phase(&cur, &reason_u, "sell_submit_reject");
+                    let done = self._sniper_stop_certainty_hedge_phase(
+                        &cur,
+                        &reason_u,
+                        "sell_submit_reject",
+                    );
                     self._sniper_set_fail_pause(&reason_u, retry_pause_s(0.5));
                     return done;
                 }
@@ -8527,7 +8909,8 @@ impl MakerHedgeCapBot {
                         &format!("sniper exit {reason_u} no-derisk cancel"),
                     );
                 }
-                let done = self._sniper_stop_certainty_hedge_phase(&cur, &reason_u, "sell_no_derisk");
+                let done =
+                    self._sniper_stop_certainty_hedge_phase(&cur, &reason_u, "sell_no_derisk");
                 self._sniper_set_fail_pause(&reason_u, retry_pause_s(0.5));
                 return done;
             }
@@ -8549,8 +8932,14 @@ impl MakerHedgeCapBot {
                 self._mark_sniper_exit_state();
                 return true;
             };
-            let rem = cur.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
-            let derisk_total = (start_remaining - rem).max(0.0).max(stop_certainty_progress);
+            let rem = cur
+                .get("qty")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .max(0.0);
+            let derisk_total = (start_remaining - rem)
+                .max(0.0)
+                .max(stop_certainty_progress);
             let trigger = if derisk_total + 1e-9 >= stop_certainty_no_derisk_eps {
                 "sell_stage_residual"
             } else if submitted_any {
@@ -8796,6 +9185,7 @@ impl MakerHedgeCapBot {
                 self._log_status_signal(seconds_left);
                 last_log = now;
             }
+            self._sniper_filters_ingest_latest_tick();
             if !self._market_data_fresh() {
                 if self.sniper_stop_certainty.enabled {
                     let stop_loss_active = self._runtime_ts_get("__sniper_stop_loss_active") > 0.5;
@@ -9145,6 +9535,7 @@ impl MakerHedgeCapBot {
                 self._set_exit_reason("SNIPER_MARKET_EXPIRED");
                 break;
             }
+            self._sniper_filters_ingest_latest_tick();
             if now - last_log >= (self.cfg.log_every as f64).max(0.5) {
                 self._log_status_sniper(seconds_left);
                 last_log = now;
@@ -9294,10 +9685,7 @@ impl MakerHedgeCapBot {
                     } else if let Some(mut cand) = cand {
                         if let Value::Object(ref mut o) = cand {
                             o.insert("entry_mode".to_string(), json!("FORCE"));
-                            o.insert(
-                                "entry_reason".to_string(),
-                                json!("SNIPER_FORCE_DIFF_ENTRY"),
-                            );
+                            o.insert("entry_reason".to_string(), json!("SNIPER_FORCE_DIFF_ENTRY"));
                         }
                         if !self._sniper_entry_confirmed(&cand, now) {
                             continue;
@@ -9525,6 +9913,7 @@ impl MakerHedgeCapBot {
     }
 
     pub fn stop(&self) {
+        self._sniper_filters_save_state(true);
         self.stop_flag.store(true, Ordering::SeqCst);
     }
 
@@ -9559,16 +9948,8 @@ impl MakerHedgeCapBot {
                 .lock()
                 .ok()
                 .and_then(|v| v.clone()),
-            entry_reason: self
-                .first_entry_reason
-                .lock()
-                .ok()
-                .and_then(|v| v.clone()),
-            stop_loss_category: self
-                .stop_loss_category
-                .lock()
-                .ok()
-                .and_then(|v| v.clone()),
+            entry_reason: self.first_entry_reason.lock().ok().and_then(|v| v.clone()),
+            stop_loss_category: self.stop_loss_category.lock().ok().and_then(|v| v.clone()),
             exit_reason: self._get_exit_reason(),
             fill_count: state.seen_trade_keys.len(),
         }

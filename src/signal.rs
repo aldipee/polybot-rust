@@ -674,9 +674,7 @@ impl SignalHub {
 
     pub fn ingest_raw_message(&self, raw: &str) -> Result<Option<SignalTrade>> {
         let text = raw.trim();
-        if text.is_empty()
-            || text.eq_ignore_ascii_case("ping")
-            || text.eq_ignore_ascii_case("pong")
+        if text.is_empty() || text.eq_ignore_ascii_case("ping") || text.eq_ignore_ascii_case("pong")
         {
             return Ok(None);
         }

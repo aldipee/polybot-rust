@@ -162,10 +162,7 @@ pub fn generate_market_slug_from_now_with_style(
         let asset_name = market_asset_slug_name(&asset);
         let now_et = Utc::now().with_timezone(&New_York);
         if seg == "1H" {
-            let hour_start = now_et
-                .with_minute(0)?
-                .with_second(0)?
-                .with_nanosecond(0)?;
+            let hour_start = now_et.with_minute(0)?.with_second(0)?.with_nanosecond(0)?;
             let prefix = format!("{asset_name}-up-or-down-");
             return Some(format_1h_slug_et(&prefix, hour_start));
         }

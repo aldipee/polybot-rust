@@ -262,10 +262,7 @@ fn validate_ident(raw: &str, key: &str) -> Result<String> {
     if name.is_empty() {
         return Err(anyhow!("{key} cannot be empty"));
     }
-    if name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         Ok(name.to_string())
     } else {
         Err(anyhow!(
@@ -291,8 +288,7 @@ fn config_from_env() -> Result<PushConfig> {
         "CLICKHOUSE_TABLE_RTDS_PRICES",
     )?;
     let table_copy_collect = validate_ident(
-        &env::var("CLICKHOUSE_TABLE_COPY_COLLECT")
-            .unwrap_or_else(|_| "copy_collect".to_string()),
+        &env::var("CLICKHOUSE_TABLE_COPY_COLLECT").unwrap_or_else(|_| "copy_collect".to_string()),
         "CLICKHOUSE_TABLE_COPY_COLLECT",
     )?;
     let table_price_to_beat = validate_ident(

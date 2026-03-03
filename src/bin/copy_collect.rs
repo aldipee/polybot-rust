@@ -50,7 +50,10 @@ fn env_bool(keys: &[&str], default: bool) -> bool {
         Some(v) => v,
         None => return default,
     };
-    matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on")
+    matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on"
+    )
 }
 
 fn env_f64(keys: &[&str], default: f64) -> f64 {
@@ -137,10 +140,7 @@ fn infer_unix_ms_for_key(key: &str, v: &Value) -> Option<i64> {
     {
         return Some(raw.saturating_mul(1000));
     }
-    if k == "ts_ms"
-        || k.ends_with("_ts_ms")
-        || k.ends_with("_at_ms")
-        || k.contains("timestamp_ms")
+    if k == "ts_ms" || k.ends_with("_ts_ms") || k.ends_with("_at_ms") || k.contains("timestamp_ms")
     {
         return Some(raw);
     }
@@ -468,8 +468,13 @@ impl CollectorConfig {
     }
 
     fn from_env() -> Self {
-        let include_rtds_data =
-            env_bool(&["COPY_COLLECT_INCLUDE_RTDS_DATA", "COPY_COLLECT_ENABLE_RTDS_DATA"], true);
+        let include_rtds_data = env_bool(
+            &[
+                "COPY_COLLECT_INCLUDE_RTDS_DATA",
+                "COPY_COLLECT_ENABLE_RTDS_DATA",
+            ],
+            true,
+        );
         let ws_url = env_first(&["COPY_COLLECT_WS_URL", "SIGNAL_WS_URL", "RTDS_WS_URL"])
             .unwrap_or_else(|| "wss://ws-live-data.polymarket.com".to_string());
         let out_path = PathBuf::from(
@@ -515,14 +520,26 @@ impl CollectorConfig {
         Self {
             ws_url,
             out_path,
-            reconnect_min: env_f64(&["COPY_COLLECT_RECONNECT_MIN", "SIGNAL_WS_RECONNECT_MIN"], 0.5)
-                .max(0.1),
-            reconnect_max: env_f64(&["COPY_COLLECT_RECONNECT_MAX", "SIGNAL_WS_RECONNECT_MAX"], 8.0)
-                .max(0.5),
-            ping_interval: env_f64(&["COPY_COLLECT_PING_INTERVAL", "SIGNAL_WS_PING_INTERVAL"], 5.0)
-                .max(0.0),
+            reconnect_min: env_f64(
+                &["COPY_COLLECT_RECONNECT_MIN", "SIGNAL_WS_RECONNECT_MIN"],
+                0.5,
+            )
+            .max(0.1),
+            reconnect_max: env_f64(
+                &["COPY_COLLECT_RECONNECT_MAX", "SIGNAL_WS_RECONNECT_MAX"],
+                8.0,
+            )
+            .max(0.5),
+            ping_interval: env_f64(
+                &["COPY_COLLECT_PING_INTERVAL", "SIGNAL_WS_PING_INTERVAL"],
+                5.0,
+            )
+            .max(0.0),
             read_timeout: env_f64(
-                &["COPY_COLLECT_READ_TIMEOUT_SECONDS", "RTDS_WS_READ_TIMEOUT_SECONDS"],
+                &[
+                    "COPY_COLLECT_READ_TIMEOUT_SECONDS",
+                    "RTDS_WS_READ_TIMEOUT_SECONDS",
+                ],
                 0.25,
             )
             .max(0.05),
@@ -543,8 +560,7 @@ impl CollectorConfig {
                 "COPYTRADE_EVENT_SLUGS",
             ]),
             buy_only: env_bool(&["SIGNAL_COPY_BUY_ONLY", "COPYTRADE_BUY_ONLY"], false),
-            min_trade_size: env_f64(&["SIGNAL_COPY_MIN_SIZE", "COPYTRADE_MIN_SIZE"], 0.0)
-                .max(0.0),
+            min_trade_size: env_f64(&["SIGNAL_COPY_MIN_SIZE", "COPYTRADE_MIN_SIZE"], 0.0).max(0.0),
             price_topics,
             price_symbols,
             rfq_types,
@@ -828,7 +844,9 @@ fn upsert_clob_top_of_book(cfg: &CollectorConfig, feed: &ClobFeedShared, snapsho
         {
             let _ = queue.pop_front();
         }
-        store.latest_by_asset.insert(snapshot.asset_id.clone(), snapshot);
+        store
+            .latest_by_asset
+            .insert(snapshot.asset_id.clone(), snapshot);
     }
 }
 
@@ -845,19 +863,13 @@ fn pick_best_clob_snapshot(
             if let Some(exchange_ts_ms) = sample.exchange_ts_ms {
                 if sample.exchange_ts_precision == "s" {
                     let delta_s = ((target_ts_ms / 1000) - (exchange_ts_ms / 1000)).abs();
-                    let replace = best_s
-                        .as_ref()
-                        .map(|(d, _)| delta_s < *d)
-                        .unwrap_or(true);
+                    let replace = best_s.as_ref().map(|(d, _)| delta_s < *d).unwrap_or(true);
                     if replace {
                         best_s = Some((delta_s, sample.clone()));
                     }
                 } else {
                     let delta_ms = (target_ts_ms - exchange_ts_ms).abs();
-                    let replace = best_ms
-                        .as_ref()
-                        .map(|(d, _)| delta_ms < *d)
-                        .unwrap_or(true);
+                    let replace = best_ms.as_ref().map(|(d, _)| delta_ms < *d).unwrap_or(true);
                     if replace {
                         best_ms = Some((delta_ms, sample.clone()));
                     }
@@ -1116,8 +1128,8 @@ fn run_clob_ws_loop(cfg: CollectorConfig, feed: ClobFeedShared, stop_event: Arc<
         let (mut ws, _) = match conn {
             Ok(v) => v,
             Err(e) => {
-                let sleep_for = (backoff.min(cfg.clob_ws_reconnect_max))
-                    * (0.7 + rand::random::<f64>() * 0.6);
+                let sleep_for =
+                    (backoff.min(cfg.clob_ws_reconnect_max)) * (0.7 + rand::random::<f64>() * 0.6);
                 eprintln!("[copy_collect][clob] connect error: {e}; retry in {sleep_for:.2}s");
                 thread::sleep(Duration::from_secs_f64(sleep_for.max(0.1)));
                 backoff = (backoff * 2.0).min(cfg.clob_ws_reconnect_max);
@@ -1222,7 +1234,8 @@ fn run_clob_ws_loop(cfg: CollectorConfig, feed: ClobFeedShared, stop_event: Arc<
             }
         }
 
-        let sleep_for = (backoff.min(cfg.clob_ws_reconnect_max)) * (0.7 + rand::random::<f64>() * 0.6);
+        let sleep_for =
+            (backoff.min(cfg.clob_ws_reconnect_max)) * (0.7 + rand::random::<f64>() * 0.6);
         eprintln!("[copy_collect][clob] reconnecting in {sleep_for:.2}s");
         thread::sleep(Duration::from_secs_f64(sleep_for.max(0.1)));
         backoff = (backoff * 2.0).min(cfg.clob_ws_reconnect_max);
@@ -1269,7 +1282,8 @@ fn extract_price_points(msg: &Value, recv_ms: i64) -> Vec<PricePoint> {
                     if symbol.is_empty() || v.is_none() {
                         continue;
                     }
-                    let ts = as_i64_ms(m.get("timestamp").or_else(|| m.get("ts"))).unwrap_or(recv_ms);
+                    let ts =
+                        as_i64_ms(m.get("timestamp").or_else(|| m.get("ts"))).unwrap_or(recv_ms);
                     out.push(PricePoint {
                         topic: topic.clone(),
                         symbol,
@@ -1311,7 +1325,11 @@ fn extract_trade(msg: &Value) -> Option<TradeEvent> {
             .or_else(|| payload.get("market_slug"))
             .or_else(|| payload.get("marketSlug")),
     );
-    let event_slug = val_str(payload.get("eventSlug").or_else(|| payload.get("event_slug")));
+    let event_slug = val_str(
+        payload
+            .get("eventSlug")
+            .or_else(|| payload.get("event_slug")),
+    );
     let title = val_str(payload.get("title"));
     let side = val_str(payload.get("side")).to_ascii_uppercase();
     let outcome = val_str(payload.get("outcome"));
@@ -1369,7 +1387,11 @@ fn extract_rfq(msg: &Value) -> Option<RfqEvent> {
         return None;
     }
 
-    let request_id = val_str(payload.get("requestId").or_else(|| payload.get("request_id")));
+    let request_id = val_str(
+        payload
+            .get("requestId")
+            .or_else(|| payload.get("request_id")),
+    );
     let quote_id = val_str(payload.get("quoteId").or_else(|| payload.get("quote_id")));
     let proxy_address = val_str(
         payload
@@ -1579,13 +1601,7 @@ fn process_data_message(
             "rtds_price_age_ms": rtds_age_ms,
             "rtds_recv_age_ms": rtds_recv_age_ms,
         });
-        apply_clob_join_to_row(
-            cfg,
-            &mut row,
-            clob_feed,
-            market_pair.as_ref(),
-            trade_ts_ms,
-        );
+        apply_clob_join_to_row(cfg, &mut row, clob_feed, market_pair.as_ref(), trade_ts_ms);
         writer.append(&row)?;
         *trades_logged += 1;
         println!(
@@ -1664,7 +1680,10 @@ fn run() -> Result<()> {
 
     while cfg.max_trades <= 0 || trades_logged < cfg.max_trades {
         if cfg.run_seconds > 0.0 && (now_s() - start_ts) >= cfg.run_seconds {
-            println!("[copy_collect] reached COPY_COLLECT_RUN_SECONDS={}", cfg.run_seconds);
+            println!(
+                "[copy_collect] reached COPY_COLLECT_RUN_SECONDS={}",
+                cfg.run_seconds
+            );
             break;
         }
 
@@ -1672,7 +1691,8 @@ fn run() -> Result<()> {
         let (mut ws, _) = match conn {
             Ok(v) => v,
             Err(e) => {
-                let sleep_for = (backoff.min(cfg.reconnect_max)) * (0.7 + rand::random::<f64>() * 0.6);
+                let sleep_for =
+                    (backoff.min(cfg.reconnect_max)) * (0.7 + rand::random::<f64>() * 0.6);
                 eprintln!("[copy_collect] connect error: {e}; retry in {sleep_for:.2}s");
                 thread::sleep(Duration::from_secs_f64(sleep_for.max(0.1)));
                 backoff = (backoff * 2.0).min(cfg.reconnect_max);
@@ -1689,12 +1709,18 @@ fn run() -> Result<()> {
         let mut last_ping = Instant::now();
         loop {
             if cfg.run_seconds > 0.0 && (now_s() - start_ts) >= cfg.run_seconds {
-                println!("[copy_collect] reached COPY_COLLECT_RUN_SECONDS={}", cfg.run_seconds);
+                println!(
+                    "[copy_collect] reached COPY_COLLECT_RUN_SECONDS={}",
+                    cfg.run_seconds
+                );
                 let _ = ws.close(None);
                 return Ok(());
             }
             if cfg.max_trades > 0 && trades_logged >= cfg.max_trades {
-                println!("[copy_collect] reached COPY_COLLECT_MAX_TRADES={}", cfg.max_trades);
+                println!(
+                    "[copy_collect] reached COPY_COLLECT_MAX_TRADES={}",
+                    cfg.max_trades
+                );
                 let _ = ws.close(None);
                 return Ok(());
             }
@@ -1754,7 +1780,9 @@ fn run() -> Result<()> {
                 Message::Binary(bin) => {
                     if let Ok(text) = String::from_utf8(bin.to_vec()) {
                         let s = text.trim();
-                        if s.is_empty() || s.eq_ignore_ascii_case("ping") || s.eq_ignore_ascii_case("pong")
+                        if s.is_empty()
+                            || s.eq_ignore_ascii_case("ping")
+                            || s.eq_ignore_ascii_case("pong")
                         {
                             continue;
                         }

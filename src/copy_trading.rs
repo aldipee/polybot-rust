@@ -28,10 +28,9 @@ impl CopyTradingLogic {
             "SIGNAL_COPY_EVENT_SLUGS",
             "COPYTRADE_EVENT_SLUGS",
         ]));
-        let min_trade_size = Self::env_f64(&["SIGNAL_COPY_MIN_SIZE", "COPYTRADE_MIN_SIZE"], 0.0)
-            .max(0.0);
-        let buy_only =
-            Self::env_bool(&["SIGNAL_COPY_BUY_ONLY", "COPYTRADE_BUY_ONLY"], false);
+        let min_trade_size =
+            Self::env_f64(&["SIGNAL_COPY_MIN_SIZE", "COPYTRADE_MIN_SIZE"], 0.0).max(0.0);
+        let buy_only = Self::env_bool(&["SIGNAL_COPY_BUY_ONLY", "COPYTRADE_BUY_ONLY"], false);
         let subscribe_payload =
             Self::build_subscription_payload(ws_url, &market_slug_filters, &event_slug_filters);
 
@@ -351,11 +350,9 @@ impl CopyTradingLogic {
             return serde_json::to_string(&json!({ "market_slug": market_slug })).ok();
         }
 
-        let event_slug = Self::env_first(&[
-            "SIGNAL_COPY_SUBSCRIBE_EVENT_SLUG",
-            "SIGNAL_COPY_EVENT_SLUG",
-        ])
-        .or_else(|| Self::single_set_value(event_slug_filters));
+        let event_slug =
+            Self::env_first(&["SIGNAL_COPY_SUBSCRIBE_EVENT_SLUG", "SIGNAL_COPY_EVENT_SLUG"])
+                .or_else(|| Self::single_set_value(event_slug_filters));
         if let Some(event_slug) = event_slug {
             return serde_json::to_string(&json!({ "event_slug": event_slug })).ok();
         }
@@ -402,7 +399,10 @@ impl CopyTradingLogic {
             Some(v) => v,
             None => return default,
         };
-        matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on")
+        matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y" | "on"
+        )
     }
 
     fn env_f64(keys: &[&str], default: f64) -> f64 {
