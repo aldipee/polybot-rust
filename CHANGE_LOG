@@ -1,3 +1,20 @@
+## Version 0.1.12
+Date: 2026-03-03
+### Changes
+- Added `trade_decisions` table keyed by `trade_id` for sniper decision/execution telemetry, including:
+  - decision timing (`t_left_seconds`, `tick_age_ms`)
+  - momentum and breakout metrics
+  - submit origin/order type and micro-latency (`decide_to_send_us`, `send_to_ack_us`, `decide_to_ack_us`)
+  - Polymarket quote/depth snapshot fields
+  - execution outcomes (`limit_price_submitted`, `qty_requested`, `qty_filled`, `fill_price_avg`, `slippage_bps_vs_mid`, `fees_paid`)
+- Added repository API `upsert_trade_decision` and linked lifecycle cleanup on trade deletion.
+- Wired sniper entry submission path to capture decision + submit context and attach fill progression updates.
+- Wired main finalize flow to persist decision telemetry into `trade_decisions` for completed trade rows.
+
+### Behavior Impact
+- Every finalized trade can now be joined with a single decision telemetry row via `trade_id`.
+- Decision quality and execution quality can be analyzed post-run without parsing logs.
+
 ## Version 0.1.11
 Date: 2026-03-03
 ### Changes

@@ -1396,6 +1396,8 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
             } else {
                 None
             };
+            let decision_row = bot.trade_decision_snapshot().unwrap_or_default();
+            repo.upsert_trade_decision(&trade_id, &decision_row)?;
             repo.update_trade_result(
                 &trade_id,
                 &end_trade_iso,

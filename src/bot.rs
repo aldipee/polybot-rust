@@ -1,5 +1,6 @@
 use crate::binance_feed::{BinanceFeedConfig, BinanceFeedService};
 use crate::config::BotConfig;
+use crate::db::TradeDecisionUpsert;
 use crate::env_utils::{env_bool, env_float, env_int};
 use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
 use crate::helpers::{
@@ -10,7 +11,8 @@ use crate::logging::LogLike;
 use crate::rtds::get_live_snapshot_for_market;
 use crate::signal::{LatencyLogService, SignalHub};
 use crate::sniper_filters::{
-    normalize_asset_symbol, SniperFilterEngine, SniperFilterPersistedState,
+    FilterDecision as SniperFilterDecision, normalize_asset_symbol, SniperFilterEngine,
+    SniperFilterPersistedState,
 };
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Result};
@@ -71,6 +73,18 @@ pub struct TradeMetrics {
     pub stop_loss_category: Option<String>,
     pub exit_reason: String,
     pub fill_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SniperOrderFillAgg {
+    qty: f64,
+    notional: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SniperTradeDecisionRuntime {
+    order_id: Option<String>,
+    data: TradeDecisionUpsert,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -244,6 +258,8 @@ pub struct MakerHedgeCapBot {
     sniper_filters_persist_enabled: bool,
     sniper_filters_state_path: Option<PathBuf>,
     sniper_filters_persist_min_interval_ms: i64,
+    sniper_trade_decision: Arc<Mutex<Option<SniperTradeDecisionRuntime>>>,
+    sniper_order_fill_agg: Arc<Mutex<HashMap<String, SniperOrderFillAgg>>>,
 }
 
 impl MakerHedgeCapBot {
@@ -446,6 +462,8 @@ impl MakerHedgeCapBot {
             sniper_filters_persist_enabled,
             sniper_filters_state_path,
             sniper_filters_persist_min_interval_ms,
+            sniper_trade_decision: Arc::new(Mutex::new(None)),
+            sniper_order_fill_agg: Arc::new(Mutex::new(HashMap::new())),
         };
 
         runtime_flags.insert(
@@ -1007,7 +1025,12 @@ impl MakerHedgeCapBot {
         }
     }
 
-    fn _sniper_filters_allow_entry(&self, side: &str, context: &str, seconds_left: f64) -> bool {
+    fn _sniper_filters_eval_entry(
+        &self,
+        side: &str,
+        context: &str,
+        seconds_left: f64,
+    ) -> Option<SniperFilterDecision> {
         self._sniper_filters_ingest_latest_tick();
         let now_ms = (now_ts_f64() * 1000.0) as i64;
         let (decision, momentum_log_every, breakout_log_every) = match self.sniper_filters.lock() {
@@ -1016,7 +1039,7 @@ impl MakerHedgeCapBot {
                 f.momentum_log_every_seconds(),
                 f.breakout_log_every_seconds(),
             ),
-            Err(_) => return true,
+            Err(_) => return None,
         };
 
         if decision.breakout.applied {
@@ -1081,7 +1104,206 @@ impl MakerHedgeCapBot {
                 ),
             );
         }
-        decision.allowed
+        Some(decision)
+    }
+
+    fn _sniper_filters_allow_entry(&self, side: &str, context: &str, seconds_left: f64) -> bool {
+        self._sniper_filters_eval_entry(side, context, seconds_left)
+            .map(|d| d.allowed)
+            .unwrap_or(true)
+    }
+
+    fn _sniper_submit_order_type_from_origin(origin: &str) -> String {
+        let u = origin.trim().to_ascii_uppercase();
+        if u.contains("FAK") {
+            "FAK".to_string()
+        } else if u.contains("FOK") {
+            "FOK".to_string()
+        } else if u.contains("GTC") || u.contains("LIMIT") {
+            "GTC".to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn _sniper_order_kind_from_origin(origin: &str) -> String {
+        let u = origin.trim().to_ascii_uppercase();
+        if u.starts_with("TAKER") {
+            "taker".to_string()
+        } else if u.contains("LIMIT") || u.contains("MAKER") || u.contains("POSTONLY") {
+            "maker".to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn _sniper_apply_fill_stats_to_decision(&self, data: &mut TradeDecisionUpsert, agg: &SniperOrderFillAgg) {
+        if agg.qty <= 1e-12 || agg.notional <= 1e-12 {
+            return;
+        }
+        let avg_fill = agg.notional / agg.qty;
+        data.qty_filled = Some(agg.qty);
+        data.fill_price_avg = Some(avg_fill);
+        if let Some(mid) = data.pm_mid {
+            if mid > 1e-12 {
+                data.slippage_bps_vs_mid = Some(((avg_fill - mid) / mid) * 10_000.0);
+            }
+        }
+        let fee_rate = env_float("SNIPER_FEE_RATE", 0.0).max(0.0);
+        data.fees_paid = Some(agg.notional * fee_rate);
+    }
+
+    fn _sniper_trade_decision_record_submit(
+        &self,
+        order_id: &str,
+        side: &str,
+        seconds_left: f64,
+        asset_id: &str,
+        bid: f64,
+        ask: f64,
+        limit_price: f64,
+        qty_requested: f64,
+        filter_decision: Option<&SniperFilterDecision>,
+    ) {
+        if order_id.trim().is_empty() {
+            return;
+        }
+        let mut row = TradeDecisionUpsert {
+            t_left_seconds: Some(seconds_left),
+            submit_side: Some(side.to_string()),
+            pm_best_bid: if bid > 0.0 { Some(bid) } else { None },
+            pm_best_ask: if ask > 0.0 { Some(ask) } else { None },
+            limit_price_submitted: if limit_price > 0.0 {
+                Some(limit_price)
+            } else {
+                None
+            },
+            qty_requested: if qty_requested > 0.0 {
+                Some(qty_requested)
+            } else {
+                None
+            },
+            ..TradeDecisionUpsert::default()
+        };
+        if bid > 0.0 && ask > 0.0 {
+            let mid = 0.5 * (bid + ask);
+            let spread_abs = (ask - bid).max(0.0);
+            row.pm_mid = Some(mid);
+            row.pm_spread_abs = Some(spread_abs);
+            row.pm_spread_pct = if mid > 1e-12 {
+                Some((spread_abs / mid) * 100.0)
+            } else {
+                None
+            };
+        }
+        if !asset_id.trim().is_empty() {
+            let depth_max_age = env_float("SNIPER_ENTRY_GATE_MAX_AGE_SECONDS", 1.0).max(0.1);
+            if bid > 0.0 {
+                row.pm_depth_bid_1tick =
+                    Some(self._cum_depth(asset_id, "bids", bid, Some(16), Some(depth_max_age)));
+            }
+            if ask > 0.0 {
+                row.pm_depth_ask_1tick =
+                    Some(self._cum_depth(asset_id, "asks", ask, Some(16), Some(depth_max_age)));
+            }
+        }
+        if let Some(decision) = filter_decision {
+            let mut tick_age: Option<i64> = None;
+            if decision.momentum.applied {
+                let m = &decision.momentum;
+                row.momentum_checks_passed = Some(m.checks_passed as i64);
+                row.momentum_checks_required = Some(m.required_checks as i64);
+                row.momentum_trend_ok = Some(m.trend_ok);
+                row.momentum_slope_ok = Some(m.slope_ok);
+                row.momentum_candles_ok = Some(m.candles_ok);
+                row.momentum_ema_fast_last = m.ema_fast_last;
+                row.momentum_ema_slow_last = m.ema_slow_last;
+                row.momentum_ema_fast_prev = m.ema_fast_prev;
+                row.momentum_body_count = m.bullish_or_bearish_count.map(|v| v as i64);
+                if m.tick_age_ms < i64::MAX / 4 {
+                    tick_age = Some(m.tick_age_ms);
+                }
+            }
+            if decision.breakout.applied {
+                let b = &decision.breakout;
+                row.breakout_dir = Some(b.direction.as_str().to_string());
+                row.breakout_triggered = Some(b.triggered);
+                row.breakout_reason = Some(b.reason.clone());
+                row.breakout_hk = b.hk;
+                row.breakout_lk = b.lk;
+                row.breakout_buf_up = b.buffer_up;
+                row.breakout_buf_dn = b.buffer_dn;
+                row.breakout_persist_ms = Some(b.persist_ms);
+                row.breakout_elapsed_ms = Some(b.elapsed_ms);
+                row.breakout_cooldown_ms = Some(b.cooldown_remaining_ms);
+                if b.tick_age_ms < i64::MAX / 4 {
+                    tick_age = Some(match tick_age {
+                        Some(prev) => prev.min(b.tick_age_ms),
+                        None => b.tick_age_ms,
+                    });
+                }
+            }
+            row.tick_age_ms = tick_age;
+        }
+
+        if let Some(ctx) = self._get_order_execution_context(order_id) {
+            let origin = ctx
+                .get("origin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !origin.trim().is_empty() {
+                row.submit_origin = Some(origin.clone());
+                row.submit_order_type = Some(Self::_sniper_submit_order_type_from_origin(&origin));
+                row.order_type = Some(Self::_sniper_order_kind_from_origin(&origin));
+            }
+            let val_i64 = |key: &str| -> Option<i64> {
+                ctx.get(key)
+                    .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|x| x.round() as i64)))
+            };
+            row.decide_to_send_us = val_i64("decision_to_post_start_us");
+            row.send_to_ack_us = val_i64("post_start_to_post_end_us");
+            row.decide_to_ack_us = val_i64("decision_to_post_end_us");
+        }
+        if row.order_type.as_deref().unwrap_or("").is_empty() {
+            row.order_type = Some("unknown".to_string());
+        }
+        if row.submit_order_type.as_deref().unwrap_or("").is_empty() {
+            row.submit_order_type = Some(String::new());
+        }
+
+        if let Ok(fill_map) = self.sniper_order_fill_agg.lock() {
+            if let Some(agg) = fill_map.get(order_id) {
+                self._sniper_apply_fill_stats_to_decision(&mut row, agg);
+            }
+        }
+
+        if let Ok(mut holder) = self.sniper_trade_decision.lock() {
+            *holder = Some(SniperTradeDecisionRuntime {
+                order_id: Some(order_id.to_string()),
+                data: row,
+            });
+        }
+    }
+
+    fn _sniper_record_order_fill(&self, order_id: &str, price: f64, qty: f64) {
+        if order_id.trim().is_empty() || price <= 0.0 || qty <= 0.0 {
+            return;
+        }
+        let mut agg_row = SniperOrderFillAgg::default();
+        if let Ok(mut m) = self.sniper_order_fill_agg.lock() {
+            let e = m.entry(order_id.to_string()).or_default();
+            e.qty += qty.max(0.0);
+            e.notional += qty.max(0.0) * price.max(0.0);
+            agg_row = e.clone();
+        }
+        if let Ok(mut snap) = self.sniper_trade_decision.lock() {
+            if let Some(cur) = snap.as_mut() {
+                if cur.order_id.as_deref() == Some(order_id) {
+                    self._sniper_apply_fill_stats_to_decision(&mut cur.data, &agg_row);
+                }
+            }
+        }
     }
 
     fn _sniper_hedge_oid_key(order_id: &str) -> String {
@@ -4131,6 +4353,7 @@ impl MakerHedgeCapBot {
             let key = format!("order_evt:{order_id}:{matched_total:.8}");
             let applied = self._apply_fill(asset, price, inc, &key, side);
             if applied {
+                self._sniper_record_order_fill(order_id, price, inc);
                 self._log_execution_latency_on_fill(order_id, now_ts_f64());
             }
         }
@@ -4493,6 +4716,7 @@ impl MakerHedgeCapBot {
             };
             let applied = self._apply_fill(&asset, price, size, &key, &side);
             if applied {
+                self._sniper_record_order_fill(&taker_oid, price, size);
                 self._log_execution_latency_on_fill(&taker_oid, now_ts_f64());
                 let mut hedge_progress: Option<(String, String, f64, f64, f64)> = None;
                 let mut remove_oid = false;
@@ -4598,6 +4822,7 @@ impl MakerHedgeCapBot {
                     };
                     let applied = self._apply_fill(&asset, px, qty, &key, &side);
                     if applied && !maker_oid.is_empty() {
+                        self._sniper_record_order_fill(maker_oid, px, qty);
                         self._log_execution_latency_on_fill(maker_oid, now_ts_f64());
                     }
                     return;
@@ -7042,8 +7267,12 @@ impl MakerHedgeCapBot {
         {
             return false;
         }
-        if !self._sniper_filters_allow_entry(&side, "SNIPER_ENDGAME", seconds_left) {
-            return false;
+        let endgame_filter_decision =
+            self._sniper_filters_eval_entry(&side, "SNIPER_ENDGAME", seconds_left);
+        if let Some(decision) = &endgame_filter_decision {
+            if !decision.allowed {
+                return false;
+            }
         }
         let asset_id = if side == "YES" {
             self.yes_asset.clone().unwrap_or_default()
@@ -7140,6 +7369,25 @@ impl MakerHedgeCapBot {
         };
         if oid.is_none() {
             return false;
+        }
+        if let Some(oid) = oid.clone() {
+            let (y_bid, y_ask, n_bid, n_ask) = self._sniper_best_snapshot();
+            let (bid, ask) = if side == "YES" {
+                (y_bid, y_ask)
+            } else {
+                (n_bid, n_ask)
+            };
+            self._sniper_trade_decision_record_submit(
+                &oid,
+                &side,
+                seconds_left,
+                &asset_id,
+                bid,
+                ask,
+                px,
+                size_target as f64,
+                endgame_filter_decision.as_ref(),
+            );
         }
         let endgame_entry_reason = if trigger_mode == "RESOLUTION" {
             "SNIPER_ENDGAME_RESOLUTION"
@@ -7540,8 +7788,11 @@ impl MakerHedgeCapBot {
         if !gate_ok || ask <= 0.0 {
             return false;
         }
-        if !self._sniper_filters_allow_entry(&side, gate_context, seconds_left) {
-            return false;
+        let filter_decision = self._sniper_filters_eval_entry(&side, gate_context, seconds_left);
+        if let Some(decision) = &filter_decision {
+            if !decision.allowed {
+                return false;
+            }
         }
         let resolved_entry_reason = self._entry_reason_from_candidate(&active_cand);
         let entry_type_name = if force_diff_override {
@@ -7663,6 +7914,22 @@ impl MakerHedgeCapBot {
             if oid.is_none() {
                 return false;
             }
+            let oid = oid.unwrap_or_default();
+            let bid = active_cand
+                .get("bid")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            self._sniper_trade_decision_record_submit(
+                &oid,
+                &side,
+                seconds_left,
+                &asset_id,
+                bid,
+                ask,
+                px,
+                desired_chunk as f64,
+                filter_decision.as_ref(),
+            );
             self._set_pending_entry_reason(&resolved_entry_reason);
             let pending_key = Self::_sniper_entry_pending_key(&asset_id);
             let confirmed_key = Self::_sniper_entry_confirmed_key(&asset_id);
@@ -7685,6 +7952,8 @@ impl MakerHedgeCapBot {
         let max_orders = env_int("SNIPER_ENTRY_MAX_ORDERS", 3).max(1);
         let mut orders_sent = 0i64;
         let mut any_submitted = false;
+        let mut submitted_oid: Option<String> = None;
+        let mut submitted_qty = 0.0_f64;
         let mut sizes_to_try: Vec<i64> = vec![desired_chunk];
         if primary_type == "FOK" {
             let mut s_try = desired_chunk;
@@ -7725,9 +7994,11 @@ impl MakerHedgeCapBot {
             let oid =
                 self._place_taker_bid_fak(&asset_id, px, this_chunk as f64, Some(&primary_type));
             orders_sent += 1;
-            if oid.is_some() {
+            if let Some(oid) = oid {
                 any_submitted = true;
                 submitted_primary = true;
+                submitted_qty = this_chunk as f64;
+                submitted_oid = Some(oid);
                 break;
             }
         }
@@ -7740,12 +8011,31 @@ impl MakerHedgeCapBot {
             let oid =
                 self._place_taker_bid_fak(&asset_id, px, fb_chunk as f64, Some(&fallback_type));
             orders_sent += 1;
-            if oid.is_some() {
+            if let Some(oid) = oid {
                 any_submitted = true;
+                submitted_qty = fb_chunk as f64;
+                submitted_oid = Some(oid);
             }
         }
         if !any_submitted {
             return false;
+        }
+        if let Some(oid) = submitted_oid {
+            let bid = active_cand
+                .get("bid")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            self._sniper_trade_decision_record_submit(
+                &oid,
+                &side,
+                seconds_left,
+                &asset_id,
+                bid,
+                ask,
+                px,
+                submitted_qty.max(0.0),
+                filter_decision.as_ref(),
+            );
         }
         self._set_pending_entry_reason(&resolved_entry_reason);
 
@@ -9953,6 +10243,14 @@ impl MakerHedgeCapBot {
             exit_reason: self._get_exit_reason(),
             fill_count: state.seen_trade_keys.len(),
         }
+    }
+
+    pub fn trade_decision_snapshot(&self) -> Option<TradeDecisionUpsert> {
+        self.sniper_trade_decision
+            .lock()
+            .ok()
+            .and_then(|v| v.clone())
+            .map(|v| v.data)
     }
 
     pub fn persist_state(&self) {

@@ -146,6 +146,51 @@ pub struct UnvalidatedTradeRow {
     pub slug: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TradeDecisionUpsert {
+    pub t_left_seconds: Option<f64>,
+    pub tick_age_ms: Option<i64>,
+    pub momentum_checks_passed: Option<i64>,
+    pub momentum_checks_required: Option<i64>,
+    pub momentum_trend_ok: Option<bool>,
+    pub momentum_slope_ok: Option<bool>,
+    pub momentum_candles_ok: Option<bool>,
+    pub momentum_ema_fast_last: Option<f64>,
+    pub momentum_ema_slow_last: Option<f64>,
+    pub momentum_ema_fast_prev: Option<f64>,
+    pub momentum_body_count: Option<i64>,
+    pub breakout_dir: Option<String>,
+    pub breakout_triggered: Option<bool>,
+    pub breakout_reason: Option<String>,
+    pub breakout_hk: Option<f64>,
+    pub breakout_lk: Option<f64>,
+    pub breakout_buf_up: Option<f64>,
+    pub breakout_buf_dn: Option<f64>,
+    pub breakout_persist_ms: Option<i64>,
+    pub breakout_elapsed_ms: Option<i64>,
+    pub breakout_cooldown_ms: Option<i64>,
+    pub submit_origin: Option<String>,
+    pub submit_side: Option<String>,
+    pub submit_order_type: Option<String>,
+    pub pm_best_bid: Option<f64>,
+    pub pm_best_ask: Option<f64>,
+    pub pm_mid: Option<f64>,
+    pub pm_spread_abs: Option<f64>,
+    pub pm_spread_pct: Option<f64>,
+    pub pm_depth_bid_1tick: Option<f64>,
+    pub pm_depth_ask_1tick: Option<f64>,
+    pub order_type: Option<String>,
+    pub limit_price_submitted: Option<f64>,
+    pub fill_price_avg: Option<f64>,
+    pub qty_requested: Option<f64>,
+    pub qty_filled: Option<f64>,
+    pub slippage_bps_vs_mid: Option<f64>,
+    pub fees_paid: Option<f64>,
+    pub decide_to_send_us: Option<i64>,
+    pub send_to_ack_us: Option<i64>,
+    pub decide_to_ack_us: Option<i64>,
+}
+
 pub fn now_iso_jakarta() -> String {
     Utc::now()
         .with_timezone(&Jakarta)
@@ -283,6 +328,53 @@ CREATE TABLE IF NOT EXISTS trade (
   validation_validated_at TEXT NULL,
   validation_source TEXT NULL
 );
+
+CREATE TABLE IF NOT EXISTS trade_decisions (
+  trade_id TEXT PRIMARY KEY,
+  t_left_seconds DOUBLE PRECISION NULL,
+  tick_age_ms BIGINT NULL,
+  momentum_checks_passed BIGINT NULL,
+  momentum_checks_required BIGINT NULL,
+  momentum_trend_ok BOOLEAN NULL,
+  momentum_slope_ok BOOLEAN NULL,
+  momentum_candles_ok BOOLEAN NULL,
+  momentum_ema_fast_last DOUBLE PRECISION NULL,
+  momentum_ema_slow_last DOUBLE PRECISION NULL,
+  momentum_ema_fast_prev DOUBLE PRECISION NULL,
+  momentum_body_count BIGINT NULL,
+  breakout_dir TEXT NULL,
+  breakout_triggered BOOLEAN NULL,
+  breakout_reason TEXT NULL,
+  breakout_hk DOUBLE PRECISION NULL,
+  breakout_lk DOUBLE PRECISION NULL,
+  breakout_buf_up DOUBLE PRECISION NULL,
+  breakout_buf_dn DOUBLE PRECISION NULL,
+  breakout_persist_ms BIGINT NULL,
+  breakout_elapsed_ms BIGINT NULL,
+  breakout_cooldown_ms BIGINT NULL,
+  submit_origin TEXT NULL,
+  submit_side TEXT NULL,
+  submit_order_type TEXT NULL,
+  pm_best_bid DOUBLE PRECISION NULL,
+  pm_best_ask DOUBLE PRECISION NULL,
+  pm_mid DOUBLE PRECISION NULL,
+  pm_spread_abs DOUBLE PRECISION NULL,
+  pm_spread_pct DOUBLE PRECISION NULL,
+  pm_depth_bid_1tick DOUBLE PRECISION NULL,
+  pm_depth_ask_1tick DOUBLE PRECISION NULL,
+  order_type TEXT NULL,
+  limit_price_submitted DOUBLE PRECISION NULL,
+  fill_price_avg DOUBLE PRECISION NULL,
+  qty_requested DOUBLE PRECISION NULL,
+  qty_filled DOUBLE PRECISION NULL,
+  slippage_bps_vs_mid DOUBLE PRECISION NULL,
+  fees_paid DOUBLE PRECISION NULL,
+  decide_to_send_us BIGINT NULL,
+  send_to_ack_us BIGINT NULL,
+  decide_to_ack_us BIGINT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 "#,
         )
         .context("failed creating schema")?;
@@ -352,6 +444,53 @@ WHERE (stop_loss_category IS NULL OR trim(stop_loss_category) = '')
     upper(COALESCE(exit_reason, '')) LIKE '%STOP_LOSS%'
     OR upper(COALESCE(exit_reason, '')) LIKE '%CAP_LOCKED_LOSS%'
   );
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS t_left_seconds DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS tick_age_ms BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_checks_passed BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_checks_required BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_trend_ok BOOLEAN NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_slope_ok BOOLEAN NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_candles_ok BOOLEAN NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_ema_fast_last DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_ema_slow_last DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_ema_fast_prev DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_body_count BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_dir TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_triggered BOOLEAN NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_reason TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_hk DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_lk DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_buf_up DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_buf_dn DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_persist_ms BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_elapsed_ms BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS breakout_cooldown_ms BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS submit_origin TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS submit_side TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS submit_order_type TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pm_best_bid DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pm_best_ask DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pm_mid DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pm_spread_abs DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pm_spread_pct DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pm_depth_bid_1tick DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pm_depth_ask_1tick DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS order_type TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS limit_price_submitted DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS fill_price_avg DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS qty_requested DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS qty_filled DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS slippage_bps_vs_mid DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS fees_paid DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS decide_to_send_us BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS send_to_ack_us BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS decide_to_ack_us BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS updated_at TEXT NOT NULL DEFAULT '';
+UPDATE trade_decisions SET created_at = COALESCE(NULLIF(trim(created_at), ''), '1970-01-01T00:00:00+00:00')
+WHERE COALESCE(trim(created_at), '') = '';
+UPDATE trade_decisions SET updated_at = COALESCE(NULLIF(trim(updated_at), ''), '1970-01-01T00:00:00+00:00')
+WHERE COALESCE(trim(updated_at), '') = '';
 "#,
         )
         .context("failed migrating configuration schema for PostgreSQL compatibility")?;
@@ -1009,8 +1148,139 @@ WHERE (stop_loss_category IS NULL OR trim(stop_loss_category) = '')
         Ok(())
     }
 
+    pub fn upsert_trade_decision(
+        &self,
+        trade_id: &str,
+        row: &TradeDecisionUpsert,
+    ) -> Result<()> {
+        let mut conn = open_conn(&self.engine)?;
+        let now = now_iso_jakarta();
+        conn.execute(
+            "INSERT INTO trade_decisions (
+                trade_id,
+                t_left_seconds, tick_age_ms,
+                momentum_checks_passed, momentum_checks_required, momentum_trend_ok, momentum_slope_ok, momentum_candles_ok,
+                momentum_ema_fast_last, momentum_ema_slow_last, momentum_ema_fast_prev, momentum_body_count,
+                breakout_dir, breakout_triggered, breakout_reason, breakout_hk, breakout_lk, breakout_buf_up, breakout_buf_dn,
+                breakout_persist_ms, breakout_elapsed_ms, breakout_cooldown_ms,
+                submit_origin, submit_side, submit_order_type,
+                pm_best_bid, pm_best_ask, pm_mid, pm_spread_abs, pm_spread_pct,
+                pm_depth_bid_1tick, pm_depth_ask_1tick,
+                order_type, limit_price_submitted, fill_price_avg, qty_requested, qty_filled,
+                slippage_bps_vs_mid, fees_paid,
+                decide_to_send_us, send_to_ack_us, decide_to_ack_us,
+                created_at, updated_at
+            ) VALUES (
+                $1,
+                $2, $3,
+                $4, $5, $6, $7, $8,
+                $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18, $19,
+                $20, $21, $22,
+                $23, $24, $25,
+                $26, $27, $28, $29, $30,
+                $31, $32,
+                $33, $34, $35, $36, $37,
+                $38, $39,
+                $40, $41, $42,
+                $43, $44
+            )
+            ON CONFLICT (trade_id) DO UPDATE SET
+                t_left_seconds = EXCLUDED.t_left_seconds,
+                tick_age_ms = EXCLUDED.tick_age_ms,
+                momentum_checks_passed = EXCLUDED.momentum_checks_passed,
+                momentum_checks_required = EXCLUDED.momentum_checks_required,
+                momentum_trend_ok = EXCLUDED.momentum_trend_ok,
+                momentum_slope_ok = EXCLUDED.momentum_slope_ok,
+                momentum_candles_ok = EXCLUDED.momentum_candles_ok,
+                momentum_ema_fast_last = EXCLUDED.momentum_ema_fast_last,
+                momentum_ema_slow_last = EXCLUDED.momentum_ema_slow_last,
+                momentum_ema_fast_prev = EXCLUDED.momentum_ema_fast_prev,
+                momentum_body_count = EXCLUDED.momentum_body_count,
+                breakout_dir = EXCLUDED.breakout_dir,
+                breakout_triggered = EXCLUDED.breakout_triggered,
+                breakout_reason = EXCLUDED.breakout_reason,
+                breakout_hk = EXCLUDED.breakout_hk,
+                breakout_lk = EXCLUDED.breakout_lk,
+                breakout_buf_up = EXCLUDED.breakout_buf_up,
+                breakout_buf_dn = EXCLUDED.breakout_buf_dn,
+                breakout_persist_ms = EXCLUDED.breakout_persist_ms,
+                breakout_elapsed_ms = EXCLUDED.breakout_elapsed_ms,
+                breakout_cooldown_ms = EXCLUDED.breakout_cooldown_ms,
+                submit_origin = EXCLUDED.submit_origin,
+                submit_side = EXCLUDED.submit_side,
+                submit_order_type = EXCLUDED.submit_order_type,
+                pm_best_bid = EXCLUDED.pm_best_bid,
+                pm_best_ask = EXCLUDED.pm_best_ask,
+                pm_mid = EXCLUDED.pm_mid,
+                pm_spread_abs = EXCLUDED.pm_spread_abs,
+                pm_spread_pct = EXCLUDED.pm_spread_pct,
+                pm_depth_bid_1tick = EXCLUDED.pm_depth_bid_1tick,
+                pm_depth_ask_1tick = EXCLUDED.pm_depth_ask_1tick,
+                order_type = EXCLUDED.order_type,
+                limit_price_submitted = EXCLUDED.limit_price_submitted,
+                fill_price_avg = EXCLUDED.fill_price_avg,
+                qty_requested = EXCLUDED.qty_requested,
+                qty_filled = EXCLUDED.qty_filled,
+                slippage_bps_vs_mid = EXCLUDED.slippage_bps_vs_mid,
+                fees_paid = EXCLUDED.fees_paid,
+                decide_to_send_us = EXCLUDED.decide_to_send_us,
+                send_to_ack_us = EXCLUDED.send_to_ack_us,
+                decide_to_ack_us = EXCLUDED.decide_to_ack_us,
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &trade_id,
+                &row.t_left_seconds,
+                &row.tick_age_ms,
+                &row.momentum_checks_passed,
+                &row.momentum_checks_required,
+                &row.momentum_trend_ok,
+                &row.momentum_slope_ok,
+                &row.momentum_candles_ok,
+                &row.momentum_ema_fast_last,
+                &row.momentum_ema_slow_last,
+                &row.momentum_ema_fast_prev,
+                &row.momentum_body_count,
+                &row.breakout_dir,
+                &row.breakout_triggered,
+                &row.breakout_reason,
+                &row.breakout_hk,
+                &row.breakout_lk,
+                &row.breakout_buf_up,
+                &row.breakout_buf_dn,
+                &row.breakout_persist_ms,
+                &row.breakout_elapsed_ms,
+                &row.breakout_cooldown_ms,
+                &row.submit_origin,
+                &row.submit_side,
+                &row.submit_order_type,
+                &row.pm_best_bid,
+                &row.pm_best_ask,
+                &row.pm_mid,
+                &row.pm_spread_abs,
+                &row.pm_spread_pct,
+                &row.pm_depth_bid_1tick,
+                &row.pm_depth_ask_1tick,
+                &row.order_type,
+                &row.limit_price_submitted,
+                &row.fill_price_avg,
+                &row.qty_requested,
+                &row.qty_filled,
+                &row.slippage_bps_vs_mid,
+                &row.fees_paid,
+                &row.decide_to_send_us,
+                &row.send_to_ack_us,
+                &row.decide_to_ack_us,
+                &now,
+                &now,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_trade(&self, trade_id: &str) -> Result<()> {
         let mut conn = open_conn(&self.engine)?;
+        conn.execute("DELETE FROM trade_decisions WHERE trade_id = $1", &[&trade_id])?;
         conn.execute("DELETE FROM trade WHERE trade_id = $1", &[&trade_id])?;
         Ok(())
     }
