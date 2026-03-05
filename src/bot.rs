@@ -19,6 +19,7 @@ use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Result};
 use chrono::{TimeZone, Utc};
 use rand::Rng;
+use rand::seq::SliceRandom;
 use reqwest::blocking::Client;
 use rs_clob_client::headers::create_l2_headers;
 use rs_clob_client::{
@@ -96,6 +97,37 @@ struct TakerOrderRecord {
     applied: f64,
     px_limit: f64,
     side: String,
+    ts: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MakerSkewArbState {
+    window_start_ts: i64,
+    cost_total: f64,
+    shares_up: f64,
+    shares_down: f64,
+    downside: f64,
+    upside: f64,
+    skew_ratio: f64,
+    last_decision_ts: f64,
+    unhedged_since: f64,
+    stretch_rsi: Option<f64>,
+    stretch_diff_vs_start: Option<f64>,
+    stretch_default_side: String,
+    stretch_biased_side: String,
+    stretch_bias_reason: String,
+    stretch_eval_ts: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LadderOrderState {
+    key: String,
+    asset_id: String,
+    role: String,
+    level: i64,
+    order_id: String,
+    price: f64,
+    size: f64,
     ts: f64,
 }
 
@@ -261,6 +293,8 @@ pub struct MakerHedgeCapBot {
     sniper_filters_persist_min_interval_ms: i64,
     sniper_trade_decision: Arc<Mutex<Option<SniperTradeDecisionRuntime>>>,
     sniper_order_fill_agg: Arc<Mutex<HashMap<String, SniperOrderFillAgg>>>,
+    maker_skew_state: Arc<Mutex<MakerSkewArbState>>,
+    maker_ladder_open_orders: Arc<Mutex<HashMap<String, LadderOrderState>>>,
 }
 
 impl MakerHedgeCapBot {
@@ -288,11 +322,11 @@ impl MakerHedgeCapBot {
 
         let mut start_ts = now_ts();
         let mut expiry_ts = start_ts + cfg.market_duration_seconds;
-        if let Some(raw_ts) = market_slug
+        let slug_window_start_ts = market_slug
             .split('-')
             .last()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
+            .and_then(|s| s.parse::<i64>().ok());
+        if let Some(raw_ts) = slug_window_start_ts {
             start_ts = raw_ts;
             expiry_ts = raw_ts + cfg.market_duration_seconds;
         }
@@ -465,6 +499,8 @@ impl MakerHedgeCapBot {
             sniper_filters_persist_min_interval_ms,
             sniper_trade_decision: Arc::new(Mutex::new(None)),
             sniper_order_fill_agg: Arc::new(Mutex::new(HashMap::new())),
+            maker_skew_state: Arc::new(Mutex::new(MakerSkewArbState::default())),
+            maker_ladder_open_orders: Arc::new(Mutex::new(HashMap::new())),
         };
 
         runtime_flags.insert(
@@ -480,18 +516,32 @@ impl MakerHedgeCapBot {
             ),
         );
         out.runtime_flags = runtime_flags;
+        out._apply_cfg_overrides_from_env();
+        out.logger.info(&format!(
+            "[CFG_EFFECTIVE] dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} log_every={} market_data_stale={}s stop_buffer={}s",
+            out.cfg.dry_run,
+            out.cfg.max_total_cost,
+            out.cfg.reserve_usd,
+            out.cfg.min_shares,
+            out.cfg.clip_shares,
+            out.cfg.log_every,
+            out.cfg.market_data_stale_seconds,
+            out.cfg.stop_buffer_seconds
+        ));
 
         if let Some(market) = fetch_market_by_slug(&out.market_slug, Some(&out.logger))? {
             if let Ok((yes, no, condition)) = parse_tokens_and_condition(&market) {
                 out.condition_id = Some(condition.clone());
                 out.yes_asset = Some(yes.clone());
                 out.no_asset = Some(no.clone());
-                if let Some(st) = market
-                    .get("startDate")
-                    .and_then(|v| v.as_str())
-                    .and_then(iso_to_epoch)
-                {
-                    out.start_ts = st;
+                if slug_window_start_ts.is_none() {
+                    if let Some(st) = market
+                        .get("startDate")
+                        .and_then(|v| v.as_str())
+                        .and_then(iso_to_epoch)
+                    {
+                        out.start_ts = st;
+                    }
                 }
                 if let Some(et) = market
                     .get("endDate")
@@ -887,15 +937,18 @@ impl MakerHedgeCapBot {
     }
 
     fn _init_binance_feed_if_needed(&mut self) {
-        let needs_feed = self
+        let sniper_needs_feed = self
             .sniper_filters
             .lock()
             .map(|f| f.uses_binance_feed())
             .unwrap_or(false);
+        let maker_stretch_enabled = env_bool("MAKER_STRETCH_BIAS_ENABLED", false);
+        let maker_skew_mode = self.exec_mode == "MAKER_SKEW_ARB";
+        let needs_feed = sniper_needs_feed || (maker_stretch_enabled && maker_skew_mode);
         if !needs_feed {
             return;
         }
-        if !Self::_is_sniper_like_mode(&self.exec_mode) {
+        if !Self::_is_sniper_like_mode(&self.exec_mode) && !maker_skew_mode {
             return;
         }
         let cfg = BinanceFeedConfig::from_env();
@@ -2123,7 +2176,7 @@ impl MakerHedgeCapBot {
             return None;
         }
 
-        let side = if diff_price > 0.0 { "YES" } else { "NO" };
+        let side = if diff_price >= 0.0 { "YES" } else { "NO" };
         self._rtds_gate_log(
             "endgame_rtds_pick",
             &format!(
@@ -2661,6 +2714,11 @@ impl MakerHedgeCapBot {
                 } else if in_feed_pause {
                     self.logger.info("FEED OK -> resume.");
                     in_feed_pause = false;
+                }
+
+                if self.exec_mode == "MAKER_SKEW_ARB" {
+                    self._maker_skew_arb_step(now, qy, qn, total_cost);
+                    continue;
                 }
 
                 let delta = qy - qn;
@@ -3342,10 +3400,91 @@ impl MakerHedgeCapBot {
     }
 
     pub fn _reconcile_state_from_balances(&self, reason: &str) -> bool {
-        self.logger.info(&format!(
-            "reconcile state from balances requested: {reason}"
+        if !env_bool("MISMATCH_RECONCILE_FROM_BALANCE", false) {
+            return false;
+        }
+        let (yes, no) = match (&self.yes_asset, &self.no_asset) {
+            (Some(y), Some(n)) => (y.as_str(), n.as_str()),
+            _ => return false,
+        };
+        let b_yes = self._get_balance_allowance_conditional_cached(yes, 0.0);
+        let b_no = self._get_balance_allowance_conditional_cached(no, 0.0);
+        let (Some((yes_bal, _)), Some((no_bal, _))) = (b_yes, b_no) else {
+            return false;
+        };
+
+        let mut changed = false;
+        let y_ba = self._best_bid_ask(yes);
+        let n_ba = self._best_bid_ask(no);
+        let tick = self.cfg.tick.max(0.0001);
+        let mut y_ask = y_ba.map(|(_, a)| a).unwrap_or(0.0);
+        let mut n_ask = n_ba.map(|(_, a)| a).unwrap_or(0.0);
+        let mut y_bid = y_ba.map(|(b, _)| b).unwrap_or(0.0);
+        let mut n_bid = n_ba.map(|(b, _)| b).unwrap_or(0.0);
+        y_ask = clamp(if y_ask > 0.0 { y_ask } else { 0.99 }, tick, 0.99);
+        n_ask = clamp(if n_ask > 0.0 { n_ask } else { 0.99 }, tick, 0.99);
+        y_bid = clamp(if y_bid > 0.0 { y_bid } else { tick }, tick, 0.99);
+        n_bid = clamp(if n_bid > 0.0 { n_bid } else { tick }, tick, 0.99);
+        let sell_credit_mult = self.reconcile_sell_credit_mult.max(0.0);
+
+        let mut new_q_yes = 0.0;
+        let mut new_q_no = 0.0;
+        let mut new_c_yes = 0.0;
+        let mut new_c_no = 0.0;
+        if let Ok(s) = self.state.lock() {
+            new_q_yes = s.q_yes;
+            new_q_no = s.q_no;
+            new_c_yes = s.c_yes;
+            new_c_no = s.c_no;
+        }
+
+        if yes_bal > new_q_yes + 1e-6 {
+            let dq = yes_bal - new_q_yes;
+            new_c_yes += dq * y_ask;
+            new_q_yes = yes_bal;
+            changed = true;
+        } else if yes_bal + 1e-6 < new_q_yes {
+            let dq = new_q_yes - yes_bal;
+            new_c_yes -= dq * y_bid * sell_credit_mult;
+            new_q_yes = yes_bal;
+            changed = true;
+        }
+
+        if no_bal > new_q_no + 1e-6 {
+            let dq = no_bal - new_q_no;
+            new_c_no += dq * n_ask;
+            new_q_no = no_bal;
+            changed = true;
+        } else if no_bal + 1e-6 < new_q_no {
+            let dq = new_q_no - no_bal;
+            new_c_no -= dq * n_bid * sell_credit_mult;
+            new_q_no = no_bal;
+            changed = true;
+        }
+
+        if !changed {
+            return false;
+        }
+        new_c_yes = new_c_yes.max(0.0);
+        new_c_no = new_c_no.max(0.0);
+        if let Ok(mut s) = self.state.lock() {
+            s.q_yes = new_q_yes;
+            s.q_no = new_q_no;
+            s.c_yes = new_c_yes;
+            s.c_no = new_c_no;
+            let _ = save_state(&self.state_file, &mut s);
+        }
+        let tag = if reason.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" ({reason})")
+        };
+        self.logger.warning(&format!(
+            "Reconciled state from balances{} qYES={new_q_yes:.6} qNO={new_q_no:.6} total_cost={:.4}",
+            tag,
+            new_c_yes + new_c_no
         ));
-        false
+        true
     }
 
     pub fn _chunked_unwind_heavy_leg(&self, delta: f64, reason: &str) {
@@ -3480,6 +3619,16 @@ impl MakerHedgeCapBot {
     pub fn _apply_cfg_overrides_from_env(&mut self) {
         self.cfg.min_shares = env_float("MIN_SHARES", self.cfg.min_shares);
         self.cfg.clip_shares = env_float("CLIP_SHARES", self.cfg.clip_shares);
+        self.cfg.max_total_cost = env_float("MAX_TOTAL_COST", self.cfg.max_total_cost);
+        self.cfg.reserve_usd = env_float("RESERVE_USD", self.cfg.reserve_usd);
+        self.cfg.dry_run = env_bool("DRY_RUN", self.cfg.dry_run);
+        self.cfg.log_every = env_int("LOG_EVERY_SECONDS", self.cfg.log_every) as i64;
+        self.cfg.market_data_stale_seconds = env_int(
+            "MARKET_DATA_STALE_SECONDS",
+            self.cfg.market_data_stale_seconds,
+        ) as i64;
+        self.cfg.stop_buffer_seconds =
+            env_int("STOP_BUFFER_SECONDS", self.cfg.stop_buffer_seconds) as i64;
         self.cfg.entry_edge_ticks = env_int("ENTRY_EDGE_TICKS", self.cfg.entry_edge_ticks) as i64;
         self.cfg.hedge_buffer_ticks =
             env_int("HEDGE_BUFFER_TICKS", self.cfg.hedge_buffer_ticks) as i64;
@@ -3492,6 +3641,1157 @@ impl MakerHedgeCapBot {
             self.cfg.replace_if_price_moves_ticks,
         ) as i64;
         self.cfg.stale_seconds = env_int("STALE_SECONDS", self.cfg.stale_seconds) as i64;
+    }
+
+    fn _parse_clip_set_from_env(&self, key: &str, default_values: &[i64]) -> Vec<i64> {
+        let raw = std::env::var(key).unwrap_or_default();
+        let mut out: Vec<i64> = raw
+            .split(',')
+            .filter_map(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .collect();
+        if out.is_empty() {
+            out = default_values
+                .iter()
+                .copied()
+                .filter(|v| *v > 0)
+                .collect::<Vec<i64>>();
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn _maker_price_bucket(price: f64) -> String {
+        if price <= 0.0 {
+            "NA".to_string()
+        } else if price <= 0.20 {
+            "LE_020".to_string()
+        } else if price <= 0.35 {
+            "020_035".to_string()
+        } else if price <= 0.65 {
+            "035_065".to_string()
+        } else {
+            "GT_065".to_string()
+        }
+    }
+
+    fn _maker_clip_bucket(clip: f64) -> String {
+        if clip <= 0.0 {
+            "NA".to_string()
+        } else if clip <= 12.0 {
+            "SMALL".to_string()
+        } else if clip <= 36.0 {
+            "MID".to_string()
+        } else {
+            "LARGE".to_string()
+        }
+    }
+
+    fn _maker_pick_clip_size_for_price(&self, price: f64, peak_window: bool) -> f64 {
+        let small = self._parse_clip_set_from_env(
+            "MAKER_CLIP_SET_SMALL",
+            &[2, 3, 5, 7, 8, 9, 10, 11, 12],
+        );
+        let mid = self._parse_clip_set_from_env("MAKER_CLIP_SET_MID", &[16, 21, 30, 35, 36]);
+        let large = self._parse_clip_set_from_env(
+            "MAKER_CLIP_SET_LARGE",
+            &[40, 42, 45, 48, 54, 56],
+        );
+
+        let mut rng = rand::thread_rng();
+        let mut pick = |pool: &[i64], fallback: i64| -> i64 {
+            pool.choose(&mut rng).copied().unwrap_or(fallback.max(1))
+        };
+        let mut clip = if price <= 0.20 {
+            pick(&large, 40)
+        } else if price <= 0.35 {
+            pick(
+                &[mid.clone(), large.clone()].concat(),
+                mid.first().copied().unwrap_or(16),
+            )
+        } else if price <= 0.65 {
+            pick(
+                &[small.clone(), mid.clone()].concat(),
+                mid.first().copied().unwrap_or(16),
+            )
+        } else {
+            pick(
+                &[small.clone(), mid.clone()].concat(),
+                small.first().copied().unwrap_or(8),
+            )
+        } as f64;
+
+        if peak_window {
+            clip *= env_float("MAKER_SKEW_PEAK_CLIP_MULT", 1.25).clamp(1.0, 3.0);
+        }
+        clip.max(self.cfg.min_shares.max(1.0))
+    }
+
+    fn _maker_skew_update_state(&self, now: f64, q_yes: f64, q_no: f64, total_cost: f64) {
+        if let Ok(mut st) = self.maker_skew_state.lock() {
+            if st.window_start_ts <= 0 {
+                if let Ok(s) = self.state.lock() {
+                    st.window_start_ts = s.maker_skew_window_start_ts;
+                    st.last_decision_ts = s.maker_skew_last_decision_ts;
+                    st.unhedged_since = s.maker_skew_unhedged_since;
+                }
+            }
+            if st.window_start_ts <= 0 {
+                st.window_start_ts = self.start_ts;
+            }
+            if st.window_start_ts != self.start_ts {
+                *st = MakerSkewArbState {
+                    window_start_ts: self.start_ts,
+                    ..MakerSkewArbState::default()
+                };
+            }
+            st.cost_total = total_cost.max(0.0);
+            st.shares_up = q_yes.max(0.0);
+            st.shares_down = q_no.max(0.0);
+            let (downside, upside, skew_ratio) =
+                Self::_maker_payoff_envelope(st.shares_up, st.shares_down, st.cost_total);
+            st.downside = downside;
+            st.upside = upside;
+            st.skew_ratio = skew_ratio;
+            if (st.shares_up - st.shares_down).abs() >= self.cfg.min_shares.max(1.0) {
+                if st.unhedged_since <= 0.0 {
+                    st.unhedged_since = now;
+                }
+            } else {
+                st.unhedged_since = 0.0;
+            }
+        }
+        let persist_every = env_float("MAKER_SKEW_STATE_PERSIST_SECONDS", 2.0).max(0.2);
+        let key = "__maker_skew_state_persist_at";
+        if now >= self._runtime_ts_get(key) {
+            let rec = self
+                .maker_skew_state
+                .lock()
+                .map(|st| (st.window_start_ts, st.last_decision_ts, st.unhedged_since))
+                .ok();
+            if let Some((wts, lts, uts)) = rec {
+                if let Ok(mut s) = self.state.lock() {
+                    s.maker_skew_window_start_ts = wts;
+                    s.maker_skew_last_decision_ts = lts;
+                    s.maker_skew_unhedged_since = uts;
+                    let _ = save_state(&self.state_file, &mut s);
+                }
+            }
+            self._runtime_ts_set(key, now + persist_every);
+        }
+    }
+
+    fn _maker_poly_fee_estimate(
+        &self,
+        qty: f64,
+        price: f64,
+        is_maker: bool,
+        model_enabled: bool,
+    ) -> f64 {
+        let fee_rate = env_float("POLY_FEE_RATE", 0.25).max(0.0);
+        let exponent = env_float("POLY_FEE_EXPONENT", 2.0).clamp(0.0, 8.0);
+        let maker_rebate_bps = env_float("POLY_MAKER_REBATE_BPS", 0.0).max(0.0);
+        Self::_maker_poly_fee_formula(
+            qty,
+            price,
+            fee_rate,
+            exponent,
+            maker_rebate_bps,
+            is_maker,
+            model_enabled,
+        )
+    }
+
+    fn _maker_pair_edge_after_fees(&self, qty: f64, p_yes: f64, p_no: f64, is_maker: bool) -> f64 {
+        let model_enabled = env_bool("POLY_FEE_MODEL_ENABLED", true);
+        let gross = qty * (1.0 - p_yes - p_no);
+        let fee_yes = self._maker_poly_fee_estimate(qty, p_yes, is_maker, model_enabled);
+        let fee_no = self._maker_poly_fee_estimate(qty, p_no, is_maker, model_enabled);
+        gross - fee_yes - fee_no
+    }
+
+    fn _maker_payoff_envelope(shares_up: f64, shares_down: f64, cost_total: f64) -> (f64, f64, f64) {
+        let up = shares_up.max(0.0);
+        let down = shares_down.max(0.0);
+        let cost = cost_total.max(0.0);
+        let downside = up.min(down) - cost;
+        let upside = up.max(down) - cost;
+        let mn = up.min(down);
+        let mx = up.max(down);
+        let skew_ratio = if mn > 1e-12 { mx / mn } else { f64::INFINITY };
+        (downside, upside, skew_ratio)
+    }
+
+    fn _maker_poly_fee_formula(
+        qty: f64,
+        price: f64,
+        fee_rate: f64,
+        exponent: f64,
+        maker_rebate_bps: f64,
+        is_maker: bool,
+        model_enabled: bool,
+    ) -> f64 {
+        if qty <= 0.0 || price <= 0.0 || !model_enabled {
+            return 0.0;
+        }
+        let p = clamp(price, 1e-6, 0.999_999);
+        let notional = qty * p;
+        let taker_fee = notional * fee_rate.max(0.0) * (p * (1.0 - p)).powf(exponent.clamp(0.0, 8.0));
+        if is_maker {
+            let rebate = notional * maker_rebate_bps.max(0.0) / 10_000.0;
+            (taker_fee - rebate).max(0.0)
+        } else {
+            taker_fee.max(0.0)
+        }
+    }
+
+    fn _maker_ladder_cancel_all(&self, reason: &str) {
+        let orders = self
+            .maker_ladder_open_orders
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        if orders.is_empty() {
+            return;
+        }
+        for rec in orders.values() {
+            if !rec.order_id.trim().is_empty() {
+                let _ = self._cancel(&rec.order_id);
+            }
+        }
+        if let Ok(mut m) = self.maker_ladder_open_orders.lock() {
+            m.clear();
+        }
+        if !reason.trim().is_empty() {
+            self.logger
+                .info(&format!("[MAKER_SKEW] ladder cleared: {reason}"));
+        }
+    }
+
+    fn _maker_ladder_reserved_notional(&self) -> f64 {
+        self.maker_ladder_open_orders
+            .lock()
+            .map(|m| {
+                m.values()
+                    .map(|o| o.price.max(0.0) * o.size.max(0.0))
+                    .sum::<f64>()
+            })
+            .unwrap_or(0.0)
+    }
+
+    fn _maker_ladder_place_or_replace(
+        &self,
+        key: &str,
+        asset_id: &str,
+        role: &str,
+        level: i64,
+        target_price: f64,
+        target_size: f64,
+    ) {
+        if key.trim().is_empty() || asset_id.trim().is_empty() || target_price <= 0.0 {
+            return;
+        }
+        let now = now_ts_f64();
+        let stale = env_int("STALE_SECONDS", self.cfg.stale_seconds).max(1) as f64;
+        let replace_ticks = env_int(
+            "REPLACE_IF_PRICE_MOVES_TICKS",
+            self.cfg.replace_if_price_moves_ticks,
+        ) as f64;
+
+        let existing = self
+            .maker_ladder_open_orders
+            .lock()
+            .ok()
+            .and_then(|m| m.get(key).cloned());
+        if let Some(prev) = existing {
+            let age = (now - prev.ts).max(0.0);
+            let moved_ticks =
+                (target_price - prev.price).abs() / self.cfg.tick.max(0.0001);
+            let size_changed =
+                (target_size - prev.size).abs() >= (0.25 * prev.size).max(self.cfg.min_shares);
+            if age < stale && moved_ticks < replace_ticks && !size_changed {
+                return;
+            }
+            if !prev.order_id.trim().is_empty() {
+                let _ = self._cancel(&prev.order_id);
+            }
+            if let Ok(mut m) = self.maker_ladder_open_orders.lock() {
+                m.remove(key);
+            }
+        }
+        let oid = self._place_postonly_bid(asset_id, target_price, target_size);
+        let Some(oid) = oid else {
+            return;
+        };
+        if let Ok(mut m) = self.maker_ladder_open_orders.lock() {
+            m.insert(
+                key.to_string(),
+                LadderOrderState {
+                    key: key.to_string(),
+                    asset_id: asset_id.to_string(),
+                    role: role.to_string(),
+                    level,
+                    order_id: oid,
+                    price: target_price,
+                    size: target_size,
+                    ts: now,
+                },
+            );
+        }
+    }
+
+    fn _maker_ladder_sync_role(
+        &self,
+        role: &str,
+        asset_id: &str,
+        base_bid: f64,
+        clip_size: f64,
+        levels: i64,
+        tick_step: i64,
+    ) {
+        if levels <= 0 || base_bid <= 0.0 || clip_size <= 0.0 {
+            return;
+        }
+        let tick = self.cfg.tick.max(0.0001);
+        let lv = levels.max(1);
+        let step = tick_step.max(1) as f64;
+        let mut target_prices: Vec<f64> = Vec::new();
+
+        if role.eq_ignore_ascii_case("underdog") {
+            let floor = env_float("MAKER_UNDERDOG_FLOOR_PRICE", 0.20).clamp(tick, 0.99);
+            for i in 0..lv {
+                let mut px = base_bid - (i as f64) * step * tick;
+                px = round_down(clamp(px, floor, 0.99), tick);
+                if target_prices
+                    .last()
+                    .map(|p| (p - px).abs() > tick * 0.5)
+                    .unwrap_or(true)
+                {
+                    target_prices.push(px);
+                }
+                if px <= floor + tick * 0.5 {
+                    break;
+                }
+            }
+            if target_prices.is_empty() {
+                target_prices.push(round_down(clamp(floor, tick, 0.99), tick));
+            }
+        } else if role.eq_ignore_ascii_case("hedge") {
+            let floor = env_float("MAKER_HEDGE_FLOOR_PRICE", 0.55).clamp(tick, 0.99);
+            let span = ((lv - 1) as f64) * step * tick;
+            let start = (base_bid.max(floor + span)).clamp(tick, 0.99);
+            for i in 0..lv {
+                let mut px = start - (i as f64) * step * tick;
+                px = round_down(clamp(px, floor, 0.99), tick);
+                if target_prices
+                    .last()
+                    .map(|p| (p - px).abs() > tick * 0.5)
+                    .unwrap_or(true)
+                {
+                    target_prices.push(px);
+                }
+                if px <= floor + tick * 0.5 {
+                    break;
+                }
+            }
+            if target_prices.is_empty() {
+                target_prices.push(round_down(clamp(floor, tick, 0.99), tick));
+            }
+        } else {
+            for i in 0..lv {
+                let mut px = base_bid - (i as f64) * step * tick;
+                px = round_down(clamp(px, tick, 0.99), tick);
+                if target_prices
+                    .last()
+                    .map(|p| (p - px).abs() > tick * 0.5)
+                    .unwrap_or(true)
+                {
+                    target_prices.push(px);
+                }
+            }
+        }
+
+        let min_per_order = self.cfg.min_shares.max(1.0);
+        let max_levels_by_clip = ((clip_size + 1e-12) / min_per_order).floor().max(1.0) as usize;
+        if target_prices.len() > max_levels_by_clip {
+            target_prices.truncate(max_levels_by_clip);
+        }
+        let level_count = target_prices.len().max(1) as f64;
+        let per_level = (clip_size / level_count).max(min_per_order);
+        let mut desired: HashSet<String> = HashSet::new();
+        for (idx, px) in target_prices.into_iter().enumerate() {
+            if px <= 0.0 {
+                continue;
+            }
+            let i = idx as i64;
+            let key = format!("{role}:{asset_id}:{i}");
+            desired.insert(key.clone());
+            self._maker_ladder_place_or_replace(&key, asset_id, role, i, px, per_level);
+        }
+
+        let stale_keys: Vec<String> = self
+            .maker_ladder_open_orders
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        if v.role == role && v.asset_id == asset_id && !desired.contains(k) {
+                            Some(k.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        if stale_keys.is_empty() {
+            return;
+        }
+        for key in stale_keys {
+            let mut rec = None;
+            if let Ok(mut m) = self.maker_ladder_open_orders.lock() {
+                rec = m.remove(&key);
+            }
+            if let Some(r) = rec {
+                let _ = self._cancel(&r.order_id);
+            }
+        }
+    }
+
+    fn _maker_ladder_cancel_except_role_asset(&self, keep_role: &str, keep_asset_id: &str) {
+        let stale_keys: Vec<String> = self
+            .maker_ladder_open_orders
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        if v.role == keep_role && v.asset_id == keep_asset_id {
+                            None
+                        } else {
+                            Some(k.clone())
+                        }
+                    })
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        for key in stale_keys {
+            let mut rec = None;
+            if let Ok(mut m) = self.maker_ladder_open_orders.lock() {
+                rec = m.remove(&key);
+            }
+            if let Some(r) = rec {
+                let _ = self._cancel(&r.order_id);
+            }
+        }
+    }
+
+    fn _maker_stretch_bias_side(&self, default_side: &str) -> String {
+        let now = now_ts_f64();
+        let default_norm = default_side.trim().to_ascii_uppercase();
+        let record_stretch = |rsi: Option<f64>,
+                              diff_vs_start: Option<f64>,
+                              biased_side: &str,
+                              reason: &str| {
+            if let Ok(mut st) = self.maker_skew_state.lock() {
+                st.stretch_rsi = rsi;
+                st.stretch_diff_vs_start = diff_vs_start;
+                st.stretch_default_side = default_norm.clone();
+                st.stretch_biased_side = biased_side.to_ascii_uppercase();
+                st.stretch_bias_reason = reason.to_string();
+                st.stretch_eval_ts = now;
+            }
+        };
+        if !env_bool("MAKER_STRETCH_BIAS_ENABLED", false) {
+            record_stretch(None, None, &default_norm, "disabled");
+            return default_norm;
+        }
+        let delta_threshold = env_float("MAKER_STRETCH_DELTA_THRESHOLD", 0.0).abs();
+        let diff_price_opt =
+            get_live_snapshot_for_market(&self.market_slug).and_then(|s| s.diff_vs_price_to_beat);
+        let diff_price = diff_price_opt.unwrap_or(0.0);
+        let rsi_period = env_int("MAKER_STRETCH_RSI_PERIOD", 14).clamp(2, 100) as usize;
+        let rsi_oversold = env_float("MAKER_STRETCH_RSI_OVERSOLD", 40.0).clamp(1.0, 99.0);
+        let rsi_overbought = (100.0 - rsi_oversold).clamp(1.0, 99.0);
+
+        let mut rsi_value = None;
+        let mut has_feed = false;
+        if let Some(feed) = &self.binance_feed {
+            has_feed = true;
+            let snap = feed.snapshot();
+            let mut closes: Vec<f64> = snap.seed_klines.iter().map(|k| k.close).collect();
+            if let Some(last) = snap.last_tick {
+                closes.push(last.price.max(0.0));
+            }
+            if closes.len() > rsi_period {
+                let mut gain = 0.0;
+                let mut loss = 0.0;
+                for i in (closes.len() - rsi_period)..closes.len() {
+                    if i == 0 {
+                        continue;
+                    }
+                    let d = closes[i] - closes[i - 1];
+                    if d > 0.0 {
+                        gain += d;
+                    } else {
+                        loss += -d;
+                    }
+                }
+                let avg_gain = gain / rsi_period as f64;
+                let avg_loss = loss / rsi_period as f64;
+                if avg_loss <= 1e-12 {
+                    rsi_value = Some(100.0);
+                } else {
+                    let rs = avg_gain / avg_loss;
+                    rsi_value = Some(100.0 - (100.0 / (1.0 + rs)));
+                }
+            }
+        }
+
+        let mut biased_side = default_norm.clone();
+        let mut reason = "default_side".to_string();
+        if diff_price <= -delta_threshold {
+            if let Some(rsi) = rsi_value {
+                if rsi <= rsi_oversold {
+                    biased_side = "YES".to_string();
+                    reason = "oversold_yes".to_string();
+                }
+            } else {
+                reason = if has_feed {
+                    "no_rsi".to_string()
+                } else {
+                    "no_feed".to_string()
+                };
+            }
+        } else if diff_price >= delta_threshold {
+            if let Some(rsi) = rsi_value {
+                if rsi >= rsi_overbought {
+                    biased_side = "NO".to_string();
+                    reason = "overbought_no".to_string();
+                }
+            } else {
+                reason = if has_feed {
+                    "no_rsi".to_string()
+                } else {
+                    "no_feed".to_string()
+                };
+            }
+        } else {
+            reason = "delta_below_threshold".to_string();
+        }
+        record_stretch(rsi_value, diff_price_opt, &biased_side, &reason);
+        biased_side
+    }
+
+    fn _maker_submit_pair_orders(
+        &self,
+        size_int: i64,
+        y_px: f64,
+        n_px: f64,
+        order_type: &str,
+        post_only: Option<bool>,
+        origin: &str,
+    ) -> (Option<String>, Option<String>) {
+        if size_int <= 0 {
+            return (None, None);
+        }
+        let qty = size_int as f64;
+        let (yes, no) = match (&self.yes_asset, &self.no_asset) {
+            (Some(y), Some(n)) => (y.as_str(), n.as_str()),
+            _ => return (None, None),
+        };
+        let decide_ts = now_ts_f64();
+        let decide_ns = now_ns();
+        let signed_y = json!({
+            "asset_id": yes,
+            "side": "BUY",
+            "price": y_px,
+            "size": qty,
+        });
+        let signed_n = json!({
+            "asset_id": no,
+            "side": "BUY",
+            "price": n_px,
+            "size": qty,
+        });
+        let resps = self._post_orders_compat(
+            &[signed_y, signed_n],
+            &self._resolve_order_type(order_type),
+            post_only,
+        );
+        let y_oid = resps.first().and_then(|o| o.clone());
+        let n_oid = resps.get(1).and_then(|o| o.clone());
+        if let Some(oid) = &y_oid {
+            self._remember_taker_order(oid, yes, qty, y_px, "BUY");
+            self._track_order_execution_context(
+                oid,
+                &json!({
+                    "order_id": oid,
+                    "asset_id": yes,
+                    "side": "BUY",
+                    "px_limit": y_px,
+                    "size": qty,
+                    "decision_ts": decide_ts,
+                    "decision_ns": decide_ns,
+                    "post_start_ts": decide_ts,
+                    "post_end_ts": now_ts_f64(),
+                    "origin": format!("{origin}_YES"),
+                }),
+            );
+        }
+        if let Some(oid) = &n_oid {
+            self._remember_taker_order(oid, no, qty, n_px, "BUY");
+            self._track_order_execution_context(
+                oid,
+                &json!({
+                    "order_id": oid,
+                    "asset_id": no,
+                    "side": "BUY",
+                    "px_limit": n_px,
+                    "size": qty,
+                    "decision_ts": decide_ts,
+                    "decision_ns": decide_ns,
+                    "post_start_ts": decide_ts,
+                    "post_end_ts": now_ts_f64(),
+                    "origin": format!("{origin}_NO"),
+                }),
+            );
+        }
+        (y_oid, n_oid)
+    }
+
+    fn _maker_record_trade_decision(
+        &self,
+        t_into_s: f64,
+        reference_price: f64,
+        clip: f64,
+        downside: f64,
+        upside: f64,
+        skew_ratio: f64,
+        arb_triggered: bool,
+        arb_edge_after_fees: Option<f64>,
+        side: &str,
+        order_type: &str,
+        submit_origin: &str,
+    ) {
+        let t_left = (self.expiry_ts as f64 - now_ts_f64()).max(0.0);
+        let row = TradeDecisionUpsert {
+            t_left_seconds: Some(t_left),
+            submit_origin: Some(submit_origin.to_string()),
+            submit_side: Some(side.to_string()),
+            submit_order_type: Some(order_type.to_string()),
+            order_type: Some(order_type.to_string()),
+            qty_requested: Some(clip.max(0.0)),
+            limit_price_submitted: if reference_price > 0.0 {
+                Some(reference_price)
+            } else {
+                None
+            },
+            maker_downside: Some(downside),
+            maker_upside: Some(upside),
+            maker_skew_ratio: Some(skew_ratio),
+            maker_arb_triggered: Some(arb_triggered),
+            maker_arb_edge_after_fees: arb_edge_after_fees,
+            maker_t_into_s: Some(t_into_s.max(0.0)),
+            maker_price_bucket: Some(Self::_maker_price_bucket(reference_price)),
+            maker_clip_bucket: Some(Self::_maker_clip_bucket(clip)),
+            ..TradeDecisionUpsert::default()
+        };
+        if let Ok(mut holder) = self.sniper_trade_decision.lock() {
+            *holder = Some(SniperTradeDecisionRuntime {
+                order_id: None,
+                data: row,
+            });
+        }
+    }
+
+    fn _maker_skew_try_arb(
+        &self,
+        budget_usable: f64,
+        y_bid: f64,
+        y_ask: f64,
+        n_bid: f64,
+        n_ask: f64,
+        t_into_s: f64,
+        downside: f64,
+        upside: f64,
+        skew_ratio: f64,
+    ) -> bool {
+        if !env_bool("MAKER_ARB_ENABLED", true) || budget_usable <= 0.0 {
+            return false;
+        }
+        let order_type = self._resolve_order_type(
+            &std::env::var("MAKER_ARB_ORDER_TYPE").unwrap_or_else(|_| "FAK".to_string()),
+        );
+        let is_maker = order_type == "GTC";
+        let strict_passive = env_bool("MAKER_ARB_STRICT_PASSIVE", true);
+        let threshold = if is_maker {
+            env_float("MAKER_ARB_MAKER_THRESHOLD", 0.995)
+        } else {
+            env_float("MAKER_ARB_TAKER_THRESHOLD", 0.985)
+        }
+        .clamp(0.0, 1.0);
+        let p_yes = if is_maker { y_bid } else { y_ask };
+        let p_no = if is_maker { n_bid } else { n_ask };
+        if p_yes <= 0.0 || p_no <= 0.0 {
+            return false;
+        }
+        let sum_px = p_yes + p_no;
+        if sum_px > threshold + 1e-12 {
+            return false;
+        }
+
+        let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1);
+        let max_tick = env_int(
+            "MAKER_ARB_MAX_SHARES_PER_TICK",
+            self.cfg.clip_shares.max(self.cfg.min_shares).floor() as i64,
+        )
+        .max(min_int);
+        let max_affordable = (budget_usable / sum_px + 1e-12).floor() as i64;
+        let size_int = max_affordable.min(max_tick);
+        if size_int < min_int {
+            return false;
+        }
+        let edge_after_fees =
+            self._maker_pair_edge_after_fees(size_int as f64, p_yes, p_no, is_maker);
+        if edge_after_fees <= 0.0 {
+            return false;
+        }
+
+        self.logger.info(&format!(
+            "[MAKER_SKEW][ARB] trigger type={} size={} p_yes={:.3} p_no={:.3} sum={:.3} thr={:.3} edge_after_fees={:+.6}",
+            order_type,
+            size_int,
+            p_yes,
+            p_no,
+            sum_px,
+            threshold,
+            edge_after_fees
+        ));
+        let (qy0, qn0) = self
+            .state
+            .lock()
+            .map(|s| (s.q_yes, s.q_no))
+            .unwrap_or((0.0, 0.0));
+        let (y_oid, n_oid) = self._maker_submit_pair_orders(
+            size_int,
+            p_yes,
+            p_no,
+            &order_type,
+            if is_maker && strict_passive {
+                Some(true)
+            } else {
+                None
+            },
+            &format!("MAKER_SKEW_ARB_{}", order_type),
+        );
+        if is_maker && strict_passive && (y_oid.is_some() ^ n_oid.is_some()) {
+            if let Some(oid) = &y_oid {
+                let _ = self._cancel(oid);
+            }
+            if let Some(oid) = &n_oid {
+                let _ = self._cancel(oid);
+            }
+            return false;
+        }
+        if y_oid.is_none() && n_oid.is_none() {
+            self._maker_record_trade_decision(
+                t_into_s,
+                p_yes.min(p_no),
+                size_int as f64,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                Some(edge_after_fees),
+                "BOTH",
+                &order_type,
+                "MAKER_SKEW_ARB_SKIP",
+            );
+            return false;
+        }
+
+        let timeout_s = env_float("PAIR_ARB_TIMEOUT_SECONDS", 2.0).max(0.2);
+        let (fy, fn_) = self._wait_for_pair_fills(qy0, qn0, size_int, timeout_s);
+        if env_bool("PAIR_ARB_RECONCILE_AFTER_TIMEOUT", true) {
+            if let Some(oid) = y_oid {
+                let _ = self._cancel(&oid);
+            }
+            if let Some(oid) = n_oid {
+                let _ = self._cancel(&oid);
+            }
+        }
+        if (fy - fn_).abs() > 1e-6 {
+            self._handle_exposure_mismatch(fy, fn_);
+        }
+        self._maker_record_trade_decision(
+            t_into_s,
+            p_yes.min(p_no),
+            size_int as f64,
+            downside,
+            upside,
+            skew_ratio,
+            true,
+            Some(edge_after_fees),
+            "BOTH",
+            &order_type,
+            "MAKER_SKEW_ARB",
+        );
+        true
+    }
+
+    fn _maker_skew_arb_step(&self, now: f64, q_yes: f64, q_no: f64, total_cost: f64) {
+        if !env_bool("MAKER_SKEW_ENABLED", true) {
+            self._maker_ladder_cancel_all("disabled");
+            self.cancel_all_open_orders_local("MAKER_SKEW disabled");
+            return;
+        }
+        let refresh_base_s = env_float("MAKER_SKEW_REFRESH_SECONDS", 2.0).max(0.2);
+        let start_after_s = env_float("MAKER_SKEW_START_AFTER_SECONDS", 15.0).max(0.0);
+        let stop_new_after_s = env_float("MAKER_SKEW_STOP_NEW_AFTER_SECONDS", 290.0).max(1.0);
+        let peak_start_s = env_float("MAKER_SKEW_PEAK_START_SECONDS", 60.0).max(0.0);
+        let peak_end_s = env_float("MAKER_SKEW_PEAK_END_SECONDS", 180.0).max(peak_start_s);
+        let t_into_s = (now - self.start_ts as f64).max(0.0);
+        let peak_window = t_into_s >= peak_start_s && t_into_s <= peak_end_s;
+        let refresh_peak_s = env_float(
+            "MAKER_SKEW_REFRESH_SECONDS_PEAK",
+            (refresh_base_s * 0.5).max(0.2),
+        )
+        .max(0.05);
+        let refresh_offpeak_s = env_float(
+            "MAKER_SKEW_REFRESH_SECONDS_OFFPEAK",
+            (refresh_base_s * 1.5).max(refresh_base_s),
+        )
+        .max(refresh_peak_s);
+        let refresh_s = if peak_window {
+            refresh_peak_s
+        } else {
+            refresh_offpeak_s
+        };
+
+        self._maker_skew_update_state(now, q_yes, q_no, total_cost);
+        let (downside, upside, skew_ratio, last_decision_ts, unhedged_age) = self
+            .maker_skew_state
+            .lock()
+            .map(|s| {
+                let age = if s.unhedged_since > 0.0 {
+                    (now - s.unhedged_since).max(0.0)
+                } else {
+                    0.0
+                };
+                (s.downside, s.upside, s.skew_ratio, s.last_decision_ts, age)
+            })
+            .unwrap_or((0.0, 0.0, 1.0, 0.0, 0.0));
+
+        if self._maybe_trigger_max_loss(q_yes - q_no, unhedged_age) {
+            return;
+        }
+
+        if now - last_decision_ts < refresh_s {
+            return;
+        }
+        if let Ok(mut st) = self.maker_skew_state.lock() {
+            st.last_decision_ts = now;
+        }
+        if t_into_s < start_after_s {
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "NONE",
+                "NONE",
+                "MAKER_SKEW_WARMUP",
+            );
+            return;
+        }
+        if t_into_s >= stop_new_after_s {
+            self._maker_ladder_cancel_all("stop_new_after");
+            self.cancel_all_open_orders_local("MAKER_SKEW stop new orders");
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "NONE",
+                "NONE",
+                "MAKER_SKEW_STOP_NEW",
+            );
+            return;
+        }
+
+        let window_budget = env_float("MAKER_SKEW_WINDOW_BUDGET_USDC", 1000.0).max(1.0);
+        let hard_cap = self.cfg.max_total_cost.min(window_budget);
+        let ladder_reserved = self._maker_ladder_reserved_notional();
+        let remaining = hard_cap - total_cost - ladder_reserved;
+        if remaining <= self.cfg.reserve_usd {
+            self._maker_ladder_cancel_all("reserve reached");
+            self.cancel_all_open_orders_local("MAKER_SKEW reserve reached");
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "NONE",
+                "NONE",
+                "MAKER_SKEW_RESERVE_REACHED",
+            );
+            return;
+        }
+        let budget_usable = (remaining - self.cfg.reserve_usd).max(0.0);
+
+        let (yes, no) = match (&self.yes_asset, &self.no_asset) {
+            (Some(y), Some(n)) => (y.as_str(), n.as_str()),
+            _ => return,
+        };
+        let yq = self._best_bid_ask(yes);
+        let nq = self._best_bid_ask(no);
+        let (Some((y_bid, y_ask)), Some((n_bid, n_ask))) = (yq, nq) else {
+            return;
+        };
+        if y_bid <= 0.0 || y_ask <= 0.0 || n_bid <= 0.0 || n_ask <= 0.0 {
+            return;
+        }
+
+        // Hard guarantee for article behavior: seed both sides before any normal gate logic.
+        let base_min = env_float(
+            "MAKER_SKEW_BASE_MIN_SHARES",
+            self.cfg.min_shares.max(1.0),
+        )
+        .max(self.cfg.min_shares.max(1.0));
+        let base_needs_seed = q_yes + 1e-9 < base_min || q_no + 1e-9 < base_min;
+        let seed_since_key = "__maker_skew_seed_pending_since";
+        let seed_wait_s = env_float("MAKER_SKEW_BASE_SEED_MAX_WAIT_SECONDS", 45.0).max(1.0);
+        if base_needs_seed {
+            if self._runtime_ts_get(seed_since_key) <= 0.0 {
+                self._runtime_ts_set(seed_since_key, now);
+            }
+            let (seed_side, seed_asset, seed_bid, seed_ask, q_side) = if q_yes <= q_no {
+                ("YES", yes.to_string(), y_bid, y_ask, q_yes.max(0.0))
+            } else {
+                ("NO", no.to_string(), n_bid, n_ask, q_no.max(0.0))
+            };
+            let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1) as f64;
+            let need = (base_min - q_side).max(min_int);
+            let max_affordable = (budget_usable / seed_ask.max(1e-9)).floor();
+            if seed_ask <= 0.0 || max_affordable + 1e-9 < min_int {
+                let pending_for = now - self._runtime_ts_get(seed_since_key);
+                if pending_for >= seed_wait_s {
+                    self.logger.warning(&format!(
+                        "[MAKER_SKEW] base seed timeout side={} need={:.2} ask={:.3} budget={:.2} pending_for={:.2}s -> STOP",
+                        seed_side, need, seed_ask, budget_usable, pending_for
+                    ));
+                    self._set_exit_reason("MAKER_SKEW_BASE_SEED_TIMEOUT");
+                    self.cancel_all_orders_exchange("maker_skew base seed timeout");
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                }
+                self._maker_record_trade_decision(
+                    t_into_s,
+                    seed_ask,
+                    need,
+                    downside,
+                    upside,
+                    skew_ratio,
+                    false,
+                    None,
+                    seed_side,
+                    "NONE",
+                    "MAKER_SKEW_BASE_SEED_PENDING",
+                );
+                return;
+            }
+            let seed_order_type = self._resolve_order_type(
+                &std::env::var("MAKER_SKEW_BASE_SEED_ORDER_TYPE")
+                    .unwrap_or_else(|_| "FAK".to_string()),
+            );
+            let size = need.min(max_affordable).max(min_int);
+            let submitted = if seed_order_type == "GTC" {
+                self._place_limit_bid_gtc(&seed_asset, seed_bid, size, Some(true))
+            } else {
+                let seed_slip_ticks = env_int("MAKER_SKEW_BASE_SEED_SLIPPAGE_TICKS", 1).max(0);
+                let mut px =
+                    seed_ask + seed_slip_ticks as f64 * self.cfg.tick.max(0.0001);
+                px = round_up(
+                    clamp(px, self.cfg.tick.max(0.0001), 0.99),
+                    self.cfg.tick.max(0.0001),
+                );
+                self._place_taker_bid_fak(&seed_asset, px, size, Some(&seed_order_type))
+            };
+            self._maker_record_trade_decision(
+                t_into_s,
+                seed_ask,
+                size,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                seed_side,
+                &seed_order_type,
+                if submitted.is_some() || self.cfg.dry_run {
+                    "MAKER_SKEW_BASE_SEED"
+                } else {
+                    "MAKER_SKEW_BASE_SEED_FAIL"
+                },
+            );
+            return;
+        } else {
+            self._runtime_ts_set(seed_since_key, 0.0);
+        }
+
+        let (ok, why) = self._accumulate_allowed();
+        if !ok {
+            self._maker_ladder_cancel_all(&format!("accumulate gate: {why}"));
+            self.cancel_all_open_orders_local(&format!("accumulate gate: {why}"));
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "NONE",
+                "NONE",
+                &format!("MAKER_SKEW_GATE_{why}"),
+            );
+            return;
+        }
+        let (invalid, inv_reason) = self._quotes_invalidated();
+        if invalid {
+            self._maker_ladder_cancel_all(&format!("quote invalidated: {inv_reason}"));
+            self.cancel_all_open_orders_local(&format!("quote invalidated: {inv_reason}"));
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "NONE",
+                "NONE",
+                "MAKER_SKEW_QUOTE_INVALID",
+            );
+            return;
+        }
+
+        if self._maker_skew_try_arb(
+            budget_usable,
+            y_bid,
+            y_ask,
+            n_bid,
+            n_ask,
+            t_into_s,
+            downside,
+            upside,
+            skew_ratio,
+        ) {
+            return;
+        }
+
+        let target_ratio = env_float("MAKER_SKEW_TARGET_RATIO", 1.5).max(1.0);
+        let ratio_max = env_float("MAKER_SKEW_MAX_RATIO", 3.0).max(target_ratio);
+        let max_loss = env_float("MAKER_SKEW_MAX_WORST_CASE_LOSS_USDC", 350.0).max(1.0);
+        let default_underdog = if y_bid <= n_bid { "YES" } else { "NO" };
+        let underdog = self._maker_stretch_bias_side(default_underdog);
+        let hedge = if underdog == "YES" { "NO" } else { "YES" };
+        let min_base = self.cfg.min_shares.max(1.0);
+
+        let mut side = underdog.to_string();
+        let mut role = "underdog".to_string();
+        let side_yes = q_yes.max(0.0);
+        let side_no = q_no.max(0.0);
+        if side_yes < min_base || side_no < min_base {
+            side = if side_yes <= side_no {
+                "YES".to_string()
+            } else {
+                "NO".to_string()
+            };
+            role = "base".to_string();
+        } else if downside < -max_loss {
+            side = if side_yes <= side_no {
+                "YES".to_string()
+            } else {
+                "NO".to_string()
+            };
+            role = "hedge".to_string();
+        } else if skew_ratio > ratio_max {
+            side = hedge.to_string();
+            role = "hedge".to_string();
+        } else if skew_ratio < target_ratio {
+            side = underdog.to_string();
+            role = "underdog".to_string();
+        }
+
+        let (asset_id, bid, ask) = if side == "YES" {
+            (yes.to_string(), y_bid, y_ask)
+        } else {
+            (no.to_string(), n_bid, n_ask)
+        };
+        let mut clip = self._maker_pick_clip_size_for_price(ask.min(bid), peak_window);
+        let max_shares_budget = (budget_usable / ask.max(1e-9)).floor();
+        clip = clip.min(max_shares_budget).max(0.0);
+        if clip < self.cfg.min_shares.max(1.0) {
+            return;
+        }
+        let ladder_enabled = env_bool("MAKER_LADDER_ENABLED", true);
+        let order_type = if role == "hedge" && downside < -max_loss {
+            self._resolve_order_type(
+                &std::env::var("MAKER_EXPOSURE_UNWIND_ORDER_TYPE")
+                    .unwrap_or_else(|_| self.hedge_taker_order_type.clone()),
+            )
+        } else {
+            "GTC".to_string()
+        };
+
+        if role == "hedge" && downside < -max_loss {
+            let mut px = ask + self.hedge_slippage_ticks as f64 * self.cfg.tick.max(0.0001);
+            px = round_up(clamp(px, self.cfg.tick.max(0.0001), 0.99), self.cfg.tick.max(0.0001));
+            let _ = self._place_taker_bid_fak(&asset_id, px, clip, Some(&order_type));
+            self._maker_ladder_cancel_all("risk-first hedge taker");
+        } else if ladder_enabled {
+            let levels = if role == "hedge" {
+                env_int("MAKER_HEDGE_LADDER_LEVELS", 2)
+            } else {
+                env_int("MAKER_UNDERDOG_LADDER_LEVELS", 4)
+            }
+            .max(1);
+            let step_ticks = env_int("MAKER_LADDER_TICKS_STEP", 1).max(1);
+            self._maker_ladder_cancel_except_role_asset(&role, &asset_id);
+            self._maker_ladder_sync_role(&role, &asset_id, bid, clip, levels, step_ticks);
+            self.cancel_all_open_orders_local("maker_skew ladder mode");
+        } else {
+            let _ = self._maybe_replace(&asset_id, bid, clip, None);
+        }
+
+        self._maker_record_trade_decision(
+            t_into_s,
+            bid,
+            clip,
+            downside,
+            upside,
+            skew_ratio,
+            false,
+            None,
+            &side,
+            &order_type,
+            &format!("MAKER_SKEW_{role}"),
+        );
     }
 
     pub fn _accumulate_allowed(&self) -> (bool, String) {
@@ -7112,7 +8412,46 @@ impl MakerHedgeCapBot {
             "LP={lp:+.4} CPP={cpp:.6} TotalCost={total:.4} qYES={:.2} qNO={:.2} (mode={})",
             s.q_yes, s.q_no, self.exec_mode
         );
-        if self.exec_mode == "TAKER_PAIR" || env_bool("DEBUG_MODE", false) {
+        if self.exec_mode == "MAKER_SKEW_ARB" {
+            if let Ok(ms) = self.maker_skew_state.lock() {
+                line.push_str(&format!(
+                    " | skew downside={:+.3} upside={:+.3} ratio={:.3} t_into={:.1}s",
+                    ms.downside,
+                    ms.upside,
+                    ms.skew_ratio,
+                    (now_ts_f64() - self.start_ts as f64).max(0.0)
+                ));
+                if env_bool("MAKER_STRETCH_BIAS_ENABLED", false) {
+                    let rsi_txt = ms
+                        .stretch_rsi
+                        .map(|v| format!("{v:.1}"))
+                        .unwrap_or_else(|| "NA".to_string());
+                    let diff_txt = ms
+                        .stretch_diff_vs_start
+                        .map(|v| format!("{v:+.3}"))
+                        .unwrap_or_else(|| "NA".to_string());
+                    let default_side = if ms.stretch_default_side.trim().is_empty() {
+                        "NA"
+                    } else {
+                        ms.stretch_default_side.as_str()
+                    };
+                    let biased_side = if ms.stretch_biased_side.trim().is_empty() {
+                        "NA"
+                    } else {
+                        ms.stretch_biased_side.as_str()
+                    };
+                    let reason = if ms.stretch_bias_reason.trim().is_empty() {
+                        "NA"
+                    } else {
+                        ms.stretch_bias_reason.as_str()
+                    };
+                    line.push_str(&format!(
+                        " | stretch rsi={} diff={} default={} biased={} reason={}",
+                        rsi_txt, diff_txt, default_side, biased_side, reason
+                    ));
+                }
+            }
+        } else if self.exec_mode == "TAKER_PAIR" || env_bool("DEBUG_MODE", false) {
             if let (Some(y), Some(n)) = (&self.yes_asset, &self.no_asset) {
                 let yq = self._best_bid_ask(y);
                 let nq = self._best_bid_ask(n);
@@ -7187,15 +8526,54 @@ impl MakerHedgeCapBot {
 
     pub fn _maybe_trigger_max_loss(&self, delta: f64, unhedged_age: f64) -> bool {
         if !env_bool("MAX_LOSS_ENABLED", true) {
+            self._runtime_ts_set("__max_loss_breach_since", 0.0);
             return false;
         }
         let max_loss = env_float("MAX_LOSS_USD_PER_MARKET", 1.0).max(0.0);
         let s = self.state.lock().map(|v| v.clone()).unwrap_or_default();
         let lp = locked_profit(&s);
-        if lp <= -max_loss {
-            self.logger.warning(&format!(
-                "max-loss triggered lp={lp:.4} delta={delta:.4} unhedged_age={unhedged_age:.2}s"
-            ));
+        if lp > -max_loss {
+            self._runtime_ts_set("__max_loss_breach_since", 0.0);
+            return false;
+        }
+
+        let now = now_ts_f64();
+        let grace_s = env_float("MAX_LOSS_GRACE_SECONDS", 0.0).max(0.0);
+        let confirm_s = env_float("MAX_LOSS_CONFIRM_SECONDS", 0.0).max(0.0);
+        let mut breach_since = self._runtime_ts_get("__max_loss_breach_since");
+        if breach_since <= 0.0 {
+            breach_since = now;
+            self._runtime_ts_set("__max_loss_breach_since", breach_since);
+        }
+        let breached_for = now - breach_since;
+        if breached_for + 1e-12 < (grace_s + confirm_s) {
+            // Do not short-circuit the normal exposure handler during grace/confirm.
+            return false;
+        }
+
+        self.logger.warning(&format!(
+            "max-loss active lp={lp:.4} delta={delta:.4} unhedged_age={unhedged_age:.2}s breached_for={breached_for:.2}s limit={max_loss:.2}"
+        ));
+
+        if delta.abs() >= self.cfg.min_shares {
+            if self.exec_mode == "TAKER_PAIR" {
+                self._emergency_taker_hedge_step(delta, "max_loss");
+            } else {
+                self._maker_exposure_step(delta, unhedged_age);
+            }
+        }
+
+        let s2 = self.state.lock().map(|v| v.clone()).unwrap_or_default();
+        let lp2 = locked_profit(&s2);
+        if lp2 <= -max_loss {
+            if let Some(info) = self._flatten_now_best(s2.q_yes - s2.q_no) {
+                self._force_flatten_and_stop(s2.q_yes - s2.q_no, &info);
+            } else {
+                self.logger.warning("max-loss fallback stop (no flatten quote)");
+                self._set_exit_reason("MAX_LOSS");
+                self.cancel_all_orders_exchange("max-loss");
+                self.stop_flag.store(true, Ordering::SeqCst);
+            }
             return true;
         }
         false
@@ -7206,10 +8584,98 @@ impl MakerHedgeCapBot {
             "force flatten + stop delta={delta:.4} info={}",
             info
         ));
+        self.cancel_all_open_orders_local("force flatten");
+        self._maker_ladder_cancel_all("force flatten");
+        if let (Some(y), Some(n)) = (&self.yes_asset, &self.no_asset) {
+            self._cancel_exchange_orders_for_assets(
+                &[y.clone(), n.clone()],
+                "force flatten pre-action",
+            );
+        }
+        let min_need = self.cfg.min_shares.max(1.0);
+        let max_passes = env_int("FORCE_FLATTEN_MAX_PASSES", 5).clamp(1, 20) as usize;
+        let wait_ms = env_int("FORCE_FLATTEN_WAIT_MS", 350).clamp(50, 5_000) as u64;
+        let slip_step = env_int("FORCE_FLATTEN_SLIPPAGE_STEP_TICKS", 1).clamp(0, 50) as f64;
+        let tick = self.cfg.tick.max(0.0001);
+        let fallback_action = info
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("BUY_MISSING")
+            .to_ascii_uppercase();
+
+        for pass in 0..max_passes {
+            let _ = self._reconcile_state_from_balances("force_flatten_loop");
+            let (qy, qn) = self
+                .state
+                .lock()
+                .map(|s| (s.q_yes, s.q_no))
+                .unwrap_or((0.0, 0.0));
+            let d = qy - qn;
+            if d.abs() < min_need {
+                break;
+            }
+            let flat_info = self._flatten_now_best(d).unwrap_or_else(|| info.clone());
+            let action = flat_info
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&fallback_action)
+                .to_ascii_uppercase();
+            let need = flat_info
+                .get("need")
+                .and_then(|v| v.as_f64())
+                .unwrap_or_else(|| d.abs())
+                .max(0.0);
+            if need < min_need {
+                break;
+            }
+
+            if action == "SELL_HEAVY" {
+                let heavy_asset = flat_info
+                    .get("heavy_asset")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let heavy_bid = flat_info
+                    .get("heavy_bid")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                if !heavy_asset.trim().is_empty() && heavy_bid > 0.0 {
+                    let mut px = heavy_bid - (pass as f64 * slip_step * tick);
+                    px = round_down(clamp(px, tick, 0.99), tick);
+                    let order_type = std::env::var("MAKER_EXPOSURE_UNWIND_ORDER_TYPE")
+                        .unwrap_or_else(|_| self.hedge_taker_order_type.clone());
+                    let _ = self._place_taker_ask_fak(&heavy_asset, px, need, Some(&order_type));
+                }
+            } else {
+                let missing_asset = flat_info
+                    .get("missing_asset")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let miss_ask = flat_info
+                    .get("missing_ask")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                if !missing_asset.trim().is_empty() && miss_ask > 0.0 {
+                    let mut px = miss_ask
+                        + (self.hedge_slippage_ticks as f64 + pass as f64 * slip_step) * tick;
+                    px = round_up(clamp(px, tick, 0.99), tick);
+                    let _ = self._place_taker_bid_fak(
+                        &missing_asset,
+                        px,
+                        need,
+                        Some(&self.hedge_taker_order_type),
+                    );
+                }
+            }
+            thread::sleep(Duration::from_millis(wait_ms));
+        }
+        let _ = self._reconcile_state_from_balances("force_flatten_final");
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Ok(mut r) = self.exit_reason.lock() {
             *r = "FORCED_FLATTEN".to_string();
         }
+        self.cancel_all_orders_exchange("force flatten complete");
     }
 
     pub fn _emergency_taker_hedge_step(&self, delta: f64, reason: &str) {
@@ -10314,6 +11780,7 @@ impl MakerHedgeCapBot {
             self.logger
                 .info(&format!("Cancel-all (exchange): {reason}"));
         }
+        self._maker_ladder_cancel_all("cancel_all_exchange");
         let orders = self._list_open_orders_exchange();
         for o in orders {
             if let Some(oid) = self._extract_order_id(&o) {
@@ -10324,5 +11791,47 @@ impl MakerHedgeCapBot {
             s.open_orders.clear();
             let _ = save_state(&self.state_file, &mut s);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MakerHedgeCapBot;
+
+    #[test]
+    fn maker_payoff_envelope_math() {
+        let (downside, upside, skew) = MakerHedgeCapBot::_maker_payoff_envelope(120.0, 80.0, 150.0);
+        assert!((downside + 70.0).abs() < 1e-9);
+        assert!((upside - (-30.0)).abs() < 1e-9);
+        assert!((skew - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn maker_fee_formula_peaks_near_mid() {
+        let qty = 10.0;
+        let low = MakerHedgeCapBot::_maker_poly_fee_formula(qty, 0.1, 0.25, 2.0, 0.0, false, true);
+        let mid = MakerHedgeCapBot::_maker_poly_fee_formula(qty, 0.5, 0.25, 2.0, 0.0, false, true);
+        let high = MakerHedgeCapBot::_maker_poly_fee_formula(qty, 0.9, 0.25, 2.0, 0.0, false, true);
+        assert!(mid > low);
+        assert!(mid > high);
+    }
+
+    #[test]
+    fn maker_fee_formula_maker_rebate_non_negative() {
+        let fee = MakerHedgeCapBot::_maker_poly_fee_formula(20.0, 0.52, 0.25, 2.0, 100.0, true, true);
+        assert!(fee >= 0.0);
+    }
+
+    #[test]
+    fn maker_bucket_helpers() {
+        assert_eq!(MakerHedgeCapBot::_maker_price_bucket(0.0), "NA");
+        assert_eq!(MakerHedgeCapBot::_maker_price_bucket(0.19), "LE_020");
+        assert_eq!(MakerHedgeCapBot::_maker_price_bucket(0.30), "020_035");
+        assert_eq!(MakerHedgeCapBot::_maker_price_bucket(0.55), "035_065");
+        assert_eq!(MakerHedgeCapBot::_maker_price_bucket(0.77), "GT_065");
+        assert_eq!(MakerHedgeCapBot::_maker_clip_bucket(0.0), "NA");
+        assert_eq!(MakerHedgeCapBot::_maker_clip_bucket(10.0), "SMALL");
+        assert_eq!(MakerHedgeCapBot::_maker_clip_bucket(20.0), "MID");
+        assert_eq!(MakerHedgeCapBot::_maker_clip_bucket(45.0), "LARGE");
     }
 }

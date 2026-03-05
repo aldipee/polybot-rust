@@ -595,12 +595,7 @@ fn realized_lp_from_resolution_snapshot(
         return fallback_lp;
     };
 
-    let yes_payout = if diff_price > 0.0 {
-        q_yes.max(0.0)
-    } else {
-        0.0
-    };
-    let no_payout = if diff_price > 0.0 { 0.0 } else { q_no.max(0.0) };
+    let (yes_payout, no_payout) = payout_from_resolution_diff(diff_price, q_yes, q_no);
     let realized_lp = yes_payout + no_payout - total_cost;
     logger.info(&format!(
         "[TRADE][REALIZED] market={} lp={:+.6} fallback_lp={:+.6} q_yes={:.4} q_no={:.4} total_cost={:.6} diff_vs_price_to_beat={:+.6} source_ts_ms={} resolution_ts_ms={}",
@@ -615,6 +610,14 @@ fn realized_lp_from_resolution_snapshot(
         snapshot.resolution_ts_ms
     ));
     realized_lp
+}
+
+fn payout_from_resolution_diff(diff_price: f64, q_yes: f64, q_no: f64) -> (f64, f64) {
+    if diff_price >= 0.0 {
+        (q_yes.max(0.0), 0.0)
+    } else {
+        (0.0, q_no.max(0.0))
+    }
 }
 
 fn now_ts_f64() -> f64 {
@@ -1479,6 +1482,32 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
         hub.close();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::payout_from_resolution_diff;
+
+    #[test]
+    fn tie_resolves_to_yes() {
+        let (yes, no) = payout_from_resolution_diff(0.0, 12.0, 12.0);
+        assert_eq!(yes, 12.0);
+        assert_eq!(no, 0.0);
+    }
+
+    #[test]
+    fn positive_resolves_to_yes() {
+        let (yes, no) = payout_from_resolution_diff(0.5, 8.0, 9.0);
+        assert_eq!(yes, 8.0);
+        assert_eq!(no, 0.0);
+    }
+
+    #[test]
+    fn negative_resolves_to_no() {
+        let (yes, no) = payout_from_resolution_diff(-0.5, 8.0, 9.0);
+        assert_eq!(yes, 0.0);
+        assert_eq!(no, 9.0);
+    }
 }
 
 fn main() {

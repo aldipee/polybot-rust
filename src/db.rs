@@ -189,6 +189,14 @@ pub struct TradeDecisionUpsert {
     pub decide_to_send_us: Option<i64>,
     pub send_to_ack_us: Option<i64>,
     pub decide_to_ack_us: Option<i64>,
+    pub maker_downside: Option<f64>,
+    pub maker_upside: Option<f64>,
+    pub maker_skew_ratio: Option<f64>,
+    pub maker_arb_triggered: Option<bool>,
+    pub maker_arb_edge_after_fees: Option<f64>,
+    pub maker_t_into_s: Option<f64>,
+    pub maker_price_bucket: Option<String>,
+    pub maker_clip_bucket: Option<String>,
 }
 
 pub fn now_iso_jakarta() -> String {
@@ -372,6 +380,14 @@ CREATE TABLE IF NOT EXISTS trade_decisions (
   decide_to_send_us BIGINT NULL,
   send_to_ack_us BIGINT NULL,
   decide_to_ack_us BIGINT NULL,
+  maker_downside DOUBLE PRECISION NULL,
+  maker_upside DOUBLE PRECISION NULL,
+  maker_skew_ratio DOUBLE PRECISION NULL,
+  maker_arb_triggered BOOLEAN NULL,
+  maker_arb_edge_after_fees DOUBLE PRECISION NULL,
+  maker_t_into_s DOUBLE PRECISION NULL,
+  maker_price_bucket TEXT NULL,
+  maker_clip_bucket TEXT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -485,6 +501,14 @@ ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS fees_paid DOUBLE PRECISION 
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS decide_to_send_us BIGINT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS send_to_ack_us BIGINT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS decide_to_ack_us BIGINT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS maker_downside DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS maker_upside DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS maker_skew_ratio DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS maker_arb_triggered BOOLEAN NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS maker_arb_edge_after_fees DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS maker_t_into_s DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS maker_price_bucket TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS maker_clip_bucket TEXT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS updated_at TEXT NOT NULL DEFAULT '';
 UPDATE trade_decisions SET created_at = COALESCE(NULLIF(trim(created_at), ''), '1970-01-01T00:00:00+00:00')
@@ -1169,6 +1193,8 @@ WHERE COALESCE(trim(updated_at), '') = '';
                 order_type, limit_price_submitted, fill_price_avg, qty_requested, qty_filled,
                 slippage_bps_vs_mid, fees_paid,
                 decide_to_send_us, send_to_ack_us, decide_to_ack_us,
+                maker_downside, maker_upside, maker_skew_ratio, maker_arb_triggered, maker_arb_edge_after_fees,
+                maker_t_into_s, maker_price_bucket, maker_clip_bucket,
                 created_at, updated_at
             ) VALUES (
                 $1,
@@ -1183,7 +1209,9 @@ WHERE COALESCE(trim(updated_at), '') = '';
                 $33, $34, $35, $36, $37,
                 $38, $39,
                 $40, $41, $42,
-                $43, $44
+                $43, $44, $45, $46, $47,
+                $48, $49, $50,
+                $51, $52
             )
             ON CONFLICT (trade_id) DO UPDATE SET
                 t_left_seconds = EXCLUDED.t_left_seconds,
@@ -1227,6 +1255,14 @@ WHERE COALESCE(trim(updated_at), '') = '';
                 decide_to_send_us = EXCLUDED.decide_to_send_us,
                 send_to_ack_us = EXCLUDED.send_to_ack_us,
                 decide_to_ack_us = EXCLUDED.decide_to_ack_us,
+                maker_downside = EXCLUDED.maker_downside,
+                maker_upside = EXCLUDED.maker_upside,
+                maker_skew_ratio = EXCLUDED.maker_skew_ratio,
+                maker_arb_triggered = EXCLUDED.maker_arb_triggered,
+                maker_arb_edge_after_fees = EXCLUDED.maker_arb_edge_after_fees,
+                maker_t_into_s = EXCLUDED.maker_t_into_s,
+                maker_price_bucket = EXCLUDED.maker_price_bucket,
+                maker_clip_bucket = EXCLUDED.maker_clip_bucket,
                 updated_at = EXCLUDED.updated_at",
             &[
                 &trade_id,
@@ -1271,6 +1307,14 @@ WHERE COALESCE(trim(updated_at), '') = '';
                 &row.decide_to_send_us,
                 &row.send_to_ack_us,
                 &row.decide_to_ack_us,
+                &row.maker_downside,
+                &row.maker_upside,
+                &row.maker_skew_ratio,
+                &row.maker_arb_triggered,
+                &row.maker_arb_edge_after_fees,
+                &row.maker_t_into_s,
+                &row.maker_price_bucket,
+                &row.maker_clip_bucket,
                 &now,
                 &now,
             ],

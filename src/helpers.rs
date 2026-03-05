@@ -410,6 +410,12 @@ pub struct BotState {
     pub sniper_last_exit_ts: f64,
     pub sniper_last_side: String,
     #[serde(default)]
+    pub maker_skew_window_start_ts: i64,
+    #[serde(default)]
+    pub maker_skew_last_decision_ts: f64,
+    #[serde(default)]
+    pub maker_skew_unhedged_since: f64,
+    #[serde(default)]
     pub sniper_pending_breakout_anchor: Option<SniperEntryBreakoutAnchorState>,
     #[serde(default)]
     pub sniper_active_breakout_anchor: Option<SniperEntryBreakoutAnchorState>,
@@ -429,6 +435,9 @@ impl Default for BotState {
             sniper_last_entry_ts: 0.0,
             sniper_last_exit_ts: 0.0,
             sniper_last_side: String::new(),
+            maker_skew_window_start_ts: 0,
+            maker_skew_last_decision_ts: 0.0,
+            maker_skew_unhedged_since: 0.0,
             sniper_pending_breakout_anchor: None,
             sniper_active_breakout_anchor: None,
         }
