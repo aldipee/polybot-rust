@@ -23,12 +23,12 @@ if [ "$(id -u)" = "0" ]; then
   chown -R "${APP_UID}:${APP_GID}" /app/data /app/signals /app/state /app/output /app/logs || true
   chmod -R u+rwX,g+rwX /app/data /app/signals /app/state /app/output /app/logs || true
   if [ "$#" -eq 0 ]; then
-    exec gosu "${APP_UID}:${APP_GID}" /usr/local/bin/polybot_convert_rust
+    exec gosu "${APP_UID}:${APP_GID}" /usr/local/bin/polybot
   fi
   exec gosu "${APP_UID}:${APP_GID}" "$@"
 fi
 
 if [ "$#" -eq 0 ]; then
-  exec /usr/local/bin/polybot_convert_rust
+  exec /usr/local/bin/polybot
 fi
 exec "$@"

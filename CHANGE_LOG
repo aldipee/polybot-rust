@@ -1,3 +1,17 @@
+## Version 0.1.16
+Date: 2026-03-05
+### Changes
+- Added global runtime toggle `PNL_STATS_AT_END_ENABLED` (default `false`) to control end-of-market PnL stats/telegram summary emission.
+- Added global runtime toggle `TRADE_REALIZED_LOG_ENABLED` (default `false`) to control `[TRADE][REALIZED]` resolution log output.
+- Updated defaults:
+  - `TRADE_VALIDATION_ENABLED=false`
+  - `TRADE_VALIDATION_AFTER_MARKET_ENABLED=false`
+- Registered new env keys in `ENV_CONTRACT_KEYS`.
+
+### Behavior Impact
+- End-of-run output is quieter by default, and post-finalization validation is opt-in.
+- Operators can re-enable validation and final stats explicitly per environment.
+
 ## Version 0.1.15
 Date: 2026-03-03
 ### Changes

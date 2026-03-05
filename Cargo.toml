@@ -1,5 +1,5 @@
 [package]
-name = "polybot_convert_rust"
+name = "polybot"
 version = "0.1.15"
 edition = "2021"
 build = "build.rs"

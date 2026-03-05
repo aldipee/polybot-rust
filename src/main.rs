@@ -576,6 +576,7 @@ fn realized_lp_from_resolution_snapshot(
     total_cost: f64,
     fallback_lp: f64,
     logger: &Arc<dyn LogLike>,
+    realized_log_enabled: bool,
 ) -> f64 {
     let Some(snapshot) = get_resolution_snapshot_for_market(market_slug) else {
         return fallback_lp;
@@ -597,18 +598,20 @@ fn realized_lp_from_resolution_snapshot(
 
     let (yes_payout, no_payout) = payout_from_resolution_diff(diff_price, q_yes, q_no);
     let realized_lp = yes_payout + no_payout - total_cost;
-    logger.info(&format!(
-        "[TRADE][REALIZED] market={} lp={:+.6} fallback_lp={:+.6} q_yes={:.4} q_no={:.4} total_cost={:.6} diff_vs_price_to_beat={:+.6} source_ts_ms={} resolution_ts_ms={}",
-        market_slug,
-        realized_lp,
-        fallback_lp,
-        q_yes,
-        q_no,
-        total_cost,
-        diff_price,
-        snapshot.source_ts_ms,
-        snapshot.resolution_ts_ms
-    ));
+    if realized_log_enabled {
+        logger.info(&format!(
+            "[TRADE][REALIZED] market={} lp={:+.6} fallback_lp={:+.6} q_yes={:.4} q_no={:.4} total_cost={:.6} diff_vs_price_to_beat={:+.6} source_ts_ms={} resolution_ts_ms={}",
+            market_slug,
+            realized_lp,
+            fallback_lp,
+            q_yes,
+            q_no,
+            total_cost,
+            diff_price,
+            snapshot.source_ts_ms,
+            snapshot.resolution_ts_ms
+        ));
+    }
     realized_lp
 }
 
@@ -1029,10 +1032,12 @@ fn run() -> Result<()> {
     let daily_take_profit_usd = env_float("DAILY_PNL_TAKE_PROFIT_USD", 0.0).max(0.0);
     let daily_stop_loss_usd = env_float("DAILY_PNL_STOP_LOSS_USD", 0.0).abs();
     let next_market_delay_seconds = env_float("NEXT_MARKET_DELAY_SECONDS", 2.0).max(0.0);
-    let trade_validation_enabled = env_bool("TRADE_VALIDATION_ENABLED", true);
+    let trade_validation_enabled = env_bool("TRADE_VALIDATION_ENABLED", false);
     let trade_validation_after_market_enabled =
-        env_bool("TRADE_VALIDATION_AFTER_MARKET_ENABLED", true);
+        env_bool("TRADE_VALIDATION_AFTER_MARKET_ENABLED", false);
     let trade_validation_poll_seconds = env_float("TRADE_VALIDATION_POLL_SECONDS", 90.0).max(5.0);
+    let pnl_stats_at_end_enabled = env_bool("PNL_STATS_AT_END_ENABLED", false);
+    let trade_realized_log_enabled = env_bool("TRADE_REALIZED_LOG_ENABLED", false);
 
     let sig = env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "1".to_string());
     let funder = env::var("POLYMARKET_FUNDER").unwrap_or_default();
@@ -1363,6 +1368,7 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 metrics.total_cost,
                 metrics.lp,
                 &bot_logger,
+                trade_realized_log_enabled,
             );
             let end_trade_iso = now_iso_jakarta();
             let raw_exit_reason = if metrics.exit_reason.trim().is_empty()
@@ -1464,11 +1470,13 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
         }
         current_slug = next_slug;
 
-        let repo = session_factory.repository();
-        let _ = print_pnl_metrics(&repo, &bot_id, &bot_logger);
-        if telegram_enabled() {
-            let telegram_summary = build_telegram_pnl_summary(&repo, &bot_id, &bot_logger);
-            send_telegram_stats_if_enabled(&telegram_summary, &bot_logger);
+        if pnl_stats_at_end_enabled {
+            let repo = session_factory.repository();
+            let _ = print_pnl_metrics(&repo, &bot_id, &bot_logger);
+            if telegram_enabled() {
+                let telegram_summary = build_telegram_pnl_summary(&repo, &bot_id, &bot_logger);
+                send_telegram_stats_if_enabled(&telegram_summary, &bot_logger);
+            }
         }
         bot_logger.info(&format!(
             "Waiting {:.2}s before next market... {current_slug}",

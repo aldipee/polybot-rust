@@ -170,3 +170,23 @@ SNIPER_FILTERS_PERSIST_STATE=true
 SNIPER_FILTERS_STATE_PATH=state/sniper_filters_state_polybot_btc.json
 SNIPER_FILTERS_STATE_WRITE_MIN_INTERVAL_MS=250
 ```
+
+## Finalization and Validation Toggles
+
+These controls are global runtime toggles and are independent from sniper/maker mode logic.
+
+Default profile (now fail-open on finalization checks and quieter end-of-run logs):
+
+```env
+PNL_STATS_AT_END_ENABLED=false
+TRADE_REALIZED_LOG_ENABLED=false
+TRADE_VALIDATION_ENABLED=false
+TRADE_VALIDATION_AFTER_MARKET_ENABLED=false
+```
+
+Behavior:
+
+- `PNL_STATS_AT_END_ENABLED`: enables/disables final summary stats print and telegram summary call at market end.
+- `TRADE_REALIZED_LOG_ENABLED`: enables/disables `[TRADE][REALIZED]` detailed resolution log lines.
+- `TRADE_VALIDATION_ENABLED`: enables/disables Polymarket closed-position trade validation pass.
+- `TRADE_VALIDATION_AFTER_MARKET_ENABLED`: enables/disables immediate post-market validation polling after trade finalization.

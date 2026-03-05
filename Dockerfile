@@ -11,7 +11,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY vendor ./vendor
 COPY src ./src
-ARG BUILD_BINS="polybot_convert_rust copy_collect clickhouse_push"
+ARG BUILD_BINS="polybot copy_collect clickhouse_push"
 RUN --mount=type=cache,id=polybot-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=polybot-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=polybot-target,target=/app/target \

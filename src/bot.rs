@@ -109,6 +109,7 @@ struct MakerSkewArbState {
     downside: f64,
     upside: f64,
     skew_ratio: f64,
+    cpp: f64,
     last_decision_ts: f64,
     unhedged_since: f64,
     stretch_rsi: Option<f64>,
@@ -117,6 +118,8 @@ struct MakerSkewArbState {
     stretch_biased_side: String,
     stretch_bias_reason: String,
     stretch_eval_ts: f64,
+    stretch_chainlink_closes: Vec<f64>,
+    stretch_chainlink_last_ts_ms: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -285,6 +288,10 @@ pub struct MakerHedgeCapBot {
     clob_client: Option<Arc<RsClobClient>>,
     clob_api_creds: Option<ApiKeyCreds>,
     balance_allowance_cache: Arc<Mutex<HashMap<String, (f64, f64, f64)>>>,
+    /// Suspect tracking for reconciliation: (timestamp, api_balance) per asset.
+    reconcile_suspect_yes: Arc<Mutex<Option<(f64, f64)>>>,
+    reconcile_suspect_no: Arc<Mutex<Option<(f64, f64)>>>,
+    reconcile_last_ts: Arc<Mutex<f64>>,
     pub exchange_orders_cache: Arc<Mutex<Vec<Value>>>,
     pub binance_feed: Option<Arc<BinanceFeedService>>,
     pub sniper_filters: Arc<Mutex<SniperFilterEngine>>,
@@ -491,6 +498,9 @@ impl MakerHedgeCapBot {
             clob_client,
             clob_api_creds,
             balance_allowance_cache: Arc::new(Mutex::new(HashMap::new())),
+            reconcile_suspect_yes: Arc::new(Mutex::new(None)),
+            reconcile_suspect_no: Arc::new(Mutex::new(None)),
+            reconcile_last_ts: Arc::new(Mutex::new(0.0)),
             exchange_orders_cache: Arc::new(Mutex::new(Vec::new())),
             binance_feed: None,
             sniper_filters,
@@ -3399,19 +3409,52 @@ impl MakerHedgeCapBot {
         (true, "ok".to_string())
     }
 
-    pub fn _reconcile_state_from_balances(&self, reason: &str) -> bool {
-        if !env_bool("MISMATCH_RECONCILE_FROM_BALANCE", false) {
+    pub fn _reconcile_state_from_positions(&self, reason: &str) -> bool {
+        // Primary source is Data API positions. Legacy balance-based mode can be
+        // explicitly enabled, but mixed per-leg fallback is intentionally disabled.
+        let use_data_api = env_bool("RECONCILE_USE_DATA_API", true);
+        let use_legacy_balance = env_bool("MISMATCH_RECONCILE_FROM_BALANCE", false);
+        if !use_data_api && !use_legacy_balance {
             return false;
         }
+
+        let now = now_ts_f64();
+        let min_interval = env_float("RECONCILE_MIN_INTERVAL_SECONDS", 5.0).max(0.1);
+        if let Ok(last) = self.reconcile_last_ts.lock() {
+            if now - *last < min_interval {
+                return false;
+            }
+        }
+
         let (yes, no) = match (&self.yes_asset, &self.no_asset) {
             (Some(y), Some(n)) => (y.as_str(), n.as_str()),
             _ => return false,
         };
-        let b_yes = self._get_balance_allowance_conditional_cached(yes, 0.0);
-        let b_no = self._get_balance_allowance_conditional_cached(no, 0.0);
-        let (Some((yes_bal, _)), Some((no_bal, _))) = (b_yes, b_no) else {
-            return false;
+        let (yes_bal, no_bal) = if use_data_api {
+            let yes_pos = self._get_position_size_data_api(yes);
+            let no_pos = self._get_position_size_data_api(no);
+            match (yes_pos, no_pos) {
+                (Some(y), Some(n)) => (y, n),
+                _ => return false,
+            }
+        } else {
+            // Legacy mode only.
+            let by = self._get_balance_allowance_conditional_cached(yes, 0.0);
+            let bn = self._get_balance_allowance_conditional_cached(no, 0.0);
+            match (by, bn) {
+                (Some((yb, _)), Some((nb, _))) => (yb, nb),
+                _ => return false,
+            }
         };
+
+        // Skip if either source returned invalid data.
+        if yes_bal < -0.5 || no_bal < -0.5 {
+            return false;
+        }
+
+        if let Ok(mut last) = self.reconcile_last_ts.lock() {
+            *last = now;
+        }
 
         let mut changed = false;
         let y_ba = self._best_bid_ask(yes);
@@ -3427,39 +3470,162 @@ impl MakerHedgeCapBot {
         n_bid = clamp(if n_bid > 0.0 { n_bid } else { tick }, tick, 0.99);
         let sell_credit_mult = self.reconcile_sell_credit_mult.max(0.0);
 
-        let mut new_q_yes = 0.0;
-        let mut new_q_no = 0.0;
-        let mut new_c_yes = 0.0;
-        let mut new_c_no = 0.0;
+        let mut new_q_yes;
+        let mut new_q_no;
+        let mut new_c_yes;
+        let mut new_c_no;
         if let Ok(s) = self.state.lock() {
             new_q_yes = s.q_yes;
             new_q_no = s.q_no;
             new_c_yes = s.c_yes;
             new_c_no = s.c_no;
+        } else {
+            return false;
         }
 
-        if yes_bal > new_q_yes + 1e-6 {
+        let confirm_delay = env_float("RECONCILE_CONFIRM_DELAY_SECONDS", 3.0).max(0.5);
+        let never_zero = env_bool("RECONCILE_NEVER_ZERO_WITHOUT_CONFIRM", true);
+        let delta_threshold = self.cfg.min_shares.max(1e-6);
+
+        // --- YES reconciliation ---
+        if yes_bal > new_q_yes + delta_threshold {
+            // Data API shows MORE than we track — missed fills → trust immediately.
             let dq = yes_bal - new_q_yes;
             new_c_yes += dq * y_ask;
             new_q_yes = yes_bal;
             changed = true;
-        } else if yes_bal + 1e-6 < new_q_yes {
+            // Clear suspect since we're adjusting upward
+            if let Ok(mut s) = self.reconcile_suspect_yes.lock() {
+                *s = None;
+            }
+        } else if yes_bal + delta_threshold < new_q_yes {
+            // Data API shows LESS than we track — possible stale data or real sell.
+            // Require dual-confirmation: discrepancy must persist across two checks.
             let dq = new_q_yes - yes_bal;
-            new_c_yes -= dq * y_bid * sell_credit_mult;
-            new_q_yes = yes_bal;
-            changed = true;
+
+            // Safety: never zero out a large position from a single API check.
+            if never_zero && yes_bal < 1e-6 && new_q_yes >= self.cfg.min_shares {
+                let mut confirmed = false;
+                if let Ok(mut suspect) = self.reconcile_suspect_yes.lock() {
+                    match *suspect {
+                        Some((ts, prev_bal)) if (prev_bal - yes_bal).abs() < 1e-6 => {
+                            // Same zero reading twice — check delay
+                            if now - ts >= confirm_delay {
+                                confirmed = true;
+                                *suspect = None;
+                            }
+                        }
+                        _ => {
+                            // First time seeing this discrepancy — record and wait
+                            *suspect = Some((now, yes_bal));
+                            self.logger.warning(&format!(
+                                "[RECONCILE] YES suspect: internal={new_q_yes:.2} api={yes_bal:.2} — waiting {confirm_delay:.1}s to confirm ({reason})"
+                            ));
+                        }
+                    }
+                }
+                if !confirmed {
+                    // Don't apply yet — wait for confirmation
+                } else {
+                    new_c_yes -= dq * y_bid * sell_credit_mult;
+                    new_q_yes = yes_bal;
+                    changed = true;
+                    self.logger.warning(&format!(
+                        "[RECONCILE] YES confirmed zero after delay: internal→{yes_bal:.2} ({reason})"
+                    ));
+                }
+            } else {
+                // Non-zero downward adjustment — apply with standard dual-confirm
+                let mut confirmed = false;
+                if let Ok(mut suspect) = self.reconcile_suspect_yes.lock() {
+                    match *suspect {
+                        Some((ts, prev_bal)) if (prev_bal - yes_bal).abs() < delta_threshold => {
+                            if now - ts >= confirm_delay {
+                                confirmed = true;
+                                *suspect = None;
+                            }
+                        }
+                        _ => {
+                            *suspect = Some((now, yes_bal));
+                        }
+                    }
+                }
+                if confirmed {
+                    new_c_yes -= dq * y_bid * sell_credit_mult;
+                    new_q_yes = yes_bal;
+                    changed = true;
+                }
+            }
+        } else {
+            // Consistent — clear suspect
+            if let Ok(mut s) = self.reconcile_suspect_yes.lock() {
+                *s = None;
+            }
         }
 
-        if no_bal > new_q_no + 1e-6 {
+        // --- NO reconciliation (same logic) ---
+        if no_bal > new_q_no + delta_threshold {
             let dq = no_bal - new_q_no;
             new_c_no += dq * n_ask;
             new_q_no = no_bal;
             changed = true;
-        } else if no_bal + 1e-6 < new_q_no {
+            if let Ok(mut s) = self.reconcile_suspect_no.lock() {
+                *s = None;
+            }
+        } else if no_bal + delta_threshold < new_q_no {
             let dq = new_q_no - no_bal;
-            new_c_no -= dq * n_bid * sell_credit_mult;
-            new_q_no = no_bal;
-            changed = true;
+
+            if never_zero && no_bal < 1e-6 && new_q_no >= self.cfg.min_shares {
+                let mut confirmed = false;
+                if let Ok(mut suspect) = self.reconcile_suspect_no.lock() {
+                    match *suspect {
+                        Some((ts, prev_bal)) if (prev_bal - no_bal).abs() < 1e-6 => {
+                            if now - ts >= confirm_delay {
+                                confirmed = true;
+                                *suspect = None;
+                            }
+                        }
+                        _ => {
+                            *suspect = Some((now, no_bal));
+                            self.logger.warning(&format!(
+                                "[RECONCILE] NO suspect: internal={new_q_no:.2} api={no_bal:.2} — waiting {confirm_delay:.1}s to confirm ({reason})"
+                            ));
+                        }
+                    }
+                }
+                if confirmed {
+                    new_c_no -= dq * n_bid * sell_credit_mult;
+                    new_q_no = no_bal;
+                    changed = true;
+                    self.logger.warning(&format!(
+                        "[RECONCILE] NO confirmed zero after delay: internal→{no_bal:.2} ({reason})"
+                    ));
+                }
+            } else {
+                let mut confirmed = false;
+                if let Ok(mut suspect) = self.reconcile_suspect_no.lock() {
+                    match *suspect {
+                        Some((ts, prev_bal)) if (prev_bal - no_bal).abs() < delta_threshold => {
+                            if now - ts >= confirm_delay {
+                                confirmed = true;
+                                *suspect = None;
+                            }
+                        }
+                        _ => {
+                            *suspect = Some((now, no_bal));
+                        }
+                    }
+                }
+                if confirmed {
+                    new_c_no -= dq * n_bid * sell_credit_mult;
+                    new_q_no = no_bal;
+                    changed = true;
+                }
+            }
+        } else {
+            if let Ok(mut s) = self.reconcile_suspect_no.lock() {
+                *s = None;
+            }
         }
 
         if !changed {
@@ -3480,7 +3646,7 @@ impl MakerHedgeCapBot {
             format!(" ({reason})")
         };
         self.logger.warning(&format!(
-            "Reconciled state from balances{} qYES={new_q_yes:.6} qNO={new_q_no:.6} total_cost={:.4}",
+            "Reconciled state from positions{} qYES={new_q_yes:.6} qNO={new_q_no:.6} total_cost={:.4}",
             tag,
             new_c_yes + new_c_no
         ));
@@ -3493,7 +3659,7 @@ impl MakerHedgeCapBot {
         } else {
             0.01
         };
-        let _ = self._reconcile_state_from_balances(&format!("unwind:{reason}"));
+        let _ = self._reconcile_state_from_positions(&format!("unwind:{reason}"));
         let (qy, qn) = self
             .state
             .lock()
@@ -4086,6 +4252,33 @@ impl MakerHedgeCapBot {
         }
     }
 
+    fn _maker_compute_rsi(closes: &[f64], period: usize) -> Option<f64> {
+        if closes.len() <= period || period < 2 {
+            return None;
+        }
+        let mut gain = 0.0;
+        let mut loss = 0.0;
+        for i in (closes.len() - period)..closes.len() {
+            if i == 0 {
+                continue;
+            }
+            let d = closes[i] - closes[i - 1];
+            if d > 0.0 {
+                gain += d;
+            } else {
+                loss += -d;
+            }
+        }
+        let avg_gain = gain / period as f64;
+        let avg_loss = loss / period as f64;
+        if avg_loss <= 1e-12 {
+            Some(100.0)
+        } else {
+            let rs = avg_gain / avg_loss;
+            Some(100.0 - (100.0 / (1.0 + rs)))
+        }
+    }
+
     fn _maker_stretch_bias_side(&self, default_side: &str) -> String {
         let now = now_ts_f64();
         let default_norm = default_side.trim().to_ascii_uppercase();
@@ -4113,39 +4306,46 @@ impl MakerHedgeCapBot {
         let rsi_period = env_int("MAKER_STRETCH_RSI_PERIOD", 14).clamp(2, 100) as usize;
         let rsi_oversold = env_float("MAKER_STRETCH_RSI_OVERSOLD", 40.0).clamp(1.0, 99.0);
         let rsi_overbought = (100.0 - rsi_oversold).clamp(1.0, 99.0);
+        let rsi_source = std::env::var("MAKER_STRETCH_RSI_SOURCE")
+            .unwrap_or_else(|_| "BINANCE".to_string())
+            .trim()
+            .to_ascii_uppercase();
 
         let mut rsi_value = None;
         let mut has_feed = false;
-        if let Some(feed) = &self.binance_feed {
+        if rsi_source == "CHAINLINK" || rsi_source == "RTDS" || rsi_source == "POLYMARKET" {
+            let live = get_live_snapshot_for_market(&self.market_slug);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let max_age_ms = (self.cfg.market_data_stale_seconds.max(1) as i64) * 1000;
+            if let Some(snap) = live {
+                let age_ms = now_ms.saturating_sub(snap.updated_at_ms.max(snap.timestamp_ms));
+                if age_ms <= max_age_ms {
+                    has_feed = true;
+                    if let Ok(mut st) = self.maker_skew_state.lock() {
+                        if snap.timestamp_ms > st.stretch_chainlink_last_ts_ms {
+                            st.stretch_chainlink_last_ts_ms = snap.timestamp_ms;
+                            st.stretch_chainlink_closes.push(snap.price.max(0.0));
+                            let keep = (rsi_period * 6).max(rsi_period + 2);
+                            if st.stretch_chainlink_closes.len() > keep {
+                                let drop_n = st.stretch_chainlink_closes.len() - keep;
+                                st.stretch_chainlink_closes.drain(0..drop_n);
+                            }
+                        }
+                        rsi_value = Self::_maker_compute_rsi(&st.stretch_chainlink_closes, rsi_period);
+                    }
+                }
+            }
+        } else if let Some(feed) = &self.binance_feed {
             has_feed = true;
             let snap = feed.snapshot();
             let mut closes: Vec<f64> = snap.seed_klines.iter().map(|k| k.close).collect();
             if let Some(last) = snap.last_tick {
                 closes.push(last.price.max(0.0));
             }
-            if closes.len() > rsi_period {
-                let mut gain = 0.0;
-                let mut loss = 0.0;
-                for i in (closes.len() - rsi_period)..closes.len() {
-                    if i == 0 {
-                        continue;
-                    }
-                    let d = closes[i] - closes[i - 1];
-                    if d > 0.0 {
-                        gain += d;
-                    } else {
-                        loss += -d;
-                    }
-                }
-                let avg_gain = gain / rsi_period as f64;
-                let avg_loss = loss / rsi_period as f64;
-                if avg_loss <= 1e-12 {
-                    rsi_value = Some(100.0);
-                } else {
-                    let rs = avg_gain / avg_loss;
-                    rsi_value = Some(100.0 - (100.0 / (1.0 + rs)));
-                }
-            }
+            rsi_value = Self::_maker_compute_rsi(&closes, rsi_period);
         }
 
         let mut biased_side = default_norm.clone();
@@ -4568,13 +4768,34 @@ impl MakerHedgeCapBot {
         // Hard guarantee for article behavior: seed both sides before any normal gate logic.
         let base_min = env_float(
             "MAKER_SKEW_BASE_MIN_SHARES",
-            self.cfg.min_shares.max(1.0),
+            2.0 * self.cfg.min_shares.max(1.0),
         )
         .max(self.cfg.min_shares.max(1.0));
         let base_needs_seed = q_yes + 1e-9 < base_min || q_no + 1e-9 < base_min;
         let seed_since_key = "__maker_skew_seed_pending_since";
+        let seed_inflight_key = "__maker_skew_seed_inflight_until";
         let seed_wait_s = env_float("MAKER_SKEW_BASE_SEED_MAX_WAIT_SECONDS", 45.0).max(1.0);
         if base_needs_seed {
+            // Guard: if a taker seed order is still in-flight, wait for it.
+            let inflight_until = self._runtime_ts_get(seed_inflight_key);
+            if inflight_until > 0.0 && now < inflight_until {
+                self._maker_record_trade_decision(
+                    t_into_s,
+                    0.0,
+                    0.0,
+                    downside,
+                    upside,
+                    skew_ratio,
+                    false,
+                    None,
+                    "NONE",
+                    "NONE",
+                    "MAKER_SKEW_BASE_SEED_INFLIGHT",
+                );
+                return;
+            }
+            self._runtime_ts_set(seed_inflight_key, 0.0);
+
             if self._runtime_ts_get(seed_since_key) <= 0.0 {
                 self._runtime_ts_set(seed_since_key, now);
             }
@@ -4614,7 +4835,7 @@ impl MakerHedgeCapBot {
             }
             let seed_order_type = self._resolve_order_type(
                 &std::env::var("MAKER_SKEW_BASE_SEED_ORDER_TYPE")
-                    .unwrap_or_else(|_| "FAK".to_string()),
+                    .unwrap_or_else(|_| "GTC".to_string()),
             );
             let size = need.min(max_affordable).max(min_int);
             let submitted = if seed_order_type == "GTC" {
@@ -4629,6 +4850,11 @@ impl MakerHedgeCapBot {
                 );
                 self._place_taker_bid_fak(&seed_asset, px, size, Some(&seed_order_type))
             };
+            // If taker order was sent, set in-flight cooldown to prevent double-fill.
+            if seed_order_type != "GTC" && (submitted.is_some() || self.cfg.dry_run) {
+                let cooldown_s = env_float("MAKER_SKEW_BASE_SEED_INFLIGHT_SECONDS", 6.0).max(1.0);
+                self._runtime_ts_set(seed_inflight_key, now + cooldown_s);
+            }
             self._maker_record_trade_decision(
                 t_into_s,
                 seed_ask,
@@ -4705,12 +4931,48 @@ impl MakerHedgeCapBot {
         }
 
         let target_ratio = env_float("MAKER_SKEW_TARGET_RATIO", 1.5).max(1.0);
-        let ratio_max = env_float("MAKER_SKEW_MAX_RATIO", 3.0).max(target_ratio);
+        let ratio_max = env_float("MAKER_SKEW_MAX_RATIO", 3.3).max(target_ratio);
         let max_loss = env_float("MAKER_SKEW_MAX_WORST_CASE_LOSS_USDC", 350.0).max(1.0);
         let default_underdog = if y_bid <= n_bid { "YES" } else { "NO" };
         let underdog = self._maker_stretch_bias_side(default_underdog);
         let hedge = if underdog == "YES" { "NO" } else { "YES" };
         let min_base = self.cfg.min_shares.max(1.0);
+
+        // CPP (cost-per-pair) risk cap — prevents over-accumulating one side.
+        // Matches the 0x8e9c trader's envelope: median CPP ~1.17, 75th ~1.33, max ~1.98.
+        let min_shares_held = q_yes.min(q_no).max(0.0);
+        let cpp = if min_shares_held > 1e-9 {
+            total_cost / min_shares_held
+        } else {
+            f64::INFINITY
+        };
+        let cpp_soft = env_float("MAKER_SKEW_CPP_SOFT_CAP", 1.33).max(1.0);
+        let cpp_hard = env_float("MAKER_SKEW_CPP_HARD_CAP", 1.98).max(cpp_soft);
+
+        // Store CPP in state for logging.
+        if let Ok(mut st) = self.maker_skew_state.lock() {
+            st.cpp = cpp;
+        }
+
+        // CPP hard cap: stop all accumulation, cancel ladders.
+        if cpp.is_finite() && cpp >= cpp_hard {
+            self._maker_ladder_cancel_all("cpp_hard_cap");
+            self.cancel_all_open_orders_local("MAKER_SKEW cpp hard cap");
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "NONE",
+                "NONE",
+                &format!("MAKER_SKEW_CPP_HARD_CAP(cpp={cpp:.3})"),
+            );
+            return;
+        }
 
         let mut side = underdog.to_string();
         let mut role = "underdog".to_string();
@@ -4730,6 +4992,17 @@ impl MakerHedgeCapBot {
                 "NO".to_string()
             };
             role = "hedge".to_string();
+        } else if cpp.is_finite() && cpp >= cpp_soft {
+            // CPP soft cap: only buy the smaller side to bring CPP back down.
+            side = if side_yes <= side_no {
+                "YES".to_string()
+            } else {
+                "NO".to_string()
+            };
+            role = "cpp_hedge".to_string();
+            self.logger.info(&format!(
+                "[MAKER_SKEW] CPP soft cap hit cpp={cpp:.3} >= {cpp_soft:.3} -> hedge smaller side={side}"
+            ));
         } else if skew_ratio > ratio_max {
             side = hedge.to_string();
             role = "hedge".to_string();
@@ -4755,16 +5028,27 @@ impl MakerHedgeCapBot {
                 &std::env::var("MAKER_EXPOSURE_UNWIND_ORDER_TYPE")
                     .unwrap_or_else(|_| self.hedge_taker_order_type.clone()),
             )
+        } else if role == "cpp_hedge" {
+            self._resolve_order_type(
+                &std::env::var("MAKER_SKEW_CPP_HEDGE_ORDER_TYPE")
+                    .unwrap_or_else(|_| "GTC".to_string()),
+            )
         } else {
             "GTC".to_string()
         };
 
-        if role == "hedge" && downside < -max_loss {
-            let mut px = ask + self.hedge_slippage_ticks as f64 * self.cfg.tick.max(0.0001);
+        if (role == "hedge" && downside < -max_loss) || (role == "cpp_hedge" && order_type != "GTC") {
+            let slip_ticks = if role == "cpp_hedge" {
+                env_int("MAKER_SKEW_CPP_HEDGE_SLIPPAGE_TICKS", 1).max(0)
+            } else {
+                self.hedge_slippage_ticks as i64
+            };
+            let mut px = ask + slip_ticks as f64 * self.cfg.tick.max(0.0001);
             px = round_up(clamp(px, self.cfg.tick.max(0.0001), 0.99), self.cfg.tick.max(0.0001));
             let _ = self._place_taker_bid_fak(&asset_id, px, clip, Some(&order_type));
-            self._maker_ladder_cancel_all("risk-first hedge taker");
+            self._maker_ladder_cancel_all(&format!("{role} taker"));
         } else if ladder_enabled {
+
             let levels = if role == "hedge" {
                 env_int("MAKER_HEDGE_LADDER_LEVELS", 2)
             } else {
@@ -4959,6 +5243,10 @@ impl MakerHedgeCapBot {
         let mark_first_entry_fill = side_u == "BUY" && qty_after > qty_before + 1e-12;
         let _ = save_state(&self.state_file, &mut guard);
         drop(guard);
+
+        // Clear seed in-flight cooldown on any fill — allows immediate re-seeding
+        // of the other side instead of waiting for the hardcoded timeout.
+        self._runtime_ts_set("__maker_skew_seed_inflight_until", 0.0);
 
         let mut opened_reason: Option<String> = None;
         if opened_position {
@@ -7723,13 +8011,42 @@ impl MakerHedgeCapBot {
     }
 
     pub fn _handle_exposure_mismatch(&self, filled_yes: f64, filled_no: f64) {
-        let mut delta = filled_yes - filled_no;
-        if delta.abs() < 1e-9 {
+        let fill_delta = filled_yes - filled_no;
+        if fill_delta.abs() < 1e-9 {
             return;
         }
 
-        let _ = self._reconcile_state_from_balances("exposure_mismatch");
+        let _ = self._reconcile_state_from_positions("exposure_mismatch");
+        let (qy, qn) = self
+            .state
+            .lock()
+            .map(|s| (s.q_yes, s.q_no))
+            .unwrap_or((0.0, 0.0));
+        let state_delta = qy - qn;
+        if state_delta.abs() < 1e-9 {
+            self.logger.info(&format!(
+                "Exposure mismatch cleared after reconcile. filled_yes={filled_yes:.2} filled_no={filled_no:.2}"
+            ));
+            return;
+        }
+
+        let mut delta = fill_delta;
+        if fill_delta.signum() != state_delta.signum()
+            || (fill_delta - state_delta).abs() >= self.cfg.min_shares
+        {
+            self.logger.warning(&format!(
+                "Exposure mismatch tiebreak: fill_delta={fill_delta:.2} state_delta={state_delta:.2}; using state delta."
+            ));
+            delta = state_delta;
+        }
+
         if delta.abs() < self.cfg.min_shares {
+            if (fill_delta - delta).abs() >= self.cfg.min_shares {
+                self.logger.info(&format!(
+                    "Exposure mismatch reduced below min_shares after reconcile. fill_delta={fill_delta:.2} state_delta={delta:.2} -> skip stop"
+                ));
+                return;
+            }
             self.logger.info(&format!(
                 "Exposure mismatch below min_shares. filled_yes={filled_yes:.2} filled_no={filled_no:.2} delta={delta:.2} -> STOP"
             ));
@@ -8415,10 +8732,11 @@ impl MakerHedgeCapBot {
         if self.exec_mode == "MAKER_SKEW_ARB" {
             if let Ok(ms) = self.maker_skew_state.lock() {
                 line.push_str(&format!(
-                    " | skew downside={:+.3} upside={:+.3} ratio={:.3} t_into={:.1}s",
+                    " | skew downside={:+.3} upside={:+.3} ratio={:.3} cpp={:.3} t_into={:.1}s",
                     ms.downside,
                     ms.upside,
                     ms.skew_ratio,
+                    ms.cpp,
                     (now_ts_f64() - self.start_ts as f64).max(0.0)
                 ));
                 if env_bool("MAKER_STRETCH_BIAS_ENABLED", false) {
@@ -8604,7 +8922,7 @@ impl MakerHedgeCapBot {
             .to_ascii_uppercase();
 
         for pass in 0..max_passes {
-            let _ = self._reconcile_state_from_balances("force_flatten_loop");
+            let _ = self._reconcile_state_from_positions("force_flatten_loop");
             let (qy, qn) = self
                 .state
                 .lock()
@@ -8670,7 +8988,7 @@ impl MakerHedgeCapBot {
             }
             thread::sleep(Duration::from_millis(wait_ms));
         }
-        let _ = self._reconcile_state_from_balances("force_flatten_final");
+        let _ = self._reconcile_state_from_positions("force_flatten_final");
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Ok(mut r) = self.exit_reason.lock() {
             *r = "FORCED_FLATTEN".to_string();

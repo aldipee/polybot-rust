@@ -9,7 +9,7 @@ fi
 instance_name="$1"
 root_dir="${POLYBOT_ROOT:-/root/polybot-rust}"
 instance_dir="$root_dir/instances/$instance_name"
-bin_path="${POLYBOT_BIN:-$root_dir/target/release/polybot_convert_rust}"
+bin_path="${POLYBOT_BIN:-$root_dir/target/release/polybot}"
 env_file="$instance_dir/.env"
 service_env_file="$instance_dir/service.env"
 
