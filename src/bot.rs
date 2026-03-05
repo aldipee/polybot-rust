@@ -4068,20 +4068,29 @@ impl MakerHedgeCapBot {
         env_float("MAKER_SUBMIT_REJECT_COOLDOWN_SECONDS", 5.0).max(0.0)
     }
 
-    fn _pair_arb_imbalance_release_shares(&self) -> f64 {
+    fn _pair_arb_imbalance_enter_shares(&self) -> f64 {
         env_float(
-            "PAIR_ARB_IMBALANCE_RELEASE_SHARES",
+            "PAIR_ARB_IMBALANCE_ENTER_SHARES",
             self.cfg.min_shares.max(1.0),
         )
         .max(0.0)
     }
 
-    fn _maker_effective_inventory(&self) -> (f64, f64) {
-        let (q_yes, q_no) = self
-            .state
+    fn _pair_arb_imbalance_release_shares(&self) -> f64 {
+        env_float("PAIR_ARB_IMBALANCE_RELEASE_SHARES", 1.0)
+            .max(0.0)
+            .min(self._pair_arb_imbalance_enter_shares())
+    }
+
+    fn _maker_actual_inventory(&self) -> (f64, f64) {
+        self.state
             .lock()
             .map(|s| (s.q_yes.max(0.0), s.q_no.max(0.0)))
-            .unwrap_or((0.0, 0.0));
+            .unwrap_or((0.0, 0.0))
+    }
+
+    fn _maker_effective_inventory(&self) -> (f64, f64) {
+        let (q_yes, q_no) = self._maker_actual_inventory();
         if !env_bool("MAKER_EFFECTIVE_Q_INCLUDE_OPEN_BUYS", true) {
             return (q_yes, q_no);
         }
@@ -4294,6 +4303,41 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|p| p.is_some())
             .unwrap_or(false)
+    }
+
+    fn _maker_recovery_mode_snapshot(&self) -> (bool, f64, String, String, Option<String>) {
+        self._pair_arb_clear_pending_if_resolved();
+        let pending_active = self
+            .pair_arb_pending_imbalance
+            .lock()
+            .map(|p| p.is_some())
+            .unwrap_or(false);
+        let (q_yes, q_no) = self._maker_actual_inventory();
+        let gap = (q_yes - q_no).abs();
+        let light_side = if q_yes <= q_no { "YES" } else { "NO" };
+        let heavy_side = if light_side == "YES" { "NO" } else { "YES" };
+        let was_active = self._runtime_ts_get("__maker_recovery_mode_active") > 0.0;
+        let enter = self._pair_arb_imbalance_enter_shares();
+        let release = self._pair_arb_imbalance_release_shares();
+        let active = if pending_active {
+            true
+        } else if was_active {
+            gap > release + 1e-6
+        } else {
+            gap + 1e-6 >= enter
+        };
+        let light_asset = if light_side == "YES" {
+            self.yes_asset.clone()
+        } else {
+            self.no_asset.clone()
+        };
+        (
+            active,
+            gap,
+            heavy_side.to_string(),
+            light_side.to_string(),
+            light_asset,
+        )
     }
 
     fn _maker_order_slot_get(&self, key: &MakerOrderKey) -> MakerOrderSlot {
@@ -4878,6 +4922,22 @@ impl MakerHedgeCapBot {
                 Some(true),
                 origin,
             );
+        }
+        let (recovery_active, recovery_gap, recovery_heavy_side, recovery_light_side, recovery_asset) =
+            self._maker_recovery_mode_snapshot();
+        if recovery_active {
+            if let Some(light_asset_id) = recovery_asset.as_deref() {
+                if key.asset_id != light_asset_id {
+                    self.logger.info(&format!(
+                        "[MAKER_ORD] skip heavy-side BUY during recovery asset={} heavy={} light={} gap={recovery_gap:.2} origin={}",
+                        key.asset_id,
+                        recovery_heavy_side,
+                        recovery_light_side,
+                        origin
+                    ));
+                    return None;
+                }
+            }
         }
 
         let now = now_ts_f64();
@@ -5627,8 +5687,8 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|s| (s.q_yes, s.q_no))
             .unwrap_or((0.0, 0.0));
-        let (q_yes_eff, q_no_eff) = self._maker_effective_inventory();
-        let current_gap = (q_yes_eff - q_no_eff).abs();
+        let (q_yes_actual, q_no_actual) = self._maker_actual_inventory();
+        let current_gap = (q_yes_actual - q_no_actual).abs();
         let max_imbalance = env_float(
             "PAIR_ARB_MAX_IMBALANCE_SHARES",
             self.cfg.clip_shares.max(self.cfg.min_shares),
@@ -5636,14 +5696,14 @@ impl MakerHedgeCapBot {
         .max(1.0);
         if self._pair_arb_pending_active() {
             self.logger.info(&format!(
-                "[MAKER_SKEW][ARB] suppressed: pending imbalance active (qYES={q_yes_eff:.2} qNO={q_no_eff:.2} gap={current_gap:.2})"
+                "[MAKER_SKEW][ARB] suppressed: pending imbalance active (qYES={q_yes_actual:.2} qNO={q_no_actual:.2} gap={current_gap:.2})"
             ));
             return false;
         }
         let projected_gap = current_gap + size_int as f64;
         if projected_gap > max_imbalance + 1e-6 {
             self.logger.info(&format!(
-                "[MAKER_SKEW][ARB] suppressed: projected_gap={projected_gap:.1} > max={max_imbalance:.1} (qYES={q_yes_eff:.1} qNO={q_no_eff:.1} size={size_int})"
+                "[MAKER_SKEW][ARB] suppressed: projected_gap={projected_gap:.1} > max={max_imbalance:.1} (qYES={q_yes_actual:.1} qNO={q_no_actual:.1} size={size_int})"
             ));
             return false;
         }
@@ -6090,17 +6150,11 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        self._pair_arb_clear_pending_if_resolved();
-        let imbalance_gate = env_float(
-            "PAIR_ARB_MAX_IMBALANCE_SHARES",
-            self.cfg.clip_shares.max(self.cfg.min_shares),
-        )
-        .max(1.0);
-        let inventory_gap = (q_yes_eff - q_no_eff).abs();
-        let recovery_mode = self._pair_arb_pending_active() || inventory_gap > imbalance_gate + 1e-6;
-        let recovery_side = if q_yes_eff <= q_no_eff { "YES" } else { "NO" };
-        let recovery_asset = if recovery_side == "YES" { yes } else { no };
-        let recovery_heavy_side = if recovery_side == "YES" { "NO" } else { "YES" };
+        let (recovery_mode, recovery_gap, recovery_heavy_side, recovery_side, recovery_asset) =
+            self._maker_recovery_mode_snapshot();
+        let recovery_asset = recovery_asset
+            .as_deref()
+            .unwrap_or(if recovery_side == "YES" { yes } else { no });
         let recovery_active_key = "__maker_recovery_mode_active";
         let recovery_log_key = "__maker_recovery_mode_log_until";
         let recovery_log_every = 5.0;
@@ -6109,19 +6163,19 @@ impl MakerHedgeCapBot {
             self._maker_cancel_strategy_orders(Some(recovery_asset), "imbalance recovery");
             if self._runtime_ts_get(recovery_active_key) <= 0.0 {
                 self.logger.info(&format!(
-                    "[MAKER_SKEW] recovery mode enter gap={inventory_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
+                    "[MAKER_SKEW] recovery mode enter gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
                 ));
                 self._runtime_ts_set(recovery_active_key, 1.0);
                 self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
             } else if now >= self._runtime_ts_get(recovery_log_key) {
                 self.logger.info(&format!(
-                    "[MAKER_SKEW] recovery mode remain gap={inventory_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
+                    "[MAKER_SKEW] recovery mode remain gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
                 ));
                 self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
             }
         } else if self._runtime_ts_get(recovery_active_key) > 0.0 {
             self.logger.info(&format!(
-                "[MAKER_SKEW] recovery mode exit gap={inventory_gap:.2} threshold={:.2}",
+                "[MAKER_SKEW] recovery mode exit gap={recovery_gap:.2} threshold={:.2}",
                 self._pair_arb_imbalance_release_shares()
             ));
             self._runtime_ts_set(recovery_active_key, 0.0);

@@ -1,3 +1,84 @@
+## Version 0.1.20
+Date: 2026-03-06
+### Changes
+
+#### Fix 1: Recovery mode now uses filled inventory with hysteresis
+- **File:** `src/bot.rs` - new helpers `_pair_arb_imbalance_enter_shares`,
+  `_maker_actual_inventory`, `_maker_recovery_mode_snapshot`
+  (line ~4068, ~4083, ~4294)
+- **Problem:** `v0.1.19` fixed maker fill accounting, but recovery mode still used effective
+  inventory (filled shares plus open BUY remainder). That let recovery mode exit too early:
+  a working YES rebalancing order reduced the effective gap, recovery switched off, and the
+  bot immediately resumed normal price-based flow even though the actual filled YES/NO gap
+  was still unresolved. This was visible in run `btc-updown-5m-1772747100`, where recovery
+  repeatedly entered and exited around a real `25/30` inventory split.
+- **Root cause:** Recovery state used the wrong signal for control decisions:
+  - **effective gap** for enter / exit
+  - no hysteresis between enter and exit thresholds
+  As soon as an open light-side order existed, the effective gap shrank, recovery exited, and
+  heavy-side logic was allowed to resume before the actual filled position was balanced.
+- **Fix:**
+  - Added `PAIR_ARB_IMBALANCE_ENTER_SHARES` (default: `min_shares`)
+  - Recovery mode is now derived from **actual filled inventory** (`q_yes`, `q_no`), not open
+    order remainder
+  - Added hysteresis:
+    - enter recovery when `actual_gap >= PAIR_ARB_IMBALANCE_ENTER_SHARES`
+    - if already active, stay in recovery until `actual_gap <= PAIR_ARB_IMBALANCE_RELEASE_SHARES`
+  - Release threshold now defaults to `1.0` share and is clamped to `<= enter threshold`
+- **Impact:** Recovery mode no longer flaps on and off just because a deficit-side order is
+  working. Once imbalance recovery starts, it stays active until the actual filled position is
+  meaningfully repaired.
+
+#### Fix 2: Hard block heavy-side maker BUY submits during recovery
+- **File:** `src/bot.rs` - `_maker_order_upsert_gtc` (line ~4863)
+- **Problem:** Even after recovery mode was introduced, heavy-side BUY orders could still be
+  submitted and only get canceled later by recovery logic. In the same `btc-updown-5m-1772747100`
+  run, the bot posted multiple NO-side orders while already NO-heavy (`0xeb1db203`, `0x503cca7e`,
+  `0x6612a20c`, `0x6a64f673`, `0x6cef99e9`, `0x3942931c`). Some were canceled, but the design
+  still allowed late fills after cancel, which is exactly how skew kept worsening.
+- **Root cause:** Recovery mode influenced side selection in `_maker_skew_arb_step`, but there
+  was no final admission control at the actual order submission point. If a heavy-side path
+  reached `_maker_order_upsert_gtc`, it could still post before later logic tried to unwind it.
+- **Fix:**
+  - `_maker_order_upsert_gtc` now checks the recovery snapshot before placing any BUY
+  - If recovery is active and the target asset is not the deficit-side asset, the order is
+    rejected locally and logged as:
+    - `[MAKER_ORD] skip heavy-side BUY during recovery ...`
+- **Impact:** Heavy-side maker BUYs are now blocked **before** they reach the exchange while
+  the bot is in imbalance recovery. That removes the submit -> cancel -> late-fill path that
+  was still increasing skew after `v0.1.19`.
+
+#### Fix 3: Pair-arb projected-gap suppression now uses actual filled inventory
+- **File:** `src/bot.rs` - `_maker_skew_try_arb` (line ~5630)
+- **Problem:** Pair-arb suppression was still using effective inventory. That was directionally
+  useful, but it mixed working open orders into a guard whose job is to prevent adding new risk
+  on top of already-filled imbalance.
+- **Fix:** Pair-arb projected-gap checks now use actual filled YES/NO inventory for:
+  - pending-imbalance suppression logs
+  - projected post-trade gap calculations
+- **Impact:** New pair risk is now judged against actual exposure already on the books, not
+  against temporary open-order state.
+
+### New Environment Keys
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PAIR_ARB_IMBALANCE_ENTER_SHARES` | `min_shares` | Actual filled-gap threshold to enter recovery mode |
+
+### Updated Environment Keys
+| Key | Old Default | New Default | Description |
+|-----|-------------|-------------|-------------|
+| `PAIR_ARB_IMBALANCE_RELEASE_SHARES` | `min_shares` | `1.0` | Actual filled-gap threshold to exit recovery mode |
+
+### Behavior Impact
+- Recovery mode is now sticky until the **filled** YES/NO gap is actually repaired.
+- Heavy-side maker BUYs are blocked at submit time during recovery, not merely canceled after the fact.
+- Pair-arb suppression and recovery decisions are now aligned to actual exposure instead of open-order remainder.
+- Maker fill dedupe and pair-order fill accounting from `v0.1.19` are unchanged.
+
+### Validation
+- `cargo check -q`
+- `cargo test -q`
+
 ## Version 0.1.19
 Date: 2026-03-06
 ### Changes
