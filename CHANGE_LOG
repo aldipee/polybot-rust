@@ -1,3 +1,117 @@
+## Version 0.1.19
+Date: 2026-03-06
+### Changes
+
+#### Fix 1: Maker execution dedupe and per-order fill progress
+- **File:** `src/bot.rs` - maker trade handling (`_handle_user_trade_event`) and new helpers
+  `_maker_trade_exec_key`, `_maker_record_exec_fill`, `_maker_exec_applied_qty`
+  (line ~4101, ~4192, ~7918)
+- **Problem:** Maker trade events could apply the same economic execution more than once when
+  the user stream emitted duplicate or differently wrapped events for the same maker fill.
+  This showed up in run `btc-updown-5m-1772745300`, where the pair NO leg was treated as
+  `fn=10` internally while trade history only supported `5`. Once inventory was overstated,
+  the rest of the strategy reacted to a phantom position.
+- **Root cause:** Maker fill dedupe used a top-level trade-event key, not an execution-level
+  key tied to the maker order leg itself. If the same fill reappeared with a different outer
+  event id or wrapper, `_apply_fill` could still mutate inventory again.
+- **Fix:**
+  - Added `MakerExecProgress { applied_qty, last_update_ts }`
+  - Added `maker_seen_exec_keys` and `maker_exec_progress` bot state
+  - Built a stable maker execution key from the maker leg:
+    - preferred: `maker_order_id + transaction_hash + taker_order_id + match_time + qty + price`
+    - fallback: `maker_order_id + top_level_trade_id + qty + price`
+    - fallback: `maker_order_id + status + match_time + qty + price`
+  - Maker fills are now applied only once per execution key
+  - Every applied maker fill increments per-order applied quantity in `maker_exec_progress`
+  - Added `[FILL][MAKER_DEDUPE]` log when a duplicate execution is dropped
+- **Impact:** Maker inventory now tracks unique executions instead of outer trade-event wrappers.
+  Pair logic can rely on order-level applied quantity without being polluted by duplicate maker
+  events.
+
+#### Fix 2: Maker pair-arb fill wait now uses pair order ids, not global inventory deltas
+- **File:** `src/bot.rs` - `_maker_skew_try_arb` and new helper `_wait_for_pair_order_fills`
+  (line ~5676, ~9316)
+- **Problem:** Maker pair-arb timeout handling used `_wait_for_pair_fills(q_yes, q_no, ...)`,
+  which measured changes in global inventory. That made `fy/fn` vulnerable to:
+  - duplicate fill application
+  - unrelated seed / ladder fills during the timeout window
+  - reconciliation or lifecycle noise unrelated to the specific pair orders
+- **Fix:**
+  - Added `_wait_for_pair_order_fills(y_oid, n_oid, y0, n0, target_size, timeout_s)`
+  - For maker GTC pair-arb, `fy/fn` now come from `maker_exec_progress[order_id].applied_qty`
+    for the submitted YES and NO order ids only
+  - Added `[MAKER_SKEW][ARB] fill wait ... fy= fn=` log with pair OID tails for auditability
+  - Kept the old global-delta wait path for non-maker pair flows
+- **Impact:** Pair mismatch / defer decisions are now based on fills from the submitted pair
+  orders themselves, not on whatever else happened to inventory while waiting.
+
+#### Fix 3: Pending pair imbalance is explicit state, and pair-arb admission uses projected gap
+- **File:** `src/bot.rs` - new helpers `_pair_arb_set_pending_imbalance`,
+  `_pair_arb_clear_pending_if_resolved`, `_pair_arb_pending_active`, and `_maker_skew_try_arb`
+  pre-submit gate (line ~4225, ~4269, ~5622)
+- **Problem:** `v0.1.18` suppressed some overlapping pair-arb entries, but it still inferred
+  unresolved imbalance indirectly and only checked the current YES/NO gap. A deferred 5-share
+  gap could still allow another 5-share pair to open before the threshold was exceeded.
+- **Fix:**
+  - Added `PairArbPendingImbalance { yes_oid, no_oid, heavy_side, light_side, gap_shares, created_ts }`
+  - When a maker pair partially fills and one leg is still live, the bot records pending
+    imbalance state explicitly
+  - New pair-arb submissions are now suppressed if either is true:
+    - pending imbalance is active
+    - `current_gap + pair_size > PAIR_ARB_MAX_IMBALANCE_SHARES`
+  - Pending imbalance clears only when actual filled inventory gap falls back under the release
+    threshold
+  - Added logs for set / clear / suppression reasons
+- **New env key:** `PAIR_ARB_IMBALANCE_RELEASE_SHARES` (default: `min_shares`)
+  - release threshold for clearing pending imbalance / recovery mode
+- **Impact:** Pair-arb overlap is now blocked by first-class unresolved state plus projected
+  post-trade skew, not just by a snapshot of the current gap.
+
+#### Fix 4: Recovery mode forces deficit-only rebalancing in normal maker flow
+- **File:** `src/bot.rs` - `_maker_skew_arb_step` (line ~6073)
+- **Problem:** Even after pair-arb defer and pair-arb suppression, the normal seed / ladder /
+  underdog logic could still buy the heavy inventory side because it was primarily price-driven.
+  That meant the bot could keep worsening skew after the pair-arb path itself had been blocked.
+- **Fix:**
+  - Added a recovery-mode gate in `_maker_skew_arb_step`
+  - Recovery mode activates when:
+    - pending pair imbalance exists, or
+    - effective YES/NO inventory gap exceeds `PAIR_ARB_MAX_IMBALANCE_SHARES`
+  - While active, the bot:
+    - cancels ladder and strategy maker BUY orders on the heavy side
+    - skips new pair-arb expansion
+    - forces side selection to the smaller inventory side
+    - tags the path as `imbalance_rebalance`
+  - Recovery mode exits only after the actual filled gap falls back under
+    `PAIR_ARB_IMBALANCE_RELEASE_SHARES`
+- **Impact:** Once skew recovery begins, normal maker flow can no longer accumulate the heavy
+  side. Rebalancing is explicitly deficit-only until the gap is resolved.
+
+### Logging / Observability
+- Added `[FILL][MAKER_DEDUPE]` for dropped duplicate maker executions
+- Added `[MAKER_SKEW][ARB] fill wait ... fy= fn=` for pair-order fill auditing
+- Added pending-imbalance set / clear logs with gap, age, and pair OID tails
+- Added pair-arb suppression logs for:
+  - `pending imbalance active`
+  - `projected_gap > PAIR_ARB_MAX_IMBALANCE_SHARES`
+- Added recovery-mode enter / remain / exit logs
+
+### New Environment Keys
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PAIR_ARB_IMBALANCE_RELEASE_SHARES` | `min_shares` | Filled-gap threshold to clear pending imbalance / recovery mode |
+
+### Behavior Impact
+- Maker fill accounting is now execution-deduped and order-centric.
+- Maker pair-arb defer / mismatch logic now evaluates only the submitted pair orders.
+- New pair-arb entries are blocked while prior deferred pair exposure is unresolved.
+- Normal maker flow switches to deficit-only rebalancing during imbalance recovery.
+- Reject cooldown / backoff behavior from `v0.1.18` is unchanged in this patch.
+
+### Validation
+- `cargo check -q`
+- `cargo test -q`
+
 ## Version 0.1.18
 Date: 2026-03-06
 ### Changes

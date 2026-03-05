@@ -180,6 +180,22 @@ struct MakerOrderSlot {
     replace_target: Option<MakerOrderReplaceTarget>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct MakerExecProgress {
+    applied_qty: f64,
+    last_update_ts: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PairArbPendingImbalance {
+    yes_oid: Option<String>,
+    no_oid: Option<String>,
+    heavy_side: String,
+    light_side: String,
+    gap_shares: f64,
+    created_ts: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SniperPostHedgePolicy {
     HybridTimed,
@@ -350,6 +366,9 @@ pub struct MakerHedgeCapBot {
     maker_ladder_open_orders: Arc<Mutex<HashMap<String, LadderOrderState>>>,
     maker_order_slots: Arc<Mutex<HashMap<MakerOrderKey, MakerOrderSlot>>>,
     maker_order_index: Arc<Mutex<HashMap<String, MakerOrderKey>>>,
+    maker_exec_progress: Arc<Mutex<HashMap<String, MakerExecProgress>>>,
+    maker_seen_exec_keys: Arc<Mutex<HashSet<String>>>,
+    pair_arb_pending_imbalance: Arc<Mutex<Option<PairArbPendingImbalance>>>,
 }
 
 impl MakerHedgeCapBot {
@@ -561,6 +580,9 @@ impl MakerHedgeCapBot {
             maker_ladder_open_orders: Arc::new(Mutex::new(HashMap::new())),
             maker_order_slots: Arc::new(Mutex::new(HashMap::new())),
             maker_order_index: Arc::new(Mutex::new(HashMap::new())),
+            maker_exec_progress: Arc::new(Mutex::new(HashMap::new())),
+            maker_seen_exec_keys: Arc::new(Mutex::new(HashSet::new())),
+            pair_arb_pending_imbalance: Arc::new(Mutex::new(None)),
         };
 
         runtime_flags.insert(
@@ -4046,6 +4068,234 @@ impl MakerHedgeCapBot {
         env_float("MAKER_SUBMIT_REJECT_COOLDOWN_SECONDS", 5.0).max(0.0)
     }
 
+    fn _pair_arb_imbalance_release_shares(&self) -> f64 {
+        env_float(
+            "PAIR_ARB_IMBALANCE_RELEASE_SHARES",
+            self.cfg.min_shares.max(1.0),
+        )
+        .max(0.0)
+    }
+
+    fn _maker_effective_inventory(&self) -> (f64, f64) {
+        let (q_yes, q_no) = self
+            .state
+            .lock()
+            .map(|s| (s.q_yes.max(0.0), s.q_no.max(0.0)))
+            .unwrap_or((0.0, 0.0));
+        if !env_bool("MAKER_EFFECTIVE_Q_INCLUDE_OPEN_BUYS", true) {
+            return (q_yes, q_no);
+        }
+        let yes_open = self
+            .yes_asset
+            .as_deref()
+            .map(|aid| self._maker_order_open_buy_remaining(aid))
+            .unwrap_or(0.0);
+        let no_open = self
+            .no_asset
+            .as_deref()
+            .map(|aid| self._maker_order_open_buy_remaining(aid))
+            .unwrap_or(0.0);
+        (q_yes + yes_open, q_no + no_open)
+    }
+
+    fn _maker_trade_exec_key(&self, msg: &Value, maker_leg: &Value) -> Option<String> {
+        let maker_oid = maker_leg
+            .get("order_id")
+            .or_else(|| maker_leg.get("orderId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if maker_oid.is_empty() {
+            return None;
+        }
+        let qty = Self::_value_f64(
+            maker_leg
+                .get("matched_amount")
+                .or_else(|| maker_leg.get("matchedAmount"))
+                .or_else(|| maker_leg.get("size"))
+                .or_else(|| maker_leg.get("filled")),
+        )
+        .unwrap_or(0.0);
+        let px = Self::_value_f64(maker_leg.get("price")).unwrap_or(0.0);
+        if qty <= 0.0 || px <= 0.0 {
+            return None;
+        }
+        let tx_hash = msg
+            .get("transaction_hash")
+            .or_else(|| msg.get("transactionHash"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let taker_oid = msg
+            .get("taker_order_id")
+            .or_else(|| msg.get("takerOrderId"))
+            .or_else(|| msg.get("taker_orderId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let match_time = msg
+            .get("match_time")
+            .or_else(|| msg.get("matchTime"))
+            .or_else(|| msg.get("timestamp"))
+            .or_else(|| msg.get("ts"))
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.trim().to_string()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let trade_id = msg
+            .get("id")
+            .or_else(|| msg.get("trade_id"))
+            .or_else(|| msg.get("tradeId"))
+            .or_else(|| msg.get("tradeID"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let status = msg
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        if !tx_hash.is_empty() && !taker_oid.is_empty() && !match_time.is_empty() {
+            return Some(format!(
+                "maker_exec:{maker_oid}:{tx_hash}:{taker_oid}:{match_time}:{qty:.8}:{px:.8}"
+            ));
+        }
+        if !trade_id.is_empty() {
+            return Some(format!(
+                "maker_exec:{maker_oid}:{trade_id}:{qty:.8}:{px:.8}"
+            ));
+        }
+        Some(format!(
+            "maker_exec:{maker_oid}:{status}:{match_time}:{qty:.8}:{px:.8}"
+        ))
+    }
+
+    fn _maker_exec_applied_qty(&self, order_id: &str) -> f64 {
+        if order_id.trim().is_empty() {
+            return 0.0;
+        }
+        self.maker_exec_progress
+            .lock()
+            .ok()
+            .and_then(|m| m.get(order_id).cloned())
+            .map(|r| r.applied_qty.max(0.0))
+            .unwrap_or(0.0)
+    }
+
+    fn _maker_record_exec_fill(&self, order_id: &str, exec_key: &str, qty: f64) -> bool {
+        if order_id.trim().is_empty() || exec_key.trim().is_empty() || qty <= 0.0 {
+            return false;
+        }
+        if let Ok(mut seen) = self.maker_seen_exec_keys.lock() {
+            if !seen.insert(exec_key.to_string()) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        if let Ok(mut progress) = self.maker_exec_progress.lock() {
+            let entry = progress.entry(order_id.to_string()).or_default();
+            entry.applied_qty += qty.max(0.0);
+            entry.last_update_ts = now_ts_f64();
+        }
+        true
+    }
+
+    fn _pair_arb_set_pending_imbalance(
+        &self,
+        yes_oid: Option<&str>,
+        no_oid: Option<&str>,
+        heavy_side: &str,
+        light_side: &str,
+        gap_shares: f64,
+    ) {
+        let gap = gap_shares.max(0.0);
+        if gap <= 1e-9 {
+            return;
+        }
+        let now = now_ts_f64();
+        if let Ok(mut holder) = self.pair_arb_pending_imbalance.lock() {
+            *holder = Some(PairArbPendingImbalance {
+                yes_oid: yes_oid.map(|s| s.to_string()).filter(|s| !s.trim().is_empty()),
+                no_oid: no_oid.map(|s| s.to_string()).filter(|s| !s.trim().is_empty()),
+                heavy_side: heavy_side.trim().to_ascii_uppercase(),
+                light_side: light_side.trim().to_ascii_uppercase(),
+                gap_shares: gap,
+                created_ts: now,
+            });
+        }
+        self.logger.info(&format!(
+            "[MAKER_SKEW][ARB] pending imbalance set heavy={} light={} gap={gap:.2}",
+            heavy_side.trim().to_ascii_uppercase(),
+            light_side.trim().to_ascii_uppercase()
+        ));
+    }
+
+    fn _pair_arb_clear_pending_if_resolved(&self) {
+        let release = self._pair_arb_imbalance_release_shares();
+        let now = now_ts_f64();
+        let (q_yes, q_no) = self
+            .state
+            .lock()
+            .map(|s| (s.q_yes.max(0.0), s.q_no.max(0.0)))
+            .unwrap_or((0.0, 0.0));
+        let gap = (q_yes - q_no).abs();
+        let mut cleared = false;
+        let mut heavy = "YES".to_string();
+        let mut light = "NO".to_string();
+        let mut pending_age_s = 0.0;
+        let mut yes_oid = "?".to_string();
+        let mut no_oid = "?".to_string();
+        if q_no > q_yes {
+            heavy = "NO".to_string();
+            light = "YES".to_string();
+        }
+        if let Ok(mut holder) = self.pair_arb_pending_imbalance.lock() {
+            if let Some(pending) = holder.as_mut() {
+                pending.gap_shares = gap;
+                pending.heavy_side = heavy.clone();
+                pending.light_side = light.clone();
+                pending_age_s = (now - pending.created_ts).max(0.0);
+                yes_oid = pending
+                    .yes_oid
+                    .as_deref()
+                    .map(|s| s.chars().take(10).collect::<String>())
+                    .unwrap_or_else(|| "?".to_string());
+                no_oid = pending
+                    .no_oid
+                    .as_deref()
+                    .map(|s| s.chars().take(10).collect::<String>())
+                    .unwrap_or_else(|| "?".to_string());
+                if gap <= release + 1e-6 {
+                    *holder = None;
+                    cleared = true;
+                }
+            }
+        }
+        if cleared {
+            self.logger.info(&format!(
+                "[MAKER_SKEW][ARB] pending imbalance cleared gap={gap:.2} release={release:.2} age={pending_age_s:.1}s yes_oid={} no_oid={}",
+                yes_oid,
+                no_oid
+            ));
+        }
+    }
+
+    fn _pair_arb_pending_active(&self) -> bool {
+        self._pair_arb_clear_pending_if_resolved();
+        self.pair_arb_pending_imbalance
+            .lock()
+            .map(|p| p.is_some())
+            .unwrap_or(false)
+    }
+
     fn _maker_order_slot_get(&self, key: &MakerOrderKey) -> MakerOrderSlot {
         self.maker_order_slots
             .lock()
@@ -5377,18 +5627,23 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|s| (s.q_yes, s.q_no))
             .unwrap_or((0.0, 0.0));
-
-        // Fix A: Block new pair arbs when YES/NO imbalance is too large.
-        // Lets base seed / hedge flows close the gap instead of compounding it.
-        let imbalance = (qy0 - qn0).abs();
+        let (q_yes_eff, q_no_eff) = self._maker_effective_inventory();
+        let current_gap = (q_yes_eff - q_no_eff).abs();
         let max_imbalance = env_float(
             "PAIR_ARB_MAX_IMBALANCE_SHARES",
             self.cfg.clip_shares.max(self.cfg.min_shares),
         )
         .max(1.0);
-        if imbalance > max_imbalance + 1e-6 {
+        if self._pair_arb_pending_active() {
             self.logger.info(&format!(
-                "[MAKER_SKEW][ARB] suppressed: imbalance={imbalance:.1} > max={max_imbalance:.1} (qYES={qy0:.0} qNO={qn0:.0})"
+                "[MAKER_SKEW][ARB] suppressed: pending imbalance active (qYES={q_yes_eff:.2} qNO={q_no_eff:.2} gap={current_gap:.2})"
+            ));
+            return false;
+        }
+        let projected_gap = current_gap + size_int as f64;
+        if projected_gap > max_imbalance + 1e-6 {
+            self.logger.info(&format!(
+                "[MAKER_SKEW][ARB] suppressed: projected_gap={projected_gap:.1} > max={max_imbalance:.1} (qYES={q_yes_eff:.1} qNO={q_no_eff:.1} size={size_int})"
             ));
             return false;
         }
@@ -5432,7 +5687,31 @@ impl MakerHedgeCapBot {
         }
 
         let timeout_s = env_float("PAIR_ARB_TIMEOUT_SECONDS", 2.0).max(0.2);
-        let (fy, fn_) = self._wait_for_pair_fills(qy0, qn0, size_int, timeout_s);
+        let y0 = 0.0;
+        let n0 = 0.0;
+        let (fy, fn_) = if is_maker {
+            self._wait_for_pair_order_fills(
+                y_oid.as_deref(),
+                n_oid.as_deref(),
+                y0,
+                n0,
+                size_int,
+                timeout_s,
+            )
+        } else {
+            self._wait_for_pair_fills(qy0, qn0, size_int, timeout_s)
+        };
+        self.logger.info(&format!(
+            "[MAKER_SKEW][ARB] fill wait y_oid={} n_oid={} fy={fy:.2} fn={fn_:.2}",
+            y_oid
+                .as_deref()
+                .map(|s| s.chars().take(10).collect::<String>())
+                .unwrap_or_else(|| "?".to_string()),
+            n_oid
+                .as_deref()
+                .map(|s| s.chars().take(10).collect::<String>())
+                .unwrap_or_else(|| "?".to_string())
+        ));
         let mismatch = (fy - fn_).abs() > 1e-6;
         let target = size_int as f64;
         let y_filled = fy >= target - 1e-6;
@@ -5480,6 +5759,15 @@ impl MakerHedgeCapBot {
                     }
                 }
             }
+            let heavy_side = if fy >= fn_ { "YES" } else { "NO" };
+            let light_side = if heavy_side == "YES" { "NO" } else { "YES" };
+            self._pair_arb_set_pending_imbalance(
+                y_oid.as_deref(),
+                n_oid.as_deref(),
+                heavy_side,
+                light_side,
+                (fy - fn_).abs(),
+            );
             self.logger.info(&format!(
                 "Pair arb partial: fy={fy:.0} fn={fn_:.0} - unfilled leg still live (y_live={y_live} n_live={n_live}), deferring hedge"
             ));
@@ -5495,6 +5783,8 @@ impl MakerHedgeCapBot {
             }
             if mismatch {
                 self._handle_exposure_mismatch(fy, fn_);
+            } else {
+                self._pair_arb_clear_pending_if_resolved();
             }
         }
         self._maker_record_trade_decision(
@@ -5800,6 +6090,44 @@ impl MakerHedgeCapBot {
             return;
         }
 
+        self._pair_arb_clear_pending_if_resolved();
+        let imbalance_gate = env_float(
+            "PAIR_ARB_MAX_IMBALANCE_SHARES",
+            self.cfg.clip_shares.max(self.cfg.min_shares),
+        )
+        .max(1.0);
+        let inventory_gap = (q_yes_eff - q_no_eff).abs();
+        let recovery_mode = self._pair_arb_pending_active() || inventory_gap > imbalance_gate + 1e-6;
+        let recovery_side = if q_yes_eff <= q_no_eff { "YES" } else { "NO" };
+        let recovery_asset = if recovery_side == "YES" { yes } else { no };
+        let recovery_heavy_side = if recovery_side == "YES" { "NO" } else { "YES" };
+        let recovery_active_key = "__maker_recovery_mode_active";
+        let recovery_log_key = "__maker_recovery_mode_log_until";
+        let recovery_log_every = 5.0;
+        if recovery_mode {
+            self._maker_ladder_cancel_all("imbalance recovery");
+            self._maker_cancel_strategy_orders(Some(recovery_asset), "imbalance recovery");
+            if self._runtime_ts_get(recovery_active_key) <= 0.0 {
+                self.logger.info(&format!(
+                    "[MAKER_SKEW] recovery mode enter gap={inventory_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
+                ));
+                self._runtime_ts_set(recovery_active_key, 1.0);
+                self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
+            } else if now >= self._runtime_ts_get(recovery_log_key) {
+                self.logger.info(&format!(
+                    "[MAKER_SKEW] recovery mode remain gap={inventory_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
+                ));
+                self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
+            }
+        } else if self._runtime_ts_get(recovery_active_key) > 0.0 {
+            self.logger.info(&format!(
+                "[MAKER_SKEW] recovery mode exit gap={inventory_gap:.2} threshold={:.2}",
+                self._pair_arb_imbalance_release_shares()
+            ));
+            self._runtime_ts_set(recovery_active_key, 0.0);
+            self._runtime_ts_set(recovery_log_key, 0.0);
+        }
+
         if self._maker_skew_try_arb(
             budget_usable,
             y_bid,
@@ -5858,11 +6186,22 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        let mut side = underdog.to_string();
-        let mut role = "underdog".to_string();
+        let mut side = if recovery_mode {
+            recovery_side.to_string()
+        } else {
+            underdog.to_string()
+        };
+        let mut role = if recovery_mode {
+            "imbalance_rebalance".to_string()
+        } else {
+            "underdog".to_string()
+        };
         let side_yes = q_yes_eff.max(0.0);
         let side_no = q_no_eff.max(0.0);
-        if side_yes < min_base || side_no < min_base {
+        if recovery_mode {
+            side = recovery_side.to_string();
+            role = "imbalance_rebalance".to_string();
+        } else if side_yes < min_base || side_no < min_base {
             side = if side_yes <= side_no {
                 "YES".to_string()
             } else {
@@ -7593,15 +7932,67 @@ impl MakerHedgeCapBot {
                         .or_else(|| mo.get("orderId"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let key = if !trade_id.is_empty() {
-                        format!("{trade_id}:maker")
-                    } else {
-                        format!("trade_fallback:maker:{maker_oid}:{asset}:{side}:{qty:.8}:{px:.8}")
-                    };
+                    let key = self._maker_trade_exec_key(msg, &mo).unwrap_or_else(|| {
+                        if !trade_id.is_empty() {
+                            format!("maker_exec:{maker_oid}:{trade_id}:{qty:.8}:{px:.8}")
+                        } else {
+                            format!(
+                                "trade_fallback:maker:{maker_oid}:{asset}:{side}:{qty:.8}:{px:.8}"
+                            )
+                        }
+                    });
+                    let already_seen = self
+                        .maker_seen_exec_keys
+                        .lock()
+                        .map(|s| s.contains(&key))
+                        .unwrap_or(false);
+                    if already_seen {
+                        let tx_hash = msg
+                            .get("transaction_hash")
+                            .or_else(|| msg.get("transactionHash"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let taker_oid = msg
+                            .get("taker_order_id")
+                            .or_else(|| msg.get("takerOrderId"))
+                            .or_else(|| msg.get("taker_orderId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let match_time = msg
+                            .get("match_time")
+                            .or_else(|| msg.get("matchTime"))
+                            .or_else(|| msg.get("timestamp"))
+                            .or_else(|| msg.get("ts"))
+                            .map(|v| match v {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                _ => "".to_string(),
+                            })
+                            .unwrap_or_default();
+                        self.logger.info(&format!(
+                            "[FILL][MAKER_DEDUPE] drop oid={}.. qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                            maker_oid.chars().take(10).collect::<String>(),
+                            trade_id,
+                            tx_hash,
+                            taker_oid,
+                            match_time
+                        ));
+                        return;
+                    }
                     let applied = self._apply_fill(&asset, px, qty, &key, &side);
                     if applied && !maker_oid.is_empty() {
+                        let _ = self._maker_record_exec_fill(maker_oid, &key, qty);
                         self._sniper_record_order_fill(maker_oid, px, qty);
                         self._log_execution_latency_on_fill(maker_oid, now_ts_f64());
+                    } else if self
+                        .state
+                        .lock()
+                        .map(|s| s.seen_trade_keys.iter().any(|k| k == &key))
+                        .unwrap_or(false)
+                    {
+                        if let Ok(mut seen) = self.maker_seen_exec_keys.lock() {
+                            seen.insert(key);
+                        }
                     }
                     return;
                 }
@@ -8920,6 +9311,41 @@ impl MakerHedgeCapBot {
         }
         let s = self.state.lock().map(|v| v.clone()).unwrap_or_default();
         ((s.q_yes - qy0).max(0.0), (s.q_no - qn0).max(0.0))
+    }
+
+    pub fn _wait_for_pair_order_fills(
+        &self,
+        y_oid: Option<&str>,
+        n_oid: Option<&str>,
+        y0: f64,
+        n0: f64,
+        target_size: i64,
+        timeout_s: f64,
+    ) -> (f64, f64) {
+        let deadline = now_ts_f64() + timeout_s.max(0.01);
+        while now_ts_f64() < deadline && !self.stop_flag.load(Ordering::SeqCst) {
+            let fy = y_oid
+                .map(|oid| (self._maker_exec_applied_qty(oid) - y0).max(0.0))
+                .unwrap_or(0.0);
+            let fn_ = n_oid
+                .map(|oid| (self._maker_exec_applied_qty(oid) - n0).max(0.0))
+                .unwrap_or(0.0);
+            if fy >= target_size as f64 && fn_ >= target_size as f64 {
+                return (fy, fn_);
+            }
+            let rem = (deadline - now_ts_f64()).max(0.0);
+            if rem <= 0.0 {
+                break;
+            }
+            thread::sleep(Duration::from_secs_f64(rem.min(0.05)));
+        }
+        let fy = y_oid
+            .map(|oid| (self._maker_exec_applied_qty(oid) - y0).max(0.0))
+            .unwrap_or(0.0);
+        let fn_ = n_oid
+            .map(|oid| (self._maker_exec_applied_qty(oid) - n0).max(0.0))
+            .unwrap_or(0.0);
+        (fy, fn_)
     }
 
     pub fn _handle_exposure_mismatch(&self, filled_yes: f64, filled_no: f64) {

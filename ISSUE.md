@@ -1,4 +1,4 @@
-# Issue: Same-Side Maker GTC Accumulation (Duplicate In-Flight Orders)
+# Issue #1: Same-Side Maker GTC Accumulation (Duplicate In-Flight Orders)
 
 ## Status
 - Date: 2026-03-05
@@ -119,7 +119,146 @@ In `src/env_contract.rs`:
 4. No force-flatten triggered due to duplicate-order artifact.
 5. Risk controls still trigger when true risk breaches occur.
 
+---
+
+# Issue #2: Pair Arb Runaway Accumulation + Submit Reject Spam
+
+## Status
+- Date: 2026-03-06
+- Severity: High (capital loss, wasted API calls)
+- Scope: `MAKER_SKEW_ARB` pair arb flow + maker submit lifecycle
+- Current state: Fixed in v0.1.18. Imbalance guard, reject backoff deployed. Quote invalidation bypass pending.
+
+## Problem Summary
+Three compounding issues discovered in production runs `btc-updown-5m-1772743500` (LP=+2.28, lucky) and `btc-updown-5m-1772743800` (LP=-2.30, loss):
+
+1. **Pair arb runaway accumulation:** When one pair leg fills fast and the other is deferred (v0.1.17 Fix 2), the bot immediately fires another pair arb, compounding the YES/NO gap. Observed: YES=30 vs NO=10 (3:1 ratio) within seconds, requiring taker FAK at 0.70-0.74 to catch up.
+2. **Submit reject spam:** 17 rejects over 100 seconds with flat 5s cooldown. Exchange consistently rejecting at a price level, but bot retries forever.
+3. **Deferred leg orphaned:** When Fix 2 defers a hedge and the live leg is later cancelled by another path (quote invalidation, ladder mode), the gap is never explicitly closed.
+
+## Observed Symptoms
+
+### Run `btc-updown-5m-1772743500` (v0.1.17, LP=+2.28)
+- `03:50:38` pair arb defers (NO still live), YES=15 NO=10
+- `03:50:38` immediately fires ANOTHER pair arb
+- `03:50:44` defers again, YES=30 NO=10 (3:1 ratio)
+- `03:50:47` forced taker FAK BUY 5 NO @ 0.70
+- `03:50:55` another taker FAK BUY 5 NO @ 0.74
+- Got lucky: BTC went UP (YES wins), LP=+2.28
+
+### Run `btc-updown-5m-1772743800` (v0.1.17, LP=-2.30)
+- Same pair arb compounding pattern: YES=30 NO=10
+- Two taker FAK at 0.70 and 0.74 to catch up
+- 17 submit rejects on YES side (03:51:21 to 03:53:05)
+- Emergency hedge blocked at expiry (ask=0.84 vs cap=0.52)
+- BTC went DOWN: LP=-2.30
+
+## Root Cause
+
+### Pair arb compounding
+No check for existing position imbalance before opening new pair arb. Each arb is individually valid (edge > 0), but aggregate position becomes dangerously one-sided when multiple pairs overlap with deferred legs.
+
+### Submit reject spam
+The 5s flat cooldown prevents rapid-fire rejects but allows infinite retries at the same interval. When the exchange has no liquidity at the desired price level, 5s is not enough backoff.
+
+### Deferred leg orphan
+v0.1.17 Fix 2 defers hedge when unfilled leg is "still live." But if another code path (quote invalidation, ladder mode) cancels that leg, the gap becomes permanent. No follow-up mechanism tracks the orphaned gap.
+
+## Implemented Fixes (v0.1.18)
+
+### Fix A: Pair arb imbalance guard
+In `src/bot.rs` — `_maker_skew_try_arb` (line ~5372):
+- Before submitting pair orders, check `|qYES - qNO| > PAIR_ARB_MAX_IMBALANCE_SHARES`.
+- If imbalanced, suppress pair arb and log suppression.
+- Base seed, ladder, and taker hedge paths remain free to rebalance.
+- Default threshold: `max(clip_shares, min_shares)` (typically 8 shares).
+
+### Fix B: Submit reject exponential backoff
+In `src/bot.rs`:
+- Added `consecutive_rejects` counter to `MakerOrderSlot` (line ~169).
+- `_maker_order_on_submit_reject` increments counter (line ~4198).
+- `_maker_order_on_submit_ack` resets counter to 0 (line ~4165).
+- `_maker_order_upsert_gtc` cooldown uses `base * 2^(n-1)`, capped at max (line ~4668).
+- Schedule: 5s → 10s → 20s → 40s → 60s (cap).
+- Reduces 17 rejects to ~3-4 over same period.
+
+### Fix C: Deferred leg follow-through
+Covered by Fix A — imbalance guard prevents compounding. Existing ladder path (line ~5861) picks deficit side for rebalancing when `skew_ratio > ratio_max` or CPP soft cap hit.
+
+### Config keys added
+In `src/env_contract.rs`:
+- `PAIR_ARB_MAX_IMBALANCE_SHARES` (default: `max(clip_shares, min_shares)`)
+- `MAKER_SUBMIT_REJECT_COOLDOWN_SECONDS` (default: 5.0)
+- `MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS` (default: 60.0)
+
+## Validation (v0.1.18 test run `btc-updown-5m-1772745300`)
+- Only 1 pair arb fired (vs 2-3 previously). Fix A would block second if attempted.
+- Zero submit rejects (vs 17 previously). Fix B working.
+- No cancel churn. Fix 1 (v0.1.17) holding.
+- Deferred hedge correctly applied at 04:15:57.
+- **New issue discovered:** see below.
+
+---
+
+# Issue #3: Quote Invalidation Blocks Hedge Rebalancing
+
+## Status
+- Date: 2026-03-06
+- Severity: Medium-High (leaves imbalanced position exposed to expiry)
+- Scope: `_quotes_invalidated` gate in `_maker_skew_main_loop`
+- Current state: Identified, not yet implemented.
+
+## Problem Summary
+When the market spread is tight (YES bid + NO ask > 0.98), `_quotes_invalidated()` returns true and the bot cancels all orders and returns early from the main loop. This blocks ALL order activity including hedge/rebalancing orders on the deficit side. The bot sits idle with an imbalanced position until expiry.
+
+## Observed Symptoms
+
+### Run `btc-updown-5m-1772745300` (v0.1.18, LP=-3.89)
+- At 04:16:16, position is YES=15, NO=24.99 (ratio=1.666, gap=9.99 shares).
+- Spread tight: YES bid + NO ask ≈ 0.99 > 0.98 threshold.
+- `_quotes_invalidated` returns true on EVERY loop iteration.
+- Bot cancels (nothing to cancel) and returns. Never reaches ladder/hedge code.
+- **3 minutes of total inactivity** (04:16:16 to 04:19:10) with exposed position.
+- Emergency hedge blocked at expiry (ask=1.00 vs cap=0.58).
+- Only ~5 YES shares grabbed by near-expiry maker order before cancel-all.
+
+## Root Cause
+The `_quotes_invalidated` gate (line ~5783 in `_maker_skew_main_loop`) is a blanket block. It correctly prevents accumulation orders when spreads are unfavorable, but it also blocks hedge/rebalancing orders that would **reduce** risk.
+
+### Code flow when invalidated:
+```
+_quotes_invalidated() == true
+  → _maker_ladder_cancel_all()     // cancels aggressive orders (correct)
+  → _maker_cancel_strategy_orders() // cancels strategy orders (correct)
+  → return                          // blocks ALL further logic (WRONG for hedge)
+```
+
+The ladder path at line ~5861 would pick the deficit side (YES) for rebalancing, but it's never reached.
+
+## Proposed Fix: Hedge Bypass on Quote Invalidation
+When quotes are invalidated BUT position is imbalanced beyond a threshold:
+1. Still cancel existing aggressive orders (keep current behavior).
+2. Do NOT return early — fall through to ladder path.
+3. Force side = deficit side, role = "hedge".
+4. Post maker order at bid price on deficit side.
+5. New env key: `MAKER_SKEW_HEDGE_BYPASS_QUOTE_INVALIDATION` (default: true).
+6. New env key: `MAKER_SKEW_HEDGE_BYPASS_MIN_GAP` (default: clip_shares).
+
+### Constraints:
+- Only deficit side allowed through (reduces risk, doesn't increase it).
+- Only when gap > minimum threshold.
+- Uses maker posting (not taker), so no overpaying.
+- Still goes through `_maker_order_upsert_gtc` lifecycle gate.
+- Reject backoff (Fix B) prevents spam if price level unavailable.
+
+### Expected impact:
+- In the test run, bot would have posted YES orders during the 3-minute idle window.
+- Even slow fills would close the gap partially before expiry.
+- No change to behavior when position is balanced.
+
 ## Notes for Next AI Model
-- Primary files to inspect: `src/bot.rs`, `src/env_contract.rs`.
-- Key methods: `_maker_order_upsert_gtc`, `_maker_order_reconcile_asset`, `_maker_order_on_user_event`, `_maker_order_request_cancel`, `_maker_order_open_buy_remaining`.
-- Main remaining watchpoint: repeated cancel-request churn for same OID under quote-invalidation loops; ensure cancel state + exchange ACK transitions remain stable.
+- Primary files: `src/bot.rs`, `src/env_contract.rs`.
+- Key methods for this issue: `_quotes_invalidated` (line ~5883), the invalidation gate (line ~5783), ladder side selection (line ~5861).
+- The fix modifies the early-return block at line ~5784-5801 to conditionally fall through.
+- Must ensure the bypass only allows deficit-side hedge orders, not new accumulation.
+- Test with runs where spread is persistently tight (sum > 0.98) and position is imbalanced.
