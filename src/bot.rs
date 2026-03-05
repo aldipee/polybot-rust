@@ -12,14 +12,14 @@ use crate::logging::LogLike;
 use crate::rtds::get_live_snapshot_for_market;
 use crate::signal::{LatencyLogService, SignalHub};
 use crate::sniper_filters::{
-    BreakoutInvalidationStopDecision, FilterDecision as SniperFilterDecision, normalize_asset_symbol,
-    SniperFilterEngine, SniperFilterPersistedState,
+    normalize_asset_symbol, BreakoutInvalidationStopDecision,
+    FilterDecision as SniperFilterDecision, SniperFilterEngine, SniperFilterPersistedState,
 };
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Result};
 use chrono::{TimeZone, Utc};
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use reqwest::blocking::Client;
 use rs_clob_client::headers::create_l2_headers;
 use rs_clob_client::{
@@ -132,6 +132,50 @@ struct LadderOrderState {
     price: f64,
     size: f64,
     ts: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MakerOrderKey {
+    asset_id: String,
+    side: String,
+}
+
+impl MakerOrderKey {
+    fn buy(asset_id: &str) -> Self {
+        Self {
+            asset_id: asset_id.trim().to_string(),
+            side: "BUY".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MakerOrderLifecycle {
+    #[default]
+    Idle,
+    SubmitPending,
+    Working,
+    CancelPending,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MakerOrderReplaceTarget {
+    price: f64,
+    size: f64,
+    origin: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MakerOrderSlot {
+    state: MakerOrderLifecycle,
+    order_id: Option<String>,
+    price: f64,
+    size: f64,
+    remaining: f64,
+    last_submit_ts: f64,
+    last_cancel_ts: f64,
+    origin: String,
+    replace_target: Option<MakerOrderReplaceTarget>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +346,8 @@ pub struct MakerHedgeCapBot {
     sniper_order_fill_agg: Arc<Mutex<HashMap<String, SniperOrderFillAgg>>>,
     maker_skew_state: Arc<Mutex<MakerSkewArbState>>,
     maker_ladder_open_orders: Arc<Mutex<HashMap<String, LadderOrderState>>>,
+    maker_order_slots: Arc<Mutex<HashMap<MakerOrderKey, MakerOrderSlot>>>,
+    maker_order_index: Arc<Mutex<HashMap<String, MakerOrderKey>>>,
 }
 
 impl MakerHedgeCapBot {
@@ -511,6 +557,8 @@ impl MakerHedgeCapBot {
             sniper_order_fill_agg: Arc::new(Mutex::new(HashMap::new())),
             maker_skew_state: Arc::new(Mutex::new(MakerSkewArbState::default())),
             maker_ladder_open_orders: Arc::new(Mutex::new(HashMap::new())),
+            maker_order_slots: Arc::new(Mutex::new(HashMap::new())),
+            maker_order_index: Arc::new(Mutex::new(HashMap::new())),
         };
 
         runtime_flags.insert(
@@ -1189,7 +1237,9 @@ impl MakerHedgeCapBot {
         if !(b.applied && b.passed && b.triggered) {
             return None;
         }
-        let (Some(hk), Some(lk), Some(buffer_up), Some(buffer_dn)) = (b.hk, b.lk, b.buffer_up, b.buffer_dn) else {
+        let (Some(hk), Some(lk), Some(buffer_up), Some(buffer_dn)) =
+            (b.hk, b.lk, b.buffer_up, b.buffer_dn)
+        else {
             return None;
         };
         if b.direction.as_str() == "NONE" {
@@ -1301,21 +1351,14 @@ impl MakerHedgeCapBot {
             .unwrap_or(0.0);
         let (distance_bps, armed_already_invalidated, entry_buffer_dn, entry_buffer_up) =
             if anchor.side.trim().eq_ignore_ascii_case("NO") && anchor.entry_buffer_dn > 0.0 {
-                let d = ((armed_price - anchor.entry_buffer_dn) / anchor.entry_buffer_dn) * 10_000.0;
-                (
-                    Some(d),
-                    Some(d > 0.0),
-                    Some(anchor.entry_buffer_dn),
-                    None,
-                )
-            } else if anchor.side.trim().eq_ignore_ascii_case("YES") && anchor.entry_buffer_up > 0.0 {
-                let d = ((anchor.entry_buffer_up - armed_price) / anchor.entry_buffer_up) * 10_000.0;
-                (
-                    Some(d),
-                    Some(d > 0.0),
-                    None,
-                    Some(anchor.entry_buffer_up),
-                )
+                let d =
+                    ((armed_price - anchor.entry_buffer_dn) / anchor.entry_buffer_dn) * 10_000.0;
+                (Some(d), Some(d > 0.0), Some(anchor.entry_buffer_dn), None)
+            } else if anchor.side.trim().eq_ignore_ascii_case("YES") && anchor.entry_buffer_up > 0.0
+            {
+                let d =
+                    ((anchor.entry_buffer_up - armed_price) / anchor.entry_buffer_up) * 10_000.0;
+                (Some(d), Some(d > 0.0), None, Some(anchor.entry_buffer_up))
             } else {
                 (None, None, None, None)
             };
@@ -1503,7 +1546,11 @@ impl MakerHedgeCapBot {
         }
     }
 
-    fn _sniper_apply_fill_stats_to_decision(&self, data: &mut TradeDecisionUpsert, agg: &SniperOrderFillAgg) {
+    fn _sniper_apply_fill_stats_to_decision(
+        &self,
+        data: &mut TradeDecisionUpsert,
+        agg: &SniperOrderFillAgg,
+    ) {
         if agg.qty <= 1e-12 || agg.notional <= 1e-12 {
             return;
         }
@@ -3855,15 +3902,11 @@ impl MakerHedgeCapBot {
     }
 
     fn _maker_pick_clip_size_for_price(&self, price: f64, peak_window: bool) -> f64 {
-        let small = self._parse_clip_set_from_env(
-            "MAKER_CLIP_SET_SMALL",
-            &[2, 3, 5, 7, 8, 9, 10, 11, 12],
-        );
+        let small =
+            self._parse_clip_set_from_env("MAKER_CLIP_SET_SMALL", &[2, 3, 5, 7, 8, 9, 10, 11, 12]);
         let mid = self._parse_clip_set_from_env("MAKER_CLIP_SET_MID", &[16, 21, 30, 35, 36]);
-        let large = self._parse_clip_set_from_env(
-            "MAKER_CLIP_SET_LARGE",
-            &[40, 42, 45, 48, 54, 56],
-        );
+        let large =
+            self._parse_clip_set_from_env("MAKER_CLIP_SET_LARGE", &[40, 42, 45, 48, 54, 56]);
 
         let mut rng = rand::thread_rng();
         let mut pick = |pool: &[i64], fallback: i64| -> i64 {
@@ -3977,7 +4020,685 @@ impl MakerHedgeCapBot {
         gross - fee_yes - fee_no
     }
 
-    fn _maker_payoff_envelope(shares_up: f64, shares_down: f64, cost_total: f64) -> (f64, f64, f64) {
+    fn _maker_single_inflight_enabled(&self) -> bool {
+        env_bool("MAKER_SINGLE_INFLIGHT_PER_SIDE", true)
+    }
+
+    fn _maker_submit_pending_ttl_seconds(&self) -> f64 {
+        env_float("MAKER_SUBMIT_PENDING_TTL_SECONDS", 6.0).max(0.5)
+    }
+
+    fn _maker_cancel_pending_ttl_seconds(&self) -> f64 {
+        env_float("MAKER_CANCEL_PENDING_TTL_SECONDS", 3.0).max(0.5)
+    }
+
+    fn _maker_working_missing_ttl_seconds(&self) -> f64 {
+        env_float("MAKER_WORKING_MISSING_TTL_SECONDS", 12.0).max(1.0)
+    }
+
+    fn _maker_replace_min_interval_seconds(&self) -> f64 {
+        env_float("MAKER_REPLACE_MIN_INTERVAL_SECONDS", 0.5).max(0.0)
+    }
+
+    fn _maker_order_slot_get(&self, key: &MakerOrderKey) -> MakerOrderSlot {
+        self.maker_order_slots
+            .lock()
+            .ok()
+            .and_then(|m| m.get(key).cloned())
+            .unwrap_or_default()
+    }
+
+    fn _maker_order_clear_index_for_key(&self, key: &MakerOrderKey) {
+        if let Ok(mut idx) = self.maker_order_index.lock() {
+            idx.retain(|_, v| v != key);
+        }
+    }
+
+    fn _maker_order_open_buy_remaining(&self, asset_id: &str) -> f64 {
+        if !self._maker_single_inflight_enabled() {
+            return 0.0;
+        }
+        let key = MakerOrderKey::buy(asset_id);
+        let slot = self._maker_order_slot_get(&key);
+        if matches!(
+            slot.state,
+            MakerOrderLifecycle::Working
+                | MakerOrderLifecycle::SubmitPending
+                | MakerOrderLifecycle::CancelPending
+        ) {
+            if slot.remaining > 0.0 {
+                slot.remaining.max(0.0)
+            } else {
+                slot.size.max(0.0)
+            }
+        } else {
+            0.0
+        }
+    }
+
+    fn _maker_order_on_cancel_ack_by_order_id(&self, order_id: &str) {
+        if !self._maker_single_inflight_enabled() || order_id.trim().is_empty() {
+            return;
+        }
+        let key = self
+            .maker_order_index
+            .lock()
+            .ok()
+            .and_then(|idx| idx.get(order_id).cloned());
+        let Some(key) = key else {
+            return;
+        };
+        if let Ok(mut slots) = self.maker_order_slots.lock() {
+            let slot = slots.entry(key).or_default();
+            if slot.order_id.as_deref() == Some(order_id) {
+                slot.state = MakerOrderLifecycle::CancelPending;
+                slot.last_cancel_ts = now_ts_f64();
+            }
+        }
+    }
+
+    fn _maker_order_on_submit_ack(
+        &self,
+        order_id: &str,
+        key: &MakerOrderKey,
+        price: f64,
+        size: f64,
+        origin: &str,
+    ) {
+        if !self._maker_single_inflight_enabled() || order_id.trim().is_empty() {
+            return;
+        }
+        let now = now_ts_f64();
+        let mut prev_oid: Option<String> = None;
+        if let Ok(mut slots) = self.maker_order_slots.lock() {
+            let slot = slots.entry(key.clone()).or_default();
+            prev_oid = slot.order_id.clone();
+            slot.state = MakerOrderLifecycle::Working;
+            slot.order_id = Some(order_id.to_string());
+            slot.price = price;
+            slot.size = size.max(0.0);
+            slot.remaining = size.max(0.0);
+            slot.last_submit_ts = now;
+            slot.origin = origin.to_string();
+            slot.replace_target = None;
+        }
+        if let Ok(mut idx) = self.maker_order_index.lock() {
+            if let Some(prev) = prev_oid {
+                if prev != order_id {
+                    idx.remove(&prev);
+                }
+            }
+            idx.insert(order_id.to_string(), key.clone());
+        }
+        if key.side == "BUY" && !key.asset_id.trim().is_empty() {
+            if let Ok(mut s) = self.state.lock() {
+                s.open_orders.insert(
+                    key.asset_id.clone(),
+                    OpenOrderState {
+                        order_id: Some(order_id.to_string()),
+                        price: Some(price),
+                        size: Some(size.max(0.0)),
+                        ts: Some(now),
+                    },
+                );
+                let _ = save_state(&self.state_file, &mut s);
+            }
+        }
+    }
+
+    fn _maker_order_on_submit_reject(&self, key: &MakerOrderKey, reason: &str) {
+        if !self._maker_single_inflight_enabled() {
+            return;
+        }
+        if let Ok(mut slots) = self.maker_order_slots.lock() {
+            let slot = slots.entry(key.clone()).or_default();
+            if slot.order_id.is_some() {
+                slot.state = MakerOrderLifecycle::Working;
+            } else {
+                slot.state = MakerOrderLifecycle::Idle;
+                slot.replace_target = None;
+            }
+        }
+        if !reason.trim().is_empty() {
+            self.logger.warning(&format!(
+                "[MAKER_ORD] submit reject asset={} side={} reason={reason}",
+                key.asset_id, key.side
+            ));
+        }
+    }
+
+    fn _maker_order_request_cancel(&self, key: &MakerOrderKey, reason: &str) -> bool {
+        if !self._maker_single_inflight_enabled() {
+            return false;
+        }
+        let now = now_ts_f64();
+        let slot = self._maker_order_slot_get(key);
+        let Some(oid) = slot.order_id.clone() else {
+            return false;
+        };
+        if slot.state == MakerOrderLifecycle::CancelPending
+            && now - slot.last_cancel_ts < self._maker_cancel_pending_ttl_seconds()
+        {
+            return false;
+        }
+        if now - slot.last_cancel_ts < self._maker_replace_min_interval_seconds() {
+            return false;
+        }
+        if !self._cancel(&oid) {
+            return false;
+        }
+        if let Ok(mut slots) = self.maker_order_slots.lock() {
+            if let Some(s) = slots.get_mut(key) {
+                if s.order_id.as_deref() == Some(oid.as_str()) {
+                    s.state = MakerOrderLifecycle::CancelPending;
+                    s.last_cancel_ts = now;
+                }
+            }
+        }
+        if !reason.trim().is_empty() {
+            self.logger.info(&format!(
+                "[MAKER_ORD] cancel requested asset={} side={} oid={}.. ({reason})",
+                key.asset_id,
+                key.side,
+                oid.chars().take(10).collect::<String>()
+            ));
+        }
+        true
+    }
+
+    fn _maker_order_cancel_all_except_asset(&self, keep_asset_id: Option<&str>, reason: &str) {
+        if !self._maker_single_inflight_enabled() {
+            return;
+        }
+        let keep = keep_asset_id.unwrap_or("").trim().to_string();
+        let keys: Vec<MakerOrderKey> = self
+            .maker_order_slots
+            .lock()
+            .map(|m| {
+                m.keys()
+                    .filter_map(|k| {
+                        if k.side != "BUY" {
+                            return None;
+                        }
+                        if !keep.is_empty() && k.asset_id == keep {
+                            return None;
+                        }
+                        Some(k.clone())
+                    })
+                    .collect::<Vec<MakerOrderKey>>()
+            })
+            .unwrap_or_default();
+        for key in keys {
+            let _ = self._maker_order_request_cancel(&key, reason);
+        }
+    }
+
+    fn _maker_cancel_strategy_orders(&self, keep_asset_id: Option<&str>, reason: &str) {
+        if self._maker_single_inflight_enabled() {
+            self._maker_order_cancel_all_except_asset(keep_asset_id, reason);
+            return;
+        }
+        if let Some(keep) = keep_asset_id {
+            self.cancel_all_open_orders_local_except(keep, reason);
+        } else {
+            self.cancel_all_open_orders_local(reason);
+        }
+    }
+
+    fn _maker_order_reconcile_asset(&self, asset_id: &str, intended_price: Option<f64>) {
+        if !self._maker_single_inflight_enabled() || self.cfg.dry_run {
+            return;
+        }
+        let aid = asset_id.trim().to_string();
+        if aid.is_empty() {
+            return;
+        }
+        let key = MakerOrderKey::buy(&aid);
+        let max_active = env_int("MAKER_MAX_ACTIVE_BUY_ORDERS_PER_ASSET", 1).max(1) as usize;
+        let pick_keep_oid = |orders: &[Value], tracked_oid: Option<String>| -> Option<String> {
+            if orders.is_empty() {
+                return None;
+            }
+            if let Some(t) = tracked_oid {
+                let has_tracked = orders
+                    .iter()
+                    .any(|o| self._extract_order_id(o).map(|id| id == t).unwrap_or(false));
+                if has_tracked {
+                    return Some(t);
+                }
+            }
+            if let Some(ip) = intended_price.filter(|p| *p > 0.0) {
+                return orders
+                    .iter()
+                    .filter_map(|o| {
+                        let oid = self._extract_order_id(o)?;
+                        let d = (self._extract_order_price(o) - ip).abs();
+                        Some((oid, d))
+                    })
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|x| x.0);
+            }
+            orders
+                .iter()
+                .filter_map(|o| {
+                    self._extract_order_id(o)
+                        .map(|oid| (oid, self._extract_order_price(o)))
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|x| x.0)
+        };
+
+        let mut buy_orders: Vec<Value> = self
+            ._list_open_orders_exchange()
+            .into_iter()
+            .filter(|o| {
+                self._extract_order_token_id(o).as_deref() == Some(aid.as_str())
+                    && self._extract_order_side(o) == "BUY"
+                    && self._extract_order_id(o).is_some()
+                    && self._extract_order_remaining_size(o) > 1e-9
+            })
+            .collect();
+        if buy_orders.len() > max_active {
+            let tracked_oid = self._maker_order_slot_get(&key).order_id;
+            let keep_oid = pick_keep_oid(&buy_orders, tracked_oid);
+            for o in &buy_orders {
+                let Some(oid) = self._extract_order_id(o) else {
+                    continue;
+                };
+                if keep_oid.as_deref() == Some(oid.as_str()) {
+                    continue;
+                }
+                let _ = self._cancel(&oid);
+            }
+            buy_orders = self
+                ._list_open_orders_exchange()
+                .into_iter()
+                .filter(|o| {
+                    self._extract_order_token_id(o).as_deref() == Some(aid.as_str())
+                        && self._extract_order_side(o) == "BUY"
+                        && self._extract_order_id(o).is_some()
+                        && self._extract_order_remaining_size(o) > 1e-9
+                })
+                .collect();
+        }
+
+        let tracked_oid = self._maker_order_slot_get(&key).order_id;
+        let keep_oid = pick_keep_oid(&buy_orders, tracked_oid);
+        let keep_order = keep_oid.as_ref().and_then(|oid| {
+            buy_orders.iter().find_map(|o| {
+                self._extract_order_id(o)
+                    .filter(|x| x == oid)
+                    .map(|_| o.clone())
+            })
+        });
+
+        if let Some(order) = keep_order {
+            let oid = self._extract_order_id(&order).unwrap_or_default();
+            let price = self._extract_order_price(&order);
+            let remaining = self._extract_order_remaining_size(&order).max(0.0);
+            let size = remaining.max(0.0);
+            self._maker_order_on_submit_ack(&oid, &key, price, size, "RECONCILE");
+            if max_active == 1 {
+                for o in buy_orders {
+                    let Some(oid2) = self._extract_order_id(&o) else {
+                        continue;
+                    };
+                    if oid2 == oid {
+                        continue;
+                    }
+                    let _ = self._cancel(&oid2);
+                }
+            }
+            return;
+        }
+
+        let now = now_ts_f64();
+        let submit_ttl = self._maker_submit_pending_ttl_seconds();
+        let cancel_ttl = self._maker_cancel_pending_ttl_seconds();
+        let working_missing_ttl = self._maker_working_missing_ttl_seconds();
+        let cur_slot = self._maker_order_slot_get(&key);
+        if buy_orders.is_empty()
+            && cur_slot.state == MakerOrderLifecycle::Working
+            && cur_slot.order_id.is_some()
+            && (now - cur_slot.last_submit_ts) < working_missing_ttl
+        {
+            // Exchange list can be transiently stale right after submit/cancel churn.
+            // Keep local working slot conservative for a short grace period to avoid
+            // duplicate same-side submits.
+            return;
+        }
+        if let Ok(mut slots) = self.maker_order_slots.lock() {
+            let slot = slots.entry(key.clone()).or_default();
+            let keep_pending = match slot.state {
+                MakerOrderLifecycle::SubmitPending => now - slot.last_submit_ts < submit_ttl,
+                MakerOrderLifecycle::CancelPending => now - slot.last_cancel_ts < cancel_ttl,
+                _ => false,
+            };
+            if !keep_pending {
+                slot.state = MakerOrderLifecycle::Idle;
+                slot.order_id = None;
+                slot.remaining = 0.0;
+                slot.replace_target = None;
+            }
+        }
+        self._maker_order_clear_index_for_key(&key);
+        if let Ok(mut s) = self.state.lock() {
+            let should_remove = s
+                .open_orders
+                .get(&aid)
+                .and_then(|oo| oo.order_id.clone())
+                .is_some();
+            if should_remove {
+                s.open_orders.remove(&aid);
+                let _ = save_state(&self.state_file, &mut s);
+            }
+        }
+    }
+
+    fn _maker_order_on_user_event(&self, msg: &Value) {
+        if !self._maker_single_inflight_enabled() {
+            return;
+        }
+        let oid = self._extract_order_id(msg).unwrap_or_default();
+        if oid.trim().is_empty() {
+            return;
+        }
+        let side = msg
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        let key_from_index = self
+            .maker_order_index
+            .lock()
+            .ok()
+            .and_then(|idx| idx.get(&oid).cloned());
+        let msg_asset_id = msg
+            .get("asset_id")
+            .or_else(|| msg.get("token_id"))
+            .or_else(|| msg.get("assetId"))
+            .or_else(|| msg.get("tokenId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let key = if let Some(k) = key_from_index {
+            k
+        } else {
+            if side != "BUY" || msg_asset_id.is_empty() {
+                return;
+            }
+            MakerOrderKey::buy(&msg_asset_id)
+        };
+        if key.side != "BUY" || key.asset_id.trim().is_empty() {
+            return;
+        }
+        let asset_id = key.asset_id.clone();
+        let typ = msg
+            .get("type")
+            .or_else(|| msg.get("event_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let status = msg
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let cancelish = matches!(
+            typ.as_str(),
+            "CANCELLATION" | "CANCELED" | "CANCELLED" | "REJECTION" | "REJECTED"
+        ) || matches!(status.as_str(), "CANCELED" | "CANCELLED" | "REJECTED");
+        let price = Self::_value_f64(msg.get("price")).unwrap_or(0.0);
+        let original = Self::_value_f64(
+            msg.get("original_size")
+                .or_else(|| msg.get("originalSize"))
+                .or_else(|| msg.get("size")),
+        )
+        .unwrap_or(0.0);
+        let matched = Self::_value_f64(
+            msg.get("size_matched")
+                .or_else(|| msg.get("matched_size"))
+                .or_else(|| msg.get("filled_size"))
+                .or_else(|| msg.get("filled")),
+        )
+        .unwrap_or(0.0);
+        let mut remaining = if original > 0.0 {
+            (original - matched).max(0.0)
+        } else {
+            Self::_value_f64(
+                msg.get("remaining_size")
+                    .or_else(|| msg.get("remainingSize"))
+                    .or_else(|| msg.get("size")),
+            )
+            .unwrap_or(0.0)
+            .max(0.0)
+        };
+        if !remaining.is_finite() {
+            remaining = 0.0;
+        }
+        if cancelish || remaining <= 1e-9 {
+            if let Ok(mut slots) = self.maker_order_slots.lock() {
+                let slot = slots.entry(key.clone()).or_default();
+                if slot.order_id.as_deref() == Some(oid.as_str())
+                    || slot.order_id.is_none()
+                    || slot.state == MakerOrderLifecycle::CancelPending
+                {
+                    slot.state = MakerOrderLifecycle::Idle;
+                    slot.order_id = None;
+                    slot.remaining = 0.0;
+                    slot.replace_target = None;
+                }
+            }
+            if let Ok(mut idx) = self.maker_order_index.lock() {
+                idx.remove(&oid);
+            }
+            if let Ok(mut s) = self.state.lock() {
+                let should_remove = s
+                    .open_orders
+                    .get(&asset_id)
+                    .and_then(|oo| oo.order_id.clone())
+                    .map(|x| x == oid)
+                    .unwrap_or(false);
+                if should_remove {
+                    s.open_orders.remove(&asset_id);
+                    let _ = save_state(&self.state_file, &mut s);
+                }
+            }
+            return;
+        }
+
+        let max_active = env_int("MAKER_MAX_ACTIVE_BUY_ORDERS_PER_ASSET", 1).max(1);
+        let mut duplicate_oid: Option<String> = None;
+        let mut should_adopt = true;
+        if let Ok(mut slots) = self.maker_order_slots.lock() {
+            let slot = slots.entry(key.clone()).or_default();
+            if let Some(cur_oid) = slot.order_id.clone() {
+                if cur_oid != oid && slot.state == MakerOrderLifecycle::Working && max_active <= 1 {
+                    duplicate_oid = Some(oid.clone());
+                    should_adopt = false;
+                }
+            }
+            if should_adopt {
+                slot.state = MakerOrderLifecycle::Working;
+                slot.order_id = Some(oid.clone());
+                slot.price = if price > 0.0 { price } else { slot.price };
+                slot.size = original.max(remaining).max(slot.size);
+                slot.remaining = remaining;
+                slot.origin = if slot.origin.trim().is_empty() {
+                    "ORDER_EVENT".to_string()
+                } else {
+                    slot.origin.clone()
+                };
+                slot.replace_target = None;
+            }
+        }
+        if let Some(dup) = duplicate_oid {
+            self.logger.warning(&format!(
+                "[MAKER_ORD] duplicate BUY order for asset={} tracked differs; canceling {}..",
+                asset_id,
+                dup.chars().take(10).collect::<String>()
+            ));
+            let _ = self._cancel(&dup);
+            return;
+        }
+        if should_adopt {
+            if let Ok(mut idx) = self.maker_order_index.lock() {
+                idx.retain(|_, v| v != &key);
+                idx.insert(oid.clone(), key);
+            }
+            if let Ok(mut s) = self.state.lock() {
+                s.open_orders.insert(
+                    asset_id,
+                    OpenOrderState {
+                        order_id: Some(oid),
+                        price: Some(price),
+                        size: Some(remaining),
+                        ts: Some(now_ts_f64()),
+                    },
+                );
+                let _ = save_state(&self.state_file, &mut s);
+            }
+        }
+    }
+
+    fn _maker_order_upsert_gtc(
+        &self,
+        key: &MakerOrderKey,
+        price: f64,
+        size: f64,
+        origin: &str,
+    ) -> Option<String> {
+        if key.asset_id.trim().is_empty() || key.side != "BUY" {
+            return None;
+        }
+        if !self._maker_single_inflight_enabled() {
+            return self._place_limit_bid_gtc_with_origin(
+                &key.asset_id,
+                price,
+                size,
+                Some(true),
+                origin,
+            );
+        }
+
+        let now = now_ts_f64();
+        let submit_ttl = self._maker_submit_pending_ttl_seconds();
+        let cancel_ttl = self._maker_cancel_pending_ttl_seconds();
+        let replace_min = self._maker_replace_min_interval_seconds();
+        let stale = env_int("STALE_SECONDS", self.cfg.stale_seconds).max(1) as f64;
+        let replace_ticks = env_int(
+            "REPLACE_IF_PRICE_MOVES_TICKS",
+            self.cfg.replace_if_price_moves_ticks,
+        ) as f64;
+
+        self._maker_order_reconcile_asset(&key.asset_id, Some(price));
+        let mut slot = self._maker_order_slot_get(key);
+        let mut target_price = price;
+        let mut target_size = size;
+        let mut target_origin = origin.to_string();
+        if slot.state == MakerOrderLifecycle::CancelPending {
+            if let Some(tgt) = slot.replace_target.clone() {
+                if tgt.price > 0.0 && tgt.size > 0.0 {
+                    target_price = tgt.price;
+                    target_size = tgt.size;
+                    if !tgt.origin.trim().is_empty() {
+                        target_origin = tgt.origin;
+                    }
+                }
+            }
+        }
+        if slot.state == MakerOrderLifecycle::SubmitPending
+            && now - slot.last_submit_ts < submit_ttl
+        {
+            return slot.order_id.clone();
+        }
+        if slot.state == MakerOrderLifecycle::CancelPending
+            && now - slot.last_cancel_ts < cancel_ttl
+        {
+            return None;
+        }
+        if slot.state != MakerOrderLifecycle::Working
+            && slot.state != MakerOrderLifecycle::Idle
+            && now - slot.last_submit_ts >= submit_ttl
+            && now - slot.last_cancel_ts >= cancel_ttl
+        {
+            if let Ok(mut slots) = self.maker_order_slots.lock() {
+                let s = slots.entry(key.clone()).or_default();
+                s.state = MakerOrderLifecycle::Idle;
+                s.order_id = None;
+                s.remaining = 0.0;
+                s.replace_target = None;
+            }
+            slot = self._maker_order_slot_get(key);
+        }
+
+        if slot.state == MakerOrderLifecycle::Working {
+            if let Some(oid) = slot.order_id.clone() {
+                let old_price = slot.price.max(0.0);
+                let old_size = slot.remaining.max(slot.size).max(0.0);
+                let age = (now - slot.last_submit_ts).max(0.0);
+                let moved_ticks = (target_price - old_price).abs() / self.cfg.tick.max(0.0001);
+                let size_changed = old_size <= 0.0
+                    || (target_size - old_size).abs() >= (0.25 * old_size).max(self.cfg.min_shares);
+                if age < stale && moved_ticks < replace_ticks && !size_changed {
+                    return Some(oid);
+                }
+                if now - slot.last_cancel_ts < replace_min {
+                    return None;
+                }
+                if self._maker_order_request_cancel(key, "maker_order_replace") {
+                    if let Ok(mut slots) = self.maker_order_slots.lock() {
+                        if let Some(s) = slots.get_mut(key) {
+                            s.replace_target = Some(MakerOrderReplaceTarget {
+                                price: target_price,
+                                size: target_size,
+                                origin: target_origin.clone(),
+                            });
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+
+        if slot.state == MakerOrderLifecycle::CancelPending
+            && now - slot.last_cancel_ts < cancel_ttl
+        {
+            return None;
+        }
+
+        if let Ok(mut slots) = self.maker_order_slots.lock() {
+            let s = slots.entry(key.clone()).or_default();
+            s.state = MakerOrderLifecycle::SubmitPending;
+            s.last_submit_ts = now;
+            s.price = target_price;
+            s.size = target_size.max(0.0);
+            s.remaining = target_size.max(0.0);
+            s.origin = target_origin.clone();
+        }
+        let oid = self._place_limit_bid_gtc_with_origin(
+            &key.asset_id,
+            target_price,
+            target_size,
+            Some(true),
+            &target_origin,
+        );
+        if let Some(oid) = oid {
+            self._maker_order_on_submit_ack(&oid, key, target_price, target_size, &target_origin);
+            return Some(oid);
+        }
+        self._maker_order_on_submit_reject(key, "post_order returned no oid");
+        self._maker_order_reconcile_asset(&key.asset_id, Some(price));
+        None
+    }
+
+    fn _maker_payoff_envelope(
+        shares_up: f64,
+        shares_down: f64,
+        cost_total: f64,
+    ) -> (f64, f64, f64) {
         let up = shares_up.max(0.0);
         let down = shares_down.max(0.0);
         let cost = cost_total.max(0.0);
@@ -4003,7 +4724,8 @@ impl MakerHedgeCapBot {
         }
         let p = clamp(price, 1e-6, 0.999_999);
         let notional = qty * p;
-        let taker_fee = notional * fee_rate.max(0.0) * (p * (1.0 - p)).powf(exponent.clamp(0.0, 8.0));
+        let taker_fee =
+            notional * fee_rate.max(0.0) * (p * (1.0 - p)).powf(exponent.clamp(0.0, 8.0));
         if is_maker {
             let rebate = notional * maker_rebate_bps.max(0.0) / 10_000.0;
             (taker_fee - rebate).max(0.0)
@@ -4072,8 +4794,7 @@ impl MakerHedgeCapBot {
             .and_then(|m| m.get(key).cloned());
         if let Some(prev) = existing {
             let age = (now - prev.ts).max(0.0);
-            let moved_ticks =
-                (target_price - prev.price).abs() / self.cfg.tick.max(0.0001);
+            let moved_ticks = (target_price - prev.price).abs() / self.cfg.tick.max(0.0001);
             let size_changed =
                 (target_size - prev.size).abs() >= (0.25 * prev.size).max(self.cfg.min_shares);
             if age < stale && moved_ticks < replace_ticks && !size_changed {
@@ -4176,6 +4897,15 @@ impl MakerHedgeCapBot {
                     target_prices.push(px);
                 }
             }
+        }
+
+        if self._maker_single_inflight_enabled() {
+            self._maker_ladder_cancel_all("single_inflight_guard");
+            if let Some(px) = target_prices.first().copied() {
+                let key = MakerOrderKey::buy(asset_id);
+                let _ = self._maker_order_upsert_gtc(&key, px, clip_size, "MAKER_POSTONLY_GTC");
+            }
+            return;
         }
 
         let min_per_order = self.cfg.min_shares.max(1.0);
@@ -4282,19 +5012,17 @@ impl MakerHedgeCapBot {
     fn _maker_stretch_bias_side(&self, default_side: &str) -> String {
         let now = now_ts_f64();
         let default_norm = default_side.trim().to_ascii_uppercase();
-        let record_stretch = |rsi: Option<f64>,
-                              diff_vs_start: Option<f64>,
-                              biased_side: &str,
-                              reason: &str| {
-            if let Ok(mut st) = self.maker_skew_state.lock() {
-                st.stretch_rsi = rsi;
-                st.stretch_diff_vs_start = diff_vs_start;
-                st.stretch_default_side = default_norm.clone();
-                st.stretch_biased_side = biased_side.to_ascii_uppercase();
-                st.stretch_bias_reason = reason.to_string();
-                st.stretch_eval_ts = now;
-            }
-        };
+        let record_stretch =
+            |rsi: Option<f64>, diff_vs_start: Option<f64>, biased_side: &str, reason: &str| {
+                if let Ok(mut st) = self.maker_skew_state.lock() {
+                    st.stretch_rsi = rsi;
+                    st.stretch_diff_vs_start = diff_vs_start;
+                    st.stretch_default_side = default_norm.clone();
+                    st.stretch_biased_side = biased_side.to_ascii_uppercase();
+                    st.stretch_bias_reason = reason.to_string();
+                    st.stretch_eval_ts = now;
+                }
+            };
         if !env_bool("MAKER_STRETCH_BIAS_ENABLED", false) {
             record_stretch(None, None, &default_norm, "disabled");
             return default_norm;
@@ -4334,7 +5062,8 @@ impl MakerHedgeCapBot {
                                 st.stretch_chainlink_closes.drain(0..drop_n);
                             }
                         }
-                        rsi_value = Self::_maker_compute_rsi(&st.stretch_chainlink_closes, rsi_period);
+                        rsi_value =
+                            Self::_maker_compute_rsi(&st.stretch_chainlink_closes, rsi_period);
                     }
                 }
             }
@@ -4402,25 +5131,33 @@ impl MakerHedgeCapBot {
         };
         let decide_ts = now_ts_f64();
         let decide_ns = now_ns();
-        let signed_y = json!({
-            "asset_id": yes,
-            "side": "BUY",
-            "price": y_px,
-            "size": qty,
-        });
-        let signed_n = json!({
-            "asset_id": no,
-            "side": "BUY",
-            "price": n_px,
-            "size": qty,
-        });
-        let resps = self._post_orders_compat(
-            &[signed_y, signed_n],
-            &self._resolve_order_type(order_type),
-            post_only,
-        );
-        let y_oid = resps.first().and_then(|o| o.clone());
-        let n_oid = resps.get(1).and_then(|o| o.clone());
+        let resolved = self._resolve_order_type(order_type);
+        let (y_oid, n_oid) = if resolved == "GTC" && self._maker_single_inflight_enabled() {
+            let y_key = MakerOrderKey::buy(yes);
+            let n_key = MakerOrderKey::buy(no);
+            (
+                self._maker_order_upsert_gtc(&y_key, y_px, qty, &format!("{origin}_YES")),
+                self._maker_order_upsert_gtc(&n_key, n_px, qty, &format!("{origin}_NO")),
+            )
+        } else {
+            let signed_y = json!({
+                "asset_id": yes,
+                "side": "BUY",
+                "price": y_px,
+                "size": qty,
+            });
+            let signed_n = json!({
+                "asset_id": no,
+                "side": "BUY",
+                "price": n_px,
+                "size": qty,
+            });
+            let resps = self._post_orders_compat(&[signed_y, signed_n], &resolved, post_only);
+            (
+                resps.first().and_then(|o| o.clone()),
+                resps.get(1).and_then(|o| o.clone()),
+            )
+        };
         if let Some(oid) = &y_oid {
             self._remember_taker_order(oid, yes, qty, y_px, "BUY");
             self._track_order_execution_context(
@@ -4643,7 +5380,7 @@ impl MakerHedgeCapBot {
     fn _maker_skew_arb_step(&self, now: f64, q_yes: f64, q_no: f64, total_cost: f64) {
         if !env_bool("MAKER_SKEW_ENABLED", true) {
             self._maker_ladder_cancel_all("disabled");
-            self.cancel_all_open_orders_local("MAKER_SKEW disabled");
+            self._maker_cancel_strategy_orders(None, "MAKER_SKEW disabled");
             return;
         }
         let refresh_base_s = env_float("MAKER_SKEW_REFRESH_SECONDS", 2.0).max(0.2);
@@ -4711,7 +5448,7 @@ impl MakerHedgeCapBot {
         }
         if t_into_s >= stop_new_after_s {
             self._maker_ladder_cancel_all("stop_new_after");
-            self.cancel_all_open_orders_local("MAKER_SKEW stop new orders");
+            self._maker_cancel_strategy_orders(None, "MAKER_SKEW stop new orders");
             self._maker_record_trade_decision(
                 t_into_s,
                 0.0,
@@ -4734,7 +5471,7 @@ impl MakerHedgeCapBot {
         let remaining = hard_cap - total_cost - ladder_reserved;
         if remaining <= self.cfg.reserve_usd {
             self._maker_ladder_cancel_all("reserve reached");
-            self.cancel_all_open_orders_local("MAKER_SKEW reserve reached");
+            self._maker_cancel_strategy_orders(None, "MAKER_SKEW reserve reached");
             self._maker_record_trade_decision(
                 t_into_s,
                 0.0,
@@ -4771,7 +5508,18 @@ impl MakerHedgeCapBot {
             2.0 * self.cfg.min_shares.max(1.0),
         )
         .max(self.cfg.min_shares.max(1.0));
-        let base_needs_seed = q_yes + 1e-9 < base_min || q_no + 1e-9 < base_min;
+        let include_open_buys = env_bool("MAKER_EFFECTIVE_Q_INCLUDE_OPEN_BUYS", true);
+        let q_yes_eff = if include_open_buys {
+            q_yes + self._maker_order_open_buy_remaining(yes)
+        } else {
+            q_yes
+        };
+        let q_no_eff = if include_open_buys {
+            q_no + self._maker_order_open_buy_remaining(no)
+        } else {
+            q_no
+        };
+        let base_needs_seed = q_yes_eff + 1e-9 < base_min || q_no_eff + 1e-9 < base_min;
         let seed_since_key = "__maker_skew_seed_pending_since";
         let seed_inflight_key = "__maker_skew_seed_inflight_until";
         let seed_wait_s = env_float("MAKER_SKEW_BASE_SEED_MAX_WAIT_SECONDS", 45.0).max(1.0);
@@ -4799,10 +5547,10 @@ impl MakerHedgeCapBot {
             if self._runtime_ts_get(seed_since_key) <= 0.0 {
                 self._runtime_ts_set(seed_since_key, now);
             }
-            let (seed_side, seed_asset, seed_bid, seed_ask, q_side) = if q_yes <= q_no {
-                ("YES", yes.to_string(), y_bid, y_ask, q_yes.max(0.0))
+            let (seed_side, seed_asset, seed_bid, seed_ask, q_side) = if q_yes_eff <= q_no_eff {
+                ("YES", yes.to_string(), y_bid, y_ask, q_yes_eff.max(0.0))
             } else {
-                ("NO", no.to_string(), n_bid, n_ask, q_no.max(0.0))
+                ("NO", no.to_string(), n_bid, n_ask, q_no_eff.max(0.0))
             };
             let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1) as f64;
             let need = (base_min - q_side).max(min_int);
@@ -4839,11 +5587,11 @@ impl MakerHedgeCapBot {
             );
             let size = need.min(max_affordable).max(min_int);
             let submitted = if seed_order_type == "GTC" {
-                self._place_limit_bid_gtc(&seed_asset, seed_bid, size, Some(true))
+                let seed_key = MakerOrderKey::buy(&seed_asset);
+                self._maker_order_upsert_gtc(&seed_key, seed_bid, size, "LIMIT_GTC_POSTONLY")
             } else {
                 let seed_slip_ticks = env_int("MAKER_SKEW_BASE_SEED_SLIPPAGE_TICKS", 1).max(0);
-                let mut px =
-                    seed_ask + seed_slip_ticks as f64 * self.cfg.tick.max(0.0001);
+                let mut px = seed_ask + seed_slip_ticks as f64 * self.cfg.tick.max(0.0001);
                 px = round_up(
                     clamp(px, self.cfg.tick.max(0.0001), 0.99),
                     self.cfg.tick.max(0.0001),
@@ -4880,7 +5628,7 @@ impl MakerHedgeCapBot {
         let (ok, why) = self._accumulate_allowed();
         if !ok {
             self._maker_ladder_cancel_all(&format!("accumulate gate: {why}"));
-            self.cancel_all_open_orders_local(&format!("accumulate gate: {why}"));
+            self._maker_cancel_strategy_orders(None, &format!("accumulate gate: {why}"));
             self._maker_record_trade_decision(
                 t_into_s,
                 0.0,
@@ -4899,7 +5647,7 @@ impl MakerHedgeCapBot {
         let (invalid, inv_reason) = self._quotes_invalidated();
         if invalid {
             self._maker_ladder_cancel_all(&format!("quote invalidated: {inv_reason}"));
-            self.cancel_all_open_orders_local(&format!("quote invalidated: {inv_reason}"));
+            self._maker_cancel_strategy_orders(None, &format!("quote invalidated: {inv_reason}"));
             self._maker_record_trade_decision(
                 t_into_s,
                 0.0,
@@ -4940,7 +5688,7 @@ impl MakerHedgeCapBot {
 
         // CPP (cost-per-pair) risk cap — prevents over-accumulating one side.
         // Matches the 0x8e9c trader's envelope: median CPP ~1.17, 75th ~1.33, max ~1.98.
-        let min_shares_held = q_yes.min(q_no).max(0.0);
+        let min_shares_held = q_yes_eff.min(q_no_eff).max(0.0);
         let cpp = if min_shares_held > 1e-9 {
             total_cost / min_shares_held
         } else {
@@ -4957,7 +5705,7 @@ impl MakerHedgeCapBot {
         // CPP hard cap: stop all accumulation, cancel ladders.
         if cpp.is_finite() && cpp >= cpp_hard {
             self._maker_ladder_cancel_all("cpp_hard_cap");
-            self.cancel_all_open_orders_local("MAKER_SKEW cpp hard cap");
+            self._maker_cancel_strategy_orders(None, "MAKER_SKEW cpp hard cap");
             self._maker_record_trade_decision(
                 t_into_s,
                 0.0,
@@ -4976,8 +5724,8 @@ impl MakerHedgeCapBot {
 
         let mut side = underdog.to_string();
         let mut role = "underdog".to_string();
-        let side_yes = q_yes.max(0.0);
-        let side_no = q_no.max(0.0);
+        let side_yes = q_yes_eff.max(0.0);
+        let side_no = q_no_eff.max(0.0);
         if side_yes < min_base || side_no < min_base {
             side = if side_yes <= side_no {
                 "YES".to_string()
@@ -5037,18 +5785,21 @@ impl MakerHedgeCapBot {
             "GTC".to_string()
         };
 
-        if (role == "hedge" && downside < -max_loss) || (role == "cpp_hedge" && order_type != "GTC") {
+        if (role == "hedge" && downside < -max_loss) || (role == "cpp_hedge" && order_type != "GTC")
+        {
             let slip_ticks = if role == "cpp_hedge" {
                 env_int("MAKER_SKEW_CPP_HEDGE_SLIPPAGE_TICKS", 1).max(0)
             } else {
                 self.hedge_slippage_ticks as i64
             };
             let mut px = ask + slip_ticks as f64 * self.cfg.tick.max(0.0001);
-            px = round_up(clamp(px, self.cfg.tick.max(0.0001), 0.99), self.cfg.tick.max(0.0001));
+            px = round_up(
+                clamp(px, self.cfg.tick.max(0.0001), 0.99),
+                self.cfg.tick.max(0.0001),
+            );
             let _ = self._place_taker_bid_fak(&asset_id, px, clip, Some(&order_type));
             self._maker_ladder_cancel_all(&format!("{role} taker"));
         } else if ladder_enabled {
-
             let levels = if role == "hedge" {
                 env_int("MAKER_HEDGE_LADDER_LEVELS", 2)
             } else {
@@ -5058,7 +5809,7 @@ impl MakerHedgeCapBot {
             let step_ticks = env_int("MAKER_LADDER_TICKS_STEP", 1).max(1);
             self._maker_ladder_cancel_except_role_asset(&role, &asset_id);
             self._maker_ladder_sync_role(&role, &asset_id, bid, clip, levels, step_ticks);
-            self.cancel_all_open_orders_local("maker_skew ladder mode");
+            self._maker_order_cancel_all_except_asset(Some(&asset_id), "maker_skew ladder mode");
         } else {
             let _ = self._maybe_replace(&asset_id, bid, clip, None);
         }
@@ -6770,6 +7521,8 @@ impl MakerHedgeCapBot {
             return;
         }
 
+        self._maker_order_on_user_event(msg);
+
         let side = msg
             .get("side")
             .and_then(|v| v.as_str())
@@ -6929,6 +7682,7 @@ impl MakerHedgeCapBot {
                     if let Ok(mut ex) = self.exchange_orders_cache.lock() {
                         ex.retain(|o| self._extract_order_id(o).as_deref() != Some(order_id));
                     }
+                    self._maker_order_on_cancel_ack_by_order_id(order_id);
                     return true;
                 }
                 Err(e) => {
@@ -7209,6 +7963,12 @@ impl MakerHedgeCapBot {
         intended_price: Option<f64>,
         force: bool,
     ) {
+        if self._maker_single_inflight_enabled() && !self.cfg.dry_run {
+            self._maker_order_reconcile_asset(asset_id, intended_price);
+            if !env_bool("RECONCILE_EXCHANGE_ORDERS", true) {
+                return;
+            }
+        }
         if !env_bool("RECONCILE_EXCHANGE_ORDERS", true) || self.cfg.dry_run {
             return;
         }
@@ -7615,6 +8375,22 @@ impl MakerHedgeCapBot {
         size: f64,
         post_only: Option<bool>,
     ) -> Option<String> {
+        let origin = if post_only.unwrap_or(false) {
+            "LIMIT_GTC_POSTONLY"
+        } else {
+            "LIMIT_GTC"
+        };
+        self._place_limit_bid_gtc_with_origin(asset_id, price, size, post_only, origin)
+    }
+
+    fn _place_limit_bid_gtc_with_origin(
+        &self,
+        asset_id: &str,
+        price: f64,
+        size: f64,
+        post_only: Option<bool>,
+        origin: &str,
+    ) -> Option<String> {
         let tick = if self.cfg.tick > 0.0 {
             self.cfg.tick
         } else {
@@ -7695,7 +8471,7 @@ impl MakerHedgeCapBot {
                 "decision_ns": decide_ns,
                 "post_start_ts": decide_ts,
                 "post_end_ts": now_ts_f64(),
-                "origin": if post_only.unwrap_or(false) { "LIMIT_GTC_POSTONLY" } else { "LIMIT_GTC" },
+                "origin": origin,
             }),
         );
         Some(oid)
@@ -8584,6 +9360,12 @@ impl MakerHedgeCapBot {
         size: f64,
         stale_seconds: Option<i64>,
     ) -> bool {
+        if self._maker_single_inflight_enabled() {
+            let key = MakerOrderKey::buy(asset_id);
+            return self
+                ._maker_order_upsert_gtc(&key, price, size, "MAKER_POSTONLY_GTC")
+                .is_some();
+        }
         let now = now_ts_f64();
         let aid = asset_id.to_string();
         let guard_key = format!("__cancel_pending_until_{aid}");
@@ -8887,7 +9669,8 @@ impl MakerHedgeCapBot {
             if let Some(info) = self._flatten_now_best(s2.q_yes - s2.q_no) {
                 self._force_flatten_and_stop(s2.q_yes - s2.q_no, &info);
             } else {
-                self.logger.warning("max-loss fallback stop (no flatten quote)");
+                self.logger
+                    .warning("max-loss fallback stop (no flatten quote)");
                 self._set_exit_reason("MAX_LOSS");
                 self.cancel_all_orders_exchange("max-loss");
                 self.stop_flag.store(true, Ordering::SeqCst);
@@ -9707,27 +10490,21 @@ impl MakerHedgeCapBot {
                     let mom_yes = st
                         .momentum_yes
                         .as_ref()
-                        .map(|m| {
-                            format!(
-                                "{}/{}:{}",
-                                m.checks_passed, m.required_checks, m.reason
-                            )
-                        })
+                        .map(|m| format!("{}/{}:{}", m.checks_passed, m.required_checks, m.reason))
                         .unwrap_or_else(|| "na".to_string());
                     let mom_no = st
                         .momentum_no
                         .as_ref()
-                        .map(|m| {
-                            format!(
-                                "{}/{}:{}",
-                                m.checks_passed, m.required_checks, m.reason
-                            )
-                        })
+                        .map(|m| format!("{}/{}:{}", m.checks_passed, m.required_checks, m.reason))
                         .unwrap_or_else(|| "na".to_string());
                     let breakout_summary = if yes.breakout.applied || no.breakout.applied {
-                        let dir = if yes.breakout.direction != crate::sniper_filters::BreakoutDirection::None {
+                        let dir = if yes.breakout.direction
+                            != crate::sniper_filters::BreakoutDirection::None
+                        {
                             yes.breakout.direction.as_str().to_string()
-                        } else if no.breakout.direction != crate::sniper_filters::BreakoutDirection::None {
+                        } else if no.breakout.direction
+                            != crate::sniper_filters::BreakoutDirection::None
+                        {
                             no.breakout.direction.as_str().to_string()
                         } else {
                             st.active_trigger.as_str().to_string()
@@ -12136,7 +12913,8 @@ mod tests {
 
     #[test]
     fn maker_fee_formula_maker_rebate_non_negative() {
-        let fee = MakerHedgeCapBot::_maker_poly_fee_formula(20.0, 0.52, 0.25, 2.0, 100.0, true, true);
+        let fee =
+            MakerHedgeCapBot::_maker_poly_fee_formula(20.0, 0.52, 0.25, 2.0, 100.0, true, true);
         assert!(fee >= 0.0);
     }
 
