@@ -1,3 +1,147 @@
+## Version 0.1.18
+Date: 2026-03-06
+### Changes
+
+#### Fix A: Pair arb imbalance guard — prevent runaway one-sided accumulation
+- **File:** `src/bot.rs` — `_maker_skew_try_arb` (line ~5372)
+- **Problem:** When a pair arb deferred its hedge (Fix 2 / v0.1.17) because the unfilled leg
+  was still live, the bot immediately fired another pair arb on the next loop iteration. If the
+  YES side filled instantly but NO was slow, this compounded into YES=30 vs NO=10 within
+  seconds (3:1 ratio). The bot then had to emergency-buy NO via taker FAK at 0.70-0.74,
+  destroying all edge. Observed in runs `btc-updown-5m-1772743500` (LP=+2.28, got lucky) and
+  `btc-updown-5m-1772743800` (LP=-2.30, taker overpay + blocked hedge at expiry).
+- **Root cause:** No check for existing position imbalance before opening new pair arb. Each
+  pair arb is individually valid (edge > 0), but the aggregate position becomes dangerously
+  one-sided when multiple pairs overlap with deferred NO legs.
+- **Fix:** Before submitting pair orders, check `|qYES - qNO| > PAIR_ARB_MAX_IMBALANCE_SHARES`.
+  If the imbalance exceeds the threshold, suppress the pair arb and log the suppression. The
+  base seed and ladder paths remain free to rebalance the deficit side via maker orders.
+- **New env key:** `PAIR_ARB_MAX_IMBALANCE_SHARES` (default: `max(clip_shares, min_shares)`)
+  — maximum allowed YES/NO share gap before pair arb triggers are suppressed.
+- **Impact:** Prevents compounding position skew from overlapping pair arbs. Does not affect
+  single-side seed/ladder/hedge flows. If clip_shares=8, default threshold is 8 shares.
+
+#### Fix B: Submit reject exponential backoff
+- **File:** `src/bot.rs` — `MakerOrderSlot` (line ~169), `_maker_order_on_submit_reject`
+  (line ~4192), `_maker_order_upsert_gtc` (line ~4668), `_maker_order_on_submit_ack`
+  (line ~4165)
+- **Problem:** The 5s flat reject cooldown (added in v0.1.17) prevented rapid-fire rejects but
+  still allowed 17+ wasted API calls over 100 seconds when the exchange consistently rejected
+  at a price level (no liquidity available). Observed in run `btc-updown-5m-1772743800`:
+  17 rejects on YES side from 03:51:21 to 03:53:05, all returning "post_order returned no oid".
+- **Fix:** Added `consecutive_rejects` counter to `MakerOrderSlot`. On each reject, counter
+  increments. On successful submit ACK, counter resets to 0. The cooldown now uses exponential
+  backoff: `base_cooldown * 2^(consecutive_rejects - 1)`, capped at
+  `MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS`.
+  - 1st reject: 5s cooldown
+  - 2nd reject: 10s
+  - 3rd reject: 20s
+  - 4th reject: 40s
+  - 5th+: 60s (capped)
+- **New env keys:**
+  - `MAKER_SUBMIT_REJECT_COOLDOWN_SECONDS` (default: 5.0) — base cooldown after first reject
+  - `MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS` (default: 60.0) — ceiling for backoff
+- **Impact:** Reduces wasted API calls from 17 to ~3-4 over same period. Recovers instantly
+  when conditions change (successful submit resets counter). No impact on first-attempt submits.
+
+#### Fix C: Deferred leg follow-through (covered by Fix A)
+- **Problem:** When Fix 2 (v0.1.17) deferred a hedge because the unfilled leg was still live,
+  another code path (ladder mode, quote invalidation) could cancel that leg before it filled,
+  orphaning the position gap. The gap was never explicitly tracked or closed.
+- **Assessment:** Fix A (imbalance guard) is the primary defense — it prevents new pair arbs
+  from compounding the gap. The existing ladder path (line ~5861) already picks the deficit
+  side when `skew_ratio > ratio_max` or when CPP soft cap is hit. No additional code is needed
+  beyond Fix A for gap recovery; the normal maker flow handles rebalancing.
+- **Monitoring note:** If logs show persistent imbalance (ratio > 1.5 for > 30s) without any
+  rebalancing orders, the ladder side-selection logic may need adjustment. Current heuristic
+  picks the "underdog" (cheaper bid side), which may not always match the deficit side.
+
+### New Environment Keys
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PAIR_ARB_MAX_IMBALANCE_SHARES` | `max(clip_shares, min_shares)` | Max YES/NO gap before pair arb suppressed |
+| `MAKER_SUBMIT_REJECT_COOLDOWN_SECONDS` | `5.0` | Base cooldown after submit reject |
+| `MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS` | `60.0` | Max cooldown with exponential backoff |
+
+### Behavior Impact
+- Pair arb triggers suppressed when position imbalance exceeds threshold (default ~8 shares).
+- Submit rejects now use exponential backoff (5s → 10s → 20s → 40s → 60s cap).
+- No changes to emergency hedge, taker FAK, or base seed paths.
+- Fix C (deferred gap) is handled implicitly by Fix A + existing ladder rebalancing.
+
+## Version 0.1.17
+Date: 2026-03-06
+### Changes
+
+#### Fix 1: Cancel churn on already-canceled maker orders
+- **File:** `src/bot.rs` — `_maker_order_on_cancel_ack_by_order_id` (line ~4079)
+- **Problem:** When the exchange ACK'd a cancel, the slot was set to `CancelPending` and
+  the `order_id` was kept. On every subsequent loop iteration, `_maker_order_request_cancel`
+  found the stale OID, passed the throttle guard, and fired another cancel API call against
+  an already-dead order. Observed: 24 redundant cancel requests on a single OID
+  (`0x94b54692`) over 2 minutes in run `btc-updown-5m-1772714700`.
+- **Fix:** On cancel ACK, the slot now transitions to `Idle`, `order_id` is cleared to
+  `None`, `replace_target` is cleared, and the OID is removed from `maker_order_index`.
+  `_maker_order_request_cancel` exits immediately at the `let Some(oid) = slot.order_id`
+  guard because there is no OID to cancel.
+- **Impact:** Eliminates all redundant cancel API calls on already-canceled orders. No
+  behavioral change to active trading — late fills are still handled independently by
+  `_maker_order_on_user_event` via the WS event hook.
+
+#### Fix 2: Pair arb false exposure mismatch from stale Data API
+- **File:** `src/bot.rs` — `_maker_skew_try_arb` (line ~5403) and new helper
+  `_maker_order_is_live` (line ~4056)
+- **Problem:** After pair arb timeout (default 2s), the bot cancelled both order legs and
+  immediately called `_handle_exposure_mismatch`. When one leg filled but the other had
+  not yet (fill event latency 1-5s), this triggered a false exposure mismatch. The
+  mismatch handler called `_reconcile_state_from_positions` which hit the Polymarket Data
+  API — but the API returned 0 for the unfilled side (known 1-3s propagation delay),
+  triggering reconciliation suspect warnings. The subsequent emergency hedge was blocked
+  by `_hedge_price_cap` (ask always exceeded the breakeven cap), leaving the bot in a
+  panic loop that spammed submit rejects for the remainder of the market (100+ wasted
+  API calls observed in run `btc-updown-5m-1772717400`). Three separate emergency hedge
+  attempts were all blocked (ask=0.73/0.78/0.88 vs cap=0.55-0.63), and the bot exited
+  with an unhedged 8-share delta at LP=-3.44.
+- **Root cause chain:**
+  1. `_wait_for_pair_fills` 2s timeout too tight for maker GTC fill latency
+  2. `PAIR_ARB_RECONCILE_AFTER_TIMEOUT` cancels both legs (including the still-live one)
+  3. `_handle_exposure_mismatch` reconciles against stale Data API (returns 0)
+  4. Emergency hedge blocked by price cap → stuck in reject loop
+- **Fix — slot-based liveness check:**
+  - Added `_maker_order_is_live(asset_id, expected_oid, max_age_s)` helper that checks
+    three conditions against the maker order slot:
+    1. **State**: slot is `Working` or `SubmitPending` (not `Idle`/`CancelPending`)
+    2. **OID match**: slot's `order_id` matches the expected OID from this pair submission
+    3. **Freshness**: `now - last_submit_ts < max_age_s` (default: `PAIR_ARB_TIMEOUT * 3`)
+  - Refactored `_maker_skew_try_arb` post-timeout flow:
+    - After `_wait_for_pair_fills`, checks each unfilled leg with `_maker_order_is_live`
+    - **If unfilled leg is still live:** skips `_handle_exposure_mismatch` entirely; only
+      cancels the filled leg's residual (if any); lets the live order continue working on
+      the exchange. The normal main loop handles it from there (quote replacement, cancel
+      on invalidation, fill via WS events).
+    - **If both legs are dead (filled, canceled, rejected, or stale):** proceeds with
+      normal cancel-both + `_handle_exposure_mismatch` as before.
+  - Added optional tuning knob `PAIR_ARB_LIVE_DEFER_MAX_SECONDS` (default:
+    `max(PAIR_ARB_TIMEOUT_SECONDS * 3, 0.5)`) to control how long an unfilled maker leg
+    can be considered live for defer logic.
+  - Liveness defer is now only evaluated for maker GTC path with single-inflight enabled,
+    and performs a reconcile pass on both assets before checking slot liveness.
+- **Why slot truth, not OID existence:** The `y_oid.is_some()` variable only proves an OID
+  was returned at submit time — it says nothing about current exchange state. The slot is
+  the single source of truth: it tracks lifecycle transitions from submit ACK, fill events,
+  cancel ACK, and reconciliation. Checking slot state + OID match + age provides
+  evidence-based liveness, not an assumption.
+- **Impact:** Prevents false exposure mismatch cascades when one pair leg fills slower than
+  the timeout. Eliminates the emergency-hedge-blocked → submit-reject-spam failure mode.
+  No change to behavior when both legs genuinely fail (mismatch handler still fires).
+
+### Behavior Impact
+- Maker order cancel churn eliminated: no repeated cancel API calls on dead orders.
+- Pair arb mismatch handling is now aware of live unfilled orders, preventing false
+  panic-hedge cascades from Data API propagation delays.
+- Emergency hedge and exposure mismatch logic unchanged for genuine mismatch scenarios.
+- New optional tuning key: `PAIR_ARB_LIVE_DEFER_MAX_SECONDS`.
+
 ## Version 0.1.16
 Date: 2026-03-05
 ### Changes

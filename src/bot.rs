@@ -174,6 +174,8 @@ struct MakerOrderSlot {
     remaining: f64,
     last_submit_ts: f64,
     last_cancel_ts: f64,
+    last_reject_ts: f64,
+    consecutive_rejects: u32,
     origin: String,
     replace_target: Option<MakerOrderReplaceTarget>,
 }
@@ -4040,12 +4042,48 @@ impl MakerHedgeCapBot {
         env_float("MAKER_REPLACE_MIN_INTERVAL_SECONDS", 0.5).max(0.0)
     }
 
+    fn _maker_submit_reject_cooldown_seconds(&self) -> f64 {
+        env_float("MAKER_SUBMIT_REJECT_COOLDOWN_SECONDS", 5.0).max(0.0)
+    }
+
     fn _maker_order_slot_get(&self, key: &MakerOrderKey) -> MakerOrderSlot {
         self.maker_order_slots
             .lock()
             .ok()
             .and_then(|m| m.get(key).cloned())
             .unwrap_or_default()
+    }
+
+    fn _maker_order_is_live(
+        &self,
+        asset_id: &str,
+        expected_oid: Option<&str>,
+        max_age_s: f64,
+    ) -> bool {
+        if !self._maker_single_inflight_enabled() {
+            return false;
+        }
+        let key = MakerOrderKey::buy(asset_id);
+        let slot = self._maker_order_slot_get(&key);
+        if !matches!(
+            slot.state,
+            MakerOrderLifecycle::Working | MakerOrderLifecycle::SubmitPending
+        ) {
+            return false;
+        }
+        let Some(slot_oid) = &slot.order_id else {
+            return false;
+        };
+        if let Some(expected) = expected_oid {
+            if slot_oid != expected {
+                return false;
+            }
+        }
+        let age = now_ts_f64() - slot.last_submit_ts;
+        if age > max_age_s || age < 0.0 {
+            return false;
+        }
+        true
     }
 
     fn _maker_order_clear_index_for_key(&self, key: &MakerOrderKey) {
@@ -4089,11 +4127,16 @@ impl MakerHedgeCapBot {
             return;
         };
         if let Ok(mut slots) = self.maker_order_slots.lock() {
-            let slot = slots.entry(key).or_default();
+            let slot = slots.entry(key.clone()).or_default();
             if slot.order_id.as_deref() == Some(order_id) {
-                slot.state = MakerOrderLifecycle::CancelPending;
+                slot.state = MakerOrderLifecycle::Idle;
+                slot.order_id = None;
                 slot.last_cancel_ts = now_ts_f64();
+                slot.replace_target = None;
             }
+        }
+        if let Ok(mut idx) = self.maker_order_index.lock() {
+            idx.remove(order_id);
         }
     }
 
@@ -4121,6 +4164,7 @@ impl MakerHedgeCapBot {
             slot.last_submit_ts = now;
             slot.origin = origin.to_string();
             slot.replace_target = None;
+            slot.consecutive_rejects = 0;
         }
         if let Ok(mut idx) = self.maker_order_index.lock() {
             if let Some(prev) = prev_oid {
@@ -4150,8 +4194,11 @@ impl MakerHedgeCapBot {
         if !self._maker_single_inflight_enabled() {
             return;
         }
+        let now = now_ts_f64();
         if let Ok(mut slots) = self.maker_order_slots.lock() {
             let slot = slots.entry(key.clone()).or_default();
+            slot.last_reject_ts = now;
+            slot.consecutive_rejects = slot.consecutive_rejects.saturating_add(1);
             if slot.order_id.is_some() {
                 slot.state = MakerOrderLifecycle::Working;
             } else {
@@ -4586,6 +4633,7 @@ impl MakerHedgeCapBot {
         let now = now_ts_f64();
         let submit_ttl = self._maker_submit_pending_ttl_seconds();
         let cancel_ttl = self._maker_cancel_pending_ttl_seconds();
+        let reject_cooldown = self._maker_submit_reject_cooldown_seconds();
         let replace_min = self._maker_replace_min_interval_seconds();
         let stale = env_int("STALE_SECONDS", self.cfg.stale_seconds).max(1) as f64;
         let replace_ticks = env_int(
@@ -4618,6 +4666,25 @@ impl MakerHedgeCapBot {
             && now - slot.last_cancel_ts < cancel_ttl
         {
             return None;
+        }
+        if slot.order_id.is_none()
+            && slot.state == MakerOrderLifecycle::Idle
+            && reject_cooldown > 0.0
+            && slot.last_reject_ts > 0.0
+        {
+            // Backoff: base cooldown * 2^(consecutive_rejects-1), capped at max
+            let max_reject_cooldown =
+                env_float("MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS", 60.0).max(reject_cooldown);
+            let effective_cooldown = if slot.consecutive_rejects <= 1 {
+                reject_cooldown
+            } else {
+                (reject_cooldown
+                    * 2.0_f64.powi((slot.consecutive_rejects - 1).min(6) as i32))
+                .min(max_reject_cooldown)
+            };
+            if now - slot.last_reject_ts < effective_cooldown {
+                return None;
+            }
         }
         if slot.state != MakerOrderLifecycle::Working
             && slot.state != MakerOrderLifecycle::Idle
@@ -5310,6 +5377,22 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|s| (s.q_yes, s.q_no))
             .unwrap_or((0.0, 0.0));
+
+        // Fix A: Block new pair arbs when YES/NO imbalance is too large.
+        // Lets base seed / hedge flows close the gap instead of compounding it.
+        let imbalance = (qy0 - qn0).abs();
+        let max_imbalance = env_float(
+            "PAIR_ARB_MAX_IMBALANCE_SHARES",
+            self.cfg.clip_shares.max(self.cfg.min_shares),
+        )
+        .max(1.0);
+        if imbalance > max_imbalance + 1e-6 {
+            self.logger.info(&format!(
+                "[MAKER_SKEW][ARB] suppressed: imbalance={imbalance:.1} > max={max_imbalance:.1} (qYES={qy0:.0} qNO={qn0:.0})"
+            ));
+            return false;
+        }
+
         let (y_oid, n_oid) = self._maker_submit_pair_orders(
             size_int,
             p_yes,
@@ -5350,16 +5433,69 @@ impl MakerHedgeCapBot {
 
         let timeout_s = env_float("PAIR_ARB_TIMEOUT_SECONDS", 2.0).max(0.2);
         let (fy, fn_) = self._wait_for_pair_fills(qy0, qn0, size_int, timeout_s);
-        if env_bool("PAIR_ARB_RECONCILE_AFTER_TIMEOUT", true) {
-            if let Some(oid) = y_oid {
-                let _ = self._cancel(&oid);
+        let mismatch = (fy - fn_).abs() > 1e-6;
+        let target = size_int as f64;
+        let y_filled = fy >= target - 1e-6;
+        let n_filled = fn_ >= target - 1e-6;
+        let mut y_live = false;
+        let mut n_live = false;
+        if mismatch && is_maker && self._maker_single_inflight_enabled() {
+            let max_live_age = env_float(
+                "PAIR_ARB_LIVE_DEFER_MAX_SECONDS",
+                (timeout_s * 3.0).max(0.5),
+            )
+            .max(0.2);
+            let yes_asset = self.yes_asset.as_deref().unwrap_or("");
+            let no_asset = self.no_asset.as_deref().unwrap_or("");
+            if !yes_asset.is_empty() {
+                self._maker_order_reconcile_asset(yes_asset, Some(p_yes));
             }
-            if let Some(oid) = n_oid {
-                let _ = self._cancel(&oid);
+            if !no_asset.is_empty() {
+                self._maker_order_reconcile_asset(no_asset, Some(p_no));
             }
+            y_live = !y_filled
+                && y_oid
+                    .as_deref()
+                    .map(|oid| self._maker_order_is_live(yes_asset, Some(oid), max_live_age))
+                    .unwrap_or(false);
+            n_live = !n_filled
+                && n_oid
+                    .as_deref()
+                    .map(|oid| self._maker_order_is_live(no_asset, Some(oid), max_live_age))
+                    .unwrap_or(false);
         }
-        if (fy - fn_).abs() > 1e-6 {
-            self._handle_exposure_mismatch(fy, fn_);
+
+        if mismatch && (y_live || n_live) {
+            // Unfilled leg still live on exchange - don't panic-hedge.
+            // Cancel only the filled leg's residual when reconcile-after-timeout is enabled.
+            if env_bool("PAIR_ARB_RECONCILE_AFTER_TIMEOUT", true) {
+                if !y_live {
+                    if let Some(oid) = &y_oid {
+                        let _ = self._cancel(oid);
+                    }
+                }
+                if !n_live {
+                    if let Some(oid) = &n_oid {
+                        let _ = self._cancel(oid);
+                    }
+                }
+            }
+            self.logger.info(&format!(
+                "Pair arb partial: fy={fy:.0} fn={fn_:.0} - unfilled leg still live (y_live={y_live} n_live={n_live}), deferring hedge"
+            ));
+        } else {
+            // Both sides resolved or dead - normal cleanup.
+            if env_bool("PAIR_ARB_RECONCILE_AFTER_TIMEOUT", true) {
+                if let Some(oid) = &y_oid {
+                    let _ = self._cancel(oid);
+                }
+                if let Some(oid) = &n_oid {
+                    let _ = self._cancel(oid);
+                }
+            }
+            if mismatch {
+                self._handle_exposure_mismatch(fy, fn_);
+            }
         }
         self._maker_record_trade_decision(
             t_into_s,
