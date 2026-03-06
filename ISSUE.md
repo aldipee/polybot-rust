@@ -127,7 +127,7 @@ In `src/env_contract.rs`:
 - Date: 2026-03-06
 - Severity: High (capital loss, wasted API calls)
 - Scope: `MAKER_SKEW_ARB` pair arb flow + maker submit lifecycle
-- Current state: Fixed in v0.1.18. Imbalance guard, reject backoff deployed. Quote invalidation bypass pending.
+- Current state: Partially mitigated in v0.1.18-v0.1.20. Pair overlap/recovery controls improved, but maker pair-leg accounting is still intermittently wrong; not production-stable.
 
 ## Problem Summary
 Three compounding issues discovered in production runs `btc-updown-5m-1772743500` (LP=+2.28, lucky) and `btc-updown-5m-1772743800` (LP=-2.30, loss):
@@ -262,3 +262,152 @@ When quotes are invalidated BUT position is imbalanced beyond a threshold:
 - The fix modifies the early-return block at line ~5784-5801 to conditionally fall through.
 - Must ensure the bypass only allows deficit-side hedge orders, not new accumulation.
 - Test with runs where spread is persistently tight (sum > 0.98) and position is imbalanced.
+
+---
+
+# Issue #4: Intermittent Maker Pair-Leg Fill Double-Application
+
+## Status
+- Date: 2026-03-06
+- Severity: Critical (inventory/cost corruption drives wrong strategy decisions)
+- Scope: Maker fill dedupe, `maker_exec_progress`, pair-arb fill accounting
+- Current state: Reproduced in multiple v0.1.20 runs. Control-path fixes are mostly working, but accounting is still not trustworthy.
+
+## Problem Summary
+The remaining failure mode is no longer runaway pair-arb admission. The control logic now usually defers and suppresses correctly. The unresolved bug is that some maker pair-leg fills are still being applied twice to internal inventory/cost before later duplicate variants are only logged as deduped.
+
+When this happens:
+1. `qYES` / `qNO` diverges from actual exchange trade history.
+2. `maker_exec_progress` for the affected pair order is effectively overstated.
+3. Recovery mode, suppression, and expiry behavior are then driven by phantom inventory.
+
+## What Works Now
+- Recovery mode enters/exits more sanely than earlier versions.
+- Heavy-side BUY blocking and pending-imbalance suppression are materially improved.
+- Reject storms are no longer the dominant problem.
+- Some runs match trade history exactly (for example `output/btc-updown-5m-1772748600/btc-updown-5m-1772748600_bot-v_0_1_20.log`).
+
+## What Is Still Broken
+- Pair-leg maker fills can still be double-applied under certain message-shape/lifecycle combinations.
+- The bot can end a market with inventory and total cost materially higher than the actual fills in exchange trade history.
+- This is intermittent, which makes it more dangerous: some runs look clean, some do not.
+
+## Observed Symptoms
+
+### Run `btc-updown-5m-1772748900`
+Evidence file:
+- `output/btc-updown-5m-1772748900/btc-updown-5m-1772748900.log`
+- trade history pasted during analysis on 2026-03-06 (same market)
+
+Key log evidence:
+```text
+2026-03-06 05:17:36.521|INFO| LP=+1.1994 CPP=0.940026 TotalCost=18.7992 qYES=20.00 qNO=20.00
+2026-03-06 05:17:56.114|INFO| [LATENCY][FILL] submit->fill=16898ms oid=0xab04b2f5..
+2026-03-06 05:17:57.172|INFO| [LATENCY][FILL] submit->fill=221ms oid=0xdc5dd810..
+2026-03-06 05:17:57.367|INFO| LP=-0.2976 CPP=1.011903 TotalCost=25.2961 qYES=25.00 qNO=29.99
+```
+
+Final mismatch for the run:
+- Bot final state: `qYES=25.00 qNO=29.99`
+- Trade-history-supported state:
+  - YES = `24.991175`
+  - NO = `24.986630`
+
+That run ended close to balanced in exchange history, but the bot carried a phantom extra NO leg of about `+5` shares internally.
+
+### Run `btc-updown-5m-1772749200`
+Evidence files:
+- `output/btc-updown-5m-1772749200/btc-updown-5m-1772749200.log`
+- trade history pasted during analysis on 2026-03-06 (same market)
+
+Key log evidence:
+```text
+2026-03-06 05:20:43.643|INFO| LP=-0.5000 CPP=1.050000 TotalCost=10.5000 qYES=10.00 qNO=10.00
+2026-03-06 05:20:47.998|INFO| [MAKER_SKEW][ARB] fill wait y_oid=0x0125037e n_oid=0x1c9d5845 fy=0.00 fn=5.00
+2026-03-06 05:20:48.895|INFO| LP=-6.5000 CPP=1.650000 TotalCost=16.5000 qYES=10.00 qNO=20.00
+2026-03-06 05:20:52.953|INFO| LP=-0.3008 CPP=1.015041 TotalCost=20.2995 qYES=20.00 qNO=20.00
+2026-03-06 05:21:15.891|INFO| LP=-2.2995 CPP=1.091980 TotalCost=27.2995 qYES=30.00 qNO=25.00
+```
+
+Trade-history-supported fills for this market:
+- YES:
+  - `0x973a9b10` = `10`
+  - `0x0125037e` = `2.040000 + 2.959352 = 4.999352`
+  - `0x44f7efc4` = `0.420000 + 4.580000 = 5.000000`
+  - `0x96d0a15f` = `5.000000`
+  - Total YES = `24.999352`
+- NO:
+  - `0xcec5b939` = `8.770000 + 1.230000 = 10.000000`
+  - `0x1c9d5845` = `5.000000`
+  - `0x94183a3a` = `5.000000`
+  - Total NO = `20.000000`
+
+Bot final state for the same run:
+- `qYES=30.00 qNO=25.00`
+- `TotalCost=27.2995`
+
+Expected state from trade history:
+- `qYES=24.999352`
+- `qNO=20.000000`
+
+The excess again lines up with a duplicated first pair application:
+- phantom YES `~5`
+- phantom NO `5`
+
+## Root Cause Hypothesis
+The current dedupe key is still not stable across all maker message variants. The same economic execution can arrive in more than one shape:
+1. one variant is applied to inventory and per-order progress,
+2. a later variant is recognized and logged as duplicate,
+3. but by then the internal state has already absorbed the fill more than once.
+
+The pattern suggests the problem is not only logging duplication. It is an inventory mutation path problem.
+
+## Why This Is The Main Remaining Blocker
+The control plane is now mostly doing the right thing:
+- pending imbalance is set and cleared,
+- pair-arb suppression fires while imbalance is active,
+- heavy-side admission is much better,
+- reject storms are mostly contained.
+
+But none of that is trustworthy if inventory is wrong. A bot with incorrect `qYES/qNO` can still:
+- rebalance the wrong side,
+- suppress valid trades for the wrong reason,
+- carry phantom cost into expiry logic,
+- misreport PnL and risk.
+
+## Recommended Fix Direction
+
+### 1) Use transaction-first maker execution dedupe
+Primary identity should be:
+- `maker_order_id + transaction_hash`
+
+Only use weaker fallbacks if `transaction_hash` is absent, and log when fallback path is used.
+
+### 2) Inventory mutation and `maker_exec_progress` must share the same ledger
+Do not let one path dedupe inventory while another separately increments per-order progress. Both should be driven by the same accepted unique execution record.
+
+### 3) Add hard invariant on per-order applied quantity
+For each maker order:
+- `applied_qty(order_id)` must never exceed the sum of unique transaction-backed matched amounts seen for that order.
+
+If it would exceed:
+- reject the mutation,
+- emit a hard warning with `order_id`, `tx`, `qty`, `applied_qty_before`, `applied_qty_after`, `expected_max`.
+
+### 4) Keep pair `fy/fn` fully order-centric
+Continue using pair-order OIDs for pair wait logic, but source those values only from the deduped maker execution ledger.
+
+## Validation Checklist
+1. Replay `btc-updown-5m-1772748900` and confirm final state is near:
+   - `qYES=24.991175`
+   - `qNO=24.986630`
+2. Replay `btc-updown-5m-1772749200` and confirm the first pair cycle lands near `qYES=15 qNO=15`, then final state is near:
+   - `qYES=24.999352`
+   - `qNO=20.000000`
+3. No maker order's `applied_qty` exceeds the sum of unique transaction-backed fills for that order.
+4. Duplicate user-trade events still log as deduped, but no longer mutate inventory/cost/progress.
+
+## Notes for Next AI Model
+- This is the highest-priority remaining issue.
+- Fix accounting before making more strategy changes.
+- Primary files: `src/bot.rs`, possibly `src/env_contract.rs` only if new diagnostic toggles are added.

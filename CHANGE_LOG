@@ -1,3 +1,87 @@
+## Version 0.1.21
+Date: 2026-03-06
+### Changes
+
+#### Fix 1: Unified maker execution dedupe and fill application
+- **File:** `src/bot.rs` - new maker execution ledger types and commit path
+  (`MakerExecCandidate`, `MakerExecRecord`, `MakerExecLedger`,
+  `MakerExecApplyResult`, `_maker_trade_exec_candidate`,
+  `_maker_trade_exec_aliases`, `_maker_commit_exec_fill`)
+  (line ~190, ~4155, ~4244, ~4337)
+- **Problem:** `v0.1.20` improved control-plane behavior, but maker accounting could still
+  double-apply the same economic fill when the same execution arrived in more than one user
+  trade-event shape. This was visible in `btc-updown-5m-1772749200`, where the first pair leg
+  fills were each treated as roughly `10` shares internally even though trade history only
+  supported `5` shares per leg.
+- **Root cause:** Maker fill handling still had split truth:
+  - inventory dedupe lived in `_apply_fill` using `state.seen_trade_keys`
+  - maker order progress dedupe lived in separate maker execution tracking
+  - one economic fill could be accepted once under a weaker identity and again under a richer one
+- **Fix:**
+  - Added a canonical maker execution ledger with:
+    - alias-to-canonical mapping
+    - canonical execution records
+    - per-order applied fill progress
+  - Maker trade events are now parsed into a structured candidate and assigned aliases in
+    strict priority order:
+    - `maker_tx:{order_id}:{tx_hash}:{qty}:{price}`
+    - `maker_trade:{order_id}:{trade_id}`
+    - `maker_match:{order_id}:{taker_order_id}:{match_time}:{qty}:{price}`
+  - Added `_maker_commit_exec_fill(...)` as the single acceptance path for maker fills
+  - Canonical ids are persisted in `state.seen_trade_keys`, but maker inventory mutation and
+    maker per-order progress now happen in the same commit step
+- **Impact:** A maker economic execution can now mutate inventory at most once per canonical
+  alias resolution path, and pair-order progress is updated from the same accepted execution.
+
+#### Fix 2: Split generic fill mutation from maker-safe no-dedupe mutation
+- **File:** `src/bot.rs` - `_apply_fill`, `_apply_fill_locked_nodedupe`,
+  `_apply_fill_finalize` (line ~6745, ~6828, ~6865)
+- **Problem:** Maker fills previously reused `_apply_fill(...)`, which both mutated inventory
+  and performed its own dedupe. That made it impossible to guarantee that maker inventory and
+  maker per-order progress were driven by the same acceptance decision.
+- **Fix:**
+  - Kept `_apply_fill(...)` for taker/generic paths
+  - Added `_apply_fill_locked_nodedupe(...)` for maker-only use after canonical dedupe succeeds
+  - Added `_apply_fill_finalize(...)` so maker and generic paths still share entry-reason /
+    first-fill side effects without duplicating that logic
+- **Impact:** Maker accounting no longer depends on the generic trade-key path. Taker behavior is
+  unchanged.
+
+#### Fix 3: Maker trade-event handling now uses the canonical ledger path only
+- **File:** `src/bot.rs` - `_handle_user_trade_event` maker branch (line ~8304)
+- **Problem:** The old maker trade branch built ad-hoc keys, called `_apply_fill`, and then
+  separately updated maker execution progress. That allowed inventory and progress to drift.
+- **Fix:**
+  - Replaced the old maker branch with:
+    - candidate extraction
+    - canonical commit
+    - explicit result handling:
+      - `[FILL][MAKER_APPLY]`
+      - `[FILL][MAKER_DEDUPE]`
+      - `[FILL][MAKER_CONFLICT]`
+      - `[FILL][MAKER_DROP_WEAK]`
+  - Pair-order fill waiting continues to use per-order applied quantity, but that quantity now
+    comes from the unified maker execution ledger
+- **Impact:** Maker trade history, internal inventory, and pair-order fill progress are now
+  aligned to one execution-acceptance path.
+
+### New Environment Keys
+- None
+
+### Updated Environment Keys
+- None
+
+### Behavior Impact
+- Maker fills are now accepted through one canonical ledger path before touching inventory.
+- Duplicate maker trade-event variants are dropped earlier and logged with canonical alias context.
+- Pair-order fill progress is now coupled to the same accepted maker executions that mutated
+  inventory.
+- Recovery / suppression logic from `v0.1.20` is unchanged; this release focuses on accounting.
+
+### Validation
+- `cargo check -q`
+- `cargo test -q`
+
 ## Version 0.1.20
 Date: 2026-03-06
 ### Changes

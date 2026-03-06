@@ -187,6 +187,53 @@ struct MakerExecProgress {
 }
 
 #[derive(Debug, Clone, Default)]
+struct MakerExecCandidate {
+    order_id: String,
+    asset_id: String,
+    side: String,
+    qty: f64,
+    price: f64,
+    tx_hash: Option<String>,
+    trade_id: Option<String>,
+    taker_order_id: Option<String>,
+    match_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MakerExecRecord {
+    canonical_id: String,
+    order_id: String,
+    qty: f64,
+    price: f64,
+    asset_id: String,
+    side: String,
+    aliases: Vec<String>,
+    applied_ts: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MakerExecLedger {
+    alias_to_canonical: HashMap<String, String>,
+    records: HashMap<String, MakerExecRecord>,
+    per_order_applied: HashMap<String, MakerExecProgress>,
+}
+
+#[derive(Debug, Clone)]
+enum MakerExecApplyResult {
+    Applied { canonical_id: String },
+    Duplicate { canonical_id: String },
+    Conflict { canonical_id: String, reason: String },
+    DroppedWeakId { reason: String },
+}
+
+#[derive(Debug, Clone, Default)]
+struct ApplyFillMutationMeta {
+    opened_position: bool,
+    closed_position: bool,
+    mark_first_entry_fill: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 struct PairArbPendingImbalance {
     yes_oid: Option<String>,
     no_oid: Option<String>,
@@ -366,8 +413,7 @@ pub struct MakerHedgeCapBot {
     maker_ladder_open_orders: Arc<Mutex<HashMap<String, LadderOrderState>>>,
     maker_order_slots: Arc<Mutex<HashMap<MakerOrderKey, MakerOrderSlot>>>,
     maker_order_index: Arc<Mutex<HashMap<String, MakerOrderKey>>>,
-    maker_exec_progress: Arc<Mutex<HashMap<String, MakerExecProgress>>>,
-    maker_seen_exec_keys: Arc<Mutex<HashSet<String>>>,
+    maker_exec_ledger: Arc<Mutex<MakerExecLedger>>,
     pair_arb_pending_imbalance: Arc<Mutex<Option<PairArbPendingImbalance>>>,
 }
 
@@ -580,8 +626,7 @@ impl MakerHedgeCapBot {
             maker_ladder_open_orders: Arc::new(Mutex::new(HashMap::new())),
             maker_order_slots: Arc::new(Mutex::new(HashMap::new())),
             maker_order_index: Arc::new(Mutex::new(HashMap::new())),
-            maker_exec_progress: Arc::new(Mutex::new(HashMap::new())),
-            maker_seen_exec_keys: Arc::new(Mutex::new(HashSet::new())),
+            maker_exec_ledger: Arc::new(Mutex::new(MakerExecLedger::default())),
             pair_arb_pending_imbalance: Arc::new(Mutex::new(None)),
         };
 
@@ -4107,17 +4152,33 @@ impl MakerHedgeCapBot {
         (q_yes + yes_open, q_no + no_open)
     }
 
-    fn _maker_trade_exec_key(&self, msg: &Value, maker_leg: &Value) -> Option<String> {
-        let maker_oid = maker_leg
+    fn _maker_trade_exec_candidate(
+        &self,
+        msg: &Value,
+        maker_leg: &Value,
+    ) -> Option<MakerExecCandidate> {
+        let order_id = maker_leg
             .get("order_id")
             .or_else(|| maker_leg.get("orderId"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim()
             .to_string();
-        if maker_oid.is_empty() {
-            return None;
-        }
+        let asset_id = maker_leg
+            .get("asset_id")
+            .or_else(|| maker_leg.get("assetId"))
+            .or_else(|| maker_leg.get("token_id"))
+            .or_else(|| maker_leg.get("tokenId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let side = maker_leg
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
         let qty = Self::_value_f64(
             maker_leg
                 .get("matched_amount")
@@ -4126,25 +4187,36 @@ impl MakerHedgeCapBot {
                 .or_else(|| maker_leg.get("filled")),
         )
         .unwrap_or(0.0);
-        let px = Self::_value_f64(maker_leg.get("price")).unwrap_or(0.0);
-        if qty <= 0.0 || px <= 0.0 {
+        let price = Self::_value_f64(maker_leg.get("price")).unwrap_or(0.0);
+        if order_id.is_empty()
+            || asset_id.is_empty()
+            || !matches!(side.as_str(), "BUY" | "SELL")
+            || qty <= 0.0
+            || price <= 0.0
+        {
             return None;
         }
         let tx_hash = msg
             .get("transaction_hash")
             .or_else(|| msg.get("transactionHash"))
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let taker_oid = msg
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let trade_id = msg
+            .get("id")
+            .or_else(|| msg.get("trade_id"))
+            .or_else(|| msg.get("tradeId"))
+            .or_else(|| msg.get("tradeID"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let taker_order_id = msg
             .get("taker_order_id")
             .or_else(|| msg.get("takerOrderId"))
             .or_else(|| msg.get("taker_orderId"))
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let match_time = msg
             .get("match_time")
             .or_else(|| msg.get("matchTime"))
@@ -4155,66 +4227,256 @@ impl MakerHedgeCapBot {
                 Value::Number(n) => Some(n.to_string()),
                 _ => None,
             })
-            .unwrap_or_default();
-        let trade_id = msg
-            .get("id")
-            .or_else(|| msg.get("trade_id"))
-            .or_else(|| msg.get("tradeId"))
-            .or_else(|| msg.get("tradeID"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let status = msg
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_ascii_uppercase();
-        if !tx_hash.is_empty() && !taker_oid.is_empty() && !match_time.is_empty() {
-            return Some(format!(
-                "maker_exec:{maker_oid}:{tx_hash}:{taker_oid}:{match_time}:{qty:.8}:{px:.8}"
+            .filter(|s| !s.is_empty());
+        Some(MakerExecCandidate {
+            order_id,
+            asset_id,
+            side,
+            qty,
+            price,
+            tx_hash,
+            trade_id,
+            taker_order_id,
+            match_time,
+        })
+    }
+
+    fn _maker_trade_exec_aliases(candidate: &MakerExecCandidate) -> Vec<String> {
+        let mut aliases: Vec<String> = Vec::new();
+        if let Some(tx_hash) = candidate.tx_hash.as_deref() {
+            aliases.push(format!(
+                "maker_tx:{}:{}:{:.8}:{:.8}",
+                candidate.order_id, tx_hash, candidate.qty, candidate.price
             ));
         }
-        if !trade_id.is_empty() {
-            return Some(format!(
-                "maker_exec:{maker_oid}:{trade_id}:{qty:.8}:{px:.8}"
+        if let Some(trade_id) = candidate.trade_id.as_deref() {
+            aliases.push(format!("maker_trade:{}:{}", candidate.order_id, trade_id));
+        }
+        if let (Some(taker_oid), Some(match_time)) = (
+            candidate.taker_order_id.as_deref(),
+            candidate.match_time.as_deref(),
+        ) {
+            aliases.push(format!(
+                "maker_match:{}:{}:{}:{:.8}:{:.8}",
+                candidate.order_id, taker_oid, match_time, candidate.qty, candidate.price
             ));
         }
-        Some(format!(
-            "maker_exec:{maker_oid}:{status}:{match_time}:{qty:.8}:{px:.8}"
-        ))
+        aliases
+    }
+
+    fn _maker_exec_alias_kind(exec_id: &str) -> &'static str {
+        if exec_id.starts_with("maker_tx:") {
+            "tx"
+        } else if exec_id.starts_with("maker_trade:") {
+            "trade"
+        } else if exec_id.starts_with("maker_match:") {
+            "match"
+        } else {
+            "unknown"
+        }
+    }
+
+    fn _maker_exec_record_matches(record: &MakerExecRecord, candidate: &MakerExecCandidate) -> bool {
+        const EPS: f64 = 1e-9;
+        record.order_id == candidate.order_id
+            && record.asset_id == candidate.asset_id
+            && record.side == candidate.side
+            && (record.qty - candidate.qty).abs() <= EPS
+            && (record.price - candidate.price).abs() <= EPS
+    }
+
+    fn _maker_exec_order_sum(ledger: &MakerExecLedger, order_id: &str) -> f64 {
+        if order_id.trim().is_empty() {
+            return 0.0;
+        }
+        ledger
+            .records
+            .values()
+            .filter(|rec| rec.order_id == order_id)
+            .map(|rec| rec.qty.max(0.0))
+            .sum::<f64>()
+    }
+
+    fn _maker_exec_attach_aliases(
+        ledger: &mut MakerExecLedger,
+        canonical_id: &str,
+        aliases: &[String],
+    ) {
+        let mut clean_aliases: Vec<String> = aliases
+            .iter()
+            .filter(|alias| !alias.trim().is_empty())
+            .cloned()
+            .collect();
+        clean_aliases.dedup();
+        for alias in &clean_aliases {
+            ledger
+                .alias_to_canonical
+                .insert(alias.clone(), canonical_id.to_string());
+        }
+        if let Some(record) = ledger.records.get_mut(canonical_id) {
+            for alias in clean_aliases {
+                if !record.aliases.iter().any(|v| v == &alias) {
+                    record.aliases.push(alias);
+                }
+            }
+        }
     }
 
     fn _maker_exec_applied_qty(&self, order_id: &str) -> f64 {
         if order_id.trim().is_empty() {
             return 0.0;
         }
-        self.maker_exec_progress
+        self.maker_exec_ledger
             .lock()
             .ok()
-            .and_then(|m| m.get(order_id).cloned())
-            .map(|r| r.applied_qty.max(0.0))
+            .and_then(|ledger| ledger.per_order_applied.get(order_id).cloned())
+            .map(|rec| rec.applied_qty.max(0.0))
             .unwrap_or(0.0)
     }
 
-    fn _maker_record_exec_fill(&self, order_id: &str, exec_key: &str, qty: f64) -> bool {
-        if order_id.trim().is_empty() || exec_key.trim().is_empty() || qty <= 0.0 {
-            return false;
+    fn _maker_commit_exec_fill(&self, candidate: MakerExecCandidate) -> MakerExecApplyResult {
+        const EPS: f64 = 1e-9;
+        let aliases = Self::_maker_trade_exec_aliases(&candidate);
+        if aliases.is_empty() {
+            return MakerExecApplyResult::DroppedWeakId {
+                reason: "no_strong_alias".to_string(),
+            };
         }
-        if let Ok(mut seen) = self.maker_seen_exec_keys.lock() {
-            if !seen.insert(exec_key.to_string()) {
-                return false;
+
+        let now = now_ts_f64();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return MakerExecApplyResult::Conflict {
+                    canonical_id: aliases[0].clone(),
+                    reason: "state_lock_failed".to_string(),
+                }
             }
-        } else {
-            return false;
+        };
+        let mut ledger = match self.maker_exec_ledger.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return MakerExecApplyResult::Conflict {
+                    canonical_id: aliases[0].clone(),
+                    reason: "maker_exec_ledger_lock_failed".to_string(),
+                }
+            }
+        };
+
+        let mut canonical_id = aliases
+            .iter()
+            .find_map(|alias| ledger.alias_to_canonical.get(alias).cloned());
+        if canonical_id.is_none() {
+            canonical_id = aliases
+                .iter()
+                .find(|alias| state.seen_trade_keys.iter().any(|seen| seen == *alias))
+                .cloned();
         }
-        if let Ok(mut progress) = self.maker_exec_progress.lock() {
-            let entry = progress.entry(order_id.to_string()).or_default();
-            entry.applied_qty += qty.max(0.0);
-            entry.last_update_ts = now_ts_f64();
+        let canonical_id = canonical_id.unwrap_or_else(|| aliases[0].clone());
+
+        if let Some(existing) = ledger.records.get(&canonical_id).cloned() {
+            if !Self::_maker_exec_record_matches(&existing, &candidate) {
+                return MakerExecApplyResult::Conflict {
+                    canonical_id,
+                    reason: format!(
+                        "alias_resolved_to_existing_record_mismatch order_id={} qty={:.8} price={:.8} asset={} side={}",
+                        existing.order_id, existing.qty, existing.price, existing.asset_id, existing.side
+                    ),
+                };
+            }
+            Self::_maker_exec_attach_aliases(&mut ledger, &existing.canonical_id, &aliases);
+            return MakerExecApplyResult::Duplicate {
+                canonical_id: existing.canonical_id,
+            };
         }
-        true
+
+        if state.seen_trade_keys.iter().any(|seen| seen == &canonical_id)
+            || aliases
+                .iter()
+                .any(|alias| state.seen_trade_keys.iter().any(|seen| seen == alias))
+        {
+            return MakerExecApplyResult::Duplicate { canonical_id };
+        }
+
+        let order_sum_before = Self::_maker_exec_order_sum(&ledger, &candidate.order_id);
+        let applied_before = ledger
+            .per_order_applied
+            .get(&candidate.order_id)
+            .map(|rec| rec.applied_qty.max(0.0))
+            .unwrap_or(0.0);
+        if (order_sum_before - applied_before).abs() > EPS {
+            self.logger.warning(&format!(
+                "[FILL][MAKER_INVARIANT] oid={}.. applied={applied_before:.8} expected={order_sum_before:.8} stage=pre_apply",
+                candidate.order_id.chars().take(10).collect::<String>()
+            ));
+            return MakerExecApplyResult::Conflict {
+                canonical_id,
+                reason: format!(
+                    "pre_apply_invariant_mismatch applied={applied_before:.8} expected={order_sum_before:.8}"
+                ),
+            };
+        }
+
+        let Some(meta) = self._apply_fill_locked_nodedupe(
+            &mut state,
+            &candidate.asset_id,
+            candidate.price,
+            candidate.qty,
+            &candidate.side,
+        ) else {
+            return MakerExecApplyResult::Conflict {
+                canonical_id,
+                reason: "apply_fill_locked_nodedupe_failed".to_string(),
+            };
+        };
+
+        state.seen_trade_keys.push(canonical_id.clone());
+        let _ = save_state(&self.state_file, &mut state);
+        drop(state);
+
+        let record = MakerExecRecord {
+            canonical_id: canonical_id.clone(),
+            order_id: candidate.order_id.clone(),
+            qty: candidate.qty,
+            price: candidate.price,
+            asset_id: candidate.asset_id.clone(),
+            side: candidate.side.clone(),
+            aliases: Vec::new(),
+            applied_ts: now,
+        };
+        ledger.records.insert(canonical_id.clone(), record);
+        Self::_maker_exec_attach_aliases(&mut ledger, &canonical_id, &aliases);
+        let entry = ledger
+            .per_order_applied
+            .entry(candidate.order_id.clone())
+            .or_default();
+        entry.applied_qty += candidate.qty.max(0.0);
+        entry.last_update_ts = now;
+
+        let order_sum_after = Self::_maker_exec_order_sum(&ledger, &candidate.order_id);
+        let applied_after = ledger
+            .per_order_applied
+            .get(&candidate.order_id)
+            .map(|rec| rec.applied_qty.max(0.0))
+            .unwrap_or(0.0);
+        if (order_sum_after - applied_after).abs() > EPS {
+            self.logger.warning(&format!(
+                "[FILL][MAKER_INVARIANT] oid={}.. applied={applied_after:.8} expected={order_sum_after:.8} stage=post_apply",
+                candidate.order_id.chars().take(10).collect::<String>()
+            ));
+            drop(ledger);
+            self._apply_fill_finalize(meta);
+            return MakerExecApplyResult::Conflict {
+                canonical_id,
+                reason: format!(
+                    "post_apply_invariant_mismatch applied={applied_after:.8} expected={order_sum_after:.8}"
+                ),
+            };
+        }
+        drop(ledger);
+
+        self._apply_fill_finalize(meta);
+        MakerExecApplyResult::Applied { canonical_id }
     }
 
     fn _pair_arb_set_pending_imbalance(
@@ -6563,6 +6825,88 @@ impl MakerHedgeCapBot {
         true
     }
 
+    fn _apply_fill_locked_nodedupe(
+        &self,
+        guard: &mut BotState,
+        asset_id: &str,
+        price: f64,
+        filled: f64,
+        side: &str,
+    ) -> Option<ApplyFillMutationMeta> {
+        let side_u = side.trim().to_ascii_uppercase();
+        if !matches!(side_u.as_str(), "BUY" | "SELL") {
+            return None;
+        }
+        if filled <= 0.0 || price <= 0.0 {
+            return None;
+        }
+
+        let yes_asset = self.yes_asset.as_deref().unwrap_or_default();
+        let sign = if side_u == "BUY" { 1.0 } else { -1.0 };
+        let qty = sign * filled;
+        let qty_before = guard.q_yes + guard.q_no;
+        if asset_id == yes_asset {
+            guard.q_yes = (guard.q_yes + qty).max(0.0);
+            guard.c_yes = (guard.c_yes + price * qty).max(0.0);
+        } else if self.no_asset.as_deref() == Some(asset_id) {
+            guard.q_no = (guard.q_no + qty).max(0.0);
+            guard.c_no = (guard.c_no + price * qty).max(0.0);
+        } else {
+            return None;
+        }
+        let qty_after = guard.q_yes + guard.q_no;
+        Some(ApplyFillMutationMeta {
+            opened_position: side_u == "BUY" && qty_before <= 1e-12 && qty_after > 1e-12,
+            closed_position: qty_after <= 1e-12,
+            mark_first_entry_fill: side_u == "BUY" && qty_after > qty_before + 1e-12,
+        })
+    }
+
+    fn _apply_fill_finalize(&self, meta: ApplyFillMutationMeta) {
+        let ApplyFillMutationMeta {
+            opened_position,
+            closed_position,
+            mark_first_entry_fill,
+        } = meta;
+
+        // Clear seed in-flight cooldown on any fill; allows immediate re-seeding
+        // of the other side instead of waiting for the hardcoded timeout.
+        self._runtime_ts_set("__maker_skew_seed_inflight_until", 0.0);
+
+        let mut opened_reason: Option<String> = None;
+        if opened_position {
+            let reason = self
+                ._take_pending_entry_reason()
+                .unwrap_or_else(|| self._default_entry_reason());
+            if let Ok(mut active_reason) = self.active_entry_reason.lock() {
+                *active_reason = Some(reason.clone());
+            }
+            opened_reason = Some(reason);
+        } else if closed_position {
+            if let Ok(mut active_reason) = self.active_entry_reason.lock() {
+                *active_reason = None;
+            }
+        }
+
+        if mark_first_entry_fill {
+            let fill_ts = crate::db::now_iso_jakarta();
+            if let Ok(mut first) = self.first_entry_fill_iso.lock() {
+                if first.is_none() {
+                    *first = Some(fill_ts);
+                }
+            }
+            if let Ok(mut first_reason) = self.first_entry_reason.lock() {
+                if first_reason.is_none() {
+                    let reason = opened_reason.unwrap_or_else(|| {
+                        self._take_pending_entry_reason()
+                            .unwrap_or_else(|| self._default_entry_reason())
+                    });
+                    *first_reason = Some(reason);
+                }
+            }
+        }
+    }
+
     pub fn _lat_ms(&self, t1: f64, t0: f64) -> Option<i64> {
         if !t1.is_finite() || !t0.is_finite() {
             return None;
@@ -7957,95 +8301,66 @@ impl MakerHedgeCapBot {
                 }
             }
             if let Some(mo) = maker_leg {
-                let asset = mo
-                    .get("asset_id")
-                    .or_else(|| mo.get("assetId"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let side = mo
-                    .get("side")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_ascii_uppercase();
-                let qty = Self::_value_f64(
-                    mo.get("matched_amount")
-                        .or_else(|| mo.get("matchedAmount"))
-                        .or_else(|| mo.get("size"))
-                        .or_else(|| mo.get("filled")),
-                )
-                .unwrap_or(0.0);
-                let px = Self::_value_f64(mo.get("price")).unwrap_or(0.0);
-                if !asset.trim().is_empty()
-                    && matches!(side.as_str(), "BUY" | "SELL")
-                    && qty > 0.0
-                    && px > 0.0
-                {
-                    let maker_oid = mo
-                        .get("order_id")
-                        .or_else(|| mo.get("orderId"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let key = self._maker_trade_exec_key(msg, &mo).unwrap_or_else(|| {
-                        if !trade_id.is_empty() {
-                            format!("maker_exec:{maker_oid}:{trade_id}:{qty:.8}:{px:.8}")
-                        } else {
-                            format!(
-                                "trade_fallback:maker:{maker_oid}:{asset}:{side}:{qty:.8}:{px:.8}"
-                            )
+                if let Some(candidate) = self._maker_trade_exec_candidate(msg, &mo) {
+                    let maker_oid = candidate.order_id.clone();
+                    let trade_id = candidate.trade_id.clone().unwrap_or_default();
+                    let tx_hash = candidate.tx_hash.clone().unwrap_or_default();
+                    let taker_oid = candidate.taker_order_id.clone().unwrap_or_default();
+                    let match_time = candidate.match_time.clone().unwrap_or_default();
+                    let qty = candidate.qty;
+                    let px = candidate.price;
+                    match self._maker_commit_exec_fill(candidate) {
+                        MakerExecApplyResult::Applied { canonical_id } => {
+                            let alias_kind = Self::_maker_exec_alias_kind(&canonical_id);
+                            self.logger.info(&format!(
+                                "[FILL][MAKER_APPLY] oid={}.. canonical={} alias_kind={} qty={qty:.6} px={px:.4}",
+                                maker_oid.chars().take(10).collect::<String>(),
+                                canonical_id,
+                                alias_kind
+                            ));
+                            self._sniper_record_order_fill(&maker_oid, px, qty);
+                            self._log_execution_latency_on_fill(&maker_oid, now_ts_f64());
                         }
-                    });
-                    let already_seen = self
-                        .maker_seen_exec_keys
-                        .lock()
-                        .map(|s| s.contains(&key))
-                        .unwrap_or(false);
-                    if already_seen {
-                        let tx_hash = msg
-                            .get("transaction_hash")
-                            .or_else(|| msg.get("transactionHash"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let taker_oid = msg
-                            .get("taker_order_id")
-                            .or_else(|| msg.get("takerOrderId"))
-                            .or_else(|| msg.get("taker_orderId"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let match_time = msg
-                            .get("match_time")
-                            .or_else(|| msg.get("matchTime"))
-                            .or_else(|| msg.get("timestamp"))
-                            .or_else(|| msg.get("ts"))
-                            .map(|v| match v {
-                                Value::String(s) => s.clone(),
-                                Value::Number(n) => n.to_string(),
-                                _ => "".to_string(),
-                            })
-                            .unwrap_or_default();
-                        self.logger.info(&format!(
-                            "[FILL][MAKER_DEDUPE] drop oid={}.. qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
-                            maker_oid.chars().take(10).collect::<String>(),
-                            trade_id,
-                            tx_hash,
-                            taker_oid,
-                            match_time
-                        ));
-                        return;
-                    }
-                    let applied = self._apply_fill(&asset, px, qty, &key, &side);
-                    if applied && !maker_oid.is_empty() {
-                        let _ = self._maker_record_exec_fill(maker_oid, &key, qty);
-                        self._sniper_record_order_fill(maker_oid, px, qty);
-                        self._log_execution_latency_on_fill(maker_oid, now_ts_f64());
-                    } else if self
-                        .state
-                        .lock()
-                        .map(|s| s.seen_trade_keys.iter().any(|k| k == &key))
-                        .unwrap_or(false)
-                    {
-                        if let Ok(mut seen) = self.maker_seen_exec_keys.lock() {
-                            seen.insert(key);
+                        MakerExecApplyResult::Duplicate { canonical_id } => {
+                            let alias_kind = Self::_maker_exec_alias_kind(&canonical_id);
+                            self.logger.info(&format!(
+                                "[FILL][MAKER_DEDUPE] drop oid={}.. canonical={} alias_kind={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                maker_oid.chars().take(10).collect::<String>(),
+                                canonical_id,
+                                alias_kind,
+                                trade_id,
+                                tx_hash,
+                                taker_oid,
+                                match_time
+                            ));
+                        }
+                        MakerExecApplyResult::Conflict {
+                            canonical_id,
+                            reason,
+                        } => {
+                            let alias_kind = Self::_maker_exec_alias_kind(&canonical_id);
+                            self.logger.warning(&format!(
+                                "[FILL][MAKER_CONFLICT] oid={}.. canonical={} alias_kind={} reason={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                maker_oid.chars().take(10).collect::<String>(),
+                                canonical_id,
+                                alias_kind,
+                                reason,
+                                trade_id,
+                                tx_hash,
+                                taker_oid,
+                                match_time
+                            ));
+                        }
+                        MakerExecApplyResult::DroppedWeakId { reason } => {
+                            self.logger.warning(&format!(
+                                "[FILL][MAKER_DROP_WEAK] oid={}.. reason={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                maker_oid.chars().take(10).collect::<String>(),
+                                reason,
+                                trade_id,
+                                tx_hash,
+                                taker_oid,
+                                match_time
+                            ));
                         }
                     }
                     return;
@@ -13507,7 +13822,9 @@ impl MakerHedgeCapBot {
 
 #[cfg(test)]
 mod tests {
-    use super::MakerHedgeCapBot;
+    use super::{
+        MakerExecCandidate, MakerExecLedger, MakerExecRecord, MakerHedgeCapBot,
+    };
 
     #[test]
     fn maker_payoff_envelope_math() {
@@ -13545,5 +13862,126 @@ mod tests {
         assert_eq!(MakerHedgeCapBot::_maker_clip_bucket(10.0), "SMALL");
         assert_eq!(MakerHedgeCapBot::_maker_clip_bucket(20.0), "MID");
         assert_eq!(MakerHedgeCapBot::_maker_clip_bucket(45.0), "LARGE");
+    }
+
+    #[test]
+    fn maker_exec_aliases_prefer_tx_then_trade_then_match() {
+        let candidate = MakerExecCandidate {
+            order_id: "oid-1".to_string(),
+            asset_id: "asset-1".to_string(),
+            side: "BUY".to_string(),
+            qty: 5.0,
+            price: 0.38,
+            tx_hash: Some("0xtx".to_string()),
+            trade_id: Some("trade-1".to_string()),
+            taker_order_id: Some("taker-1".to_string()),
+            match_time: Some("1772749249".to_string()),
+        };
+
+        let aliases = MakerHedgeCapBot::_maker_trade_exec_aliases(&candidate);
+        assert_eq!(aliases.len(), 3);
+        assert_eq!(aliases[0], "maker_tx:oid-1:0xtx:5.00000000:0.38000000");
+        assert_eq!(aliases[1], "maker_trade:oid-1:trade-1");
+        assert_eq!(
+            aliases[2],
+            "maker_match:oid-1:taker-1:1772749249:5.00000000:0.38000000"
+        );
+    }
+
+    #[test]
+    fn maker_exec_alias_enrichment_resolves_to_existing_trade_canonical() {
+        let trade_only = MakerExecCandidate {
+            order_id: "oid-1".to_string(),
+            asset_id: "asset-1".to_string(),
+            side: "BUY".to_string(),
+            qty: 5.0,
+            price: 0.38,
+            tx_hash: None,
+            trade_id: Some("trade-1".to_string()),
+            taker_order_id: None,
+            match_time: None,
+        };
+        let enriched = MakerExecCandidate {
+            tx_hash: Some("0xtx".to_string()),
+            taker_order_id: Some("taker-1".to_string()),
+            match_time: Some("1772749249".to_string()),
+            ..trade_only.clone()
+        };
+
+        let trade_aliases = MakerHedgeCapBot::_maker_trade_exec_aliases(&trade_only);
+        let canonical = trade_aliases[0].clone();
+        let mut ledger = MakerExecLedger::default();
+        ledger.records.insert(
+            canonical.clone(),
+            MakerExecRecord {
+                canonical_id: canonical.clone(),
+                order_id: trade_only.order_id.clone(),
+                qty: trade_only.qty,
+                price: trade_only.price,
+                asset_id: trade_only.asset_id.clone(),
+                side: trade_only.side.clone(),
+                aliases: Vec::new(),
+                applied_ts: 0.0,
+            },
+        );
+        MakerHedgeCapBot::_maker_exec_attach_aliases(&mut ledger, &canonical, &trade_aliases);
+
+        let enriched_aliases = MakerHedgeCapBot::_maker_trade_exec_aliases(&enriched);
+        let resolved = enriched_aliases
+            .iter()
+            .find_map(|alias| ledger.alias_to_canonical.get(alias).cloned());
+        assert_eq!(resolved.as_deref(), Some(canonical.as_str()));
+        assert!(MakerHedgeCapBot::_maker_exec_record_matches(
+            ledger.records.get(&canonical).unwrap(),
+            &enriched
+        ));
+    }
+
+    #[test]
+    fn maker_exec_alias_enrichment_resolves_to_existing_match_canonical() {
+        let match_only = MakerExecCandidate {
+            order_id: "oid-2".to_string(),
+            asset_id: "asset-2".to_string(),
+            side: "SELL".to_string(),
+            qty: 2.5,
+            price: 0.61,
+            tx_hash: None,
+            trade_id: None,
+            taker_order_id: Some("taker-2".to_string()),
+            match_time: Some("1772749257".to_string()),
+        };
+        let enriched = MakerExecCandidate {
+            tx_hash: Some("0xtx-2".to_string()),
+            trade_id: Some("trade-2".to_string()),
+            ..match_only.clone()
+        };
+
+        let match_aliases = MakerHedgeCapBot::_maker_trade_exec_aliases(&match_only);
+        let canonical = match_aliases[0].clone();
+        let mut ledger = MakerExecLedger::default();
+        ledger.records.insert(
+            canonical.clone(),
+            MakerExecRecord {
+                canonical_id: canonical.clone(),
+                order_id: match_only.order_id.clone(),
+                qty: match_only.qty,
+                price: match_only.price,
+                asset_id: match_only.asset_id.clone(),
+                side: match_only.side.clone(),
+                aliases: Vec::new(),
+                applied_ts: 0.0,
+            },
+        );
+        MakerHedgeCapBot::_maker_exec_attach_aliases(&mut ledger, &canonical, &match_aliases);
+
+        let enriched_aliases = MakerHedgeCapBot::_maker_trade_exec_aliases(&enriched);
+        let resolved = enriched_aliases
+            .iter()
+            .find_map(|alias| ledger.alias_to_canonical.get(alias).cloned());
+        assert_eq!(resolved.as_deref(), Some(canonical.as_str()));
+        assert!(MakerHedgeCapBot::_maker_exec_record_matches(
+            ledger.records.get(&canonical).unwrap(),
+            &enriched
+        ));
     }
 }
