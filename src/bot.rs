@@ -238,6 +238,24 @@ fn pair_base_should_latch_risk_exit(reason: &str) -> bool {
     matches!(reason.trim(), "near_expiry" | "latched")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairBaseSubMinGapPolicy {
+    Hold,
+    TakerImmediate,
+}
+
+fn pair_base_sub_min_gap_policy() -> PairBaseSubMinGapPolicy {
+    match std::env::var("PAIR_BASE_SUB_MIN_GAP_POLICY")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "taker" | "taker_immediate" | "immediate" => PairBaseSubMinGapPolicy::TakerImmediate,
+        _ => PairBaseSubMinGapPolicy::Hold,
+    }
+}
+
 fn pair_base_near_expiry_taker_override_active(
     reason: &str,
     t_left: f64,
@@ -6769,6 +6787,39 @@ impl MakerHedgeCapBot {
                 ),
                 "pair_base_recovery_covered",
             );
+            return;
+        }
+        let min_shares = self.cfg.min_shares.max(1.0);
+        if remaining_gap + 1e-6 < min_shares {
+            let (q_yes_actual, q_no_actual) = self._maker_actual_inventory();
+            match pair_base_sub_min_gap_policy() {
+                PairBaseSubMinGapPolicy::Hold => {
+                    self._pair_base_set_phase(
+                        PairBasePhaseState::MergePending,
+                        Some(pair_id),
+                        self._pair_base_live_order_id(&ctx.yes_asset),
+                        self._pair_base_live_order_id(&ctx.no_asset),
+                        remaining_gap,
+                        q_yes_actual,
+                        q_no_actual,
+                    );
+                    self._maker_dbg_idle(
+                        &format!(
+                            "[PAIR_BASE] merge: sub_min_gap policy=hold gap={gap:.2} remaining_gap={remaining_gap:.2} heavy={heavy} light={light}"
+                        ),
+                        "pair_base_recovery_sub_min_hold",
+                    );
+                }
+                PairBaseSubMinGapPolicy::TakerImmediate => {
+                    self._maker_dbg_idle(
+                        &format!(
+                            "[PAIR_BASE] merge: sub_min_gap policy=taker_immediate gap={gap:.2} remaining_gap={remaining_gap:.2} heavy={heavy} light={light}"
+                        ),
+                        "pair_base_recovery_sub_min_taker",
+                    );
+                    self._maker_pair_base_risk_exit_step("sub_min_immediate", total_cost, true);
+                }
+            }
             return;
         }
         let other_asset = if light == "YES" {

@@ -1,3 +1,13 @@
+## Version 0.1.25
+Date: 2026-03-07
+### Changes
+
+#### Release Bump
+- Bumped the crate/package version for the current Step 1 pair-base, recovery, terminal-exit, and telemetry work so the current tree can be committed as a new patch release.
+
+### Validation
+- Version metadata updated in `Cargo.toml`, `Cargo.lock`, and `CHANGE_LOG`
+
 ## Version 0.1.24
 Date: 2026-03-06
 ### Changes
