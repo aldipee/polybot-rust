@@ -3356,6 +3356,10 @@ impl MakerHedgeCapBot {
         self._dbg(msg, key, throttle_s);
     }
 
+    fn _maker_dbg_idle(&self, msg: &str, key: &str) {
+        self._dbg_maker(msg, key, Some(5.0));
+    }
+
     pub fn _book_url(&self) -> String {
         format!("{}/book", self.cfg.clob_host.trim_end_matches('/'))
     }
@@ -4135,6 +4139,58 @@ impl MakerHedgeCapBot {
             .unwrap_or((0.0, 0.0))
     }
 
+    fn _maker_projected_gap_from_inventory(
+        q_yes: f64,
+        q_no: f64,
+        unsettled_yes: f64,
+        unsettled_no: f64,
+        buy_side: &str,
+        add_size: f64,
+    ) -> f64 {
+        let side = buy_side.trim().to_ascii_uppercase();
+        let add = add_size.max(0.0);
+        let proj_yes = q_yes.max(0.0) + unsettled_yes.max(0.0) + if side == "YES" { add } else { 0.0 };
+        let proj_no = q_no.max(0.0) + unsettled_no.max(0.0) + if side == "NO" { add } else { 0.0 };
+        (proj_yes - proj_no).abs()
+    }
+
+    fn _maker_projected_gap_after_buy(
+        &self,
+        asset_id: &str,
+        add_size: f64,
+    ) -> Option<(f64, f64, f64, f64, f64, f64)> {
+        let (yes, no) = match (&self.yes_asset, &self.no_asset) {
+            (Some(y), Some(n)) => (y.as_str(), n.as_str()),
+            _ => return None,
+        };
+        let side = if asset_id == yes {
+            "YES"
+        } else if asset_id == no {
+            "NO"
+        } else {
+            return None;
+        };
+        let (q_yes, q_no) = self._maker_actual_inventory();
+        let (unsettled_yes, unsettled_no) = self._maker_recovery_unsettled_buy_risks();
+        let current_gap = (q_yes - q_no).abs();
+        let projected_gap = Self::_maker_projected_gap_from_inventory(
+            q_yes,
+            q_no,
+            unsettled_yes,
+            unsettled_no,
+            side,
+            add_size,
+        );
+        Some((
+            current_gap,
+            projected_gap,
+            q_yes,
+            q_no,
+            unsettled_yes,
+            unsettled_no,
+        ))
+    }
+
     fn _maker_effective_inventory(&self) -> (f64, f64) {
         let (q_yes, q_no) = self._maker_actual_inventory();
         if !env_bool("MAKER_EFFECTIVE_Q_INCLUDE_OPEN_BUYS", true) {
@@ -4635,6 +4691,64 @@ impl MakerHedgeCapBot {
         (unsettled_yes, unsettled_no)
     }
 
+    fn _maker_recovery_light_requote_ready(&self, asset_id: &str) -> bool {
+        if asset_id.trim().is_empty() || !self._maker_single_inflight_enabled() {
+            return false;
+        }
+        let key = MakerOrderKey::buy(asset_id);
+        let slot = self._maker_order_slot_get(&key);
+        if slot.order_id.is_some() || slot.state != MakerOrderLifecycle::Idle {
+            return false;
+        }
+        if slot.last_cancel_ts <= 0.0 {
+            return false;
+        }
+        let now = now_ts_f64();
+        let cooldown = self
+            ._maker_cancel_pending_ttl_seconds()
+            .max(self._maker_replace_min_interval_seconds())
+            .max(0.5);
+        now - slot.last_cancel_ts >= cooldown
+    }
+
+    fn _maker_recovery_light_refresh_reason(&self, asset_id: &str) -> Option<String> {
+        if asset_id.trim().is_empty() || !self._maker_single_inflight_enabled() {
+            return None;
+        }
+        let key = MakerOrderKey::buy(asset_id);
+        let slot = self._maker_order_slot_get(&key);
+        if slot.state != MakerOrderLifecycle::Working || slot.order_id.is_none() {
+            return None;
+        }
+        let now = now_ts_f64();
+        let stale = env_int("STALE_SECONDS", self.cfg.stale_seconds).max(1) as f64;
+        let age = (now - slot.last_submit_ts).max(0.0);
+        if age + 1e-6 < stale {
+            return None;
+        }
+        let (invalid, inv_reason) = self._quotes_invalidated();
+        if invalid {
+            return Some(format!("recovery quote invalidated: {inv_reason}"));
+        }
+        let (bid, _ask) = self._best_bid_ask(asset_id).unwrap_or((0.0, 0.0));
+        if bid > 0.0 && slot.price > 0.0 {
+            let moved_ticks = (bid - slot.price).abs() / self.cfg.tick.max(0.0001);
+            let replace_ticks = env_int(
+                "REPLACE_IF_PRICE_MOVES_TICKS",
+                self.cfg.replace_if_price_moves_ticks,
+            )
+            .max(1) as f64;
+            if moved_ticks >= replace_ticks {
+                return Some(format!("recovery refresh bid_move={moved_ticks:.1}t"));
+            }
+        }
+        let max_age = (stale * 3.0).max(5.0);
+        if age >= max_age {
+            return Some(format!("recovery stale age={age:.1}s"));
+        }
+        None
+    }
+
     fn _maker_recovery_mode_snapshot(
         &self,
     ) -> (bool, f64, String, String, Option<String>, f64) {
@@ -4645,26 +4759,46 @@ impl MakerHedgeCapBot {
             .map(|p| p.is_some())
             .unwrap_or(false);
         let (q_yes, q_no) = self._maker_actual_inventory();
+        let actual_gap = (q_yes - q_no).abs();
         let (unsettled_yes, unsettled_no) = self._maker_recovery_unsettled_buy_risks();
-        let unsettled_total = unsettled_yes + unsettled_no;
-        let projected_yes = q_yes + unsettled_yes;
-        let projected_no = q_no + unsettled_no;
-        let gap = (projected_yes - projected_no).abs();
-        let light_side = if projected_yes <= projected_no {
-            "YES"
-        } else {
-            "NO"
-        };
-        let heavy_side = if light_side == "YES" { "NO" } else { "YES" };
         let was_active = self._runtime_ts_get("__maker_recovery_mode_active") > 0.0;
         let enter = self._pair_arb_imbalance_enter_shares();
         let release = self._pair_arb_imbalance_release_shares();
+        // Determine heavy/light from actual fills; fall back to persisted direction when balanced
+        let (heavy_side, light_side) = if actual_gap > 1e-6 {
+            if q_yes > q_no {
+                ("YES", "NO")
+            } else {
+                ("NO", "YES")
+            }
+        } else if was_active {
+            // Fills balanced but recovery still active — use persisted direction
+            if self._runtime_ts_get("__maker_recovery_heavy_yes") > 0.5 {
+                ("YES", "NO")
+            } else {
+                ("NO", "YES")
+            }
+        } else {
+            if q_yes >= q_no {
+                ("YES", "NO")
+            } else {
+                ("NO", "YES")
+            }
+        };
+        // Only heavy-side unsettled risk can keep recovery alive
+        let unsettled_heavy = if heavy_side == "YES" {
+            unsettled_yes
+        } else {
+            unsettled_no
+        };
         let active = if pending_active {
             true
         } else if was_active {
-            gap > release + 1e-6 || unsettled_total > 1e-6
+            // Stay: actual gap above release OR heavy-side unsettled risk still exists
+            actual_gap > release + 1e-6 || unsettled_heavy > 1e-6
         } else {
-            gap + 1e-6 >= enter
+            // Enter: actual filled gap only — unsettled risk alone cannot trigger entry
+            actual_gap + 1e-6 >= enter
         };
         let light_asset = if light_side == "YES" {
             self.yes_asset.clone()
@@ -4673,11 +4807,11 @@ impl MakerHedgeCapBot {
         };
         (
             active,
-            gap,
+            actual_gap,
             heavy_side.to_string(),
             light_side.to_string(),
             light_asset,
-            unsettled_total,
+            unsettled_heavy,
         )
     }
 
@@ -5270,22 +5404,12 @@ impl MakerHedgeCapBot {
             recovery_heavy_side,
             recovery_light_side,
             recovery_asset,
-            recovery_unsettled_total,
+            _recovery_unsettled_heavy,
         ) = self._maker_recovery_mode_snapshot();
         if recovery_active {
-            if recovery_unsettled_total > 1e-6 {
-                let current_oid = self._maker_order_slot_get(key).order_id;
-                self.logger.info(&format!(
-                    "[MAKER_ORD] skip BUY during recovery while unsettled risk exists asset={} heavy={} light={} gap={recovery_gap:.2} unsettled={recovery_unsettled_total:.2} origin={}",
-                    key.asset_id,
-                    recovery_heavy_side,
-                    recovery_light_side,
-                    origin
-                ));
-                return current_oid;
-            }
             if let Some(light_asset_id) = recovery_asset.as_deref() {
                 if key.asset_id != light_asset_id {
+                    // Always block heavy-side BUY during recovery
                     self.logger.info(&format!(
                         "[MAKER_ORD] skip heavy-side BUY during recovery asset={} heavy={} light={} gap={recovery_gap:.2} origin={}",
                         key.asset_id,
@@ -5294,6 +5418,18 @@ impl MakerHedgeCapBot {
                         origin
                     ));
                     return None;
+                }
+                // Light-side: one-flight — block stacking if a recovery order is already unsettled
+                let light_unsettled = self._maker_recovery_unsettled_buy_risk(light_asset_id);
+                if light_unsettled > 1e-6 && !self._maker_recovery_light_requote_ready(light_asset_id)
+                {
+                    let current_oid = self._maker_order_slot_get(key).order_id;
+                    self.logger.info(&format!(
+                        "[MAKER_ORD] skip light-side BUY stacking during recovery asset={} light_unsettled={light_unsettled:.2} gap={recovery_gap:.2} origin={}",
+                        key.asset_id,
+                        origin
+                    ));
+                    return current_oid;
                 }
             }
         }
@@ -6006,10 +6142,24 @@ impl MakerHedgeCapBot {
         let p_yes = if is_maker { y_bid } else { y_ask };
         let p_no = if is_maker { n_bid } else { n_ask };
         if p_yes <= 0.0 || p_no <= 0.0 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_SKEW][ARB] idle: missing_prices type={} p_yes={p_yes:.3} p_no={p_no:.3}",
+                    order_type
+                ),
+                "maker_skew_arb_idle_missing_prices",
+            );
             return false;
         }
         let sum_px = p_yes + p_no;
         if sum_px > threshold + 1e-12 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_SKEW][ARB] idle: sum_above_threshold type={} sum={sum_px:.3} thr={threshold:.3} p_yes={p_yes:.3} p_no={p_no:.3}",
+                    order_type
+                ),
+                "maker_skew_arb_idle_sum_above_threshold",
+            );
             return false;
         }
 
@@ -6022,11 +6172,25 @@ impl MakerHedgeCapBot {
         let max_affordable = (budget_usable / sum_px + 1e-12).floor() as i64;
         let size_int = max_affordable.min(max_tick);
         if size_int < min_int {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_SKEW][ARB] idle: size_below_min type={} size={} min={} budget={budget_usable:.2} sum={sum_px:.3}",
+                    order_type, size_int, min_int
+                ),
+                "maker_skew_arb_idle_size_below_min",
+            );
             return false;
         }
         let edge_after_fees =
             self._maker_pair_edge_after_fees(size_int as f64, p_yes, p_no, is_maker);
         if edge_after_fees <= 0.0 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_SKEW][ARB] idle: non_positive_edge type={} size={} edge={edge_after_fees:+.6} sum={sum_px:.3}",
+                    order_type, size_int
+                ),
+                "maker_skew_arb_idle_non_positive_edge",
+            );
             return false;
         }
 
@@ -6471,6 +6635,11 @@ impl MakerHedgeCapBot {
 
         let (ok, why) = self._accumulate_allowed();
         if !ok {
+            let why_key = why.split('(').next().unwrap_or("unknown");
+            self._maker_dbg_idle(
+                &format!("[MAKER_SKEW] idle: accumulate gate blocked reason={why}"),
+                &format!("maker_skew_idle_gate_{why_key}"),
+            );
             self._maker_ladder_cancel_all(&format!("accumulate gate: {why}"));
             self._maker_cancel_strategy_orders(None, &format!("accumulate gate: {why}"));
             self._maker_record_trade_decision(
@@ -6490,6 +6659,10 @@ impl MakerHedgeCapBot {
         }
         let (invalid, inv_reason) = self._quotes_invalidated();
         if invalid {
+            self._maker_dbg_idle(
+                &format!("[MAKER_SKEW] idle: quote invalidated reason={inv_reason}"),
+                "maker_skew_idle_quote_invalid",
+            );
             self._maker_ladder_cancel_all(&format!("quote invalidated: {inv_reason}"));
             self._maker_cancel_strategy_orders(None, &format!("quote invalidated: {inv_reason}"));
             self._maker_record_trade_decision(
@@ -6514,47 +6687,81 @@ impl MakerHedgeCapBot {
             recovery_heavy_side,
             recovery_side,
             recovery_asset,
-            recovery_unsettled_total,
+            recovery_unsettled_heavy,
         ) = self._maker_recovery_mode_snapshot();
-        let recovery_asset = recovery_asset
+        let recovery_asset_id = recovery_asset
             .as_deref()
             .unwrap_or(if recovery_side == "YES" { yes } else { no });
         let recovery_active_key = "__maker_recovery_mode_active";
+        let recovery_heavy_key = "__maker_recovery_heavy_yes";
         let recovery_log_key = "__maker_recovery_mode_log_until";
         let recovery_log_every = 5.0;
         if recovery_mode {
             self._maker_ladder_cancel_all("imbalance recovery");
-            self._maker_cancel_strategy_orders(Some(recovery_asset), "imbalance recovery");
+            self._maker_cancel_strategy_orders(Some(recovery_asset_id), "imbalance recovery");
             if self._runtime_ts_get(recovery_active_key) <= 0.0 {
                 self.logger.info(&format!(
                     "[MAKER_SKEW] recovery mode enter gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
                 ));
                 self._runtime_ts_set(recovery_active_key, 1.0);
+                self._runtime_ts_set(
+                    recovery_heavy_key,
+                    if recovery_heavy_side == "YES" { 1.0 } else { 0.0 },
+                );
                 self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
             } else if now >= self._runtime_ts_get(recovery_log_key) {
                 self.logger.info(&format!(
-                    "[MAKER_SKEW] recovery mode remain gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
+                    "[MAKER_SKEW] recovery mode remain gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side} unsettled_heavy={recovery_unsettled_heavy:.2}"
                 ));
                 self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
             }
-            if recovery_unsettled_total > 1e-6 {
-                self._maker_cancel_strategy_orders(None, "imbalance recovery unsettled");
-                self._maker_record_trade_decision(
-                    t_into_s,
-                    0.0,
-                    0.0,
-                    downside,
-                    upside,
-                    skew_ratio,
-                    false,
-                    None,
-                    "NONE",
-                    "NONE",
-                    &format!(
-                        "MAKER_SKEW_RECOVERY_WAIT_UNSETTLED(gap={recovery_gap:.2},risk={recovery_unsettled_total:.2})"
-                    ),
-                );
-                return;
+            // Wait for light-side unsettled risk to settle before placing another recovery order
+            let light_unsettled = self._maker_recovery_unsettled_buy_risk(recovery_asset_id);
+            if light_unsettled > 1e-6 {
+                let recovery_key = MakerOrderKey::buy(recovery_asset_id);
+                if let Some(reason) = self._maker_recovery_light_refresh_reason(recovery_asset_id) {
+                    let _ = self._maker_order_request_cancel(&recovery_key, &reason);
+                    self._maker_record_trade_decision(
+                        t_into_s,
+                        0.0,
+                        0.0,
+                        downside,
+                        upside,
+                        skew_ratio,
+                        false,
+                        None,
+                        "NONE",
+                        "NONE",
+                        &format!(
+                            "MAKER_SKEW_RECOVERY_REFRESH(gap={recovery_gap:.2},light_risk={light_unsettled:.2})"
+                        ),
+                    );
+                    return;
+                }
+                if !self._maker_recovery_light_requote_ready(recovery_asset_id) {
+                    // Preserve the active recovery-side order while waiting for its unsettled risk
+                    // to settle; cancel only non-recovery strategy orders.
+                    self._maker_cancel_strategy_orders(
+                        Some(recovery_asset_id),
+                        "imbalance recovery unsettled",
+                    );
+                    self._maker_record_trade_decision(
+                        t_into_s,
+                        0.0,
+                        0.0,
+                        downside,
+                        upside,
+                        skew_ratio,
+                        false,
+                        None,
+                        "NONE",
+                        "NONE",
+                        &format!(
+                            "MAKER_SKEW_RECOVERY_WAIT_UNSETTLED(gap={recovery_gap:.2},light_risk={light_unsettled:.2})"
+                        ),
+                    );
+                    return;
+                }
             }
         } else if self._runtime_ts_get(recovery_active_key) > 0.0 {
             self._maker_ladder_cancel_all("recovery settled");
@@ -6564,6 +6771,7 @@ impl MakerHedgeCapBot {
                 self._pair_arb_imbalance_release_shares()
             ));
             self._runtime_ts_set(recovery_active_key, 0.0);
+            self._runtime_ts_set(recovery_heavy_key, 0.0);
             self._runtime_ts_set(recovery_log_key, 0.0);
         }
 
@@ -6682,6 +6890,13 @@ impl MakerHedgeCapBot {
         let max_shares_budget = (budget_usable / ask.max(1e-9)).floor();
         clip = clip.min(max_shares_budget).max(0.0);
         if clip < self.cfg.min_shares.max(1.0) {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_SKEW] idle: clip_below_min side={side} role={role} clip={clip:.2} min={:.2} bid={bid:.3} ask={ask:.3} budget={budget_usable:.2}",
+                    self.cfg.min_shares.max(1.0)
+                ),
+                "maker_skew_idle_clip_below_min",
+            );
             return;
         }
         let ladder_enabled = env_bool("MAKER_LADDER_ENABLED", true);
@@ -6698,6 +6913,46 @@ impl MakerHedgeCapBot {
         } else {
             "GTC".to_string()
         };
+
+        if !recovery_mode && order_type == "GTC" {
+            if let Some((
+                current_gap,
+                projected_gap,
+                q_yes_actual,
+                q_no_actual,
+                unsettled_yes,
+                unsettled_no,
+            )) = self._maker_projected_gap_after_buy(&asset_id, clip)
+            {
+                let enter = self._pair_arb_imbalance_enter_shares();
+                if projected_gap > enter + 1e-6 && projected_gap > current_gap + 1e-6 {
+                    self.logger.info(&format!(
+                        "[MAKER_SKEW] normal BUY suppressed side={side} role={role} projected_gap={projected_gap:.2} > enter={enter:.2} current_gap={current_gap:.2} clip={clip:.2} qYES={q_yes_actual:.2} qNO={q_no_actual:.2} unsettled_yes={unsettled_yes:.2} unsettled_no={unsettled_no:.2}"
+                    ));
+                    let keep_asset_id = if asset_id == yes { no } else { yes };
+                    self._maker_cancel_strategy_orders(
+                        Some(keep_asset_id),
+                        "maker_skew projected gap suppress",
+                    );
+                    self._maker_record_trade_decision(
+                        t_into_s,
+                        bid,
+                        clip,
+                        downside,
+                        upside,
+                        skew_ratio,
+                        false,
+                        None,
+                        &side,
+                        &order_type,
+                        &format!(
+                            "MAKER_SKEW_PROJECTED_GAP_SUPPRESS(gap={projected_gap:.2},enter={enter:.2},role={role})"
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
 
         if (role == "hedge" && downside < -max_loss) || (role == "cpp_hedge" && order_type != "GTC")
         {
@@ -14106,5 +14361,44 @@ mod tests {
             ledger.records.get(&canonical).unwrap(),
             &enriched
         ));
+    }
+
+    #[test]
+    fn maker_projected_gap_allows_light_side_buy_that_stays_below_enter() {
+        let projected = MakerHedgeCapBot::_maker_projected_gap_from_inventory(
+            25.08,
+            24.55,
+            0.0,
+            0.0,
+            "NO",
+            5.0,
+        );
+        assert!((projected - 4.47).abs() < 1e-6);
+    }
+
+    #[test]
+    fn maker_projected_gap_blocks_same_side_buy_that_would_reopen_recovery() {
+        let projected = MakerHedgeCapBot::_maker_projected_gap_from_inventory(
+            25.08,
+            29.55,
+            0.0,
+            0.0,
+            "NO",
+            5.0,
+        );
+        assert!((projected - 9.47).abs() < 1e-6);
+    }
+
+    #[test]
+    fn maker_projected_gap_includes_unsettled_buy_risk() {
+        let projected = MakerHedgeCapBot::_maker_projected_gap_from_inventory(
+            25.0,
+            22.0,
+            0.0,
+            4.0,
+            "NO",
+            5.0,
+        );
+        assert!((projected - 6.0).abs() < 1e-6);
     }
 }

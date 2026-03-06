@@ -9,3 +9,4 @@ utils/__pycache__/
 *.env
 *.json
 target_hotfix/
+rtds_prices.jsonl

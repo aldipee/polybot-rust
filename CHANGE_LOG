@@ -1,3 +1,77 @@
+## Version 0.1.23
+Date: 2026-03-06
+### Changes
+
+#### Fix 1: Recovery entry no longer triggers from unsettled risk alone
+- **File:** `src/bot.rs` — `_maker_recovery_mode_snapshot` (line ~4638)
+- **Problem:** `v0.1.22` projected unsettled BUY risk into the gap calculation for both entry and
+  stay decisions. At 0/0 inventory, a single bootstrap seed order created projected gap = 10,
+  triggering false recovery. This blocked the offsetting side for ~2 minutes in run
+  `btc-updown-5m-1772758500` (`skip BUY during recovery while unsettled risk exists` while
+  qYES=0.00 qNO=0.00).
+- **Root cause:** Recovery entry used `projected_gap` (fills + unsettled) instead of `actual_gap`
+  (fills only). A working seed order is not a real imbalance — it is the mechanism for building
+  the first position.
+- **Fix:**
+  - Entry: uses actual filled gap only (`actual_gap >= PAIR_ARB_IMBALANCE_ENTER_SHARES`).
+    Unsettled risk alone cannot trigger recovery entry.
+  - Stay: uses actual filled gap OR **heavy-side** unsettled risk. Light-side unsettled risk
+    (the bootstrap/recovery order itself) does not keep recovery alive.
+  - Heavy/light side determination now uses actual fills when gap > 0. When actual gap is 0 but
+    recovery is still active (settling phase), uses persisted `__maker_recovery_heavy_yes`
+    direction from when recovery entered.
+- **Impact:** No false recovery at 0/0 or balanced inventory. Recovery still catches genuine
+  imbalance from fills and still waits for heavy-side cancel-pending risk to settle.
+
+#### Fix 2: Heavy-side BUY block and light-side one-flight are now directional
+- **File:** `src/bot.rs` — `_maker_order_upsert_gtc` (line ~5295)
+- **Problem:** `v0.1.22` blocked ALL BUY submits during recovery when any unsettled risk existed.
+  This was too broad — it blocked the first offsetting light-side order (the recovery order itself)
+  at 0/0, causing the bootstrap deadlock in `btc-updown-5m-1772758500`.
+- **Fix:**
+  - Heavy-side BUY: always blocked during recovery (unchanged).
+  - Light-side BUY: allowed as the first recovery order. Blocked only if a light-side recovery
+    order is already unsettled (`_maker_recovery_unsettled_buy_risk(light_asset) > 0`).
+  - Log messages updated:
+    - `[MAKER_ORD] skip heavy-side BUY during recovery` (unchanged)
+    - `[MAKER_ORD] skip light-side BUY stacking during recovery` (new — one-flight guard)
+- **Impact:** Recovery can now place exactly one deficit-side order at a time. The old blanket
+  block that caused bootstrap deadlock is removed. One-flight discipline prevents overshoot.
+
+#### Fix 3: Recovery persists heavy-side direction and uses directional unsettled wait
+- **File:** `src/bot.rs` — `_maker_skew_arb_step` (line ~6532)
+- **Problem:** When actual filled gap reached 0 during recovery (e.g., 20/20 after rebalancing),
+  the heavy/light side was no longer derivable from fills. Without a stable reference, the stay
+  decision and directional unsettled check could become ambiguous or flip sides.
+- **Fix:**
+  - On recovery entry, persists heavy side via `__maker_recovery_heavy_yes` runtime key.
+  - `_maker_recovery_mode_snapshot` reads this persisted direction when actual gap is 0 but
+    recovery is still active.
+  - Unsettled wait in `_maker_skew_arb_step` now checks **light-side** unsettled risk only
+    (the recovery order), not total unsettled. Heavy-side unsettled keeps recovery alive via
+    the snapshot stay logic, but does not block placing the offsetting recovery order.
+  - On recovery exit, clears `__maker_recovery_heavy_yes`.
+  - Recovery remain log now includes `unsettled_heavy` for observability.
+- **Impact:** Recovery direction is stable through the entire settling phase, even when fills
+  become balanced before heavy-side cancel-pending risk has fully settled.
+  The unsettled-wait branch now preserves the active light-side recovery order instead of
+  canceling it, so one-flight recovery can actually rest/fill rather than churn on each loop.
+
+### New Environment Keys
+- None (registered previously missing `PAIR_ARB_IMBALANCE_ENTER_SHARES` and
+  `PAIR_ARB_IMBALANCE_RELEASE_SHARES` in `env_contract.rs`)
+
+### Behavior Impact
+- Recovery mode no longer activates from unsettled risk alone — requires actual filled imbalance.
+- Bootstrap from 0/0 is no longer blocked by false recovery.
+- Heavy-side BUY block is always-on during recovery; light-side uses one-flight discipline.
+- Recovery direction is persisted and stable through the settling phase.
+- Heavy-side cancel-pending risk keeps recovery alive until settled (prevents late-fill imbalance
+  reintroduction).
+
+### Validation
+- `cargo check -q`
+
 ## Version 0.1.22
 Date: 2026-03-06
 ### Changes
