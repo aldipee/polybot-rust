@@ -3207,10 +3207,11 @@ impl MakerHedgeCapBot {
                 }
             }
 
-            let _ = ws.close(None);
             if self.stop_flag.load(Ordering::SeqCst) {
+                drop(ws);
                 break;
             }
+            let _ = ws.close(None);
             self._on_close(channel, close_code, &close_msg);
 
             let mut rng = rand::thread_rng();
@@ -4567,7 +4568,76 @@ impl MakerHedgeCapBot {
             .unwrap_or(false)
     }
 
-    fn _maker_recovery_mode_snapshot(&self) -> (bool, f64, String, String, Option<String>) {
+    fn _maker_recovery_unsettled_buy_risk(&self, asset_id: &str) -> f64 {
+        if !self._maker_single_inflight_enabled() || asset_id.trim().is_empty() {
+            return 0.0;
+        }
+        let key = MakerOrderKey::buy(asset_id);
+        let slot = self._maker_order_slot_get(&key);
+        let now = now_ts_f64();
+        let settle_grace = self
+            ._maker_working_missing_ttl_seconds()
+            .max(self._maker_cancel_pending_ttl_seconds())
+            .max(self._maker_submit_pending_ttl_seconds())
+            .max(1.0);
+
+        let mut risk = if matches!(
+            slot.state,
+            MakerOrderLifecycle::Working
+                | MakerOrderLifecycle::SubmitPending
+                | MakerOrderLifecycle::CancelPending
+        ) {
+            if slot.remaining > 0.0 {
+                slot.remaining.max(0.0)
+            } else {
+                slot.size.max(0.0)
+            }
+        } else {
+            0.0
+        };
+
+        // Late fills can still arrive shortly after local cancel/idle transitions. Preserve
+        // the last known order size as unsettled risk for a short grace window.
+        if slot.order_id.is_none()
+            && slot.state == MakerOrderLifecycle::Idle
+            && slot.last_cancel_ts > 0.0
+            && now - slot.last_cancel_ts < settle_grace
+        {
+            risk = risk.max(slot.remaining.max(slot.size).max(0.0));
+        }
+
+        let state_open_risk = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.open_orders.get(asset_id).cloned())
+            .filter(|oo| {
+                oo.order_id.is_some()
+                    && oo.ts.map(|ts| now - ts < settle_grace).unwrap_or(false)
+            })
+            .and_then(|oo| oo.size)
+            .unwrap_or(0.0)
+            .max(0.0);
+        risk.max(state_open_risk)
+    }
+
+    fn _maker_recovery_unsettled_buy_risks(&self) -> (f64, f64) {
+        let unsettled_yes = self
+            .yes_asset
+            .as_deref()
+            .map(|aid| self._maker_recovery_unsettled_buy_risk(aid))
+            .unwrap_or(0.0);
+        let unsettled_no = self
+            .no_asset
+            .as_deref()
+            .map(|aid| self._maker_recovery_unsettled_buy_risk(aid))
+            .unwrap_or(0.0);
+        (unsettled_yes, unsettled_no)
+    }
+
+    fn _maker_recovery_mode_snapshot(
+        &self,
+    ) -> (bool, f64, String, String, Option<String>, f64) {
         self._pair_arb_clear_pending_if_resolved();
         let pending_active = self
             .pair_arb_pending_imbalance
@@ -4575,8 +4645,16 @@ impl MakerHedgeCapBot {
             .map(|p| p.is_some())
             .unwrap_or(false);
         let (q_yes, q_no) = self._maker_actual_inventory();
-        let gap = (q_yes - q_no).abs();
-        let light_side = if q_yes <= q_no { "YES" } else { "NO" };
+        let (unsettled_yes, unsettled_no) = self._maker_recovery_unsettled_buy_risks();
+        let unsettled_total = unsettled_yes + unsettled_no;
+        let projected_yes = q_yes + unsettled_yes;
+        let projected_no = q_no + unsettled_no;
+        let gap = (projected_yes - projected_no).abs();
+        let light_side = if projected_yes <= projected_no {
+            "YES"
+        } else {
+            "NO"
+        };
         let heavy_side = if light_side == "YES" { "NO" } else { "YES" };
         let was_active = self._runtime_ts_get("__maker_recovery_mode_active") > 0.0;
         let enter = self._pair_arb_imbalance_enter_shares();
@@ -4584,7 +4662,7 @@ impl MakerHedgeCapBot {
         let active = if pending_active {
             true
         } else if was_active {
-            gap > release + 1e-6
+            gap > release + 1e-6 || unsettled_total > 1e-6
         } else {
             gap + 1e-6 >= enter
         };
@@ -4599,6 +4677,7 @@ impl MakerHedgeCapBot {
             heavy_side.to_string(),
             light_side.to_string(),
             light_asset,
+            unsettled_total,
         )
     }
 
@@ -5185,9 +5264,26 @@ impl MakerHedgeCapBot {
                 origin,
             );
         }
-        let (recovery_active, recovery_gap, recovery_heavy_side, recovery_light_side, recovery_asset) =
-            self._maker_recovery_mode_snapshot();
+        let (
+            recovery_active,
+            recovery_gap,
+            recovery_heavy_side,
+            recovery_light_side,
+            recovery_asset,
+            recovery_unsettled_total,
+        ) = self._maker_recovery_mode_snapshot();
         if recovery_active {
+            if recovery_unsettled_total > 1e-6 {
+                let current_oid = self._maker_order_slot_get(key).order_id;
+                self.logger.info(&format!(
+                    "[MAKER_ORD] skip BUY during recovery while unsettled risk exists asset={} heavy={} light={} gap={recovery_gap:.2} unsettled={recovery_unsettled_total:.2} origin={}",
+                    key.asset_id,
+                    recovery_heavy_side,
+                    recovery_light_side,
+                    origin
+                ));
+                return current_oid;
+            }
             if let Some(light_asset_id) = recovery_asset.as_deref() {
                 if key.asset_id != light_asset_id {
                     self.logger.info(&format!(
@@ -6412,8 +6508,14 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        let (recovery_mode, recovery_gap, recovery_heavy_side, recovery_side, recovery_asset) =
-            self._maker_recovery_mode_snapshot();
+        let (
+            recovery_mode,
+            recovery_gap,
+            recovery_heavy_side,
+            recovery_side,
+            recovery_asset,
+            recovery_unsettled_total,
+        ) = self._maker_recovery_mode_snapshot();
         let recovery_asset = recovery_asset
             .as_deref()
             .unwrap_or(if recovery_side == "YES" { yes } else { no });
@@ -6435,7 +6537,28 @@ impl MakerHedgeCapBot {
                 ));
                 self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
             }
+            if recovery_unsettled_total > 1e-6 {
+                self._maker_cancel_strategy_orders(None, "imbalance recovery unsettled");
+                self._maker_record_trade_decision(
+                    t_into_s,
+                    0.0,
+                    0.0,
+                    downside,
+                    upside,
+                    skew_ratio,
+                    false,
+                    None,
+                    "NONE",
+                    "NONE",
+                    &format!(
+                        "MAKER_SKEW_RECOVERY_WAIT_UNSETTLED(gap={recovery_gap:.2},risk={recovery_unsettled_total:.2})"
+                    ),
+                );
+                return;
+            }
         } else if self._runtime_ts_get(recovery_active_key) > 0.0 {
+            self._maker_ladder_cancel_all("recovery settled");
+            self._maker_cancel_strategy_orders(None, "recovery settled");
             self.logger.info(&format!(
                 "[MAKER_SKEW] recovery mode exit gap={recovery_gap:.2} threshold={:.2}",
                 self._pair_arb_imbalance_release_shares()

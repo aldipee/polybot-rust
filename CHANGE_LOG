@@ -1,3 +1,67 @@
+## Version 0.1.22
+Date: 2026-03-06
+### Changes
+
+#### Fix 1: Recovery mode now stays active while unresolved BUY risk still exists
+- **File:** `src/bot.rs` - new helpers `_maker_recovery_unsettled_buy_risk`,
+  `_maker_recovery_unsettled_buy_risks`, and updated `_maker_recovery_mode_snapshot`
+  (line ~4571, ~4638)
+- **Problem:** `v0.1.21` improved maker execution dedupe, but recovery mode could still exit or
+  relax too early when the filled YES/NO inventory looked balanced while older deficit-side BUY
+  orders were still live, cancel-pending, or in the late-fill window. In run
+  `btc-updown-5m-1772754300`, the bot recovered from `0/20` to `20/20`, but later from a
+  `25/20` partial pair state it continued accumulating NO because prior NO BUY risk had not fully
+  settled.
+- **Root cause:** Recovery state only looked at current filled inventory plus pending pair state.
+  It did not preserve unresolved maker BUY risk from:
+  - live / submit-pending BUYs
+  - cancel-pending BUYs
+  - recently canceled BUYs still inside the late-fill window
+- **Fix:**
+  - Added per-asset unsettled BUY risk helpers
+  - Recovery snapshot now projects exposure as:
+    - `q_yes + unsettled_yes`
+    - `q_no + unsettled_no`
+  - If recovery was already active, it now stays active while either condition is true:
+    - projected gap is still above the release threshold
+    - unresolved BUY risk still exists
+- **Impact:** Recovery no longer turns off just because filled inventory briefly looks balanced
+  while unresolved deficit-side BUY risk is still capable of changing exposure.
+
+#### Fix 2: Recovery path now refuses to stack additional BUYs while unsettled risk exists
+- **File:** `src/bot.rs` - `_maker_order_upsert_gtc` and `_maker_skew_arb_step`
+  (line ~5170, ~6129)
+- **Problem:** During recovery, the bot could still submit a fresh deficit-side BUY while an
+  earlier deficit-side BUY was live, cancel-pending, or recently canceled. If the old order then
+  filled late, the bot overshot into the opposite skew. This is the path that produced repeated
+  NO accumulation in `btc-updown-5m-1772754300` after the pair partial at `06:47:49`.
+- **Fix:**
+  - `_maker_order_upsert_gtc` now blocks all BUY submits during recovery while unresolved BUY
+    risk remains
+  - `_maker_skew_arb_step` now enters an explicit recovery wait state:
+    - cancels strategy orders conservatively
+    - records `MAKER_SKEW_RECOVERY_WAIT_UNSETTLED`
+    - does not place another recovery order until unresolved risk clears
+  - On recovery exit, strategy / ladder orders are swept once more to avoid carrying residual
+    orders back into normal flow
+- **Impact:** Recovery now behaves as single-flight rebalancing. The bot waits for the previous
+  BUY risk to settle before adding more inventory.
+
+### New Environment Keys
+- None
+
+### Updated Environment Keys
+- None
+
+### Behavior Impact
+- Recovery mode now reflects unresolved BUY risk, not only filled inventory.
+- Normal flow cannot resume while late-fill exposure from prior recovery orders is still open.
+- Deficit-side rebalancing is now serialized instead of layered.
+
+### Validation
+- `cargo check -q`
+- `cargo test -q`
+
 ## Version 0.1.21
 Date: 2026-03-06
 ### Changes

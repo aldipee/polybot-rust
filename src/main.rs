@@ -1031,7 +1031,6 @@ fn run() -> Result<()> {
     let account_name = env::var("ACCOUNT_NAME").unwrap_or_else(|_| "default".to_string());
     let daily_take_profit_usd = env_float("DAILY_PNL_TAKE_PROFIT_USD", 0.0).max(0.0);
     let daily_stop_loss_usd = env_float("DAILY_PNL_STOP_LOSS_USD", 0.0).abs();
-    let next_market_delay_seconds = env_float("NEXT_MARKET_DELAY_SECONDS", 2.0).max(0.0);
     let trade_validation_enabled = env_bool("TRADE_VALIDATION_ENABLED", false);
     let trade_validation_after_market_enabled =
         env_bool("TRADE_VALIDATION_AFTER_MARKET_ENABLED", false);
@@ -1329,122 +1328,167 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 }
             };
 
-        let run_result = bot.run();
-        if let Some(svc) = &rtds_service {
-            svc.close();
-        }
+        // Grab shared handles to detect when the bot stops trading,
+        // so we can roll to the next market without waiting for bot.run()
+        // to fully return (WS close handshake can take 10+ seconds).
+        let bot_stop_flag = bot.stop_flag.clone();
+        let bot_exit_reason = bot.exit_reason.clone();
+        // Spawn bot.run() + all post-market cleanup in a background thread.
+        // The main loop will poll stop_flag and proceed to the next market
+        // as soon as the bot is done trading.
+        let bg_slug = current_slug.clone();
+        let bg_bot_id = bot_id.clone();
+        let bg_cfg = cfg.clone();
+        let bg_logger = bot_logger.clone();
+        let bg_session_factory = session_factory.clone();
+        let bg_trade_validation_enabled = trade_validation_enabled;
+        let bg_trade_validation_after_market_enabled = trade_validation_after_market_enabled;
+        let bg_pnl_stats_at_end_enabled = pnl_stats_at_end_enabled;
+        let bg_trade_realized_log_enabled = trade_realized_log_enabled;
+        thread::spawn(move || {
+            let run_result = bot.run();
 
-        let run_reason = match run_result {
-            Ok(r) => r,
-            Err(e) if e.to_string() == "NO_MARKET" => {
-                bot_logger.info(&format!("No market yet for {current_slug}. Skipping."));
-                thread::sleep(Duration::from_secs(2));
-                current_slug = get_next_slug(&current_slug);
-                continue;
+            // Close RTDS (waits for resolution price) in background.
+            if let Some(svc) = rtds_service {
+                svc.close();
             }
-            Err(e) => {
-                bot_logger.warning(&format!("Bot crashed: {e}. Moving to next slug."));
-                format!("CRASH:{}", e)
-            }
-        };
-        bot_logger.info(&format!("Run finished with reason={run_reason}"));
 
-        let mut metrics = bot.trade_metrics_snapshot();
-        let has_trade_activity = metrics.fill_count > 0
-            || metrics.total_cost > 1e-9
-            || metrics.q_yes > 1e-9
-            || metrics.q_no > 1e-9;
-        if !has_trade_activity {
-            repo.delete_trade(&trade_id)?;
-            bot.persist_state();
-            bot_logger.info(&format!(
-                "Deleted pending trade row {trade_id}. reason=NO_TRADE_ACTIVITY"
-            ));
-        } else {
-            metrics.lp = realized_lp_from_resolution_snapshot(
-                &current_slug,
-                metrics.q_yes,
-                metrics.q_no,
-                metrics.total_cost,
-                metrics.lp,
-                &bot_logger,
-                trade_realized_log_enabled,
-            );
-            let end_trade_iso = now_iso_jakarta();
-            let raw_exit_reason = if metrics.exit_reason.trim().is_empty()
-                || metrics.exit_reason.eq_ignore_ascii_case("RUNNING")
-            {
-                run_reason.clone()
-            } else {
-                metrics.exit_reason.clone()
+            let run_reason = match run_result {
+                Ok(r) => r,
+                Err(e) => {
+                    bg_logger.warning(&format!("Bot crashed: {e}. Moving to next slug."));
+                    format!("CRASH:{}", e)
+                }
             };
-            let exit_reason_category = analytics_exit_reason(&raw_exit_reason);
-            let effective_entry_iso = metrics
-                .entry_time_iso
-                .as_deref()
-                .unwrap_or(bot.start_trade_iso.as_str());
-            let holding_secs = holding_duration_seconds(effective_entry_iso, &end_trade_iso);
-            let total_qty = metrics.q_yes + metrics.q_no;
-            let entry_price = if total_qty > 1e-9 {
-                Some(metrics.total_cost / total_qty)
+            bg_logger.info(&format!("Run finished with reason={run_reason}"));
+
+            let repo = bg_session_factory.repository();
+            let mut metrics = bot.trade_metrics_snapshot();
+            let has_trade_activity = metrics.fill_count > 0
+                || metrics.total_cost > 1e-9
+                || metrics.q_yes > 1e-9
+                || metrics.q_no > 1e-9;
+            if !has_trade_activity {
+                let _ = repo.delete_trade(&trade_id);
+                bot.persist_state();
+                bg_logger.info(&format!(
+                    "Deleted pending trade row {trade_id}. reason=NO_TRADE_ACTIVITY"
+                ));
             } else {
-                None
-            };
-            let exit_price = if total_qty > 1e-9 {
-                Some((metrics.total_cost + metrics.lp) / total_qty)
-            } else {
-                None
-            };
-            let stop_loss_category = if exit_reason_category == "STOP_LOSS" {
-                Some(
-                    metrics
-                        .stop_loss_category
-                        .clone()
-                        .unwrap_or_else(|| "MARKET".to_string()),
-                )
-            } else {
-                None
-            };
-            let decision_row = bot.trade_decision_snapshot().unwrap_or_default();
-            repo.upsert_trade_decision(&trade_id, &decision_row)?;
-            repo.update_trade_result(
-                &trade_id,
-                &end_trade_iso,
-                metrics.lp,
-                metrics.total_cost,
-                metrics.cpp,
-                metrics.q_yes,
-                metrics.q_no,
-                &raw_exit_reason,
-                metrics.entry_time_iso.as_deref(),
-                holding_secs,
-                metrics.entry_reason.as_deref(),
-                Some(exit_reason_category.as_str()),
-                stop_loss_category.as_deref(),
-                entry_price,
-                exit_price,
-            )?;
-            bot.persist_state();
-            bot_logger.info(&format!(
-                "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4}",
-                metrics.lp, metrics.total_cost
-            ));
-        }
-        if trade_validation_enabled && trade_validation_after_market_enabled {
-            if let Err(e) =
-                reconcile_unvalidated_trades_with_polymarket(&repo, &bot_id, &cfg, &bot_logger)
-            {
-                bot_logger.warning(&format!(
-                    "[TRADE_VALIDATE] post-market poll error trade_id={} err={e:#}",
-                    trade_id
+                metrics.lp = realized_lp_from_resolution_snapshot(
+                    &bg_slug,
+                    metrics.q_yes,
+                    metrics.q_no,
+                    metrics.total_cost,
+                    metrics.lp,
+                    &bg_logger,
+                    bg_trade_realized_log_enabled,
+                );
+                let end_trade_iso = now_iso_jakarta();
+                let raw_exit_reason = if metrics.exit_reason.trim().is_empty()
+                    || metrics.exit_reason.eq_ignore_ascii_case("RUNNING")
+                {
+                    run_reason.clone()
+                } else {
+                    metrics.exit_reason.clone()
+                };
+                let exit_reason_category = analytics_exit_reason(&raw_exit_reason);
+                let effective_entry_iso = metrics
+                    .entry_time_iso
+                    .as_deref()
+                    .unwrap_or(bot.start_trade_iso.as_str());
+                let holding_secs =
+                    holding_duration_seconds(effective_entry_iso, &end_trade_iso);
+                let total_qty = metrics.q_yes + metrics.q_no;
+                let entry_price = if total_qty > 1e-9 {
+                    Some(metrics.total_cost / total_qty)
+                } else {
+                    None
+                };
+                let exit_price = if total_qty > 1e-9 {
+                    Some((metrics.total_cost + metrics.lp) / total_qty)
+                } else {
+                    None
+                };
+                let stop_loss_category = if exit_reason_category == "STOP_LOSS" {
+                    Some(
+                        metrics
+                            .stop_loss_category
+                            .clone()
+                            .unwrap_or_else(|| "MARKET".to_string()),
+                    )
+                } else {
+                    None
+                };
+                let decision_row = bot.trade_decision_snapshot().unwrap_or_default();
+                let _ = repo.upsert_trade_decision(&trade_id, &decision_row);
+                let _ = repo.update_trade_result(
+                    &trade_id,
+                    &end_trade_iso,
+                    metrics.lp,
+                    metrics.total_cost,
+                    metrics.cpp,
+                    metrics.q_yes,
+                    metrics.q_no,
+                    &raw_exit_reason,
+                    metrics.entry_time_iso.as_deref(),
+                    holding_secs,
+                    metrics.entry_reason.as_deref(),
+                    Some(exit_reason_category.as_str()),
+                    stop_loss_category.as_deref(),
+                    entry_price,
+                    exit_price,
+                );
+                bot.persist_state();
+                bg_logger.info(&format!(
+                    "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4}",
+                    metrics.lp, metrics.total_cost
                 ));
             }
-            last_trade_validation_poll_ts = now_ts_f64();
+
+            if bg_trade_validation_enabled && bg_trade_validation_after_market_enabled {
+                let repo = bg_session_factory.repository();
+                if let Err(e) = reconcile_unvalidated_trades_with_polymarket(
+                    &repo,
+                    &bg_bot_id,
+                    &bg_cfg,
+                    &bg_logger,
+                ) {
+                    bg_logger.warning(&format!(
+                        "[TRADE_VALIDATE] post-market poll error trade_id={} err={e:#}",
+                        trade_id
+                    ));
+                }
+            }
+
+            bg_logger.info(&format!("Ending this market {bg_slug}"));
+            upload_logs_before_rollover(&bg_slug, &bg_bot_id, &bg_logger);
+
+            if bg_pnl_stats_at_end_enabled {
+                let repo = bg_session_factory.repository();
+                let _ = print_pnl_metrics(&repo, &bg_bot_id, &bg_logger);
+                if telegram_enabled() {
+                    let telegram_summary =
+                        build_telegram_pnl_summary(&repo, &bg_bot_id, &bg_logger);
+                    send_telegram_stats_if_enabled(&telegram_summary, &bg_logger);
+                }
+            }
+        });
+
+        // Wait for the bot to signal it's done trading (stop_flag set).
+        // This returns as soon as the bot's main trading loop ends,
+        // WITHOUT waiting for WS close handshake or post-market cleanup.
+        while !bot_stop_flag.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(50));
         }
 
-        thread::sleep(Duration::from_secs(2));
-        bot_logger.info(&format!("Ending this market {current_slug}"));
-        upload_logs_before_rollover(&current_slug, &bot_id, &bot_logger);
+        // Read exit reason from the shared mutex (set before stop_flag).
+        let run_reason = bot_exit_reason
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_else(|_| "ROLLOVER".to_string());
+        bot_logger.info(&format!("Bot stopped trading, reason={run_reason}"));
+
         let next_slug = if run_reason.starts_with("SWITCH:") {
             let ns = run_reason.trim_start_matches("SWITCH:").trim().to_string();
             bot_logger.info(&format!(
@@ -1468,21 +1512,8 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
             ));
             break;
         }
-        current_slug = next_slug;
 
-        if pnl_stats_at_end_enabled {
-            let repo = session_factory.repository();
-            let _ = print_pnl_metrics(&repo, &bot_id, &bot_logger);
-            if telegram_enabled() {
-                let telegram_summary = build_telegram_pnl_summary(&repo, &bot_id, &bot_logger);
-                send_telegram_stats_if_enabled(&telegram_summary, &bot_logger);
-            }
-        }
-        bot_logger.info(&format!(
-            "Waiting {:.2}s before next market... {current_slug}",
-            next_market_delay_seconds
-        ));
-        thread::sleep(Duration::from_secs_f64(next_market_delay_seconds));
+        current_slug = next_slug;
     }
 
     signal_stop_event.store(true, Ordering::SeqCst);
