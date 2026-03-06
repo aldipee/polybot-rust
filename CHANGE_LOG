@@ -1,3 +1,89 @@
+## Version 0.1.24
+Date: 2026-03-06
+### Changes
+
+#### Fix 1: Step 1 can now run under the existing `MAKER_SKEW_ARB` mode
+- **File:** `src/bot.rs` - `_maker_skew_arb_step` and new `_maker_quote_only_step`
+- **Problem:** Step 1 requires:
+  - `MAKER_SKEW_ENABLED=false`
+  - `MAKER_ARB_ENABLED=false`
+  - `MAKER_STRETCH_BIAS_ENABLED=false`
+  But the existing code treated `MAKER_SKEW_ENABLED=false` as a full kill switch, so the engine
+  stopped instead of running a maker-only proof mode.
+- **Fix:**
+  - Added a quote-only fallback path inside the existing top-level mode.
+  - When skew, arb, and stretch are all disabled, the bot now runs a two-sided maker quote loop
+    instead of shutting down the strategy engine.
+- **Impact:** Step 1 is now executable without introducing a new external mode or changing the
+  user-facing configuration model.
+
+#### Fix 2: Quote-only no longer depends on the mixed skew accumulate gate
+- **File:** `src/bot.rs` - `_maker_quote_only_step`, new `_maker_quote_only_allowed`
+- **Problem:** The first quote-only implementation still inherited `_accumulate_allowed()`, which
+  was designed for the broader mixed skew engine. That made Step 1 depend on shared skew-policy
+  gates instead of a dedicated maker-only admissibility check.
+- **Fix:**
+  - Added `_maker_quote_only_allowed(...)` with quote-only-native checks:
+    - missing quotes
+    - zero bid/ask
+    - spread too wide
+    - parity off
+  - `_maker_quote_only_step(...)` now uses that helper directly.
+- **Impact:** Step 1 quote-only behavior is now isolated from the mixed skew gate path and is
+  easier to reason about and measure.
+
+#### Fix 3: Quote-only no longer uses broad shared quote invalidation
+- **File:** `src/bot.rs` - `_maker_quote_only_step`
+- **Problem:** The quote-only path still called `_quotes_invalidated()`, which was built for the
+  full skew engine and could cancel both sides too aggressively in exactly the environments where
+  Step 1 is supposed to prove maker-only spread capture.
+- **Fix:**
+  - Removed `_quotes_invalidated()` from the quote-only path.
+  - Quote-only now relies on:
+    - dedicated quote-only admissibility checks
+    - safe paired bid construction
+    - paired gate checks
+    - existing maker cancel / replace lifecycle
+- **Impact:** Step 1 no longer inherits the broad shared invalidation logic that previously made
+  quote-only behavior appear to “shut off” for architectural reasons rather than true market
+  conditions.
+
+#### Fix 4: Internal maker-skew loop is now phase-separated
+- **File:** `src/bot.rs`
+- **Problem:** Base seed, shared gates, recovery, pair arb, and directional skew logic were still
+  tightly coupled inside one large loop, making Step 1 and later roadmap work harder to isolate.
+- **Fix:**
+  - Refactored the current engine into internal phases under the same top-level mode:
+    - base seed
+    - shared gate handling
+    - recovery handling
+    - directional handling
+- **Impact:** No intended user-facing behavior change from the refactor itself, but the engine is
+  now structured cleanly enough to separate pair/merge priority later without destabilizing the
+  current mode surface.
+
+### New Environment Keys
+- None
+
+### Updated Environment Keys
+- None
+
+### Behavior Impact
+- Step 1 maker-only proof mode is now runnable using the existing config combination.
+- Quote-only now idles for native reasons like:
+  - `missing_quotes`
+  - `zero_bid_ask`
+  - `spread_too_wide(...)`
+  - `parity_off(...)`
+  - `no_pair_edge`
+  - `budget_too_small`
+- Normal skew mode behavior is preserved; the quote-only gating changes apply only to the Step 1
+  fallback path.
+
+### Validation
+- `cargo check -q`
+- `cargo test -q`
+
 ## Version 0.1.23
 Date: 2026-03-06
 ### Changes

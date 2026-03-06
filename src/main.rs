@@ -1441,8 +1441,12 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 );
                 bot.persist_state();
                 bg_logger.info(&format!(
-                    "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4}",
-                    metrics.lp, metrics.total_cost
+                    "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4} cpp={:.4} qYES={:.2} qNO={:.2}",
+                    metrics.lp,
+                    metrics.total_cost,
+                    metrics.cpp,
+                    metrics.q_yes,
+                    metrics.q_no
                 ));
             }
 

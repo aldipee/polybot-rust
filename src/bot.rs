@@ -122,6 +122,163 @@ struct MakerSkewArbState {
     stretch_chainlink_last_ts_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+struct MakerSkewLoopCtx {
+    now: f64,
+    t_into_s: f64,
+    peak_window: bool,
+    total_cost: f64,
+    budget_usable: f64,
+    yes_asset: String,
+    no_asset: String,
+    y_bid: f64,
+    y_ask: f64,
+    n_bid: f64,
+    n_ask: f64,
+    q_yes_eff: f64,
+    q_no_eff: f64,
+    downside: f64,
+    upside: f64,
+    skew_ratio: f64,
+}
+
+#[derive(Debug, Clone)]
+struct MakerSkewRecoveryState {
+    mode: bool,
+    side: String,
+}
+
+#[derive(Debug, Clone)]
+struct PairBaseRecoveryState {
+    mode: bool,
+    gap: f64,
+    heavy_side: String,
+    light_side: String,
+    light_asset_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct PairBaseFeeNetSnapshot {
+    fees_enabled: bool,
+    fee_source: String,
+    maker_rebate_bps: f64,
+    estimated_fees: f64,
+    fee_net_pair_cost: f64,
+    fee_net_worst_case_pnl: f64,
+    fee_net_best_case_pnl: f64,
+    pair_coverage: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PairBasePhaseState {
+    #[default]
+    Flat,
+    PairResting,
+    MergePending,
+    Balanced,
+    RiskExitOnly,
+}
+
+impl PairBasePhaseState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "Flat",
+            Self::PairResting => "PairResting",
+            Self::MergePending => "MergePending",
+            Self::Balanced => "Balanced",
+            Self::RiskExitOnly => "RiskExitOnly",
+        }
+    }
+}
+
+fn pair_base_remaining_gap(actual_gap: f64, light_unsettled: f64) -> f64 {
+    (actual_gap.max(0.0) - light_unsettled.max(0.0)).max(0.0)
+}
+
+fn pair_base_phase_without_recovery(
+    has_inventory: bool,
+    actual_gap: f64,
+    release: f64,
+    pair_orders_live: bool,
+) -> Option<PairBasePhaseState> {
+    if pair_orders_live {
+        return Some(PairBasePhaseState::PairResting);
+    }
+    if actual_gap <= release + 1e-6 && has_inventory {
+        return Some(PairBasePhaseState::Balanced);
+    }
+    if !has_inventory {
+        return Some(PairBasePhaseState::Flat);
+    }
+    None
+}
+
+fn pair_base_should_force_recovery(
+    phase: PairBasePhaseState,
+    actual_gap: f64,
+    release: f64,
+    light_leg_trusted: bool,
+) -> bool {
+    if actual_gap <= release + 1e-6 {
+        return false;
+    }
+    match phase {
+        PairBasePhaseState::MergePending => true,
+        PairBasePhaseState::PairResting => !light_leg_trusted,
+        _ => false,
+    }
+}
+
+fn pair_base_early_risk_exit_lead_seconds(stop_buffer_s: f64) -> f64 {
+    let stop_buffer = stop_buffer_s.max(1.0);
+    (stop_buffer * 2.0).max(stop_buffer + 10.0).max(30.0)
+}
+
+fn pair_base_should_latch_risk_exit(reason: &str) -> bool {
+    matches!(reason.trim(), "near_expiry" | "latched")
+}
+
+fn pair_base_near_expiry_taker_override_active(
+    reason: &str,
+    t_left: f64,
+    force_seconds: f64,
+    override_max_price: f64,
+) -> bool {
+    reason.trim() == "pair_base_near_expiry"
+        && force_seconds > 0.0
+        && override_max_price > 0.0
+        && t_left <= force_seconds + 1e-6
+}
+
+fn pair_base_effective_taker_cap(base_cap: f64, override_max_price: f64) -> f64 {
+    base_cap.max(clamp(override_max_price, 0.0, 0.99))
+}
+
+fn pair_base_allows_merge_requote(worst_case_pnl: f64) -> bool {
+    worst_case_pnl > 1e-9
+}
+
+fn pair_base_recovery_uses_exact_order(origin: &str, size: f64, min_shares: f64) -> bool {
+    origin.trim() == "PAIR_BASE_RECOVERY" && size + 1e-6 < min_shares.max(1.0)
+}
+
+fn pair_submit_tracks_taker_fallback(resolved_order_type: &str) -> bool {
+    resolved_order_type.trim().to_ascii_uppercase() != "GTC"
+}
+
+#[derive(Debug, Clone, Default)]
+struct PairBaseRuntimeState {
+    phase: PairBasePhaseState,
+    active_pair_id: Option<String>,
+    yes_oid: Option<String>,
+    no_oid: Option<String>,
+    target_qty: f64,
+    filled_yes: f64,
+    filled_no: f64,
+    state_enter_ts: f64,
+    risk_exit_latched: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct LadderOrderState {
     key: String,
@@ -378,6 +535,7 @@ pub struct MakerHedgeCapBot {
     pub loop_wait_seconds_sniper: f64,
     sniper_stop_certainty: SniperStopCertaintyConfig,
     pub condition_id: Option<String>,
+    pub market_fees_enabled: Option<bool>,
     pub yes_asset: Option<String>,
     pub no_asset: Option<String>,
     pub runtime_flags: HashMap<String, Value>,
@@ -415,6 +573,7 @@ pub struct MakerHedgeCapBot {
     maker_order_index: Arc<Mutex<HashMap<String, MakerOrderKey>>>,
     maker_exec_ledger: Arc<Mutex<MakerExecLedger>>,
     pair_arb_pending_imbalance: Arc<Mutex<Option<PairArbPendingImbalance>>>,
+    pair_base_state: Arc<Mutex<PairBaseRuntimeState>>,
 }
 
 impl MakerHedgeCapBot {
@@ -592,6 +751,7 @@ impl MakerHedgeCapBot {
             loop_wait_seconds_sniper: env_float("LOOP_WAIT_SECONDS_SNIPER", 0.05),
             sniper_stop_certainty: SniperStopCertaintyConfig::from_env(),
             condition_id: None,
+            market_fees_enabled: None,
             yes_asset: None,
             no_asset: None,
             runtime_flags: HashMap::new(),
@@ -628,6 +788,7 @@ impl MakerHedgeCapBot {
             maker_order_index: Arc::new(Mutex::new(HashMap::new())),
             maker_exec_ledger: Arc::new(Mutex::new(MakerExecLedger::default())),
             pair_arb_pending_imbalance: Arc::new(Mutex::new(None)),
+            pair_base_state: Arc::new(Mutex::new(PairBaseRuntimeState::default())),
         };
 
         runtime_flags.insert(
@@ -657,6 +818,10 @@ impl MakerHedgeCapBot {
         ));
 
         if let Some(market) = fetch_market_by_slug(&out.market_slug, Some(&out.logger))? {
+            out.market_fees_enabled = market
+                .get("feesEnabled")
+                .or_else(|| market.get("fees_enabled"))
+                .and_then(|v| v.as_bool());
             if let Ok((yes, no, condition)) = parse_tokens_and_condition(&market) {
                 out.condition_id = Some(condition.clone());
                 out.yes_asset = Some(yes.clone());
@@ -687,6 +852,24 @@ impl MakerHedgeCapBot {
                     out.start_ts, out.expiry_ts
                 ));
             }
+        }
+        if out._pair_base_mode_enabled() {
+            let fee_source = if out.market_fees_enabled.is_some() {
+                "market"
+            } else {
+                "env"
+            };
+            out.logger.info(&format!(
+                "[PAIR_BASE][CFG] pair_budget={:.2} merge_budget={:.2} hard_reserve={:.2} fees_enabled={} fee_source={} fee_model={} maker_rebate_bps={:.2}",
+                out._pair_base_window_budget(),
+                out._pair_base_merge_budget(),
+                out._pair_base_hard_reserve(),
+                out.market_fees_enabled
+                    .unwrap_or_else(|| env_bool("POLY_FEE_MODEL_ENABLED", true)),
+                fee_source,
+                env_bool("POLY_FEE_MODEL_ENABLED", true),
+                env_float("POLY_MAKER_REBATE_BPS", 0.0).max(0.0)
+            ));
         }
         out._warm_clob_order_meta_cache();
         out._sniper_filters_load_state();
@@ -2816,10 +2999,14 @@ impl MakerHedgeCapBot {
                 if seconds_left < self.cfg.stop_buffer_seconds as f64 {
                     let delta = qy - qn;
                     if delta.abs() >= self.cfg.min_shares {
-                        self.logger.info(&format!(
-                            "Near expiry ({seconds_left:.0}s). Forcing emergency hedge before stopping."
-                        ));
-                        self._emergency_taker_hedge_step(delta, "near_expiry");
+                        if self.exec_mode == "MAKER_SKEW_ARB" && self._pair_base_mode_enabled() {
+                            self._maker_pair_base_risk_exit_step("near_expiry", total_cost, true);
+                        } else {
+                            self.logger.info(&format!(
+                                "Near expiry ({seconds_left:.0}s). Forcing emergency hedge before stopping."
+                            ));
+                            self._emergency_taker_hedge_step(delta, "near_expiry");
+                        }
                         thread::sleep(Duration::from_secs(1));
                     }
                     self.logger.info(&format!(
@@ -2836,11 +3023,30 @@ impl MakerHedgeCapBot {
                         self.cancel_all_orders_exchange("feed stale");
                         in_feed_pause = true;
                     }
+                    if self.exec_mode == "MAKER_SKEW_ARB" && self._pair_base_mode_enabled() {
+                        let stale_key = "__pair_base_feed_stale_since";
+                        let mut stale_since = self._runtime_ts_get(stale_key);
+                        if stale_since <= 0.0 {
+                            stale_since = now;
+                            self._runtime_ts_set(stale_key, stale_since);
+                        }
+                        let delta = qy - qn;
+                        let stale_for = (now - stale_since).max(0.0);
+                        let trigger_after = 2.0 * self.cfg.market_data_stale_seconds.max(1) as f64;
+                        if delta.abs() >= self.cfg.min_shares && stale_for >= trigger_after {
+                            self._maker_pair_base_risk_exit_step(
+                                &format!("feed_stale({stale_for:.1}s)"),
+                                total_cost,
+                                true,
+                            );
+                        }
+                    }
                     continue;
                 } else if in_feed_pause {
                     self.logger.info("FEED OK -> resume.");
                     in_feed_pause = false;
                 }
+                self._runtime_ts_set("__pair_base_feed_stale_since", 0.0);
 
                 if self.exec_mode == "MAKER_SKEW_ARB" {
                     self._maker_skew_arb_step(now, qy, qn, total_cost);
@@ -5389,14 +5595,20 @@ impl MakerHedgeCapBot {
         if key.asset_id.trim().is_empty() || key.side != "BUY" {
             return None;
         }
+        let min_shares = self.cfg.min_shares.max(1.0);
+        let exact_recovery = pair_base_recovery_uses_exact_order(origin, size, min_shares);
         if !self._maker_single_inflight_enabled() {
-            return self._place_limit_bid_gtc_with_origin(
-                &key.asset_id,
-                price,
-                size,
-                Some(true),
-                origin,
-            );
+            return if exact_recovery {
+                self._place_limit_bid_gtc_exact_with_origin(
+                    &key.asset_id,
+                    price,
+                    size,
+                    Some(true),
+                    origin,
+                )
+            } else {
+                self._place_limit_bid_gtc_with_origin(&key.asset_id, price, size, Some(true), origin)
+            };
         }
         let (
             recovery_active,
@@ -5511,8 +5723,15 @@ impl MakerHedgeCapBot {
                 let old_size = slot.remaining.max(slot.size).max(0.0);
                 let age = (now - slot.last_submit_ts).max(0.0);
                 let moved_ticks = (target_price - old_price).abs() / self.cfg.tick.max(0.0001);
-                let size_changed = old_size <= 0.0
-                    || (target_size - old_size).abs() >= (0.25 * old_size).max(self.cfg.min_shares);
+                let exact_recovery_sizing =
+                    pair_base_recovery_uses_exact_order(&target_origin, target_size, min_shares)
+                        || pair_base_recovery_uses_exact_order(&slot.origin, old_size, min_shares);
+                let size_changed = if exact_recovery_sizing {
+                    old_size <= 0.0 || (target_size - old_size).abs() >= 0.01
+                } else {
+                    old_size <= 0.0
+                        || (target_size - old_size).abs() >= (0.25 * old_size).max(self.cfg.min_shares)
+                };
                 if age < stale && moved_ticks < replace_ticks && !size_changed {
                     return Some(oid);
                 }
@@ -5549,13 +5768,25 @@ impl MakerHedgeCapBot {
             s.remaining = target_size.max(0.0);
             s.origin = target_origin.clone();
         }
-        let oid = self._place_limit_bid_gtc_with_origin(
-            &key.asset_id,
-            target_price,
-            target_size,
-            Some(true),
-            &target_origin,
-        );
+        let exact_recovery_target =
+            pair_base_recovery_uses_exact_order(&target_origin, target_size, min_shares);
+        let oid = if exact_recovery_target {
+            self._place_limit_bid_gtc_exact_with_origin(
+                &key.asset_id,
+                target_price,
+                target_size,
+                Some(true),
+                &target_origin,
+            )
+        } else {
+            self._place_limit_bid_gtc_with_origin(
+                &key.asset_id,
+                target_price,
+                target_size,
+                Some(true),
+                &target_origin,
+            )
+        };
         if let Some(oid) = oid {
             self._maker_order_on_submit_ack(&oid, key, target_price, target_size, &target_origin);
             return Some(oid);
@@ -5593,16 +5824,15 @@ impl MakerHedgeCapBot {
         if qty <= 0.0 || price <= 0.0 || !model_enabled {
             return 0.0;
         }
+        if is_maker {
+            return 0.0;
+        }
         let p = clamp(price, 1e-6, 0.999_999);
         let notional = qty * p;
         let taker_fee =
             notional * fee_rate.max(0.0) * (p * (1.0 - p)).powf(exponent.clamp(0.0, 8.0));
-        if is_maker {
-            let rebate = notional * maker_rebate_bps.max(0.0) / 10_000.0;
-            (taker_fee - rebate).max(0.0)
-        } else {
-            taker_fee.max(0.0)
-        }
+        let _ = maker_rebate_bps;
+        taker_fee.max(0.0)
     }
 
     fn _maker_ladder_cancel_all(&self, reason: &str) {
@@ -6003,6 +6233,7 @@ impl MakerHedgeCapBot {
         let decide_ts = now_ts_f64();
         let decide_ns = now_ns();
         let resolved = self._resolve_order_type(order_type);
+        let track_taker_fallback = pair_submit_tracks_taker_fallback(&resolved);
         let (y_oid, n_oid) = if resolved == "GTC" && self._maker_single_inflight_enabled() {
             let y_key = MakerOrderKey::buy(yes);
             let n_key = MakerOrderKey::buy(no);
@@ -6030,7 +6261,11 @@ impl MakerHedgeCapBot {
             )
         };
         if let Some(oid) = &y_oid {
-            self._remember_taker_order(oid, yes, qty, y_px, "BUY");
+            if track_taker_fallback {
+                self._remember_taker_order(oid, yes, qty, y_px, "BUY");
+            } else {
+                self._forget_taker_order(oid);
+            }
             self._track_order_execution_context(
                 oid,
                 &json!({
@@ -6048,7 +6283,11 @@ impl MakerHedgeCapBot {
             );
         }
         if let Some(oid) = &n_oid {
-            self._remember_taker_order(oid, no, qty, n_px, "BUY");
+            if track_taker_fallback {
+                self._remember_taker_order(oid, no, qty, n_px, "BUY");
+            } else {
+                self._forget_taker_order(oid);
+            }
             self._track_order_execution_context(
                 oid,
                 &json!({
@@ -6066,6 +6305,926 @@ impl MakerHedgeCapBot {
             );
         }
         (y_oid, n_oid)
+    }
+
+    fn _pair_base_mode_enabled(&self) -> bool {
+        env_bool("PAIR_BASE_ENABLED", false)
+            && !env_bool("MAKER_SKEW_ENABLED", true)
+            && !env_bool("MAKER_ARB_ENABLED", true)
+            && !env_bool("MAKER_STRETCH_BIAS_ENABLED", false)
+    }
+
+    fn _pair_recovery_enabled(&self) -> bool {
+        env_bool("PAIR_RECOVERY_ENABLED", true)
+    }
+
+    fn _pair_base_window_budget(&self) -> f64 {
+        env_float("PAIR_BASE_WINDOW_BUDGET_USDC", self.cfg.max_total_cost)
+            .max(1.0)
+            .min(self.cfg.max_total_cost.max(1.0))
+    }
+
+    fn _pair_base_merge_budget(&self) -> f64 {
+        env_float("PAIR_BASE_MERGE_BUDGET_USDC", self.cfg.max_total_cost)
+            .max(1.0)
+            .min(self.cfg.max_total_cost.max(1.0))
+    }
+
+    fn _pair_base_hard_reserve(&self) -> f64 {
+        env_float("PAIR_BASE_HARD_RESERVE_USDC", self.cfg.reserve_usd)
+            .max(0.0)
+            .min(self._pair_base_window_budget())
+    }
+
+    fn _pair_base_fee_net_snapshot(
+        &self,
+        q_yes: f64,
+        q_no: f64,
+        total_cost: f64,
+        add_yes: f64,
+        p_yes: f64,
+        add_no: f64,
+        p_no: f64,
+    ) -> PairBaseFeeNetSnapshot {
+        let fee_model_enabled = env_bool("POLY_FEE_MODEL_ENABLED", true);
+        let fees_enabled = self.market_fees_enabled.unwrap_or(fee_model_enabled);
+        let fee_source = if self.market_fees_enabled.is_some() {
+            "market".to_string()
+        } else {
+            "env".to_string()
+        };
+        let maker_rebate_bps = env_float("POLY_MAKER_REBATE_BPS", 0.0).max(0.0);
+        let fee_yes = if add_yes > 0.0 && p_yes > 0.0 {
+            self._maker_poly_fee_estimate(add_yes, p_yes, true, fee_model_enabled && fees_enabled)
+        } else {
+            0.0
+        };
+        let fee_no = if add_no > 0.0 && p_no > 0.0 {
+            self._maker_poly_fee_estimate(add_no, p_no, true, fee_model_enabled && fees_enabled)
+        } else {
+            0.0
+        };
+        let estimated_fees = fee_yes + fee_no;
+        let q_yes_after = q_yes.max(0.0) + add_yes.max(0.0);
+        let q_no_after = q_no.max(0.0) + add_no.max(0.0);
+        let cost_after =
+            total_cost.max(0.0) + add_yes.max(0.0) * p_yes.max(0.0) + add_no.max(0.0) * p_no.max(0.0);
+        let fee_net_pair_cost = cost_after + estimated_fees;
+        let mn = q_yes_after.min(q_no_after);
+        let mx = q_yes_after.max(q_no_after);
+        let pair_coverage = if mx > 1e-9 { mn / mx } else { 1.0 };
+        PairBaseFeeNetSnapshot {
+            fees_enabled,
+            fee_source,
+            maker_rebate_bps,
+            estimated_fees,
+            fee_net_pair_cost,
+            fee_net_worst_case_pnl: mn - fee_net_pair_cost,
+            fee_net_best_case_pnl: mx - fee_net_pair_cost,
+            pair_coverage,
+        }
+    }
+
+    fn _pair_base_log_fee_net(
+        &self,
+        label: &str,
+        pair_id: &str,
+        q_yes: f64,
+        q_no: f64,
+        total_cost: f64,
+        add_yes: f64,
+        p_yes: f64,
+        add_no: f64,
+        p_no: f64,
+    ) -> PairBaseFeeNetSnapshot {
+        let snap =
+            self._pair_base_fee_net_snapshot(q_yes, q_no, total_cost, add_yes, p_yes, add_no, p_no);
+        self.logger.info(&format!(
+            "[PAIR_BASE][FEE] label={} pair_id={} fees_enabled={} fee_source={} maker_rebate_bps={:.2} est_fees={:.4} fee_net_pair_cost={:.4} fee_net_worst_case_pnl={:+.4} fee_net_best_case_pnl={:+.4} pair_coverage={:.3}",
+            label,
+            pair_id,
+            snap.fees_enabled,
+            snap.fee_source,
+            snap.maker_rebate_bps,
+            snap.estimated_fees,
+            snap.fee_net_pair_cost,
+            snap.fee_net_worst_case_pnl,
+            snap.fee_net_best_case_pnl,
+            snap.pair_coverage
+        ));
+        snap
+    }
+
+    fn _pair_base_live_order_id(&self, asset_id: &str) -> Option<String> {
+        if asset_id.trim().is_empty() {
+            return None;
+        }
+        let slot = self._maker_order_slot_get(&MakerOrderKey::buy(asset_id));
+        if !matches!(
+            slot.state,
+            MakerOrderLifecycle::Working
+                | MakerOrderLifecycle::SubmitPending
+                | MakerOrderLifecycle::CancelPending
+        ) {
+            return None;
+        }
+        if !(slot.origin.starts_with("PAIR_BASE_") || slot.origin == "PAIR_BASE_RECOVERY") {
+            return None;
+        }
+        slot.order_id
+    }
+
+    fn _pair_base_cancel_orders(&self, reason: &str) {
+        let (Some(yes), Some(no)) = (&self.yes_asset, &self.no_asset) else {
+            return;
+        };
+        let _ = self._maker_order_request_cancel(&MakerOrderKey::buy(yes), reason);
+        let _ = self._maker_order_request_cancel(&MakerOrderKey::buy(no), reason);
+    }
+
+    fn _pair_base_set_phase(
+        &self,
+        phase: PairBasePhaseState,
+        pair_id: Option<String>,
+        yes_oid: Option<String>,
+        no_oid: Option<String>,
+        target_qty: f64,
+        filled_yes: f64,
+        filled_no: f64,
+    ) {
+        let short_oid = |oid: &Option<String>| -> String {
+            oid.as_deref()
+                .map(|s| s.chars().take(10).collect::<String>())
+                .unwrap_or_else(|| "-".to_string())
+        };
+        if let Ok(mut st) = self.pair_base_state.lock() {
+            let changed = st.phase != phase
+                || st.active_pair_id != pair_id
+                || st.yes_oid != yes_oid
+                || st.no_oid != no_oid;
+            if changed {
+                let pair_label = pair_id.as_deref().unwrap_or("-");
+                self.logger.info(&format!(
+                    "[PAIR_BASE] phase {} -> {} pair_id={} y_oid={} n_oid={} target={target_qty:.2} fy={filled_yes:.2} fn={filled_no:.2}",
+                    st.phase.as_str(),
+                    phase.as_str(),
+                    pair_label,
+                    short_oid(&yes_oid),
+                    short_oid(&no_oid)
+                ));
+                st.state_enter_ts = now_ts_f64();
+            }
+            st.phase = phase;
+            st.active_pair_id = pair_id;
+            st.yes_oid = yes_oid;
+            st.no_oid = no_oid;
+            st.target_qty = target_qty;
+            st.filled_yes = filled_yes;
+            st.filled_no = filled_no;
+        }
+    }
+
+    fn _maker_pair_base_recovery_phase(
+        &self,
+        ctx: &MakerSkewLoopCtx,
+    ) -> Option<PairBaseRecoveryState> {
+        let (
+            recovery_mode,
+            recovery_gap,
+            recovery_heavy_side,
+            recovery_side,
+            recovery_asset,
+            recovery_unsettled_heavy,
+        ) = self._maker_recovery_mode_snapshot();
+        let (current_phase, _active_pair_id, _current_target_qty, state_enter_ts) = self
+            .pair_base_state
+            .lock()
+            .map(|st| {
+                (
+                    st.phase,
+                    st.active_pair_id.clone(),
+                    st.target_qty,
+                    st.state_enter_ts,
+                )
+            })
+            .unwrap_or((PairBasePhaseState::Flat, None, 0.0, 0.0));
+        let release = self._pair_arb_imbalance_release_shares();
+        let recovery_asset_id = recovery_asset.as_deref().unwrap_or(if recovery_side == "YES" {
+            ctx.yes_asset.as_str()
+        } else {
+            ctx.no_asset.as_str()
+        });
+        let trusted_age_s = (env_float("PAIR_BASE_REFRESH_SECONDS", 2.0).max(0.2) * 3.0).max(6.0);
+        let light_oid = self._pair_base_live_order_id(recovery_asset_id);
+        let light_unsettled = self._maker_recovery_unsettled_buy_risk(recovery_asset_id);
+        let live_light_fresh = light_oid
+            .as_deref()
+            .map(|oid| self._maker_order_is_live(recovery_asset_id, Some(oid), trusted_age_s))
+            .unwrap_or(false);
+        let live_light_refresh_reason = self._maker_recovery_light_refresh_reason(recovery_asset_id);
+        let light_leg_trusted = live_light_fresh
+            && live_light_refresh_reason.is_none()
+            && light_unsettled > 1e-6;
+        let forced_pair_recovery_reason = if pair_base_should_force_recovery(
+            current_phase,
+            recovery_gap,
+            release,
+            light_leg_trusted,
+        ) {
+            if current_phase == PairBasePhaseState::MergePending {
+                Some("merge_pending_latched".to_string())
+            } else if recovery_asset_id.trim().is_empty() {
+                Some("missing_light_asset".to_string())
+            } else if let Some(reason) = live_light_refresh_reason.clone() {
+                Some(reason)
+            } else if light_oid.is_none() || light_unsettled <= 1e-6 {
+                Some("missing_light_order".to_string())
+            } else {
+                let phase_age_s = (ctx.now - state_enter_ts).max(0.0);
+                Some(format!(
+                    "pair_resting_stale_live_leg age={phase_age_s:.1}s max_age={trusted_age_s:.1}s"
+                ))
+            }
+        } else {
+            None
+        };
+        let effective_recovery_mode = recovery_mode || forced_pair_recovery_reason.is_some();
+        let recovery_active_key = "__pair_base_recovery_mode_active";
+        let recovery_heavy_key = "__pair_base_recovery_heavy_yes";
+        let recovery_log_key = "__pair_base_recovery_mode_log_until";
+        let recovery_log_every = 5.0;
+        if effective_recovery_mode {
+            self._maker_ladder_cancel_all("pair_base recovery");
+            self._maker_cancel_strategy_orders(Some(recovery_asset_id), "pair_base recovery");
+            if self._runtime_ts_get(recovery_active_key) <= 0.0 {
+                if let Some(reason) = forced_pair_recovery_reason.as_deref() {
+                    self.logger.info(&format!(
+                        "[PAIR_BASE] recovery enter gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side} reason={reason}"
+                    ));
+                } else {
+                    self.logger.info(&format!(
+                        "[PAIR_BASE] recovery enter gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
+                    ));
+                }
+                self._runtime_ts_set(recovery_active_key, 1.0);
+                self._runtime_ts_set(
+                    recovery_heavy_key,
+                    if recovery_heavy_side == "YES" { 1.0 } else { 0.0 },
+                );
+                self._runtime_ts_set(recovery_log_key, ctx.now + recovery_log_every);
+            } else if ctx.now >= self._runtime_ts_get(recovery_log_key) {
+                self.logger.info(&format!(
+                    "[PAIR_BASE] recovery remain gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side} unsettled_heavy={recovery_unsettled_heavy:.2}"
+                ));
+                self._runtime_ts_set(recovery_log_key, ctx.now + recovery_log_every);
+            }
+            if light_unsettled > 1e-6 {
+                let recovery_key = MakerOrderKey::buy(recovery_asset_id);
+                if let Some(reason) = forced_pair_recovery_reason
+                    .clone()
+                    .filter(|reason| reason != "merge_pending_latched")
+                    .or_else(|| self._maker_recovery_light_refresh_reason(recovery_asset_id))
+                {
+                    let _ = self._maker_order_request_cancel(&recovery_key, &reason);
+                    self._maker_dbg_idle(
+                        &format!(
+                            "[PAIR_BASE] merge: requoting_light_leg reason={} gap={recovery_gap:.2} light_risk={light_unsettled:.2}",
+                            reason
+                        ),
+                        "pair_base_recovery_refresh",
+                    );
+                    return None;
+                }
+                if !self._maker_recovery_light_requote_ready(recovery_asset_id) {
+                    self._maker_cancel_strategy_orders(
+                        Some(recovery_asset_id),
+                        "pair_base recovery unsettled",
+                    );
+                    self._maker_dbg_idle(
+                        &format!(
+                            "[PAIR_BASE] merge: waiting_light_leg reason=unsettled gap={recovery_gap:.2} light_risk={light_unsettled:.2}"
+                        ),
+                        "pair_base_recovery_wait_unsettled",
+                    );
+                    return None;
+                }
+            }
+        } else if self._runtime_ts_get(recovery_active_key) > 0.0 {
+            self._maker_ladder_cancel_all("pair_base recovery settled");
+            self._maker_cancel_strategy_orders(None, "pair_base recovery settled");
+            self.logger.info(&format!(
+                "[PAIR_BASE] recovery exit gap={recovery_gap:.2} threshold={:.2}",
+                self._pair_arb_imbalance_release_shares()
+            ));
+            self._runtime_ts_set(recovery_active_key, 0.0);
+            self._runtime_ts_set(recovery_heavy_key, 0.0);
+            self._runtime_ts_set(recovery_log_key, 0.0);
+        }
+        Some(PairBaseRecoveryState {
+            mode: effective_recovery_mode,
+            gap: recovery_gap,
+            heavy_side: recovery_heavy_side,
+            light_side: recovery_side,
+            light_asset_id: recovery_asset_id.to_string(),
+        })
+    }
+
+    fn _maker_pair_base_risk_exit_step(&self, reason: &str, total_cost: f64, allow_taker: bool) {
+        let (q_yes, q_no) = self._maker_actual_inventory();
+        let gap = (q_yes - q_no).abs();
+        let delta = q_yes - q_no;
+        if let Ok(mut st) = self.pair_base_state.lock() {
+            if pair_base_should_latch_risk_exit(reason) {
+                st.risk_exit_latched = true;
+            }
+        }
+        let pair_id = self
+            .pair_base_state
+            .lock()
+            .ok()
+            .and_then(|st| st.active_pair_id.clone())
+            .unwrap_or_else(|| format!("pb-{}", now_ns()));
+        self._pair_base_set_phase(
+            PairBasePhaseState::RiskExitOnly,
+            Some(pair_id.clone()),
+            self._pair_base_live_order_id(self.yes_asset.as_deref().unwrap_or("")),
+            self._pair_base_live_order_id(self.no_asset.as_deref().unwrap_or("")),
+            gap,
+            q_yes,
+            q_no,
+        );
+        let t_left = (self.expiry_ts as f64 - now_ts_f64()).max(0.0);
+        let risk_key = reason
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        self._maker_dbg_idle(
+            &format!(
+                "[PAIR_BASE] risk_exit_only reason={} gap={gap:.2} qYES={q_yes:.2} qNO={q_no:.2} total_cost={total_cost:.2} t_left={t_left:.1}s",
+                reason
+            ),
+            &format!("pair_base_risk_exit_{risk_key}"),
+        );
+        if !allow_taker || gap < 0.01 {
+            return;
+        }
+        let live_yes = self
+            .yes_asset
+            .as_deref()
+            .and_then(|aid| self._pair_base_live_order_id(aid));
+        let live_no = self
+            .no_asset
+            .as_deref()
+            .and_then(|aid| self._pair_base_live_order_id(aid));
+        if live_yes.is_some() || live_no.is_some() {
+            self.cancel_all_open_orders_local("pair_base risk_exit preempt");
+            if let (Some(y), Some(n)) = (&self.yes_asset, &self.no_asset) {
+                self._cancel_exchange_orders_for_assets(
+                    &[y.clone(), n.clone()],
+                    "pair_base risk_exit preempt",
+                );
+            }
+            self._maker_dbg_idle(
+                "[PAIR_BASE] risk_exit_only waiting_cancels",
+                "pair_base_risk_exit_waiting_cancels",
+            );
+            return;
+        }
+        if gap + 1e-6 < self.cfg.min_shares {
+            let heavy_asset = if delta > 0.0 {
+                self.yes_asset.clone()
+            } else {
+                self.no_asset.clone()
+            };
+            if let Some(heavy_asset) = heavy_asset {
+                let heavy_bid = self._best_bid_ask(&heavy_asset).map(|v| v.0).unwrap_or(0.0);
+                let intended_notional_sell = if heavy_bid > 0.0 { gap * heavy_bid } else { 0.0 };
+                self.logger.warning(&format!(
+                    "[PAIR_BASE] risk_exit_action trigger={} action=taker_sell heavy_asset={} gap={gap:.2} intended_notional={intended_notional_sell:.4} qYES={q_yes:.2} qNO={q_no:.2}",
+                    reason,
+                    heavy_asset
+                ));
+            }
+            let hedge_reason = format!("pair_base_{reason}");
+            self._pair_base_exact_taker_hedge_step(delta, &hedge_reason);
+        } else {
+            let hedge_reason = format!("pair_base_{reason}");
+            let missing_asset = if delta > 0.0 {
+                self.no_asset.clone()
+            } else {
+                self.yes_asset.clone()
+            };
+            let Some(missing_asset) = missing_asset else {
+                return;
+            };
+            let (_bid, ask) = self._best_bid_ask(&missing_asset).unwrap_or((0.0, 0.0));
+            let intended_notional = if ask > 0.0 { gap * ask } else { 0.0 };
+            self.logger.warning(&format!(
+                "[PAIR_BASE] risk_exit_action trigger={} action=taker_buy missing_asset={} gap={gap:.2} intended_notional={intended_notional:.4} qYES={q_yes:.2} qNO={q_no:.2}",
+                reason,
+                missing_asset
+            ));
+            self._emergency_taker_hedge_step(delta, &hedge_reason);
+        }
+    }
+
+    fn _maker_pair_base_recovery_step(
+        &self,
+        ctx: &MakerSkewLoopCtx,
+        total_cost: f64,
+        recovery: &PairBaseRecoveryState,
+    ) {
+        if !recovery.mode {
+            return;
+        }
+        if recovery.light_asset_id.trim().is_empty() {
+            self._maker_dbg_idle(
+                "[PAIR_BASE] merge: waiting_light_leg reason=missing_light_asset",
+                "pair_base_recovery_missing_asset",
+            );
+            return;
+        }
+        let gap = recovery.gap;
+        let heavy = recovery.heavy_side.as_str();
+        let light = recovery.light_side.as_str();
+        let light_asset_id = recovery.light_asset_id.as_str();
+        let pair_id = self
+            .pair_base_state
+            .lock()
+            .ok()
+            .and_then(|st| st.active_pair_id.clone())
+            .unwrap_or_else(|| format!("pb-{}", now_ns()));
+        let light_unsettled = self._maker_recovery_unsettled_buy_risk(light_asset_id);
+        let remaining_gap = pair_base_remaining_gap(gap, light_unsettled);
+        if remaining_gap < 0.01 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE] merge: waiting_light_leg reason=covered_by_live_order gap={gap:.2} light_risk={light_unsettled:.2}"
+                ),
+                "pair_base_recovery_covered",
+            );
+            return;
+        }
+        let other_asset = if light == "YES" {
+            ctx.no_asset.as_str()
+        } else {
+            ctx.yes_asset.as_str()
+        };
+        let edge_ticks = env_int("MIN_ENTRY_EDGE_TICKS", self.cfg.entry_edge_ticks).max(0) as f64;
+        let entry_edge = edge_ticks * self.cfg.tick.max(0.0001);
+        let Some(bid) =
+            self._maker_bid_cross_ask_safe(&light_asset_id, other_asset, entry_edge)
+        else {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE] merge: waiting_light_leg reason=no_safe_bid gap={gap:.2} heavy={heavy} light={light}"
+                ),
+                "pair_base_recovery_no_safe_bid",
+            );
+            return;
+        };
+        let ask = if light == "YES" { ctx.y_ask } else { ctx.n_ask };
+        if ask <= 0.0 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE] merge: waiting_light_leg reason=missing_ask gap={gap:.2} light={light}"
+                ),
+                "pair_base_recovery_missing_ask",
+            );
+            return;
+        }
+        let merge_room = (self._pair_base_merge_budget() - total_cost).max(0.0);
+        let max_affordable = round_down(merge_room / ask.max(1e-9), 0.01).max(0.0);
+        let target_gap = round_down(remaining_gap, 0.01).max(0.0);
+        let size = target_gap.min(max_affordable);
+        if size < 0.01 {
+            self._maker_pair_base_risk_exit_step("merge_budget_too_small", total_cost, false);
+            return;
+        }
+        let (q_yes_actual, q_no_actual) = self._maker_actual_inventory();
+        let fee_snap = self._pair_base_log_fee_net(
+            "merge_requote",
+            &pair_id,
+            q_yes_actual,
+            q_no_actual,
+            total_cost,
+            if light == "YES" { size } else { 0.0 },
+            if light == "YES" { bid } else { 0.0 },
+            if light == "NO" { size } else { 0.0 },
+            if light == "NO" { bid } else { 0.0 },
+        );
+        if !pair_base_allows_merge_requote(fee_snap.fee_net_worst_case_pnl) {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE] merge: stop negative_economics gap={gap:.2} remaining_gap={target_gap:.2} worst_case={:+.4} best_case={:+.4}",
+                    fee_snap.fee_net_worst_case_pnl, fee_snap.fee_net_best_case_pnl
+                ),
+                "pair_base_recovery_negative_economics",
+            );
+            self._pair_base_set_phase(
+                PairBasePhaseState::MergePending,
+                Some(pair_id),
+                self._pair_base_live_order_id(&ctx.yes_asset),
+                self._pair_base_live_order_id(&ctx.no_asset),
+                target_gap,
+                q_yes_actual,
+                q_no_actual,
+            );
+            return;
+        }
+        let key = MakerOrderKey::buy(&light_asset_id);
+        let _ = self._maker_order_upsert_gtc(&key, bid, size, "PAIR_BASE_RECOVERY");
+        self._pair_base_set_phase(
+            PairBasePhaseState::MergePending,
+            Some(pair_id),
+            self._pair_base_live_order_id(&ctx.yes_asset),
+            self._pair_base_live_order_id(&ctx.no_asset),
+            target_gap,
+            q_yes_actual,
+            q_no_actual,
+        );
+        self._maker_record_trade_decision(
+            ctx.t_into_s,
+            bid,
+            size,
+            ctx.downside,
+            ctx.upside,
+            ctx.skew_ratio,
+            false,
+            None,
+            &light,
+            "GTC",
+            "PAIR_BASE_RECOVERY",
+        );
+    }
+
+    fn _maker_pair_base_step(&self, now: f64, q_yes: f64, q_no: f64, total_cost: f64) {
+        let refresh_s = env_float("PAIR_BASE_REFRESH_SECONDS", 2.0).max(0.2);
+        let start_after_s = env_float("MAKER_SKEW_START_AFTER_SECONDS", 15.0).max(0.0);
+        let stop_new_after_s = env_float("MAKER_SKEW_STOP_NEW_AFTER_SECONDS", 290.0).max(1.0);
+        let t_into_s = (now - self.start_ts as f64).max(0.0);
+        let (downside, upside, skew_ratio) = Self::_maker_payoff_envelope(q_yes, q_no, total_cost);
+        let last_decision_ts = self
+            .maker_skew_state
+            .lock()
+            .map(|s| s.last_decision_ts)
+            .unwrap_or(0.0);
+        if now - last_decision_ts < refresh_s {
+            return;
+        }
+        if let Ok(mut st) = self.maker_skew_state.lock() {
+            st.last_decision_ts = now;
+            st.downside = downside;
+            st.upside = upside;
+            st.skew_ratio = skew_ratio;
+        }
+
+        self._maker_ladder_cancel_all("pair_base");
+
+        if t_into_s < start_after_s {
+            self._pair_base_set_phase(PairBasePhaseState::Flat, None, None, None, 0.0, q_yes, q_no);
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "BOTH",
+                "GTC",
+                "PAIR_BASE_WARMUP",
+            );
+            return;
+        }
+        if t_into_s >= stop_new_after_s {
+            self._pair_base_cancel_orders("PAIR_BASE stop new orders");
+            self._pair_base_set_phase(PairBasePhaseState::Flat, None, None, None, 0.0, q_yes, q_no);
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "BOTH",
+                "GTC",
+                "PAIR_BASE_STOP_NEW",
+            );
+            return;
+        }
+
+        let (Some(yes), Some(no)) = (&self.yes_asset, &self.no_asset) else {
+            return;
+        };
+        let yq = self._best_bid_ask(yes).unwrap_or((0.0, 0.0));
+        let nq = self._best_bid_ask(no).unwrap_or((0.0, 0.0));
+        let include_open_buys = env_bool("MAKER_EFFECTIVE_Q_INCLUDE_OPEN_BUYS", true);
+        let q_yes_eff = if include_open_buys {
+            q_yes + self._maker_order_open_buy_remaining(yes)
+        } else {
+            q_yes
+        };
+        let q_no_eff = if include_open_buys {
+            q_no + self._maker_order_open_buy_remaining(no)
+        } else {
+            q_no
+        };
+        let ctx = MakerSkewLoopCtx {
+            now,
+            t_into_s,
+            peak_window: false,
+            total_cost,
+            budget_usable: 0.0,
+            yes_asset: yes.clone(),
+            no_asset: no.clone(),
+            y_bid: yq.0,
+            y_ask: yq.1,
+            n_bid: nq.0,
+            n_ask: nq.1,
+            q_yes_eff,
+            q_no_eff,
+            downside,
+            upside,
+            skew_ratio,
+        };
+
+        let actual_gap = (q_yes - q_no).abs();
+        let has_inventory = q_yes > 1e-6 || q_no > 1e-6;
+        let release = self._pair_arb_imbalance_release_shares();
+        let (_current_phase, active_pair_id, current_target_qty, risk_exit_latched) = self
+            .pair_base_state
+            .lock()
+            .map(|st| (st.phase, st.active_pair_id.clone(), st.target_qty, st.risk_exit_latched))
+            .unwrap_or((PairBasePhaseState::Flat, None, 0.0, false));
+        let live_yes_oid = self._pair_base_live_order_id(yes);
+        let live_no_oid = self._pair_base_live_order_id(no);
+        let pair_orders_live = live_yes_oid.is_some() || live_no_oid.is_some();
+        if risk_exit_latched {
+            if actual_gap > release + 1e-6 {
+                self._maker_pair_base_risk_exit_step("latched", total_cost, true);
+            } else {
+                self._pair_base_cancel_orders("PAIR_BASE risk exit latched");
+                self._pair_base_set_phase(
+                    PairBasePhaseState::Balanced,
+                    None,
+                    None,
+                    None,
+                    0.0,
+                    q_yes,
+                    q_no,
+                );
+                self._maker_dbg_idle(
+                    "[PAIR_BASE] idle: risk_exit_latched",
+                    "pair_base_idle_risk_exit_latched",
+                );
+            }
+            return;
+        }
+        if has_inventory {
+            let t_left = (self.expiry_ts as f64 - now).max(0.0);
+            let risk_exit_lead_s =
+                pair_base_early_risk_exit_lead_seconds(self.cfg.stop_buffer_seconds as f64);
+            if actual_gap > release + 1e-6 && t_left <= risk_exit_lead_s {
+                self._maker_pair_base_risk_exit_step("near_expiry", total_cost, true);
+                return;
+            }
+            let max_loss_limit =
+                env_float("PAIR_BASE_MAX_WORST_CASE_LOSS_USDC", self._pair_base_window_budget() * 0.5)
+                    .max(0.0);
+            let fee_snap =
+                self._pair_base_fee_net_snapshot(q_yes, q_no, total_cost, 0.0, 0.0, 0.0, 0.0);
+            if actual_gap > release + 1e-6 && fee_snap.fee_net_worst_case_pnl <= -max_loss_limit {
+                self._maker_pair_base_risk_exit_step(
+                    &format!(
+                        "max_loss(worst={:.2},limit={:.2})",
+                        fee_snap.fee_net_worst_case_pnl, max_loss_limit
+                    ),
+                    total_cost,
+                    true,
+                );
+                return;
+            }
+        }
+
+        if self._pair_recovery_enabled() {
+            let Some(recovery) = self._maker_pair_base_recovery_phase(&ctx) else {
+                let pair_id = self
+                    .pair_base_state
+                    .lock()
+                    .ok()
+                    .and_then(|st| st.active_pair_id.clone())
+                    .unwrap_or_else(|| format!("pb-{}", now_ns()));
+                self._pair_base_set_phase(
+                    PairBasePhaseState::MergePending,
+                    Some(pair_id),
+                    self._pair_base_live_order_id(yes),
+                    self._pair_base_live_order_id(no),
+                    (q_yes - q_no).abs(),
+                    q_yes,
+                    q_no,
+                );
+                return;
+            };
+            if recovery.mode {
+                self._maker_pair_base_recovery_step(&ctx, total_cost, &recovery);
+                return;
+            }
+        }
+
+        if let Some(phase) =
+            pair_base_phase_without_recovery(has_inventory, actual_gap, release, pair_orders_live)
+        {
+            match phase {
+                PairBasePhaseState::PairResting => {
+                    self._pair_base_set_phase(
+                        PairBasePhaseState::PairResting,
+                        Some(active_pair_id.unwrap_or_else(|| format!("pb-{}", now_ns()))),
+                        live_yes_oid,
+                        live_no_oid,
+                        current_target_qty,
+                        q_yes,
+                        q_no,
+                    );
+                    return;
+                }
+                PairBasePhaseState::Balanced => {
+                    self._pair_base_set_phase(
+                        PairBasePhaseState::Balanced,
+                        None,
+                        None,
+                        None,
+                        0.0,
+                        q_yes,
+                        q_no,
+                    );
+                }
+                PairBasePhaseState::Flat => {
+                    self._pair_base_set_phase(
+                        PairBasePhaseState::Flat,
+                        None,
+                        None,
+                        None,
+                        0.0,
+                        q_yes,
+                        q_no,
+                    );
+                }
+                PairBasePhaseState::MergePending | PairBasePhaseState::RiskExitOnly => {}
+            }
+        }
+
+        let (ok, why) = self._maker_quote_only_allowed(yes, no);
+        if !ok {
+            self._maker_dbg_idle(
+                &format!("[PAIR_BASE] idle: {why}"),
+                &format!("pair_base_idle_{}", why.split('(').next().unwrap_or("unknown")),
+            );
+            self._pair_base_cancel_orders(&format!("PAIR_BASE gate: {why}"));
+            return;
+        }
+
+        let min_entry_edge_ticks = env_int("MIN_ENTRY_EDGE_TICKS", self.cfg.entry_edge_ticks).max(0);
+        let entry_edge = min_entry_edge_ticks as f64 * self.cfg.tick.max(0.0001);
+        let y_bid = self._maker_bid_cross_ask_safe(yes, no, entry_edge);
+        let n_bid = self._maker_bid_cross_ask_safe(no, yes, entry_edge);
+        if y_bid.is_none() || n_bid.is_none() {
+            self._maker_dbg_idle(
+                "[PAIR_BASE] idle: no_pair_edge reason=no_safe_bids",
+                "pair_base_idle_no_safe_bids",
+            );
+            self._pair_base_cancel_orders("PAIR_BASE no safe bids");
+            return;
+        }
+        let y_bid = y_bid.unwrap_or(0.0);
+        let n_bid = n_bid.unwrap_or(0.0);
+        let (_, y_ask) = yq;
+        let (_, n_ask) = nq;
+        let tick = self.cfg.tick.max(0.0001);
+        let buf = env_float("PAIRED_ENTRY_BUFFER_TICKS", 0.0) * tick;
+        let tix = |p: f64| -> i64 { (p / tick + 1e-9).round() as i64 };
+        let thr_no_ticks = tix(1.0 - y_bid - buf);
+        let thr_yes_ticks = tix(1.0 - n_bid - buf);
+        if tix(n_ask) > thr_no_ticks
+            || tix(y_ask) > thr_yes_ticks
+            || (y_bid + n_bid) > (1.0 - entry_edge)
+        {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE] idle: no_pair_edge reason=paired_gate_fail sum={:.3} y_bid={y_bid:.3} n_bid={n_bid:.3} y_ask={y_ask:.3} n_ask={n_ask:.3}",
+                    y_bid + n_bid
+                ),
+                "pair_base_idle_paired_gate",
+            );
+            self._pair_base_cancel_orders("PAIR_BASE paired gate fail");
+            return;
+        }
+
+        let pair_budget = self._pair_base_window_budget();
+        let hard_reserve = self._pair_base_hard_reserve();
+        let remaining = pair_budget - total_cost;
+        let budget_usable = (remaining - hard_reserve).max(0.0);
+        let pair_sum = (y_bid + n_bid).max(1e-9);
+        let min_shares = self.cfg.min_shares.max(1.0);
+        let max_affordable = (budget_usable / pair_sum).floor();
+        if max_affordable + 1e-9 < min_shares {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE] idle: budget_too_small pair_sum={pair_sum:.3} pair_budget={pair_budget:.2} usable={budget_usable:.2} reserve={hard_reserve:.2}"
+                ),
+                "pair_base_idle_budget",
+            );
+            self._pair_base_cancel_orders("PAIR_BASE budget too small");
+            return;
+        }
+        let size = self.cfg.clip_shares.max(min_shares).min(max_affordable).floor() as i64;
+        if size < min_shares.ceil() as i64 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE] idle: clip_below_min size={size} min={min_shares:.2} pair_sum={pair_sum:.3} usable={budget_usable:.2}"
+                ),
+                "pair_base_idle_clip_below_min",
+            );
+            return;
+        }
+
+        let pair_id = self
+            .pair_base_state
+            .lock()
+            .ok()
+            .and_then(|st| {
+                if st.phase == PairBasePhaseState::PairResting {
+                    st.active_pair_id.clone()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| format!("pb-{}", now_ns()));
+
+        self._pair_base_log_fee_net(
+            "pair_entry",
+            &pair_id,
+            q_yes,
+            q_no,
+            total_cost,
+            size as f64,
+            y_bid,
+            size as f64,
+            n_bid,
+        );
+        let (y_oid, n_oid) =
+            self._maker_submit_pair_orders(size, y_bid, n_bid, "GTC", Some(true), "PAIR_BASE_GTC");
+        if y_oid.is_some() ^ n_oid.is_some() {
+            self._pair_base_cancel_orders("PAIR_BASE asymmetric submit");
+            self._pair_base_set_phase(PairBasePhaseState::Flat, None, None, None, 0.0, q_yes, q_no);
+            self._maker_dbg_idle(
+                "[PAIR_BASE] idle: no_pair_edge reason=asymmetric_submit",
+                "pair_base_idle_asymmetric_submit",
+            );
+            return;
+        }
+
+        let yes_oid_live = self._pair_base_live_order_id(yes).or(y_oid);
+        let no_oid_live = self._pair_base_live_order_id(no).or(n_oid);
+        if yes_oid_live.is_none() && no_oid_live.is_none() {
+            self._maker_dbg_idle(
+                "[PAIR_BASE] idle: no_pair_edge reason=no_pair_orders_live",
+                "pair_base_idle_no_live_orders",
+            );
+            return;
+        }
+
+        self._pair_base_set_phase(
+            PairBasePhaseState::PairResting,
+            Some(pair_id),
+            yes_oid_live,
+            no_oid_live,
+            size as f64,
+            q_yes,
+            q_no,
+        );
+        self._maker_record_trade_decision(
+            t_into_s,
+            0.5 * (y_bid + n_bid),
+            size as f64,
+            downside,
+            upside,
+            skew_ratio,
+            false,
+            None,
+            "BOTH",
+            "GTC",
+            "PAIR_BASE_GTC",
+        );
     }
 
     fn _maker_record_trade_decision(
@@ -6385,8 +7544,252 @@ impl MakerHedgeCapBot {
         true
     }
 
+    fn _maker_quote_only_step(&self, now: f64, q_yes: f64, q_no: f64, total_cost: f64) {
+        let refresh_s = env_float("MAKER_SKEW_REFRESH_SECONDS", 2.0).max(0.2);
+        let start_after_s = env_float("MAKER_SKEW_START_AFTER_SECONDS", 15.0).max(0.0);
+        let stop_new_after_s = env_float("MAKER_SKEW_STOP_NEW_AFTER_SECONDS", 290.0).max(1.0);
+        let t_into_s = (now - self.start_ts as f64).max(0.0);
+        let (downside, upside, skew_ratio) = Self::_maker_payoff_envelope(q_yes, q_no, total_cost);
+        let last_decision_ts = self
+            .maker_skew_state
+            .lock()
+            .map(|s| s.last_decision_ts)
+            .unwrap_or(0.0);
+        if now - last_decision_ts < refresh_s {
+            return;
+        }
+        if let Ok(mut st) = self.maker_skew_state.lock() {
+            st.last_decision_ts = now;
+            st.downside = downside;
+            st.upside = upside;
+            st.skew_ratio = skew_ratio;
+        }
+        if t_into_s < start_after_s {
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "BOTH",
+                "GTC",
+                "MAKER_QUOTE_ONLY_WARMUP",
+            );
+            return;
+        }
+        if t_into_s >= stop_new_after_s {
+            self._maker_ladder_cancel_all("quote-only stop_new_after");
+            self._maker_cancel_strategy_orders(None, "MAKER_QUOTE_ONLY stop new orders");
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "BOTH",
+                "GTC",
+                "MAKER_QUOTE_ONLY_STOP_NEW",
+            );
+            return;
+        }
+
+        let remaining = self.cfg.max_total_cost - total_cost;
+        if remaining <= self.cfg.reserve_usd {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_QUOTE_ONLY] idle: budget_too_small remaining={remaining:.2} reserve={:.2}",
+                    self.cfg.reserve_usd
+                ),
+                "maker_quote_only_idle_budget",
+            );
+            self._maker_ladder_cancel_all("quote-only reserve reached");
+            self._maker_cancel_strategy_orders(None, "MAKER_QUOTE_ONLY reserve reached");
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "BOTH",
+                "GTC",
+                "MAKER_QUOTE_ONLY_BUDGET_EXHAUSTED",
+            );
+            return;
+        }
+        let budget_usable = (remaining - self.cfg.reserve_usd).max(0.0);
+
+        let (yes, no) = match (&self.yes_asset, &self.no_asset) {
+            (Some(y), Some(n)) => (y.as_str(), n.as_str()),
+            _ => return,
+        };
+        let (ok, why) = self._maker_quote_only_allowed(yes, no);
+        if !ok {
+            let why_key = why.split('(').next().unwrap_or("unknown");
+            self._maker_dbg_idle(
+                &format!("[MAKER_QUOTE_ONLY] idle: {why}"),
+                &format!("maker_quote_only_idle_gate_{why_key}"),
+            );
+            self._maker_ladder_cancel_all(&format!("quote-only gate: {why}"));
+            self._maker_cancel_strategy_orders(None, &format!("quote-only gate: {why}"));
+            self._maker_record_trade_decision(
+                t_into_s,
+                0.0,
+                0.0,
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "BOTH",
+                "GTC",
+                &format!("MAKER_QUOTE_ONLY_GATE_{why}"),
+            );
+            return;
+        }
+
+        let min_entry_edge_ticks = env_int("MIN_ENTRY_EDGE_TICKS", self.cfg.entry_edge_ticks) as i64;
+        let effective_edge_ticks = self.cfg.entry_edge_ticks.max(min_entry_edge_ticks);
+        let entry_edge = effective_edge_ticks as f64 * self.cfg.tick;
+        let y_bid = self._maker_bid_cross_ask_safe(yes, no, entry_edge);
+        let n_bid = self._maker_bid_cross_ask_safe(no, yes, entry_edge);
+        if y_bid.is_none() || n_bid.is_none() {
+            self._maker_dbg_idle(
+                "[MAKER_QUOTE_ONLY] idle: no_pair_edge reason=no_safe_bids",
+                "maker_quote_only_idle_no_safe_bids",
+            );
+            self._maker_cancel_strategy_orders(None, "quote-only no safe bids");
+            return;
+        }
+        let y_bid = y_bid.unwrap_or(0.0);
+        let n_bid = n_bid.unwrap_or(0.0);
+
+        let yq = self._best_bid_ask(yes);
+        let nq = self._best_bid_ask(no);
+        if yq.is_none() || nq.is_none() {
+            self._maker_dbg_idle(
+                "[MAKER_QUOTE_ONLY] idle: no_pair_edge reason=missing_quotes_for_pair_gate",
+                "maker_quote_only_idle_missing_quotes",
+            );
+            self._maker_cancel_strategy_orders(None, "quote-only missing quotes");
+            return;
+        }
+        let (_, y_ask) = yq.unwrap_or((0.0, 0.0));
+        let (_, n_ask) = nq.unwrap_or((0.0, 0.0));
+        let tick = if self.cfg.tick > 0.0 { self.cfg.tick } else { 0.01 };
+        let buf = env_float("PAIRED_ENTRY_BUFFER_TICKS", 0.0) * tick;
+        let tix = |p: f64| -> i64 { (p / tick + 1e-9).round() as i64 };
+        let thr_no_ticks = tix(1.0 - y_bid - buf);
+        let thr_yes_ticks = tix(1.0 - n_bid - buf);
+        if tix(n_ask) > thr_no_ticks || tix(y_ask) > thr_yes_ticks || (y_bid + n_bid) > (1.0 - entry_edge) {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_QUOTE_ONLY] idle: no_pair_edge reason=paired_gate_fail sum={:.3} y_bid={y_bid:.3} n_bid={n_bid:.3} y_ask={y_ask:.3} n_ask={n_ask:.3}",
+                    y_bid + n_bid
+                ),
+                "maker_quote_only_idle_paired_gate",
+            );
+            self._maker_cancel_strategy_orders(None, "quote-only paired gate fail");
+            return;
+        }
+
+        let mut size = self.cfg.clip_shares.max(self.cfg.min_shares).max(1.0);
+        if env_bool("DEPTH_GATE_ENABLED", false) {
+            let (okd, whyd) = self._depth_gate_accumulate(size, y_bid, n_bid, buf);
+            if !okd && !env_bool("DEPTH_GATE_WARN_ONLY", false) {
+                self._maker_dbg_idle(
+                    &format!("[MAKER_QUOTE_ONLY] idle: no_pair_edge reason=depth_gate({whyd})"),
+                    "maker_quote_only_idle_depth_gate",
+                );
+                self._maker_cancel_strategy_orders(None, &format!("quote-only depth gate: {whyd}"));
+                return;
+            }
+        }
+
+        let pair_sum = (y_bid + n_bid).max(1e-9);
+        let max_affordable = (budget_usable / pair_sum).floor();
+        if max_affordable < self.cfg.min_shares.max(1.0) {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_QUOTE_ONLY] idle: budget_too_small pair_sum={pair_sum:.3} usable={budget_usable:.2}"
+                ),
+                "maker_quote_only_idle_pair_budget",
+            );
+            self._maker_cancel_strategy_orders(None, "quote-only budget too small");
+            self._maker_record_trade_decision(
+                t_into_s,
+                pair_sum,
+                max_affordable.max(0.0),
+                downside,
+                upside,
+                skew_ratio,
+                false,
+                None,
+                "BOTH",
+                "GTC",
+                "MAKER_QUOTE_ONLY_BUDGET_TOO_SMALL",
+            );
+            return;
+        }
+        size = size.min(max_affordable);
+        let (recovery_active, recovery_gap, _heavy_side, _light_side, _light_asset, _unsettled_heavy) =
+            self._maker_recovery_mode_snapshot();
+        if recovery_active && recovery_gap > 0.0 {
+            size = size.min(recovery_gap);
+        }
+        if size < self.cfg.min_shares.max(1.0) {
+            self._maker_dbg_idle(
+                &format!(
+                    "[MAKER_QUOTE_ONLY] idle: clip_below_min clip={size:.2} min={:.2}",
+                    self.cfg.min_shares.max(1.0)
+                ),
+                "maker_quote_only_idle_clip_below_min",
+            );
+            return;
+        }
+
+        self._maker_ladder_cancel_all("quote-only");
+        let placed_yes = self._maybe_replace(yes, y_bid, size, None);
+        let placed_no = self._maybe_replace(no, n_bid, size, None);
+        self._maker_record_trade_decision(
+            t_into_s,
+            0.5 * (y_bid + n_bid),
+            size,
+            downside,
+            upside,
+            skew_ratio,
+            false,
+            None,
+            "BOTH",
+            "GTC",
+            if placed_yes || placed_no {
+                "MAKER_QUOTE_ONLY"
+            } else {
+                "MAKER_QUOTE_ONLY_WAIT"
+            },
+        );
+    }
+
     fn _maker_skew_arb_step(&self, now: f64, q_yes: f64, q_no: f64, total_cost: f64) {
+        if self._pair_base_mode_enabled() {
+            self._maker_pair_base_step(now, q_yes, q_no, total_cost);
+            return;
+        }
         if !env_bool("MAKER_SKEW_ENABLED", true) {
+            if !env_bool("MAKER_ARB_ENABLED", true)
+                && !env_bool("MAKER_STRETCH_BIAS_ENABLED", false)
+            {
+                self._maker_quote_only_step(now, q_yes, q_no, total_cost);
+                return;
+            }
             self._maker_ladder_cancel_all("disabled");
             self._maker_cancel_strategy_orders(None, "MAKER_SKEW disabled");
             return;
@@ -6510,12 +7913,6 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        // Hard guarantee for article behavior: seed both sides before any normal gate logic.
-        let base_min = env_float(
-            "MAKER_SKEW_BASE_MIN_SHARES",
-            2.0 * self.cfg.min_shares.max(1.0),
-        )
-        .max(self.cfg.min_shares.max(1.0));
         let include_open_buys = env_bool("MAKER_EFFECTIVE_Q_INCLUDE_OPEN_BUYS", true);
         let q_yes_eff = if include_open_buys {
             q_yes + self._maker_order_open_buy_remaining(yes)
@@ -6527,112 +7924,179 @@ impl MakerHedgeCapBot {
         } else {
             q_no
         };
-        let base_needs_seed = q_yes_eff + 1e-9 < base_min || q_no_eff + 1e-9 < base_min;
+        let ctx = MakerSkewLoopCtx {
+            now,
+            t_into_s,
+            peak_window,
+            total_cost,
+            budget_usable,
+            yes_asset: yes.to_string(),
+            no_asset: no.to_string(),
+            y_bid,
+            y_ask,
+            n_bid,
+            n_ask,
+            q_yes_eff,
+            q_no_eff,
+            downside,
+            upside,
+            skew_ratio,
+        };
+
+        if self._maker_skew_handle_base_seed_phase(&ctx) {
+            return;
+        }
+        if self._maker_skew_handle_shared_gate_phase(&ctx) {
+            return;
+        }
+        let Some(recovery) = self._maker_skew_handle_recovery_phase(&ctx) else {
+            return;
+        };
+
+        if self._maker_skew_try_arb(
+            ctx.budget_usable,
+            ctx.y_bid,
+            ctx.y_ask,
+            ctx.n_bid,
+            ctx.n_ask,
+            ctx.t_into_s,
+            ctx.downside,
+            ctx.upside,
+            ctx.skew_ratio,
+        ) {
+            return;
+        }
+
+        self._maker_skew_handle_directional_phase(&ctx, &recovery);
+    }
+
+    fn _maker_skew_handle_base_seed_phase(&self, ctx: &MakerSkewLoopCtx) -> bool {
+        let base_min = env_float(
+            "MAKER_SKEW_BASE_MIN_SHARES",
+            2.0 * self.cfg.min_shares.max(1.0),
+        )
+        .max(self.cfg.min_shares.max(1.0));
+        let base_needs_seed =
+            ctx.q_yes_eff + 1e-9 < base_min || ctx.q_no_eff + 1e-9 < base_min;
         let seed_since_key = "__maker_skew_seed_pending_since";
         let seed_inflight_key = "__maker_skew_seed_inflight_until";
         let seed_wait_s = env_float("MAKER_SKEW_BASE_SEED_MAX_WAIT_SECONDS", 45.0).max(1.0);
-        if base_needs_seed {
-            // Guard: if a taker seed order is still in-flight, wait for it.
-            let inflight_until = self._runtime_ts_get(seed_inflight_key);
-            if inflight_until > 0.0 && now < inflight_until {
-                self._maker_record_trade_decision(
-                    t_into_s,
-                    0.0,
-                    0.0,
-                    downside,
-                    upside,
-                    skew_ratio,
-                    false,
-                    None,
-                    "NONE",
-                    "NONE",
-                    "MAKER_SKEW_BASE_SEED_INFLIGHT",
-                );
-                return;
-            }
-            self._runtime_ts_set(seed_inflight_key, 0.0);
+        if !base_needs_seed {
+            self._runtime_ts_set(seed_since_key, 0.0);
+            return false;
+        }
 
-            if self._runtime_ts_get(seed_since_key) <= 0.0 {
-                self._runtime_ts_set(seed_since_key, now);
-            }
-            let (seed_side, seed_asset, seed_bid, seed_ask, q_side) = if q_yes_eff <= q_no_eff {
-                ("YES", yes.to_string(), y_bid, y_ask, q_yes_eff.max(0.0))
-            } else {
-                ("NO", no.to_string(), n_bid, n_ask, q_no_eff.max(0.0))
-            };
-            let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1) as f64;
-            let need = (base_min - q_side).max(min_int);
-            let max_affordable = (budget_usable / seed_ask.max(1e-9)).floor();
-            if seed_ask <= 0.0 || max_affordable + 1e-9 < min_int {
-                let pending_for = now - self._runtime_ts_get(seed_since_key);
-                if pending_for >= seed_wait_s {
-                    self.logger.warning(&format!(
-                        "[MAKER_SKEW] base seed timeout side={} need={:.2} ask={:.3} budget={:.2} pending_for={:.2}s -> STOP",
-                        seed_side, need, seed_ask, budget_usable, pending_for
-                    ));
-                    self._set_exit_reason("MAKER_SKEW_BASE_SEED_TIMEOUT");
-                    self.cancel_all_orders_exchange("maker_skew base seed timeout");
-                    self.stop_flag.store(true, Ordering::SeqCst);
-                }
-                self._maker_record_trade_decision(
-                    t_into_s,
-                    seed_ask,
-                    need,
-                    downside,
-                    upside,
-                    skew_ratio,
-                    false,
-                    None,
-                    seed_side,
-                    "NONE",
-                    "MAKER_SKEW_BASE_SEED_PENDING",
-                );
-                return;
-            }
-            let seed_order_type = self._resolve_order_type(
-                &std::env::var("MAKER_SKEW_BASE_SEED_ORDER_TYPE")
-                    .unwrap_or_else(|_| "GTC".to_string()),
+        let inflight_until = self._runtime_ts_get(seed_inflight_key);
+        if inflight_until > 0.0 && ctx.now < inflight_until {
+            self._maker_record_trade_decision(
+                ctx.t_into_s,
+                0.0,
+                0.0,
+                ctx.downside,
+                ctx.upside,
+                ctx.skew_ratio,
+                false,
+                None,
+                "NONE",
+                "NONE",
+                "MAKER_SKEW_BASE_SEED_INFLIGHT",
             );
-            let size = need.min(max_affordable).max(min_int);
-            let submitted = if seed_order_type == "GTC" {
-                let seed_key = MakerOrderKey::buy(&seed_asset);
-                self._maker_order_upsert_gtc(&seed_key, seed_bid, size, "LIMIT_GTC_POSTONLY")
-            } else {
-                let seed_slip_ticks = env_int("MAKER_SKEW_BASE_SEED_SLIPPAGE_TICKS", 1).max(0);
-                let mut px = seed_ask + seed_slip_ticks as f64 * self.cfg.tick.max(0.0001);
-                px = round_up(
-                    clamp(px, self.cfg.tick.max(0.0001), 0.99),
-                    self.cfg.tick.max(0.0001),
-                );
-                self._place_taker_bid_fak(&seed_asset, px, size, Some(&seed_order_type))
-            };
-            // If taker order was sent, set in-flight cooldown to prevent double-fill.
-            if seed_order_type != "GTC" && (submitted.is_some() || self.cfg.dry_run) {
-                let cooldown_s = env_float("MAKER_SKEW_BASE_SEED_INFLIGHT_SECONDS", 6.0).max(1.0);
-                self._runtime_ts_set(seed_inflight_key, now + cooldown_s);
+            return true;
+        }
+        self._runtime_ts_set(seed_inflight_key, 0.0);
+
+        if self._runtime_ts_get(seed_since_key) <= 0.0 {
+            self._runtime_ts_set(seed_since_key, ctx.now);
+        }
+        let (seed_side, seed_asset, seed_bid, seed_ask, q_side) = if ctx.q_yes_eff <= ctx.q_no_eff
+        {
+            (
+                "YES",
+                ctx.yes_asset.clone(),
+                ctx.y_bid,
+                ctx.y_ask,
+                ctx.q_yes_eff.max(0.0),
+            )
+        } else {
+            (
+                "NO",
+                ctx.no_asset.clone(),
+                ctx.n_bid,
+                ctx.n_ask,
+                ctx.q_no_eff.max(0.0),
+            )
+        };
+        let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1) as f64;
+        let need = (base_min - q_side).max(min_int);
+        let max_affordable = (ctx.budget_usable / seed_ask.max(1e-9)).floor();
+        if seed_ask <= 0.0 || max_affordable + 1e-9 < min_int {
+            let pending_for = ctx.now - self._runtime_ts_get(seed_since_key);
+            if pending_for >= seed_wait_s {
+                self.logger.warning(&format!(
+                    "[MAKER_SKEW] base seed timeout side={} need={:.2} ask={:.3} budget={:.2} pending_for={:.2}s -> STOP",
+                    seed_side, need, seed_ask, ctx.budget_usable, pending_for
+                ));
+                self._set_exit_reason("MAKER_SKEW_BASE_SEED_TIMEOUT");
+                self.cancel_all_orders_exchange("maker_skew base seed timeout");
+                self.stop_flag.store(true, Ordering::SeqCst);
             }
             self._maker_record_trade_decision(
-                t_into_s,
+                ctx.t_into_s,
                 seed_ask,
-                size,
-                downside,
-                upside,
-                skew_ratio,
+                need,
+                ctx.downside,
+                ctx.upside,
+                ctx.skew_ratio,
                 false,
                 None,
                 seed_side,
-                &seed_order_type,
-                if submitted.is_some() || self.cfg.dry_run {
-                    "MAKER_SKEW_BASE_SEED"
-                } else {
-                    "MAKER_SKEW_BASE_SEED_FAIL"
-                },
+                "NONE",
+                "MAKER_SKEW_BASE_SEED_PENDING",
             );
-            return;
-        } else {
-            self._runtime_ts_set(seed_since_key, 0.0);
+            return true;
         }
+        let seed_order_type = self._resolve_order_type(
+            &std::env::var("MAKER_SKEW_BASE_SEED_ORDER_TYPE")
+                .unwrap_or_else(|_| "GTC".to_string()),
+        );
+        let size = need.min(max_affordable).max(min_int);
+        let submitted = if seed_order_type == "GTC" {
+            let seed_key = MakerOrderKey::buy(&seed_asset);
+            self._maker_order_upsert_gtc(&seed_key, seed_bid, size, "LIMIT_GTC_POSTONLY")
+        } else {
+            let seed_slip_ticks = env_int("MAKER_SKEW_BASE_SEED_SLIPPAGE_TICKS", 1).max(0);
+            let mut px = seed_ask + seed_slip_ticks as f64 * self.cfg.tick.max(0.0001);
+            px = round_up(
+                clamp(px, self.cfg.tick.max(0.0001), 0.99),
+                self.cfg.tick.max(0.0001),
+            );
+            self._place_taker_bid_fak(&seed_asset, px, size, Some(&seed_order_type))
+        };
+        if seed_order_type != "GTC" && (submitted.is_some() || self.cfg.dry_run) {
+            let cooldown_s = env_float("MAKER_SKEW_BASE_SEED_INFLIGHT_SECONDS", 6.0).max(1.0);
+            self._runtime_ts_set(seed_inflight_key, ctx.now + cooldown_s);
+        }
+        self._maker_record_trade_decision(
+            ctx.t_into_s,
+            seed_ask,
+            size,
+            ctx.downside,
+            ctx.upside,
+            ctx.skew_ratio,
+            false,
+            None,
+            seed_side,
+            &seed_order_type,
+            if submitted.is_some() || self.cfg.dry_run {
+                "MAKER_SKEW_BASE_SEED"
+            } else {
+                "MAKER_SKEW_BASE_SEED_FAIL"
+            },
+        );
+        true
+    }
 
+    fn _maker_skew_handle_shared_gate_phase(&self, ctx: &MakerSkewLoopCtx) -> bool {
         let (ok, why) = self._accumulate_allowed();
         if !ok {
             let why_key = why.split('(').next().unwrap_or("unknown");
@@ -6643,19 +8107,19 @@ impl MakerHedgeCapBot {
             self._maker_ladder_cancel_all(&format!("accumulate gate: {why}"));
             self._maker_cancel_strategy_orders(None, &format!("accumulate gate: {why}"));
             self._maker_record_trade_decision(
-                t_into_s,
+                ctx.t_into_s,
                 0.0,
                 0.0,
-                downside,
-                upside,
-                skew_ratio,
+                ctx.downside,
+                ctx.upside,
+                ctx.skew_ratio,
                 false,
                 None,
                 "NONE",
                 "NONE",
                 &format!("MAKER_SKEW_GATE_{why}"),
             );
-            return;
+            return true;
         }
         let (invalid, inv_reason) = self._quotes_invalidated();
         if invalid {
@@ -6666,21 +8130,27 @@ impl MakerHedgeCapBot {
             self._maker_ladder_cancel_all(&format!("quote invalidated: {inv_reason}"));
             self._maker_cancel_strategy_orders(None, &format!("quote invalidated: {inv_reason}"));
             self._maker_record_trade_decision(
-                t_into_s,
+                ctx.t_into_s,
                 0.0,
                 0.0,
-                downside,
-                upside,
-                skew_ratio,
+                ctx.downside,
+                ctx.upside,
+                ctx.skew_ratio,
                 false,
                 None,
                 "NONE",
                 "NONE",
                 "MAKER_SKEW_QUOTE_INVALID",
             );
-            return;
+            return true;
         }
+        false
+    }
 
+    fn _maker_skew_handle_recovery_phase(
+        &self,
+        ctx: &MakerSkewLoopCtx,
+    ) -> Option<MakerSkewRecoveryState> {
         let (
             recovery_mode,
             recovery_gap,
@@ -6689,9 +8159,11 @@ impl MakerHedgeCapBot {
             recovery_asset,
             recovery_unsettled_heavy,
         ) = self._maker_recovery_mode_snapshot();
-        let recovery_asset_id = recovery_asset
-            .as_deref()
-            .unwrap_or(if recovery_side == "YES" { yes } else { no });
+        let recovery_asset_id = recovery_asset.as_deref().unwrap_or(if recovery_side == "YES" {
+            ctx.yes_asset.as_str()
+        } else {
+            ctx.no_asset.as_str()
+        });
         let recovery_active_key = "__maker_recovery_mode_active";
         let recovery_heavy_key = "__maker_recovery_heavy_yes";
         let recovery_log_key = "__maker_recovery_mode_log_until";
@@ -6708,26 +8180,25 @@ impl MakerHedgeCapBot {
                     recovery_heavy_key,
                     if recovery_heavy_side == "YES" { 1.0 } else { 0.0 },
                 );
-                self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
-            } else if now >= self._runtime_ts_get(recovery_log_key) {
+                self._runtime_ts_set(recovery_log_key, ctx.now + recovery_log_every);
+            } else if ctx.now >= self._runtime_ts_get(recovery_log_key) {
                 self.logger.info(&format!(
                     "[MAKER_SKEW] recovery mode remain gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side} unsettled_heavy={recovery_unsettled_heavy:.2}"
                 ));
-                self._runtime_ts_set(recovery_log_key, now + recovery_log_every);
+                self._runtime_ts_set(recovery_log_key, ctx.now + recovery_log_every);
             }
-            // Wait for light-side unsettled risk to settle before placing another recovery order
             let light_unsettled = self._maker_recovery_unsettled_buy_risk(recovery_asset_id);
             if light_unsettled > 1e-6 {
                 let recovery_key = MakerOrderKey::buy(recovery_asset_id);
                 if let Some(reason) = self._maker_recovery_light_refresh_reason(recovery_asset_id) {
                     let _ = self._maker_order_request_cancel(&recovery_key, &reason);
                     self._maker_record_trade_decision(
-                        t_into_s,
+                        ctx.t_into_s,
                         0.0,
                         0.0,
-                        downside,
-                        upside,
-                        skew_ratio,
+                        ctx.downside,
+                        ctx.upside,
+                        ctx.skew_ratio,
                         false,
                         None,
                         "NONE",
@@ -6736,22 +8207,20 @@ impl MakerHedgeCapBot {
                             "MAKER_SKEW_RECOVERY_REFRESH(gap={recovery_gap:.2},light_risk={light_unsettled:.2})"
                         ),
                     );
-                    return;
+                    return None;
                 }
                 if !self._maker_recovery_light_requote_ready(recovery_asset_id) {
-                    // Preserve the active recovery-side order while waiting for its unsettled risk
-                    // to settle; cancel only non-recovery strategy orders.
                     self._maker_cancel_strategy_orders(
                         Some(recovery_asset_id),
                         "imbalance recovery unsettled",
                     );
                     self._maker_record_trade_decision(
-                        t_into_s,
+                        ctx.t_into_s,
                         0.0,
                         0.0,
-                        downside,
-                        upside,
-                        skew_ratio,
+                        ctx.downside,
+                        ctx.upside,
+                        ctx.skew_ratio,
                         false,
                         None,
                         "NONE",
@@ -6760,7 +8229,7 @@ impl MakerHedgeCapBot {
                             "MAKER_SKEW_RECOVERY_WAIT_UNSETTLED(gap={recovery_gap:.2},light_risk={light_unsettled:.2})"
                         ),
                     );
-                    return;
+                    return None;
                 }
             }
         } else if self._runtime_ts_get(recovery_active_key) > 0.0 {
@@ -6774,56 +8243,50 @@ impl MakerHedgeCapBot {
             self._runtime_ts_set(recovery_heavy_key, 0.0);
             self._runtime_ts_set(recovery_log_key, 0.0);
         }
+        Some(MakerSkewRecoveryState {
+            mode: recovery_mode,
+            side: recovery_side,
+        })
+    }
 
-        if self._maker_skew_try_arb(
-            budget_usable,
-            y_bid,
-            y_ask,
-            n_bid,
-            n_ask,
-            t_into_s,
-            downside,
-            upside,
-            skew_ratio,
-        ) {
-            return;
-        }
-
+    fn _maker_skew_handle_directional_phase(
+        &self,
+        ctx: &MakerSkewLoopCtx,
+        recovery: &MakerSkewRecoveryState,
+    ) {
+        let yes = ctx.yes_asset.as_str();
+        let no = ctx.no_asset.as_str();
         let target_ratio = env_float("MAKER_SKEW_TARGET_RATIO", 1.5).max(1.0);
         let ratio_max = env_float("MAKER_SKEW_MAX_RATIO", 3.3).max(target_ratio);
         let max_loss = env_float("MAKER_SKEW_MAX_WORST_CASE_LOSS_USDC", 350.0).max(1.0);
-        let default_underdog = if y_bid <= n_bid { "YES" } else { "NO" };
+        let default_underdog = if ctx.y_bid <= ctx.n_bid { "YES" } else { "NO" };
         let underdog = self._maker_stretch_bias_side(default_underdog);
         let hedge = if underdog == "YES" { "NO" } else { "YES" };
         let min_base = self.cfg.min_shares.max(1.0);
 
-        // CPP (cost-per-pair) risk cap — prevents over-accumulating one side.
-        // Matches the 0x8e9c trader's envelope: median CPP ~1.17, 75th ~1.33, max ~1.98.
-        let min_shares_held = q_yes_eff.min(q_no_eff).max(0.0);
+        let min_shares_held = ctx.q_yes_eff.min(ctx.q_no_eff).max(0.0);
         let cpp = if min_shares_held > 1e-9 {
-            total_cost / min_shares_held
+            ctx.total_cost / min_shares_held
         } else {
             f64::INFINITY
         };
         let cpp_soft = env_float("MAKER_SKEW_CPP_SOFT_CAP", 1.33).max(1.0);
         let cpp_hard = env_float("MAKER_SKEW_CPP_HARD_CAP", 1.98).max(cpp_soft);
 
-        // Store CPP in state for logging.
         if let Ok(mut st) = self.maker_skew_state.lock() {
             st.cpp = cpp;
         }
 
-        // CPP hard cap: stop all accumulation, cancel ladders.
         if cpp.is_finite() && cpp >= cpp_hard {
             self._maker_ladder_cancel_all("cpp_hard_cap");
             self._maker_cancel_strategy_orders(None, "MAKER_SKEW cpp hard cap");
             self._maker_record_trade_decision(
-                t_into_s,
+                ctx.t_into_s,
                 0.0,
                 0.0,
-                downside,
-                upside,
-                skew_ratio,
+                ctx.downside,
+                ctx.upside,
+                ctx.skew_ratio,
                 false,
                 None,
                 "NONE",
@@ -6833,20 +8296,20 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        let mut side = if recovery_mode {
-            recovery_side.to_string()
+        let mut side = if recovery.mode {
+            recovery.side.clone()
         } else {
             underdog.to_string()
         };
-        let mut role = if recovery_mode {
+        let mut role = if recovery.mode {
             "imbalance_rebalance".to_string()
         } else {
             "underdog".to_string()
         };
-        let side_yes = q_yes_eff.max(0.0);
-        let side_no = q_no_eff.max(0.0);
-        if recovery_mode {
-            side = recovery_side.to_string();
+        let side_yes = ctx.q_yes_eff.max(0.0);
+        let side_no = ctx.q_no_eff.max(0.0);
+        if recovery.mode {
+            side = recovery.side.clone();
             role = "imbalance_rebalance".to_string();
         } else if side_yes < min_base || side_no < min_base {
             side = if side_yes <= side_no {
@@ -6855,7 +8318,7 @@ impl MakerHedgeCapBot {
                 "NO".to_string()
             };
             role = "base".to_string();
-        } else if downside < -max_loss {
+        } else if ctx.downside < -max_loss {
             side = if side_yes <= side_no {
                 "YES".to_string()
             } else {
@@ -6863,7 +8326,6 @@ impl MakerHedgeCapBot {
             };
             role = "hedge".to_string();
         } else if cpp.is_finite() && cpp >= cpp_soft {
-            // CPP soft cap: only buy the smaller side to bring CPP back down.
             side = if side_yes <= side_no {
                 "YES".to_string()
             } else {
@@ -6873,34 +8335,35 @@ impl MakerHedgeCapBot {
             self.logger.info(&format!(
                 "[MAKER_SKEW] CPP soft cap hit cpp={cpp:.3} >= {cpp_soft:.3} -> hedge smaller side={side}"
             ));
-        } else if skew_ratio > ratio_max {
+        } else if ctx.skew_ratio > ratio_max {
             side = hedge.to_string();
             role = "hedge".to_string();
-        } else if skew_ratio < target_ratio {
+        } else if ctx.skew_ratio < target_ratio {
             side = underdog.to_string();
             role = "underdog".to_string();
         }
 
         let (asset_id, bid, ask) = if side == "YES" {
-            (yes.to_string(), y_bid, y_ask)
+            (yes.to_string(), ctx.y_bid, ctx.y_ask)
         } else {
-            (no.to_string(), n_bid, n_ask)
+            (no.to_string(), ctx.n_bid, ctx.n_ask)
         };
-        let mut clip = self._maker_pick_clip_size_for_price(ask.min(bid), peak_window);
-        let max_shares_budget = (budget_usable / ask.max(1e-9)).floor();
+        let mut clip = self._maker_pick_clip_size_for_price(ask.min(bid), ctx.peak_window);
+        let max_shares_budget = (ctx.budget_usable / ask.max(1e-9)).floor();
         clip = clip.min(max_shares_budget).max(0.0);
         if clip < self.cfg.min_shares.max(1.0) {
             self._maker_dbg_idle(
                 &format!(
-                    "[MAKER_SKEW] idle: clip_below_min side={side} role={role} clip={clip:.2} min={:.2} bid={bid:.3} ask={ask:.3} budget={budget_usable:.2}",
-                    self.cfg.min_shares.max(1.0)
+                    "[MAKER_SKEW] idle: clip_below_min side={side} role={role} clip={clip:.2} min={:.2} bid={bid:.3} ask={ask:.3} budget={:.2}",
+                    self.cfg.min_shares.max(1.0),
+                    ctx.budget_usable
                 ),
                 "maker_skew_idle_clip_below_min",
             );
             return;
         }
         let ladder_enabled = env_bool("MAKER_LADDER_ENABLED", true);
-        let order_type = if role == "hedge" && downside < -max_loss {
+        let order_type = if role == "hedge" && ctx.downside < -max_loss {
             self._resolve_order_type(
                 &std::env::var("MAKER_EXPOSURE_UNWIND_ORDER_TYPE")
                     .unwrap_or_else(|_| self.hedge_taker_order_type.clone()),
@@ -6914,7 +8377,7 @@ impl MakerHedgeCapBot {
             "GTC".to_string()
         };
 
-        if !recovery_mode && order_type == "GTC" {
+        if !recovery.mode && order_type == "GTC" {
             if let Some((
                 current_gap,
                 projected_gap,
@@ -6935,12 +8398,12 @@ impl MakerHedgeCapBot {
                         "maker_skew projected gap suppress",
                     );
                     self._maker_record_trade_decision(
-                        t_into_s,
+                        ctx.t_into_s,
                         bid,
                         clip,
-                        downside,
-                        upside,
-                        skew_ratio,
+                        ctx.downside,
+                        ctx.upside,
+                        ctx.skew_ratio,
                         false,
                         None,
                         &side,
@@ -6954,7 +8417,8 @@ impl MakerHedgeCapBot {
             }
         }
 
-        if (role == "hedge" && downside < -max_loss) || (role == "cpp_hedge" && order_type != "GTC")
+        if (role == "hedge" && ctx.downside < -max_loss)
+            || (role == "cpp_hedge" && order_type != "GTC")
         {
             let slip_ticks = if role == "cpp_hedge" {
                 env_int("MAKER_SKEW_CPP_HEDGE_SLIPPAGE_TICKS", 1).max(0)
@@ -6984,12 +8448,12 @@ impl MakerHedgeCapBot {
         }
 
         self._maker_record_trade_decision(
-            t_into_s,
+            ctx.t_into_s,
             bid,
             clip,
-            downside,
-            upside,
-            skew_ratio,
+            ctx.downside,
+            ctx.upside,
+            ctx.skew_ratio,
             false,
             None,
             &side,
@@ -7025,6 +8489,39 @@ impl MakerHedgeCapBot {
             return (
                 false,
                 format!("wide_spread(y={spr_y_ticks:.1} n={spr_n_ticks:.1})"),
+            );
+        }
+
+        let mid_y = 0.5 * (yb + ya);
+        let mid_n = 0.5 * (nb + na);
+        let parity = mid_y + mid_n;
+        if (parity - 1.0).abs() > self.parity_tolerance {
+            return (false, format!("parity_off({parity:.3})"));
+        }
+
+        (true, "ok".to_string())
+    }
+
+    fn _maker_quote_only_allowed(&self, yes: &str, no: &str) -> (bool, String) {
+        let y = self._best_bid_ask(yes);
+        let n = self._best_bid_ask(no);
+        if y.is_none() || n.is_none() {
+            return (false, "missing_quotes".to_string());
+        }
+        let (yb, ya) = y.unwrap_or((0.0, 0.0));
+        let (nb, na) = n.unwrap_or((0.0, 0.0));
+        if yb <= 0.0 || ya <= 0.0 || nb <= 0.0 || na <= 0.0 {
+            return (false, "zero_bid_ask".to_string());
+        }
+
+        let tick = self.cfg.tick.max(0.0001);
+        let spr_y_ticks = (ya - yb) / tick;
+        let spr_n_ticks = (na - nb) / tick;
+        if spr_y_ticks > self.max_spread_ticks as f64 || spr_n_ticks > self.max_spread_ticks as f64
+        {
+            return (
+                false,
+                format!("spread_too_wide(y={spr_y_ticks:.1} n={spr_n_ticks:.1})"),
             );
         }
 
@@ -7849,6 +9346,15 @@ impl MakerHedgeCapBot {
         };
         if let Ok(mut m) = self.taker_orders.lock() {
             m.insert(order_id.to_string(), rec);
+        }
+    }
+
+    pub fn _forget_taker_order(&self, order_id: &str) {
+        if order_id.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut m) = self.taker_orders.lock() {
+            m.remove(order_id);
         }
     }
 
@@ -9751,6 +11257,93 @@ impl MakerHedgeCapBot {
         Some(oid)
     }
 
+    fn _place_limit_bid_gtc_exact_with_origin(
+        &self,
+        asset_id: &str,
+        price: f64,
+        size: f64,
+        post_only: Option<bool>,
+        origin: &str,
+    ) -> Option<String> {
+        let tick = if self.cfg.tick > 0.0 {
+            self.cfg.tick
+        } else {
+            0.01
+        };
+        let mut px = clamp(price, tick, 0.99);
+        px = round_down(px, tick);
+        px = clamp(px, tick, 0.99);
+        let size = round_down(size.max(0.0), 0.01);
+        if size < 0.01 {
+            return None;
+        }
+        if self.cfg.dry_run {
+            let oid = format!("DRY_LIMIT_GTC_EXACT_{}", (now_ts_f64() * 1000.0) as i64);
+            if let Ok(mut s) = self.state.lock() {
+                s.open_orders.insert(
+                    asset_id.to_string(),
+                    OpenOrderState {
+                        order_id: Some(oid.clone()),
+                        price: Some(px),
+                        size: Some(size),
+                        ts: Some(now_ts_f64()),
+                    },
+                );
+                let _ = save_state(&self.state_file, &mut s);
+            }
+            self.logger.info(&format!(
+                "[DRY] limit bid GTC exact asset={} px={px:.3} size={size:.2} post_only={post_only:?}",
+                asset_id
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            ));
+            return Some(oid);
+        }
+
+        let decide_ts = now_ts_f64();
+        let decide_ns = now_ns();
+        let signed = json!({
+            "asset_id": asset_id,
+            "side": "BUY",
+            "price": px,
+            "size": size,
+        });
+        let oid = self._post_order_compat(&signed, "GTC", post_only)?;
+        if let Ok(mut s) = self.state.lock() {
+            s.open_orders.insert(
+                asset_id.to_string(),
+                OpenOrderState {
+                    order_id: Some(oid.clone()),
+                    price: Some(px),
+                    size: Some(size),
+                    ts: Some(now_ts_f64()),
+                },
+            );
+            let _ = save_state(&self.state_file, &mut s);
+        }
+        self._track_order_execution_context(
+            &oid,
+            &json!({
+                "order_id": oid,
+                "asset_id": asset_id,
+                "side": "BUY",
+                "px_limit": px,
+                "size": size,
+                "decision_ts": decide_ts,
+                "decision_ns": decide_ns,
+                "post_start_ts": decide_ts,
+                "post_end_ts": now_ts_f64(),
+                "origin": origin,
+            }),
+        );
+        Some(oid)
+    }
+
     pub fn _resolve_order_type(&self, name: &str) -> String {
         let mut n = name.trim().to_ascii_uppercase();
         if matches!(n.as_str(), "LIMIT" | "LIMIT_GTC" | "GTC_LIMIT") {
@@ -9835,6 +11428,72 @@ impl MakerHedgeCapBot {
         );
         self.logger.info(&format!(
             "[TAKER {ot}] sent BUY asset={} px={px:.4} sz={size:.0} oid={oid}",
+            asset_id
+        ));
+        Some(oid)
+    }
+
+    pub fn _place_taker_bid_fak_exact(
+        &self,
+        asset_id: &str,
+        price: f64,
+        size: f64,
+        order_type_name: Option<&str>,
+    ) -> Option<String> {
+        let decide_ts = now_ts_f64();
+        let decide_ns = now_ns();
+        let tick = if self.cfg.tick > 0.0 {
+            self.cfg.tick
+        } else {
+            0.01
+        };
+        let mut px = round_up(price, tick);
+        px = clamp(px, tick, 0.99);
+        let size = round_down(size.max(0.0), 0.01);
+        if size < 0.01 {
+            return None;
+        }
+        let ot_name = order_type_name.unwrap_or(&self.hedge_taker_order_type);
+        let ot = self._resolve_order_type(ot_name);
+        if self.cfg.dry_run {
+            self.logger.info(&format!(
+                "[DRY] TAKER HEDGE BUY EXACT asset={} price={px:.2} size={size:.2} type={ot}",
+                asset_id
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            ));
+            return None;
+        }
+        let signed = json!({
+            "asset_id": asset_id,
+            "side": "BUY",
+            "price": px,
+            "size": size,
+        });
+        let oid = self._post_order_compat(&signed, &ot, None)?;
+        self._remember_taker_order(&oid, asset_id, size, px, "BUY");
+        self._track_order_execution_context(
+            &oid,
+            &json!({
+                "order_id": oid,
+                "asset_id": asset_id,
+                "side": "BUY",
+                "px_limit": px,
+                "size": size,
+                "decision_ts": decide_ts,
+                "decision_ns": decide_ns,
+                "post_start_ts": decide_ts,
+                "post_end_ts": now_ts_f64(),
+                "origin": format!("TAKER_{}_BUY_EXACT", ot),
+            }),
+        );
+        self.logger.info(&format!(
+            "[TAKER {ot}] sent BUY asset={} px={px:.4} sz={size:.2} oid={oid}",
             asset_id
         ));
         Some(oid)
@@ -9931,6 +11590,81 @@ impl MakerHedgeCapBot {
         );
         self.logger.info(&format!(
             "[TAKER {ot}] sent SELL asset={} px={px:.4} sz={sz_disp} oid={oid}",
+            asset_id
+        ));
+        Some(oid)
+    }
+
+    pub fn _place_taker_ask_fak_exact(
+        &self,
+        asset_id: &str,
+        price: f64,
+        size: f64,
+        order_type_name: Option<&str>,
+    ) -> Option<String> {
+        let decide_ts = now_ts_f64();
+        let decide_ns = now_ns();
+        let tick = if self.cfg.tick > 0.0 {
+            self.cfg.tick
+        } else {
+            0.01
+        };
+        let mut px = round_down(price, tick);
+        px = clamp(px, tick, 0.99);
+        let size = q_down(size.max(0.0), 4);
+        if size < 0.0001 {
+            return None;
+        }
+        let ot_name = order_type_name.unwrap_or(&self.hedge_taker_order_type);
+        let ot = self._resolve_order_type(ot_name);
+        if self.cfg.dry_run {
+            self.logger.info(&format!(
+                "[DRY] TAKER SELL EXACT asset={} price={px:.4} size={size:.4} type={ot}",
+                asset_id
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            ));
+            return None;
+        }
+        let signed = json!({
+            "asset_id": asset_id,
+            "side": "SELL",
+            "price": px,
+            "size": size,
+        });
+        let oid = match self._post_order_compat(&signed, &ot, None) {
+            Some(v) => v,
+            None => {
+                self.logger.warning(&format!(
+                    "[TAKER {ot}] rejected SELL exact asset={} px={px:.4} sz={size:.4} (no oid)",
+                    asset_id
+                ));
+                return None;
+            }
+        };
+        self._remember_taker_order(&oid, asset_id, size, px, "SELL");
+        self._track_order_execution_context(
+            &oid,
+            &json!({
+                "order_id": oid,
+                "asset_id": asset_id,
+                "side": "SELL",
+                "px_limit": px,
+                "size": size,
+                "decision_ts": decide_ts,
+                "decision_ns": decide_ns,
+                "post_start_ts": decide_ts,
+                "post_end_ts": now_ts_f64(),
+                "origin": format!("TAKER_{}_SELL_EXACT", ot),
+            }),
+        );
+        self.logger.info(&format!(
+            "[TAKER {ot}] sent SELL asset={} px={px:.4} sz={size:.4} oid={oid}",
             asset_id
         ));
         Some(oid)
@@ -11142,7 +12876,25 @@ impl MakerHedgeCapBot {
             ));
             return;
         }
-        let cap = self._hedge_price_cap();
+        let mut cap = self._hedge_price_cap();
+        let base_cap = cap;
+        let t_left = (self.expiry_ts as f64 - now_ts_f64()).max(0.0);
+        let force_seconds = env_float("PAIR_BASE_NEAR_EXPIRY_FORCE_TAKER_SECONDS", 0.0).max(0.0);
+        let override_max_price = env_float("PAIR_BASE_NEAR_EXPIRY_TAKER_MAX_PRICE", 0.0)
+            .clamp(0.0, 0.99);
+        if pair_base_near_expiry_taker_override_active(
+            reason,
+            t_left,
+            force_seconds,
+            override_max_price,
+        ) {
+            cap = pair_base_effective_taker_cap(cap, override_max_price);
+            if cap > base_cap + 1e-9 {
+                self.logger.info(&format!(
+                    "[PAIR_BASE] near-expiry taker cap override base_cap={base_cap:.2} override_max={override_max_price:.2} effective_cap={cap:.2} t_left={t_left:.1}s ({reason})"
+                ));
+            }
+        }
         let mut px_candidate = ask + self.hedge_slippage_ticks as f64 * self.cfg.tick.max(0.0001);
         px_candidate = round_up(px_candidate, self.cfg.tick.max(0.0001));
         px_candidate = clamp(px_candidate, self.cfg.tick.max(0.0001), 0.99);
@@ -11229,6 +12981,90 @@ impl MakerHedgeCapBot {
             self.cancel_all_orders_exchange("partial hedge stop");
             self.stop_flag.store(true, Ordering::SeqCst);
         }
+    }
+
+    fn _pair_base_exact_taker_hedge_step(&self, delta: f64, reason: &str) {
+        if delta.abs() < 0.01 {
+            return;
+        }
+        let now = now_ts_f64();
+        if now < self._runtime_ts_get("__taker_inflight_until") {
+            return;
+        }
+        let last_taker_hedge_ts = self._runtime_ts_get("__last_taker_hedge_ts");
+        if now - last_taker_hedge_ts < self.taker_hedge_min_interval {
+            return;
+        }
+        self._runtime_ts_set("__last_taker_hedge_ts", now);
+        let (q_yes, q_no) = self._maker_actual_inventory();
+        let heavy_asset = if delta > 0.0 {
+            self.yes_asset.clone()
+        } else {
+            self.no_asset.clone()
+        };
+        let Some(heavy_asset) = heavy_asset else {
+            return;
+        };
+        if self.taker_strict_inflight && self._has_pending_taker_order("SELL", Some(&heavy_asset))
+        {
+            return;
+        }
+        let Some((bid, _ask)) = self._best_bid_ask(&heavy_asset) else {
+            self.logger.info(&format!(
+                "Emergency hedge exact SELL: missing best_bid_ask for {} ({reason})",
+                heavy_asset
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            ));
+            return;
+        };
+        if bid <= 0.0 {
+            self.logger.info(&format!(
+                "Emergency hedge exact SELL: missing bid for {} ({reason})",
+                heavy_asset
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            ));
+            return;
+        }
+        let tick = self.cfg.tick.max(0.0001);
+        let size = q_down(delta.abs().min(if delta > 0.0 { q_yes } else { q_no }).max(0.0), 4);
+        if size < 0.0001 {
+            return;
+        }
+        let mut px = bid - self.hedge_slippage_ticks as f64 * tick;
+        px = round_down(px, tick);
+        px = clamp(px, tick, 0.99);
+        self.logger.info(&format!(
+            "EMERGENCY HEDGE EXACT SELL ({reason}) delta={delta:.4} need={size:.4} sell={} bid={bid:.2} px={px:.2} type={}",
+            heavy_asset
+                .chars()
+                .rev()
+                .take(6)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>(),
+            self.hedge_taker_order_type
+        ));
+        self.cancel_all_open_orders_local("before emergency taker hedge");
+        self._runtime_ts_set("__taker_inflight_until", now_ts_f64() + 2.0);
+        let _oid = self._place_taker_ask_fak_exact(
+            &heavy_asset,
+            px,
+            size,
+            Some(&self.hedge_taker_order_type),
+        );
     }
 
     pub fn _sniper_best_snapshot(&self) -> (f64, f64, f64, f64) {
@@ -14201,7 +16037,10 @@ impl MakerHedgeCapBot {
 #[cfg(test)]
 mod tests {
     use super::{
-        MakerExecCandidate, MakerExecLedger, MakerExecRecord, MakerHedgeCapBot,
+        pair_base_early_risk_exit_lead_seconds, pair_base_phase_without_recovery,
+        pair_base_remaining_gap, pair_base_should_force_recovery, pair_base_should_latch_risk_exit,
+        pair_submit_tracks_taker_fallback, MakerExecCandidate, MakerExecLedger,
+        MakerExecRecord, MakerHedgeCapBot, PairBasePhaseState,
     };
 
     #[test]
@@ -14223,10 +16062,10 @@ mod tests {
     }
 
     #[test]
-    fn maker_fee_formula_maker_rebate_non_negative() {
+    fn maker_fee_formula_maker_path_is_zero_cost() {
         let fee =
             MakerHedgeCapBot::_maker_poly_fee_formula(20.0, 0.52, 0.25, 2.0, 100.0, true, true);
-        assert!(fee >= 0.0);
+        assert_eq!(fee, 0.0);
     }
 
     #[test]
@@ -14401,4 +16240,144 @@ mod tests {
         );
         assert!((projected - 6.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn pair_base_remaining_gap_respects_live_light_risk() {
+        assert!((pair_base_remaining_gap(10.0, 0.0) - 10.0).abs() < 1e-9);
+        assert!((pair_base_remaining_gap(10.0, 8.0) - 2.0).abs() < 1e-9);
+        assert!((pair_base_remaining_gap(10.0, 10.0) - 0.0).abs() < 1e-9);
+        assert!((pair_base_remaining_gap(10.0, 12.0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pair_base_phase_stays_resting_while_pair_orders_are_live() {
+        assert_eq!(
+            pair_base_phase_without_recovery(false, 0.0, 1.0, true),
+            Some(PairBasePhaseState::PairResting)
+        );
+        assert_eq!(
+            pair_base_phase_without_recovery(true, 0.0, 1.0, true),
+            Some(PairBasePhaseState::PairResting)
+        );
+    }
+
+    #[test]
+    fn pair_base_phase_only_balances_or_flats_when_no_pair_orders_are_live() {
+        assert_eq!(
+            pair_base_phase_without_recovery(true, 0.0, 1.0, false),
+            Some(PairBasePhaseState::Balanced)
+        );
+        assert_eq!(
+            pair_base_phase_without_recovery(false, 0.0, 1.0, false),
+            Some(PairBasePhaseState::Flat)
+        );
+        assert_eq!(pair_base_phase_without_recovery(true, 5.0, 1.0, false), None);
+    }
+
+    #[test]
+    fn pair_submit_does_not_track_gtc_orders_as_taker_fallback() {
+        assert!(!pair_submit_tracks_taker_fallback("GTC"));
+        assert!(!pair_submit_tracks_taker_fallback(" gtc "));
+    }
+
+    #[test]
+    fn pair_submit_tracks_non_gtc_orders_as_taker_fallback() {
+        assert!(pair_submit_tracks_taker_fallback("FAK"));
+        assert!(pair_submit_tracks_taker_fallback("FOK"));
+    }
+
+    #[test]
+    fn pair_base_forces_recovery_when_merge_pending_gap_remains() {
+        assert!(pair_base_should_force_recovery(
+            PairBasePhaseState::MergePending,
+            4.99,
+            1.0,
+            true
+        ));
+    }
+
+    #[test]
+    fn pair_base_forces_recovery_when_pair_resting_light_leg_is_untrusted() {
+        assert!(pair_base_should_force_recovery(
+            PairBasePhaseState::PairResting,
+            5.0,
+            1.0,
+            false
+        ));
+        assert!(!pair_base_should_force_recovery(
+            PairBasePhaseState::PairResting,
+            5.0,
+            1.0,
+            true
+        ));
+    }
+
+    #[test]
+    fn pair_base_early_risk_exit_lead_is_ahead_of_stop_buffer() {
+        assert!((pair_base_early_risk_exit_lead_seconds(15.0) - 30.0).abs() < 1e-9);
+        assert!((pair_base_early_risk_exit_lead_seconds(8.0) - 30.0).abs() < 1e-9);
+        assert!((pair_base_early_risk_exit_lead_seconds(20.0) - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pair_base_near_expiry_taker_override_is_reason_and_time_gated() {
+        assert!(crate::bot::pair_base_near_expiry_taker_override_active(
+            "pair_base_near_expiry",
+            9.5,
+            10.0,
+            0.85
+        ));
+        assert!(!crate::bot::pair_base_near_expiry_taker_override_active(
+            "pair_base_near_expiry",
+            12.0,
+            10.0,
+            0.85
+        ));
+        assert!(!crate::bot::pair_base_near_expiry_taker_override_active(
+            "pair_base_max_loss",
+            9.5,
+            10.0,
+            0.85
+        ));
+    }
+
+    #[test]
+    fn pair_base_near_expiry_taker_override_raises_cap() {
+        assert!((crate::bot::pair_base_effective_taker_cap(0.59, 0.85) - 0.85).abs() < 1e-9);
+        assert!((crate::bot::pair_base_effective_taker_cap(0.90, 0.85) - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pair_base_near_expiry_risk_exit_latches_terminal_mode() {
+        assert!(pair_base_should_latch_risk_exit("near_expiry"));
+        assert!(pair_base_should_latch_risk_exit("latched"));
+        assert!(!pair_base_should_latch_risk_exit("max_loss"));
+    }
+
+    #[test]
+    fn pair_base_merge_requote_requires_positive_worst_case_pnl() {
+        assert!(crate::bot::pair_base_allows_merge_requote(0.0001));
+        assert!(!crate::bot::pair_base_allows_merge_requote(0.0));
+        assert!(!crate::bot::pair_base_allows_merge_requote(-0.0001));
+    }
+
+    #[test]
+    fn pair_base_sub_min_recovery_uses_exact_orders() {
+        assert!(crate::bot::pair_base_recovery_uses_exact_order(
+            "PAIR_BASE_RECOVERY",
+            2.29,
+            5.0,
+        ));
+        assert!(!crate::bot::pair_base_recovery_uses_exact_order(
+            "PAIR_BASE_RECOVERY",
+            5.0,
+            5.0,
+        ));
+        assert!(!crate::bot::pair_base_recovery_uses_exact_order(
+            "PAIR_BASE_GTC_YES",
+            2.29,
+            5.0,
+        ));
+    }
 }
+

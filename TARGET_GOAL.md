@@ -59,6 +59,22 @@ Core operating priority:
 4. skew overlay
 5. stretch overlay
 
+### Execution State Ownership
+
+The live engine should have explicit high-level ownership states:
+
+1. `PAIR_BASE`
+2. `RECOVERY`
+3. `SKEW`
+4. `RISK_EXIT`
+
+Rules:
+
+1. `RECOVERY` preempts `PAIR_BASE`
+2. `SKEW` cannot open new risk while `RECOVERY` is active
+3. `RISK_EXIT` preempts everything
+4. exactly one missing-leg recovery quote may exist during `RECOVERY`
+
 Taker policy:
 
 1. taker is not part of normal flow
@@ -191,6 +207,7 @@ Important:
 1. `PAIR_BASE` and `PAIR_ARB` are different concepts
 2. Step 1 allows pair base and maker recovery
 3. Step 1 keeps aggressive pair-arb behavior off
+4. no Step 1 result is valid unless it is evaluated fee-net
 
 ### Step 1 metrics
 
@@ -206,6 +223,11 @@ Measure over 20+ markets:
 7. maker recovery success rate
 8. taker count
 9. actual settlement / merge PnL
+10. merge success rate
+11. residual unmerged inventory after resolution
+12. time to flat after resolution
+13. time to redeploy capital
+14. settlement PnL net of fees
 
 ### Step 1 target thresholds
 
@@ -277,6 +299,9 @@ MAKER_SKEW_MAX_RATIO=2.2
 5. both-side participation per window
 6. pair coverage ratio after skew
 7. taker count during normal operation
+8. fee-net worst-case PnL
+9. fee-net best-case PnL
+10. fee-net pair cost
 
 ### Step 2 success criteria
 
@@ -284,6 +309,7 @@ MAKER_SKEW_MAX_RATIO=2.2
 2. both sides still get filled
 3. downside remains bounded
 4. maker-only normal flow is preserved
+5. no Step 2 result is valid unless it is evaluated fee-net
 
 ---
 
@@ -310,6 +336,18 @@ This step is for advanced recovery and failure-mode handling.
 2. exactly one missing-leg quote is live
 3. no new accumulation while recovery is open
 4. taker is only allowed under explicit emergency policy
+
+### Emergency taker semantics
+
+When `RISK_EXIT` is active and taker is permitted:
+
+1. emergency taker `BUY` must size by dollars
+2. emergency taker `SELL` must size by shares
+3. every emergency taker action must log:
+   - trigger reason
+   - intended imbalance reduction
+   - actual fill result
+   - resulting inventory state
 
 ### Metrics
 
@@ -366,8 +404,9 @@ The target implementation must respect venue rules:
 1. maker-only normal flow uses post-only resting orders
 2. post-only requires `GTC` or `GTD`
 3. post-only must not be combined with `FAK` or `FOK`
-4. the orderbook should be tracked from real-time market data, not slow polling
-5. fee treatment must not be assumed blindly; market fee behavior must be logged and observed
+4. the orderbook should be tracked from the real-time market channel, not slow polling
+5. user fills and order status should be tracked from the real-time user channel
+6. fee treatment must not be assumed blindly; market fee behavior must be logged and observed
 
 Operationally, always log:
 
@@ -375,13 +414,20 @@ Operationally, always log:
 2. estimated taker fee at current price
 3. maker rebate eligibility if available
 4. fee-net pair cost
+5. fee-net worst-case PnL
+6. fee-net best-case PnL
+7. maker rebate assumed or realized
+
+### Fee-net validity rule
+
+No Step 1 or Step 2 result is valid unless it is evaluated fee-net.
 
 ---
 
 ## Acceptance Criteria for the Whole Roadmap
 
 1. no `10/0` or `0/10` bootstrap as the normal path
-2. no directional accumulation outside merge / recovery
+2. no uncontrolled directional accumulation outside approved skew budget or recovery
 3. every imbalance maps to one live missing leg
 4. taker count is near zero and only from explicit risk exits
 5. no hidden budget stop
