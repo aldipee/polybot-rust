@@ -360,7 +360,10 @@ fn pair_base_effective_risk_exit_configured_seconds(
 }
 
 fn pair_base_should_latch_risk_exit(reason: &str) -> bool {
-    matches!(reason.trim(), "near_expiry" | "latched")
+    matches!(
+        reason.trim(),
+        "near_expiry" | "latched" | "forced_negative_economics"
+    )
 }
 
 fn pair_base_phase_owns_resolution(phase: PairBasePhaseState) -> bool {
@@ -569,6 +572,19 @@ fn pair_base_recovery_window(
         };
     }
     window
+}
+
+fn pair_base_should_force_negative_economics_exit(
+    window: PairBaseRecoveryWindow,
+    recovery_age_ms: f64,
+    stall_escalation_ms: f64,
+) -> bool {
+    let stall_ms = stall_escalation_ms.max(1.0);
+    match window {
+        PairBaseRecoveryWindow::Terminal | PairBaseRecoveryWindow::Late => true,
+        PairBaseRecoveryWindow::Mid => recovery_age_ms >= (stall_ms * 2.0),
+        PairBaseRecoveryWindow::Early => recovery_age_ms >= (stall_ms * 4.0),
+    }
 }
 
 fn pair_base_resolution_floor(shares_yes: f64, shares_no: f64, total_cost: f64) -> (f64, f64) {
@@ -8309,6 +8325,30 @@ impl MakerHedgeCapBot {
         );
         if !maker_allowed_now || !pair_base_allows_merge_requote(fee_snap.fee_net_worst_case_pnl) {
             self._pair_base_metrics_update_timed_state(false, true);
+            if pair_base_should_force_negative_economics_exit(
+                window,
+                recovery_age_ms,
+                pair_base_recovery_stall_escalation_ms(),
+            ) {
+                self._maker_dbg_idle(
+                    &format!(
+                        "[PAIR_BASE] merge: escalate_risk_exit reason=forced_negative_economics gap={gap:.2} remaining_gap={target_gap:.2} window={} recovery_age_ms={:.0} maker_score={:+.4} wait_score={:+.4} worst_case={:+.4} best_case={:+.4}",
+                        window.as_str(),
+                        recovery_age_ms,
+                        maker_score,
+                        wait_score,
+                        fee_snap.fee_net_worst_case_pnl,
+                        fee_snap.fee_net_best_case_pnl
+                    ),
+                    "pair_base_recovery_force_risk_exit",
+                );
+                self._maker_pair_base_risk_exit_step(
+                    "forced_negative_economics",
+                    total_cost,
+                    true,
+                );
+                return;
+            }
             self._maker_dbg_idle(
                 &format!(
                     "[PAIR_BASE] merge: stop negative_economics gap={gap:.2} remaining_gap={target_gap:.2} window={} maker_score={:+.4} wait_score={:+.4} epsilon={:.2} worst_case={:+.4} best_case={:+.4}",
@@ -17968,6 +18008,7 @@ mod tests {
     fn pair_base_near_expiry_risk_exit_latches_terminal_mode() {
         assert!(pair_base_should_latch_risk_exit("near_expiry"));
         assert!(pair_base_should_latch_risk_exit("latched"));
+        assert!(pair_base_should_latch_risk_exit("forced_negative_economics"));
         assert!(!pair_base_should_latch_risk_exit("max_loss"));
     }
 
@@ -17989,6 +18030,40 @@ mod tests {
             pair_base_recovery_window(60.0, 20_000.0, 15_000.0),
             PairBaseRecoveryWindow::Terminal
         );
+    }
+
+    #[test]
+    fn pair_base_negative_economics_force_exit_escalates_aggressively() {
+        assert!(!crate::bot::pair_base_should_force_negative_economics_exit(
+            PairBaseRecoveryWindow::Early,
+            15_000.0,
+            15_000.0,
+        ));
+        assert!(crate::bot::pair_base_should_force_negative_economics_exit(
+            PairBaseRecoveryWindow::Early,
+            60_000.0,
+            15_000.0,
+        ));
+        assert!(!crate::bot::pair_base_should_force_negative_economics_exit(
+            PairBaseRecoveryWindow::Mid,
+            20_000.0,
+            15_000.0,
+        ));
+        assert!(crate::bot::pair_base_should_force_negative_economics_exit(
+            PairBaseRecoveryWindow::Mid,
+            30_000.0,
+            15_000.0,
+        ));
+        assert!(crate::bot::pair_base_should_force_negative_economics_exit(
+            PairBaseRecoveryWindow::Late,
+            1_000.0,
+            15_000.0,
+        ));
+        assert!(crate::bot::pair_base_should_force_negative_economics_exit(
+            PairBaseRecoveryWindow::Terminal,
+            1_000.0,
+            15_000.0,
+        ));
     }
 
     #[test]

@@ -19,6 +19,107 @@ This file is a release snapshot copied from `behaviour.md` and updated for `0.1.
 2. If active scoring is enabled manually, `0.1.26` is intended to reduce the worst false-taker behavior, not to declare active scoring complete.
 3. Step 1 status remains `PARTIAL`. This release improves the scorer guardrails; it does not complete Step 1 validation.
 
+## Current Working Tree Delta After 0.1.26
+
+This file now also reflects the current unversioned working tree after `0.1.26`.
+
+The most important post-`0.1.26` runtime changes are:
+
+1. `ENTRY_ACK_TIMEOUT_MS=1000` has now been validated as the better live canary setting versus `800ms`.
+2. `RECOVERY_SCORING_ACTIVE=true` has been exercised in live canary runs without repeating the earlier bad early-taker behavior.
+3. The current unversioned patch adds forced escalation out of long `negative_economics` stalls:
+   - `Early`: force `RiskExitOnly` after `4 x RECOVERY_STALL_ESCALATION_MS`
+   - `Mid`: force `RiskExitOnly` after `2 x RECOVERY_STALL_ESCALATION_MS`
+   - `Late` / `Terminal`: immediate forced `RiskExitOnly`
+4. The current working tree is intentionally more aggressive about flattening and control than about preserving maker purity once a recovery cycle is clearly bad.
+
+### What the latest two `1000ms` canary runs proved
+
+#### `btc-updown-5m-1772876400`
+
+Observed outcome:
+
+1. control pass
+2. no first-leg timeout aborts
+3. one cycle resolved by maker
+4. one cycle stalled in `negative_economics` and required near-expiry taker rescue
+5. final inventory returned to `qYES=10.00 qNO=10.00`
+6. final row was negative: `lp=-1.7000 cost=11.7000 cpp=1.1700`
+
+Important metrics:
+
+1. `merge_success_rate=1.000`
+2. `maker_recovery_success_rate=0.500`
+3. `risk_exit_count=1`
+4. `emergency_taker_attempts=1`
+5. `negative_economics_s=149.91`
+6. `settlement_pnl_net_of_fees=-1.7010`
+
+Interpretation:
+
+1. the `1000ms` entry timeout substantially reduced pair-entry churn
+2. active scoring stayed safe
+3. the real remaining weakness was the long `negative_economics` dwell time before rescue
+
+#### `btc-updown-5m-1772876700`
+
+Observed outcome:
+
+1. control pass
+2. first recovery cycle was fast and healthy
+3. second cycle still had some entry asymmetry noise:
+   - one first-leg timeout abort
+   - two second-leg missing-oid aborts
+4. second recovery opened `qYES=10.00 qNO=15.00`
+5. that cycle then spent a very long time in `negative_economics`
+6. near-expiry taker BUY finally flattened it to `qYES=15.00 qNO=15.00`
+7. final row was still negative: `lp=-1.6500 cost=16.6500 cpp=1.1100`
+
+Important metrics and observations:
+
+1. first cycle resolved by maker in about `9.84s`
+2. second cycle resolved by taker in about `172.28s`
+3. repeated `merge: stop negative_economics ...`
+4. repeated `[PAIR_BASE][FEE] label=merge_requote ...`
+5. final flatten happened only after:
+   - `phase MergePending -> RiskExitOnly`
+   - `risk_exit_action trigger=near_expiry`
+   - `TAKER_FAK_BUY`
+   - later fill confirmation
+
+Interpretation:
+
+1. active scoring again behaved safely
+2. `ENTRY_ACK_TIMEOUT_MS=1000` is still better than `800ms`
+3. but long negative-economics stalls were still the dominant operational problem
+
+### Cross-run interpretation
+
+Across those two latest canary runs:
+
+1. `ENTRY_ACK_TIMEOUT_MS=1000` is the correct canary setting for now
+2. `RECOVERY_SCORING_ACTIVE=true` is behaving acceptably as a canary, not yet as a signed-off default
+3. the main remaining Step 1 weakness before the current patch was no longer entry arming or scorer safety
+4. the main remaining weakness was long `negative_economics` stall time before forced flattening
+
+### What the current patch is intended to change
+
+The current unversioned patch is meant to remove the exact long-stall pattern seen in those two runs.
+
+Expected behavioural change:
+
+1. the bot should stop sitting in `MergePending` for `150s+` once maker recovery is clearly uneconomic
+2. `forced_negative_economics` should take terminal ownership earlier
+3. `RiskExitOnly` should begin earlier in bad cycles, not only in the last ~45s near expiry window
+4. the bot should flatten earlier, even if that sacrifices some profitability
+
+Practical meaning:
+
+1. control should improve
+2. average mismatch duration should drop
+3. near-expiry rescue should become a smaller share of total recovery
+4. PnL may become less noisy because the bot stops waiting for late lucky completion
+
 Date: 2026-03-07
 Scope: observed runtime behaviour of the current `PAIR_BASE + RECOVERY + RISK_EXIT` Step 1 path
 Reference: user-provided logs across many markets from 2026-03-06 through 2026-03-07
@@ -47,15 +148,19 @@ The current Step 1 path now behaves like this:
 5. it can escalate to `RiskExitOnly` near expiry and use taker to finish the pair
 6. it now usually stays flat after terminal exit because `risk_exit_latched` blocks re-entry
 
+In the current unversioned working tree, there is one additional change:
+
+1. if a recovery cycle stays uneconomic for too long, the bot now escalates out of `MergePending` earlier with `forced_negative_economics` instead of waiting deep into the late window
+
 The main remaining weakness is not accounting anymore.
-The main remaining weakness is that maker recovery is still too patient and often finishes only because the near-expiry taker path rescues it.
+The main remaining weakness is that release-era maker recovery was still too patient and often finished only because the near-expiry taker path rescued it.
 
 In short:
 
 1. accounting is mostly fixed
 2. state ownership is much better
 3. terminal behaviour is much better
-4. maker recovery is still too slow / too conservative
+4. the current patch is explicitly trying to make recovery less patient and less profit-protective once the cycle is already bad
 5. Step 1 is still `PARTIAL`, not complete
 
 ---
@@ -71,7 +176,7 @@ Relative to `TARGET_GOAL_STATUS.md`, current behaviour is approximately:
 Why it is not higher:
 
 1. maker recovery still spends too much time in passive wait / requote cycles
-2. near-expiry taker rescue is still doing too much of the real cleanup work
+2. near-expiry taker rescue is still doing too much of the real cleanup work in the pre-patch logs
 3. empirical validation over the required 20+ markets is still pending
 4. emergency taker semantics are much better now, but still share some lower-level helper behaviour
 
@@ -209,6 +314,14 @@ The tradeoff is:
 2. and the position is still imbalanced
 3. then the bot increasingly depends on the near-expiry taker path
 
+The current unversioned patch changes this further:
+
+1. `negative_economics` no longer means "just wait"
+2. after a window-dependent stall duration, it can now escalate to `forced_negative_economics`
+3. that forced path enters `RiskExitOnly` earlier than the old near-expiry-only rescue
+
+This is the most important current behaviour change beyond `0.1.26`.
+
 ### 7) Near-expiry `RiskExitOnly` now works much better
 
 This is another real improvement.
@@ -305,6 +418,8 @@ Many runs now end flat, but too often they end flat because:
 3. a taker BUY or exact SELL finished the pair in the last 30-50 seconds
 
 That is safer than before, but it is still not ideal Step 1 behaviour.
+
+The latest current patch is explicitly intended to reduce this pattern by forcing earlier risk exit on long uneconomic cycles.
 
 ### 3) Pair entry is still asymmetry-prone
 
@@ -412,6 +527,25 @@ Interpretation:
 1. control is much safer than before
 2. but the bot still often needs terminal rescue
 
+### Pattern A2: long uneconomic stall before terminal rescue
+
+Observed in the latest two `ENTRY_ACK_TIMEOUT_MS=1000` runs.
+
+Behaviour:
+
+1. pair arms successfully
+2. one side fills
+3. maker recovery starts correctly
+4. repeated `merge: stop negative_economics ...`
+5. repeated fee snapshots with worsening or still-negative worst-case completion
+6. cycle remains open for a long time
+7. near-expiry taker finally finishes it
+
+Interpretation:
+
+1. this was the last clearly dominant control inefficiency in the current worktree before the newest patch
+2. it is exactly what `forced_negative_economics` is meant to cut shorter
+
 ### Pattern B: long maker recovery stall before eventual recovery
 
 Observed repeatedly in the logs.
@@ -493,7 +627,8 @@ If the question is "what does it do now?", the best short answer is:
 1. it can build and repair pairs
 2. it usually stays logically correct
 3. it often finishes flat
-4. but it still finishes too many markets via late taker rescue instead of timely maker recovery
+4. pre-patch, it still finished too many markets via late taker rescue instead of timely maker recovery
+5. current patch direction is to flatten earlier once recovery quality is clearly bad, even at the expense of near-term profitability
 
 If the question is "is it stable enough to move to Step 2?", the current answer remains:
 
@@ -521,3 +656,11 @@ The most important practical question is:
 2. versus how many finish only because `RiskExitOnly` rescues them near expiry.
 
 That is the clearest remaining gap between current behaviour and the target roadmap.
+
+The next question after the current patch is:
+
+1. does `forced_negative_economics` materially reduce:
+   - `negative_economics_s`
+   - `avg_time_to_flat_s`
+   - late-window rescue dependence
+2. without breaking flatness at rollover
