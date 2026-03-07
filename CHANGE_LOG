@@ -1,3 +1,55 @@
+## Version 0.1.26
+Date: 2026-03-07
+### Changes
+
+#### Fix 1: Pair-base scored taker is now guarded instead of firing on tiny score gaps
+- **Files:** `src/bot.rs`, `src/env_contract.rs`
+- **Problem:** With `RECOVERY_SCORING_ACTIVE=true`, Step 1 could choose `taker_buy_light` too early on weak score differences, then either fail with `FAK no orders found to match` or get blocked by cap while recovery still owned the gap.
+- **Fix:**
+  - Added `RECOVERY_SCORING_TAKER_MIN_ADVANTAGE` with default `0.10`
+  - restricted scored `taker_buy_light` to `late` and `terminal` windows only
+  - suppressed scored taker fallback when the advantage threshold is not met
+- **Impact:** Active scoring is less likely to fire taker rescue in normal time on score noise. The scorer is still experimental, but the worst canary failure mode is narrowed.
+
+#### Fix 2: Pair-base taker rescue now has a bounded immediate retry on explicit FAK no-match
+- **File:** `src/bot.rs`
+- **Problem:** A scored or terminal taker buy could get an explicit `no orders found to match` response and then just wait for the normal loop cadence, even though the failure was definitive and the gap still had a single owner.
+- **Fix:**
+  - records explicit FAK no-match timing
+  - allows one immediate retry after a confirmed no-match, but only when there is no active inflight taker oid
+  - keeps the retry bounded to avoid duplicate terminal exits
+- **Impact:** Pair-base rescue responds faster to real no-match failures without reintroducing overlapping taker orders.
+
+#### Fix 3: Pair-base blocked scored taker no longer falls through into generic maker replace behavior
+- **File:** `src/bot.rs`
+- **Problem:** When a pair-base scored taker path was blocked by cap or match failure, the generic emergency hedge helper could still continue into broader maker-replace behavior. That leaked `MAKER_POSTONLY_GTC` submits into Step 1 recovery ownership.
+- **Fix:**
+  - pair-base-scoped taker reasons now stop at the pair-base rescue path
+  - blocked scored taker logs remain explicit, but the helper does not call generic replace logic for those reasons
+- **Impact:** Step 1 recovery keeps single-owner control instead of leaking back into generic maker submit flow after a blocked scored taker.
+
+#### Docs: Release Snapshot And Environment Sync
+- **Files:** `CHANGE_LOG`, `ENVIRONMENT.md`, `behaviour-0.1.26.md`
+- **Changes:**
+  - synced the environment reference to the current `.env` values used in recent runs
+  - added the new scorer-guard env key documentation
+  - created a versioned behaviour snapshot for `0.1.26`
+- **Impact:** Release metadata and operating docs now match the current code and runtime configuration.
+
+### New Environment Keys
+- `RECOVERY_SCORING_TAKER_MIN_ADVANTAGE`
+
+### Behavior Impact
+- `RECOVERY_SCORING_ACTIVE` is still not the safe default, but `0.1.26` makes canary runs less dangerous by:
+  - requiring real score separation before scored taker rescue
+  - keeping scored taker rescue out of early/mid recovery windows
+  - retrying explicit FAK no-match only once and only under single-flight conditions
+
+### Validation
+- `cargo check -q`
+- `cargo test -q`
+- `56` tests passed
+
 ## Version 0.1.25
 Date: 2026-03-07
 ### Changes

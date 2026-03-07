@@ -480,6 +480,10 @@ fn pair_base_recovery_scoring_active() -> bool {
     env_bool("RECOVERY_SCORING_ACTIVE", false)
 }
 
+fn pair_base_recovery_scored_taker_min_advantage() -> f64 {
+    env_float("RECOVERY_SCORING_TAKER_MIN_ADVANTAGE", 0.10).clamp(0.0, 5.0)
+}
+
 fn pair_base_recovery_terminal_compare_all_paths() -> bool {
     env_bool("RECOVERY_TERMINAL_COMPARE_ALL_PATHS", true)
 }
@@ -638,6 +642,26 @@ fn pair_base_choose_recovery_candidate(
         .cloned()
 }
 
+fn pair_base_scored_taker_allowed(
+    window: PairBaseRecoveryWindow,
+    taker_score: f64,
+    maker_score: f64,
+    wait_score: f64,
+) -> bool {
+    if !matches!(
+        window,
+        PairBaseRecoveryWindow::Late | PairBaseRecoveryWindow::Terminal
+    ) {
+        return false;
+    }
+    let baseline = if maker_score.is_finite() {
+        maker_score.max(wait_score)
+    } else {
+        wait_score
+    };
+    taker_score - baseline >= pair_base_recovery_scored_taker_min_advantage() - 1e-9
+}
+
 fn pair_base_apply_first_clip_scale(
     size: i64,
     min_shares: f64,
@@ -658,6 +682,10 @@ fn pair_base_blocks_maker_submit(phase: PairBasePhaseState) -> bool {
 
 fn pair_base_recovery_uses_exact_order(origin: &str, size: f64, min_shares: f64) -> bool {
     origin.trim() == "PAIR_BASE_RECOVERY" && size + 1e-6 < min_shares.max(1.0)
+}
+
+fn pair_base_is_reason_scoped(reason: &str) -> bool {
+    reason.trim().starts_with("pair_base_")
 }
 
 fn pair_submit_tracks_taker_fallback(resolved_order_type: &str) -> bool {
@@ -8180,7 +8208,7 @@ impl MakerHedgeCapBot {
                 );
             }
         }
-        let selected_action = if pair_base_recovery_scoring_active() {
+        let mut selected_action = if pair_base_recovery_scoring_active() {
             if window == PairBaseRecoveryWindow::Terminal
                 && !pair_base_recovery_terminal_compare_all_paths()
             {
@@ -8194,6 +8222,41 @@ impl MakerHedgeCapBot {
         } else {
             chosen_default
         };
+        if pair_base_recovery_scoring_active()
+            && selected_action == PairBaseRecoveryActionKind::TakerBuyLight
+        {
+            let taker_allowed = best_candidate
+                .as_ref()
+                .filter(|candidate| candidate.kind == PairBaseRecoveryActionKind::TakerBuyLight)
+                .map(|candidate| {
+                    pair_base_scored_taker_allowed(
+                        window,
+                        candidate.score,
+                        maker_score,
+                        wait_score,
+                    )
+                })
+                .unwrap_or(false);
+            if !taker_allowed {
+                let taker_score = best_candidate
+                    .as_ref()
+                    .filter(|candidate| candidate.kind == PairBaseRecoveryActionKind::TakerBuyLight)
+                    .map(|candidate| candidate.score)
+                    .unwrap_or(f64::NEG_INFINITY);
+                self._maker_dbg_idle(
+                    &format!(
+                        "[PAIR_BASE] merge: suppress_scored_taker_buy pair_id={pair_id} window={} taker_score={:+.4} maker_score={:+.4} wait_score={:+.4} min_advantage={:.2}",
+                        window.as_str(),
+                        taker_score,
+                        maker_score,
+                        wait_score,
+                        pair_base_recovery_scored_taker_min_advantage(),
+                    ),
+                    &format!("pair_base_scored_taker_suppressed_{}_{}", pair_id, window.as_str()),
+                );
+                selected_action = chosen_default;
+            }
+        }
         if pair_base_recovery_scoring_active() {
             match selected_action {
                 PairBaseRecoveryActionKind::ExactSellHeavy => {
@@ -12466,10 +12529,11 @@ impl MakerHedgeCapBot {
             Ok(v) => v,
             Err(e) => {
                 let err_s = e.to_string();
-                if matches!(clob_order_type, ClobOrderType::Fak)
-                    && err_s.to_ascii_lowercase().contains("no orders found to match")
-                {
+                let no_match = matches!(clob_order_type, ClobOrderType::Fak)
+                    && err_s.to_ascii_lowercase().contains("no orders found to match");
+                if no_match {
                     self._pair_base_metrics_record_fak_no_match();
+                    self._runtime_ts_set("__last_fak_no_match_ts", now_ts_f64());
                 }
                 if post_only.unwrap_or(false) {
                     self.logger
@@ -12492,10 +12556,11 @@ impl MakerHedgeCapBot {
             Ok(v) => v,
             Err(e) => {
                 let err_s = e.to_string();
-                if matches!(clob_order_type, ClobOrderType::Fak)
-                    && err_s.to_ascii_lowercase().contains("no orders found to match")
-                {
+                let no_match = matches!(clob_order_type, ClobOrderType::Fak)
+                    && err_s.to_ascii_lowercase().contains("no orders found to match");
+                if no_match {
                     self._pair_base_metrics_record_fak_no_match();
+                    self._runtime_ts_set("__last_fak_no_match_ts", now_ts_f64());
                 }
                 if post_only.unwrap_or(false) {
                     self.logger
@@ -14314,15 +14379,6 @@ impl MakerHedgeCapBot {
         if delta.abs() < self.cfg.min_shares {
             return;
         }
-        let now = now_ts_f64();
-        if now < self._runtime_ts_get("__taker_inflight_until") {
-            return;
-        }
-        let last_taker_hedge_ts = self._runtime_ts_get("__last_taker_hedge_ts");
-        if now - last_taker_hedge_ts < self.taker_hedge_min_interval {
-            return;
-        }
-        self._runtime_ts_set("__last_taker_hedge_ts", now);
         let missing_asset = if delta > 0.0 {
             self.no_asset.clone()
         } else {
@@ -14331,143 +14387,187 @@ impl MakerHedgeCapBot {
         let Some(missing_asset) = missing_asset else {
             return;
         };
-        if self.taker_strict_inflight && self._has_pending_taker_order("BUY", Some(&missing_asset))
-        {
-            return;
-        }
-        let ba = self._best_bid_ask(&missing_asset);
-        let Some((_bid, ask)) = ba else {
-            self.logger.info(&format!(
-                "Emergency hedge: missing best_bid_ask for {} ({reason})",
-                missing_asset
-                    .chars()
-                    .rev()
-                    .take(6)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
-            ));
-            return;
-        };
-        if ask <= 0.0 {
-            self.logger.info(&format!(
-                "Emergency hedge: missing ask for {} ({reason})",
-                missing_asset
-                    .chars()
-                    .rev()
-                    .take(6)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
-            ));
-            return;
-        }
-        let mut cap = self._hedge_price_cap();
-        let base_cap = cap;
-        let t_left = (self.expiry_ts as f64 - now_ts_f64()).max(0.0);
-        let force_seconds = env_float("PAIR_BASE_NEAR_EXPIRY_FORCE_TAKER_SECONDS", 0.0).max(0.0);
-        let override_max_price = env_float("PAIR_BASE_NEAR_EXPIRY_TAKER_MAX_PRICE", 0.0)
-            .clamp(0.0, 0.99);
-        if pair_base_near_expiry_taker_override_active(
-            reason,
-            t_left,
-            force_seconds,
-            override_max_price,
-        ) {
-            cap = pair_base_effective_taker_cap(cap, override_max_price);
-            if cap > base_cap + 1e-9 {
-                self.logger.info(&format!(
-                    "[PAIR_BASE] near-expiry taker cap override base_cap={base_cap:.2} override_max={override_max_price:.2} effective_cap={cap:.2} t_left={t_left:.1}s ({reason})"
-                ));
+        let pair_base_reason = pair_base_is_reason_scoped(reason);
+        let allow_immediate_retry = pair_base_reason;
+        let max_attempts = if allow_immediate_retry { 2 } else { 1 };
+        for attempt in 0..max_attempts {
+            let now = now_ts_f64();
+            if now < self._runtime_ts_get("__taker_inflight_until") {
+                return;
             }
-        }
-        let mut px_candidate = ask + self.hedge_slippage_ticks as f64 * self.cfg.tick.max(0.0001);
-        px_candidate = round_up(px_candidate, self.cfg.tick.max(0.0001));
-        px_candidate = clamp(px_candidate, self.cfg.tick.max(0.0001), 0.99);
-        let mut px = cap.min(px_candidate);
-        px = round_down(px, self.cfg.tick.max(0.0001));
+            let last_taker_hedge_ts = self._runtime_ts_get("__last_taker_hedge_ts");
+            if now - last_taker_hedge_ts < self.taker_hedge_min_interval {
+                return;
+            }
+            if self.taker_strict_inflight
+                && self._has_pending_taker_order("BUY", Some(&missing_asset))
+            {
+                return;
+            }
+            let Some((_bid, ask)) = self._best_bid_ask(&missing_asset) else {
+                self.logger.info(&format!(
+                    "Emergency hedge: missing best_bid_ask for {} ({reason})",
+                    missing_asset
+                        .chars()
+                        .rev()
+                        .take(6)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
+                ));
+                return;
+            };
+            if ask <= 0.0 {
+                self.logger.info(&format!(
+                    "Emergency hedge: missing ask for {} ({reason})",
+                    missing_asset
+                        .chars()
+                        .rev()
+                        .take(6)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
+                ));
+                return;
+            }
 
-        if cap <= 0.0 {
-            self.logger
-                .info(&format!("Hedge cap <= 0 (cap={cap:.2}) -> STOP"));
-            self._set_exit_reason("CAP_LOCKED_LOSS");
-            self.cancel_all_orders_exchange("cap<=0 locked loss");
-            self.stop_flag.store(true, Ordering::SeqCst);
-            return;
-        }
-        if ask > cap || px + 1e-9 < ask {
+            let mut cap = self._hedge_price_cap();
+            let base_cap = cap;
+            let t_left = (self.expiry_ts as f64 - now_ts_f64()).max(0.0);
+            let force_seconds =
+                env_float("PAIR_BASE_NEAR_EXPIRY_FORCE_TAKER_SECONDS", 0.0).max(0.0);
+            let override_max_price = env_float("PAIR_BASE_NEAR_EXPIRY_TAKER_MAX_PRICE", 0.0)
+                .clamp(0.0, 0.99);
+            if pair_base_near_expiry_taker_override_active(
+                reason,
+                t_left,
+                force_seconds,
+                override_max_price,
+            ) {
+                cap = pair_base_effective_taker_cap(cap, override_max_price);
+                if cap > base_cap + 1e-9 {
+                    self.logger.info(&format!(
+                        "[PAIR_BASE] near-expiry taker cap override base_cap={base_cap:.2} override_max={override_max_price:.2} effective_cap={cap:.2} t_left={t_left:.1}s ({reason})"
+                    ));
+                }
+            }
+            let mut px_candidate =
+                ask + self.hedge_slippage_ticks as f64 * self.cfg.tick.max(0.0001);
+            px_candidate = round_up(px_candidate, self.cfg.tick.max(0.0001));
+            px_candidate = clamp(px_candidate, self.cfg.tick.max(0.0001), 0.99);
+            let mut px = cap.min(px_candidate);
+            px = round_down(px, self.cfg.tick.max(0.0001));
+
+            if cap <= 0.0 {
+                self.logger
+                    .info(&format!("Hedge cap <= 0 (cap={cap:.2}) -> STOP"));
+                self._set_exit_reason("CAP_LOCKED_LOSS");
+                self.cancel_all_orders_exchange("cap<=0 locked loss");
+                self.stop_flag.store(true, Ordering::SeqCst);
+                return;
+            }
+            if ask > cap || px + 1e-9 < ask {
+                self.logger.info(&format!(
+                    "Emergency hedge blocked: ask={ask:.2} cap={cap:.2} (px={px:.2}) ({reason})."
+                ));
+                if !pair_base_reason {
+                    let size_try = delta
+                        .abs()
+                        .min(self.cfg.clip_shares)
+                        .max(self.cfg.min_shares);
+                    let hedge_stale = env_int("HEDGE_STALE_SECONDS", self.cfg.stale_seconds) as i64;
+                    let _ = self._maybe_replace(&missing_asset, cap, size_try, Some(hedge_stale));
+                    self.cancel_all_open_orders_local_except(
+                        &missing_asset,
+                        "hedge cap blocked (keep hedge)",
+                    );
+                } else {
+                    self._maker_dbg_idle(
+                        &format!(
+                            "[PAIR_BASE] risk_exit_action blocked_taker_buy trigger={reason} ask={ask:.2} cap={cap:.2} px={px:.2}"
+                        ),
+                        &format!("pair_base_taker_blocked_{}", reason),
+                    );
+                }
+                return;
+            }
+
+            let total_cost = self.state.lock().map(|s| s.c_yes + s.c_no).unwrap_or(0.0);
+            let remaining_usd = self.cfg.max_total_cost - total_cost - self.cfg.reserve_usd;
+            if remaining_usd <= 0.0 {
+                self.logger.info(&format!(
+                    "No remaining budget to hedge. total_cost={total_cost:.2} cap={:.2} reserve={:.2} -> STOP",
+                    self.cfg.max_total_cost, self.cfg.reserve_usd
+                ));
+                self._set_exit_reason("NO_BUDGET");
+                self.cancel_all_orders_exchange("no budget to hedge");
+                self.stop_flag.store(true, Ordering::SeqCst);
+                return;
+            }
+            let need_int = (delta.abs() + 1e-12).floor() as i64;
+            let max_affordable = (remaining_usd / px + 1e-12).floor() as i64;
+            let size_int = need_int.min(max_affordable);
+            let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1);
+            if size_int < min_int {
+                self.logger.info(&format!(
+                    "Hedge too expensive for remaining budget. remaining={remaining_usd:.2} px={px:.2} need={need_int} max_affordable={max_affordable} -> STOP"
+                ));
+                self._set_exit_reason("HEDGE_TOO_EXPENSIVE");
+                self.cancel_all_orders_exchange("hedge too expensive");
+                self.stop_flag.store(true, Ordering::SeqCst);
+                return;
+            }
+            let partial = size_int < need_int;
             self.logger.info(&format!(
-                "Emergency hedge blocked: ask={ask:.2} cap={cap:.2} (px={px:.2}) ({reason})."
+                "EMERGENCY HEDGE ({reason}) delta={delta:.4} need={size_int} buy={} ask={ask:.2} px={px:.2} remaining_usd={remaining_usd:.2} type={}",
+                missing_asset
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>(),
+                self.hedge_taker_order_type
             ));
-            let size_try = delta
-                .abs()
-                .min(self.cfg.clip_shares)
-                .max(self.cfg.min_shares);
-            let hedge_stale = env_int("HEDGE_STALE_SECONDS", self.cfg.stale_seconds) as i64;
-            let _ = self._maybe_replace(&missing_asset, cap, size_try, Some(hedge_stale));
-            self.cancel_all_open_orders_local_except(
+            self.cancel_all_open_orders_local("before emergency taker hedge");
+            self._runtime_ts_set("__last_taker_hedge_ts", now);
+            self._runtime_ts_set("__taker_inflight_until", now_ts_f64() + 2.0);
+            let no_match_before = self._runtime_ts_get("__last_fak_no_match_ts");
+            let oid = self._place_taker_bid_fak(
                 &missing_asset,
-                "hedge cap blocked (keep hedge)",
+                px,
+                size_int as f64,
+                Some(&self.hedge_taker_order_type),
             );
-            return;
-        }
+            if oid.is_some() {
+                if partial && (oid.is_some() || self.cfg.dry_run) {
+                    self.logger.info(&format!(
+                        "Partial hedge executed ({size_int}/{need_int} shares) due to budget. Stopping."
+                    ));
+                    thread::sleep(Duration::from_secs(1));
+                    self._set_exit_reason("PARTIAL_HEDGE_BUDGET");
+                    self.cancel_all_orders_exchange("partial hedge stop");
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                }
+                return;
+            }
 
-        let total_cost = self.state.lock().map(|s| s.c_yes + s.c_no).unwrap_or(0.0);
-        let remaining_usd = self.cfg.max_total_cost - total_cost - self.cfg.reserve_usd;
-        if remaining_usd <= 0.0 {
-            self.logger.info(&format!(
-                "No remaining budget to hedge. total_cost={total_cost:.2} cap={:.2} reserve={:.2} -> STOP",
-                self.cfg.max_total_cost, self.cfg.reserve_usd
-            ));
-            self._set_exit_reason("NO_BUDGET");
-            self.cancel_all_orders_exchange("no budget to hedge");
-            self.stop_flag.store(true, Ordering::SeqCst);
+            let explicit_no_match =
+                self._runtime_ts_get("__last_fak_no_match_ts") > no_match_before + 1e-6;
+            if explicit_no_match && attempt + 1 < max_attempts {
+                self.logger.info(&format!(
+                    "[PAIR_BASE] risk_exit_action retry_immediate trigger={reason} reason=fak_no_match attempt={}/{}",
+                    attempt + 2,
+                    max_attempts
+                ));
+                self._runtime_ts_set("__taker_inflight_until", 0.0);
+                self._runtime_ts_set("__last_taker_hedge_ts", 0.0);
+                continue;
+            }
             return;
-        }
-        let need_int = (delta.abs() + 1e-12).floor() as i64;
-        let max_affordable = (remaining_usd / px + 1e-12).floor() as i64;
-        let size_int = need_int.min(max_affordable);
-        let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1);
-        if size_int < min_int {
-            self.logger.info(&format!(
-                "Hedge too expensive for remaining budget. remaining={remaining_usd:.2} px={px:.2} need={need_int} max_affordable={max_affordable} -> STOP"
-            ));
-            self._set_exit_reason("HEDGE_TOO_EXPENSIVE");
-            self.cancel_all_orders_exchange("hedge too expensive");
-            self.stop_flag.store(true, Ordering::SeqCst);
-            return;
-        }
-        let partial = size_int < need_int;
-        self.logger.info(&format!(
-            "EMERGENCY HEDGE ({reason}) delta={delta:.4} need={size_int} buy={} ask={ask:.2} px={px:.2} remaining_usd={remaining_usd:.2} type={}",
-            missing_asset
-                .chars()
-                .rev()
-                .take(6)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>(),
-            self.hedge_taker_order_type
-        ));
-        self.cancel_all_open_orders_local("before emergency taker hedge");
-        self._runtime_ts_set("__taker_inflight_until", now_ts_f64() + 2.0);
-        let oid = self._place_taker_bid_fak(
-            &missing_asset,
-            px,
-            size_int as f64,
-            Some(&self.hedge_taker_order_type),
-        );
-        if partial && (oid.is_some() || self.cfg.dry_run) {
-            self.logger.info(&format!(
-                "Partial hedge executed ({size_int}/{need_int} shares) due to budget. Stopping."
-            ));
-            thread::sleep(Duration::from_secs(1));
-            self._set_exit_reason("PARTIAL_HEDGE_BUDGET");
-            self.cancel_all_orders_exchange("partial hedge stop");
-            self.stop_flag.store(true, Ordering::SeqCst);
         }
     }
 
@@ -17990,6 +18090,40 @@ mod tests {
         assert!(crate::bot::pair_base_allows_merge_requote(0.0001));
         assert!(!crate::bot::pair_base_allows_merge_requote(0.0));
         assert!(!crate::bot::pair_base_allows_merge_requote(-0.0001));
+    }
+
+    #[test]
+    fn pair_base_scored_taker_allowed_requires_late_window_and_real_advantage() {
+        assert!(!crate::bot::pair_base_scored_taker_allowed(
+            PairBaseRecoveryWindow::Early,
+            0.20,
+            0.05,
+            0.00,
+        ));
+        assert!(!crate::bot::pair_base_scored_taker_allowed(
+            PairBaseRecoveryWindow::Mid,
+            0.20,
+            0.05,
+            0.00,
+        ));
+        assert!(!crate::bot::pair_base_scored_taker_allowed(
+            PairBaseRecoveryWindow::Late,
+            0.08,
+            0.00,
+            0.00,
+        ));
+        assert!(crate::bot::pair_base_scored_taker_allowed(
+            PairBaseRecoveryWindow::Late,
+            0.15,
+            0.00,
+            0.00,
+        ));
+        assert!(crate::bot::pair_base_scored_taker_allowed(
+            PairBaseRecoveryWindow::Terminal,
+            0.20,
+            0.05,
+            0.00,
+        ));
     }
 
     #[test]

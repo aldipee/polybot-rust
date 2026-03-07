@@ -314,22 +314,29 @@ Required state:
 3. SELL risk exits must be sized by shares
 4. every emergency taker action must log trigger, intended imbalance reduction, actual fill, and resulting inventory
 
-### Blocker 2: Settlement / merge lifecycle metrics are still incomplete
+### Blocker 2: Settlement / merge lifecycle metrics are now emitted
 
 Current state:
 
-1. fee-net pair / merge snapshots exist
-2. the status roadmap now requires:
+1. Step 1 now emits a final `[PAIR_BASE][METRICS]` summary at market finalization
+2. emitted lifecycle metrics now include:
+   - `both_side_participation`
+   - `pair_entry_count`
    - `merge_success_rate`
+   - `maker_recovery_success_rate`
+   - `pair_coverage_avg` / `pair_coverage_min`
+   - `downside_floor_lp`
+   - `downside_floor_fee_net_worst_case`
    - `residual_unmerged_inventory_after_resolution`
    - `time_to_flat_after_resolution`
    - `time_to_redeploy_capital`
    - `settlement_pnl_net_of_fees`
-3. these are not yet fully emitted as operational metrics
+   - maker/taker fill breakdown
+   - emergency taker attempt count
 
 Required state:
 
-1. Step 1 validation must be measurable through explicit post-resolution lifecycle metrics
+1. use the emitted metrics for the 20+ market Step 1 validation run
 
 ### Blocker 3: Step 1 still needs empirical validation against the roadmap gates
 
@@ -367,15 +374,8 @@ This is the next implementation order against the approved roadmap.
 
 ### Checkpoint C: Add Step 1-native settlement / merge metrics
 
-1. both-side participation
-2. pair coverage
-3. downside floor metrics
-4. maker recovery success
-5. merge success
-6. residual unmerged inventory after resolution
-7. time to flat after resolution
-8. time to redeploy capital
-9. fee-net settlement and worst-case metrics
+1. complete
+2. emitted in final `[PAIR_BASE][METRICS]` logs during market finalization
 
 ---
 
@@ -385,5 +385,5 @@ Current status is:
 
 1. `Milestone 0` is complete
 2. the true `Step 1` now exists and is runnable
-3. the main remaining gaps are emergency taker semantics and richer settlement / merge metrics
+3. the main remaining gaps are emergency taker semantics and empirical validation
 4. the next work should be Step 1 validation, not more skew tuning
