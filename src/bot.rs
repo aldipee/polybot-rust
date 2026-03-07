@@ -229,7 +229,10 @@ fn pair_base_should_force_recovery(
     }
 }
 
-fn pair_base_early_risk_exit_lead_seconds(stop_buffer_s: f64) -> f64 {
+fn pair_base_early_risk_exit_lead_seconds(stop_buffer_s: f64, configured_seconds: f64) -> f64 {
+    if configured_seconds > 0.0 {
+        return configured_seconds.max(1.0);
+    }
     let stop_buffer = stop_buffer_s.max(1.0);
     (stop_buffer * 2.0).max(stop_buffer + 10.0).max(30.0)
 }
@@ -262,7 +265,8 @@ fn pair_base_near_expiry_taker_override_active(
     force_seconds: f64,
     override_max_price: f64,
 ) -> bool {
-    reason.trim() == "pair_base_near_expiry"
+    let normalized = reason.trim();
+    (normalized == "pair_base_near_expiry" || normalized == "pair_base_latched")
         && force_seconds > 0.0
         && override_max_price > 0.0
         && t_left <= force_seconds + 1e-6
@@ -274,6 +278,10 @@ fn pair_base_effective_taker_cap(base_cap: f64, override_max_price: f64) -> f64 
 
 fn pair_base_allows_merge_requote(worst_case_pnl: f64) -> bool {
     worst_case_pnl > 1e-9
+}
+
+fn pair_base_blocks_maker_submit(phase: PairBasePhaseState) -> bool {
+    phase == PairBasePhaseState::RiskExitOnly
 }
 
 fn pair_base_recovery_uses_exact_order(origin: &str, size: f64, min_shares: f64) -> bool {
@@ -823,13 +831,18 @@ impl MakerHedgeCapBot {
         );
         out.runtime_flags = runtime_flags;
         out._apply_cfg_overrides_from_env();
+        let min_entry_edge_ticks = env_int("MIN_ENTRY_EDGE_TICKS", out.cfg.entry_edge_ticks).max(0);
+        let effective_entry_edge_ticks = out.cfg.entry_edge_ticks.max(min_entry_edge_ticks);
         out.logger.info(&format!(
-            "[CFG_EFFECTIVE] dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} log_every={} market_data_stale={}s stop_buffer={}s",
+            "[CFG_EFFECTIVE] dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale={}s stop_buffer={}s",
             out.cfg.dry_run,
             out.cfg.max_total_cost,
             out.cfg.reserve_usd,
             out.cfg.min_shares,
             out.cfg.clip_shares,
+            out.cfg.entry_edge_ticks,
+            min_entry_edge_ticks,
+            effective_entry_edge_ticks,
             out.cfg.log_every,
             out.cfg.market_data_stale_seconds,
             out.cfg.stop_buffer_seconds
@@ -5613,6 +5626,19 @@ impl MakerHedgeCapBot {
         if key.asset_id.trim().is_empty() || key.side != "BUY" {
             return None;
         }
+        let pair_base_phase = self
+            .pair_base_state
+            .lock()
+            .ok()
+            .map(|st| st.phase)
+            .unwrap_or(PairBasePhaseState::Flat);
+        if pair_base_blocks_maker_submit(pair_base_phase) {
+            self.logger.info(&format!(
+                "[MAKER_ORD] skip BUY during pair_base risk-exit asset={} origin={}",
+                key.asset_id, origin
+            ));
+            return None;
+        }
         let min_shares = self.cfg.min_shares.max(1.0);
         let exact_recovery = pair_base_recovery_uses_exact_order(origin, size, min_shares);
         if !self._maker_single_inflight_enabled() {
@@ -7043,8 +7069,10 @@ impl MakerHedgeCapBot {
         }
         if has_inventory {
             let t_left = (self.expiry_ts as f64 - now).max(0.0);
-            let risk_exit_lead_s =
-                pair_base_early_risk_exit_lead_seconds(self.cfg.stop_buffer_seconds as f64);
+            let risk_exit_lead_s = pair_base_early_risk_exit_lead_seconds(
+                self.cfg.stop_buffer_seconds as f64,
+                env_float("PAIR_BASE_NEAR_EXPIRY_RISK_EXIT_SECONDS", 0.0),
+            );
             if actual_gap > release + 1e-6 && t_left <= risk_exit_lead_s {
                 self._maker_pair_base_risk_exit_step("near_expiry", total_cost, true);
                 return;
@@ -16365,15 +16393,27 @@ mod tests {
 
     #[test]
     fn pair_base_early_risk_exit_lead_is_ahead_of_stop_buffer() {
-        assert!((pair_base_early_risk_exit_lead_seconds(15.0) - 30.0).abs() < 1e-9);
-        assert!((pair_base_early_risk_exit_lead_seconds(8.0) - 30.0).abs() < 1e-9);
-        assert!((pair_base_early_risk_exit_lead_seconds(20.0) - 40.0).abs() < 1e-9);
+        assert!((pair_base_early_risk_exit_lead_seconds(15.0, 0.0) - 30.0).abs() < 1e-9);
+        assert!((pair_base_early_risk_exit_lead_seconds(8.0, 0.0) - 30.0).abs() < 1e-9);
+        assert!((pair_base_early_risk_exit_lead_seconds(20.0, 0.0) - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pair_base_early_risk_exit_lead_honors_env_override() {
+        assert!((pair_base_early_risk_exit_lead_seconds(15.0, 45.0) - 45.0).abs() < 1e-9);
+        assert!((pair_base_early_risk_exit_lead_seconds(15.0, 1.0) - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn pair_base_near_expiry_taker_override_is_reason_and_time_gated() {
         assert!(crate::bot::pair_base_near_expiry_taker_override_active(
             "pair_base_near_expiry",
+            9.5,
+            10.0,
+            0.85
+        ));
+        assert!(crate::bot::pair_base_near_expiry_taker_override_active(
+            "pair_base_latched",
             9.5,
             10.0,
             0.85
@@ -16410,6 +16450,16 @@ mod tests {
         assert!(crate::bot::pair_base_allows_merge_requote(0.0001));
         assert!(!crate::bot::pair_base_allows_merge_requote(0.0));
         assert!(!crate::bot::pair_base_allows_merge_requote(-0.0001));
+    }
+
+    #[test]
+    fn pair_base_risk_exit_blocks_maker_submits() {
+        assert!(crate::bot::pair_base_blocks_maker_submit(
+            crate::bot::PairBasePhaseState::RiskExitOnly
+        ));
+        assert!(!crate::bot::pair_base_blocks_maker_submit(
+            crate::bot::PairBasePhaseState::MergePending
+        ));
     }
 
     #[test]
