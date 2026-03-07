@@ -1442,7 +1442,7 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 );
                 bot.persist_state();
                 bg_logger.info(&format!(
-                    "[PAIR_BASE][METRICS] both_side_participation={} pair_entries={} merge_cycles={} merge_success_rate={:.3} maker_recovery_success_rate={:.3} risk_exit_count={} emergency_taker_attempts={} pair_coverage_avg={:.3} pair_coverage_min={:.3} downside_floor_lp={:+.4} downside_floor_fee_net_worst_case={:+.4} upside_ceiling_fee_net_best_case={:+.4} residual_gap_avg={:.4} residual_gap_max={:.4} avg_time_to_flat_s={:.2} max_time_to_flat_s={:.2} avg_time_to_redeploy_s={:.2} max_time_to_redeploy_s={:.2} taker_fee_estimate_total={:.4} settlement_pnl_net_of_fees={:+.4}",
+                    "[PAIR_BASE][METRICS] both_side_participation={} pair_entries={} merge_cycles={} merge_success_rate={:.3} maker_recovery_success_rate={:.3} risk_exit_count={} emergency_taker_attempts={} pair_coverage_avg={:.3} pair_coverage_min={:.3} downside_floor_lp={:+.4} downside_floor_fee_net_worst_case={:+.4} upside_ceiling_fee_net_best_case={:+.4} residual_gap_avg={:.4} residual_gap_max={:.4} avg_time_to_flat_s={:.2} max_time_to_flat_s={:.2} avg_time_to_redeploy_s={:.2} max_time_to_redeploy_s={:.2} covered_by_live_order_s={:.2} negative_economics_s={:.2} resolved_before_last_sixty_rate={:.3} resolved_by_maker_rate={:.3} resolved_by_exact_sell_rate={:.3} resolved_by_taker_buy_rate={:.3} fak_no_match_count={} avg_entry_fee_net_edge={:+.4} avg_maker_recovery_cost={:+.4} avg_taker_recovery_cost={:+.4} taker_fee_estimate_total={:.4} settlement_pnl_net_of_fees={:+.4}",
                     pair_metrics.both_side_participation,
                     pair_metrics.pair_entry_count,
                     pair_metrics.merge_cycle_count,
@@ -1461,6 +1461,16 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                     pair_metrics.max_time_to_flat_after_resolution_seconds,
                     pair_metrics.avg_time_to_redeploy_capital_seconds,
                     pair_metrics.max_time_to_redeploy_capital_seconds,
+                    pair_metrics.covered_by_live_order_seconds_total,
+                    pair_metrics.negative_economics_seconds_total,
+                    pair_metrics.resolved_before_last_sixty_rate,
+                    pair_metrics.resolved_by_maker_rate,
+                    pair_metrics.resolved_by_exact_sell_rate,
+                    pair_metrics.resolved_by_taker_buy_rate,
+                    pair_metrics.fak_no_match_count,
+                    pair_metrics.avg_entry_fee_net_edge,
+                    pair_metrics.avg_maker_recovery_cost,
+                    pair_metrics.avg_taker_recovery_cost,
                     pair_metrics.taker_fee_estimate_total,
                     pair_metrics.settlement_pnl_net_of_fees
                 ));
