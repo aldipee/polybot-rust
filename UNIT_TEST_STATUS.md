@@ -18,7 +18,8 @@
 | Methods (MakerHedgeCapBot) | ~228 |
 | Tests (existing in `mod tests`) | 26 |
 | Tests (Priority 1 in `bot_priority1_tests.rs`) | 105 |
-| **Total tests** | **131** |
+| Tests (Priority 2 in `bot_priority2_tests.rs`) | 82 |
+| **Total tests** | **213** |
 
 ---
 
@@ -28,6 +29,7 @@
 |------|--------|-------|--------|
 | `src/bot.rs` (inline `mod tests`) | `bot::tests` | 26 | ALL PASS |
 | `src/bot_priority1_tests.rs` | `bot::bot_priority1_tests` | 105 | ALL PASS |
+| `src/bot_priority2_tests.rs` | `bot::bot_priority2_tests` | 82 | ALL PASS |
 
 ---
 
@@ -56,7 +58,7 @@
 | 421 | `ApplyFillMutationMeta` | private | opened_position, closed_position, mark_first_entry_fill |
 | 428 | `PairArbPendingImbalance` | private | yes/no_oid, heavy/light_side, gap_shares, created_ts |
 | 468 | `SniperStopCertaintyConfig` | private | enabled, sell_budget_ms, sell_max_submits, sell_post_wait_ms, no_derisk_eps_shares, hedge_* fields, post_hedge_* fields, stop_loss_* fields, hedged_block_new_entries |
-| 532 | `MakerHedgeCapBot` | pub | ~55 fields (cfg, logger, market_slug, signal_hub, …) |
+| 532 | `MakerHedgeCapBot` | pub | ~55 fields (cfg, logger, market_slug, signal_hub, ...) |
 
 ## 2. Enums
 
@@ -145,8 +147,8 @@
 
 | Line | Method | Vis | Test Status |
 |------|--------|-----|-------------|
-| 1259 | `_runtime_ts_get` | priv | NOT TESTED |
-| 1267 | `_runtime_ts_set` | priv | NOT TESTED |
+| 1259 | `_runtime_ts_get` | priv | COVERED (P2: 4 tests) |
+| 1267 | `_runtime_ts_set` | priv | COVERED (P2: 4 tests) |
 
 ### 8.4 Sniper Filters
 
@@ -179,9 +181,9 @@
 | 1993 | `_sniper_record_order_fill` | priv | NOT TESTED |
 | 2013 | `_sniper_hedge_oid_key` | priv static | COVERED (P1: 1 test) |
 | 2017 | `_sniper_hedge_last_remaining_key` | priv static | COVERED (P1: 1 test) |
-| 2021 | `_sniper_is_hedge_order` | priv | NOT TESTED |
-| 2028 | `_sniper_mark_hedge_order` | priv | NOT TESTED |
-| 2036 | `_sniper_clear_hedge_order` | priv | NOT TESTED |
+| 2021 | `_sniper_is_hedge_order` | priv | COVERED (P2: 6 tests) |
+| 2028 | `_sniper_mark_hedge_order` | priv | COVERED (P2: 6 tests) |
+| 2036 | `_sniper_clear_hedge_order` | priv | COVERED (P2: 6 tests) |
 | 2044 | `_sniper_log_hedge_order_progress` | priv | NOT TESTED |
 
 ### 8.6 Sniper Stop Loss
@@ -190,10 +192,10 @@
 |------|--------|-----|-------------|
 | 2090 | `_sniper_stop_loss_fail_key` | priv static | COVERED (P1: 1 test) |
 | 2094 | `_sniper_normalize_stop_loss_mode` | priv static | COVERED (P1: 9 tests) |
-| 2111 | `_sniper_stop_loss_mode` | priv | NOT TESTED |
-| 2119 | `_sniper_stop_loss_fallback_mode` | priv | NOT TESTED |
-| 2129 | `_sniper_stop_loss_fallback_fails` | priv | NOT TESTED |
-| 2133 | `_sniper_stop_loss_reset_failures` | priv | NOT TESTED |
+| 2111 | `_sniper_stop_loss_mode` | priv | COVERED (P2: 1 test) |
+| 2119 | `_sniper_stop_loss_fallback_mode` | priv | COVERED (P2: 1 test) |
+| 2129 | `_sniper_stop_loss_fallback_fails` | priv | COVERED (P2: 1 test) |
+| 2133 | `_sniper_stop_loss_reset_failures` | priv | COVERED (P2: 2 tests) |
 | 2141 | `_sniper_stop_loss_record_sell_failure` | priv | NOT TESTED |
 
 ### 8.7 RTDS (Chainlink) Gate
@@ -218,18 +220,18 @@
 | 2538 | `_sniper_endgame_resolution_tick_ready` | priv | NOT TESTED |
 | 2700 | `_sniper_entry_pending_key` | priv static | COVERED (P1: 1 test) |
 | 2704 | `_sniper_entry_confirmed_key` | priv static | COVERED (P1: 1 test) |
-| 2708 | `_set_exit_reason` | priv | NOT TESTED |
-| 2714 | `_get_exit_reason` | priv | NOT TESTED |
-| 2721 | `_default_entry_reason` | priv | NOT TESTED |
-| 2733 | `_active_entry_reason_or_default` | priv | NOT TESTED |
+| 2708 | `_set_exit_reason` | priv | COVERED (P2: 3 tests) |
+| 2714 | `_get_exit_reason` | priv | COVERED (P2: 3 tests) |
+| 2721 | `_default_entry_reason` | priv | COVERED (P2: 11 tests) |
+| 2733 | `_active_entry_reason_or_default` | priv | COVERED (P2: 4 tests) |
 | 2742 | `_env_positive_float_if_set` | priv static | COVERED (P1: 4 tests) |
 | 2751 | `_sniper_tp_sl_overrides_for_entry_reason` | priv static | NOT TESTED (env-dependent) |
 | 2770 | `_sniper_tp_sl_for_entry_reason` | priv | NOT TESTED |
 | 2781 | `_force_diff_entry_reason` | priv static | COVERED (P1: 3 tests) |
 | 2788 | `_should_bypass_rtds_hold_for_take_profit` | priv | NOT TESTED |
 | 2802 | `_entry_reason_from_candidate` | priv | NOT TESTED |
-| 2827 | `_set_pending_entry_reason` | priv | NOT TESTED |
-| 2833 | `_take_pending_entry_reason` | priv | NOT TESTED |
+| 2827 | `_set_pending_entry_reason` | priv | COVERED (P2: 4 tests) |
+| 2833 | `_take_pending_entry_reason` | priv | COVERED (P2: 4 tests) |
 | 2840 | `_mark_sniper_entry_state` | priv | NOT TESTED |
 | 2849 | `_mark_sniper_exit_state` | priv | NOT TESTED |
 | 2856 | `_clear_local_position_for_asset` | priv | NOT TESTED |
@@ -285,14 +287,14 @@
 | 4259 | `_maker_skew_update_state` | priv | NOT TESTED |
 | 4313 | `_maker_poly_fee_estimate` | priv | NOT TESTED |
 | 4334 | `_maker_pair_edge_after_fees` | priv | NOT TESTED |
-| 4342 | `_maker_single_inflight_enabled` | priv | NOT TESTED |
-| 4346 | `_maker_submit_pending_ttl_seconds` | priv | NOT TESTED |
-| 4350 | `_maker_cancel_pending_ttl_seconds` | priv | NOT TESTED |
-| 4354 | `_maker_working_missing_ttl_seconds` | priv | NOT TESTED |
-| 4358 | `_maker_replace_min_interval_seconds` | priv | NOT TESTED |
-| 4362 | `_maker_submit_reject_cooldown_seconds` | priv | NOT TESTED |
-| 4366 | `_pair_arb_imbalance_enter_shares` | priv | NOT TESTED |
-| 4374 | `_pair_arb_imbalance_release_shares` | priv | NOT TESTED |
+| 4342 | `_maker_single_inflight_enabled` | priv | COVERED (P2: 1 test) |
+| 4346 | `_maker_submit_pending_ttl_seconds` | priv | COVERED (P2: 1 test) |
+| 4350 | `_maker_cancel_pending_ttl_seconds` | priv | COVERED (P2: 1 test) |
+| 4354 | `_maker_working_missing_ttl_seconds` | priv | COVERED (P2: 1 test) |
+| 4358 | `_maker_replace_min_interval_seconds` | priv | COVERED (P2: 1 test) |
+| 4362 | `_maker_submit_reject_cooldown_seconds` | priv | COVERED (P2: 1 test) |
+| 4366 | `_pair_arb_imbalance_enter_shares` | priv | COVERED (P2: 2 tests) |
+| 4374 | `_pair_arb_imbalance_release_shares` | priv | COVERED (P2: 2 tests) |
 | 4380 | `_maker_actual_inventory` | priv | NOT TESTED |
 | 4387 | `_maker_projected_gap_from_inventory` | priv | COVERED (`mod tests`) |
 | 4402 | `_maker_projected_gap_after_buy` | priv | COVERED (`mod tests`) |
@@ -366,11 +368,11 @@
 
 | Line | Method | Vis | Test Status |
 |------|--------|-----|-------------|
-| 6362 | `_pair_base_mode_enabled` | priv | NOT TESTED |
-| 6369 | `_pair_recovery_enabled` | priv | NOT TESTED |
-| 6373 | `_pair_base_window_budget` | priv | NOT TESTED |
-| 6379 | `_pair_base_merge_budget` | priv | NOT TESTED |
-| 6385 | `_pair_base_hard_reserve` | priv | NOT TESTED |
+| 6362 | `_pair_base_mode_enabled` | priv | COVERED (P2: 1 test) |
+| 6369 | `_pair_recovery_enabled` | priv | COVERED (P2: 1 test) |
+| 6373 | `_pair_base_window_budget` | priv | COVERED (P2: 2 tests) |
+| 6379 | `_pair_base_merge_budget` | priv | COVERED (P2: 2 tests) |
+| 6385 | `_pair_base_hard_reserve` | priv | COVERED (P2: 2 tests) |
 | 6391 | `_pair_base_fee_net_snapshot` | priv | NOT TESTED |
 | 6440 | `_pair_base_log_fee_net` | priv | NOT TESTED |
 | 6470 | `_pair_base_live_order_id` | priv | NOT TESTED |
@@ -426,12 +428,12 @@
 
 | Line | Method | Vis | Test Status |
 |------|--------|-----|-------------|
-| 8876 | `_lat_ms` | pub | NOT TESTED |
-| 8883 | `_lat_us` | pub | NOT TESTED |
+| 8876 | `_lat_ms` | pub | COVERED (P2: 6 tests) |
+| 8883 | `_lat_us` | pub | COVERED (P2: 4 tests) |
 | 8890 | `_set_active_signal_context` | pub | NOT TESTED |
 | 8900 | `_clear_active_signal_context` | pub | NOT TESTED |
 | 8906 | `_get_active_signal_context` | pub | NOT TESTED |
-| 8913 | `_utc_iso` | pub | NOT TESTED |
+| 8913 | `_utc_iso` | pub | COVERED (P2: 4 tests) |
 | 8922 | `_should_file_log_submit_event` | pub | NOT TESTED |
 | 8932 | `_latency_file_append` | pub | NOT TESTED |
 | 8938 | `_prune_order_exec_context_locked` | pub | NOT TESTED |
@@ -538,8 +540,8 @@
 | 13723 | `_sniper_calc_entry_size` | pub | NOT TESTED |
 | 13734 | `_log_status_sniper` | pub | NOT TESTED |
 | 13813 | `_sniper_try_enter` | pub | NOT TESTED |
-| 14215 | `_sniper_is_flat` | priv | NOT TESTED |
-| 14223 | `_sniper_is_paired_hedged` | priv | NOT TESTED |
+| 14215 | `_sniper_is_flat` | priv | COVERED (P2: 5 tests) |
+| 14223 | `_sniper_is_paired_hedged` | priv | COVERED (P2: 5 tests) |
 | 14235 | `_sniper_post_hedge_active` | priv | NOT TESTED |
 | 14239 | `_sniper_clear_post_hedge_state` | priv | NOT TESTED |
 | 14246 | `_sniper_mark_post_hedge_state` | priv | NOT TESTED |
@@ -641,6 +643,35 @@
 | 124 | `maker_order_lifecycle_default_is_idle` | Enum: MakerOrderLifecycle | PASS |
 | 125-128 | `exec_apply_result_*` | Enum: MakerExecApplyResult | PASS |
 
+### 9c. `bot_priority2_tests` (82 tests, in `src/bot_priority2_tests.rs`)
+
+| # | Test Name | Category | Status |
+|---|-----------|----------|--------|
+| 1-6 | `lat_ms_*` | Latency: _lat_ms | PASS |
+| 7-10 | `lat_us_*` | Latency: _lat_us | PASS |
+| 11-14 | `utc_iso_*` | Time: _utc_iso | PASS |
+| 15-18 | `runtime_ts_*` | State: _runtime_ts_get/set | PASS |
+| 19-21 | `exit_reason_*` | State: _set/get_exit_reason | PASS |
+| 22-25 | `pending_entry_reason_*` | State: _set/take_pending_entry_reason | PASS |
+| 26-36 | `default_entry_reason_*` | Entry: _default_entry_reason | PASS |
+| 37-40 | `active_entry_reason_*` | Entry: _active_entry_reason_or_default | PASS |
+| 41-45 | `sniper_is_flat_*` | Position: _sniper_is_flat | PASS |
+| 46-50 | `sniper_*_paired_hedged_*` | Position: _sniper_is_paired_hedged | PASS |
+| 51-56 | `sniper_*_hedge_order_*` | Hedge: _sniper_is/mark/clear_hedge_order | PASS |
+| 57-58 | `stop_loss_reset_failures_*` | Stop Loss: _sniper_stop_loss_reset_failures | PASS |
+| 59 | `stop_loss_mode_*` | Stop Loss: _sniper_stop_loss_mode | PASS |
+| 60 | `stop_loss_fallback_mode_*` | Stop Loss: _sniper_stop_loss_fallback_mode | PASS |
+| 61 | `stop_loss_fallback_fails_*` | Stop Loss: _sniper_stop_loss_fallback_fails | PASS |
+| 62-67 | `maker_*_ttl_*`, `maker_single_inflight_*` | Config: maker timing | PASS |
+| 68-69 | `pair_arb_imbalance_enter_*` | Config: imbalance enter | PASS |
+| 70-71 | `pair_arb_imbalance_release_*` | Config: imbalance release | PASS |
+| 72 | `pair_base_mode_disabled_*` | Config: pair base mode | PASS |
+| 73 | `pair_recovery_enabled_*` | Config: pair recovery | PASS |
+| 74-75 | `pair_base_window_budget_*` | Config: window budget | PASS |
+| 76-77 | `pair_base_merge_budget_*` | Config: merge budget | PASS |
+| 78-79 | `pair_base_hard_reserve_*` | Config: hard reserve | PASS |
+| 80-82 | `custom_cfg_*` | Integration: custom BotConfig | PASS |
+
 ---
 
 ## 10. Coverage Summary
@@ -654,36 +685,36 @@
 | SniperStopCertaintyConfig | 1 | 0 | 1 | 0% |
 | 8.1 Core/Init | 5 | 0 | 5 | 0% |
 | 8.2 CLOB Utils | 10 | 7 | 3 | **70%** |
-| 8.3 Runtime State | 2 | 0 | 2 | 0% |
+| 8.3 Runtime State | 2 | 2 | 0 | **100%** |
 | 8.4 Sniper Filters | 15 | 1 | 14 | 7% |
-| 8.5 Sniper Order/Trade | 11 | 4 | 7 | 36% |
-| 8.6 Sniper Stop Loss | 7 | 2 | 5 | 29% |
+| 8.5 Sniper Order/Trade | 11 | 7 | 4 | **64%** |
+| 8.6 Sniper Stop Loss | 7 | 6 | 1 | **86%** |
 | 8.7 RTDS Gate | 8 | 0 | 8 | 0% |
-| 8.8 Entry Reason / TP-SL | 19 | 4 | 15 | 21% |
+| 8.8 Entry Reason / TP-SL | 19 | 10 | 9 | **53%** |
 | 8.9 WebSocket/Connection | 11 | 1 | 10 | 9% |
 | 8.10 Market Data | 18 | 0 | 18 | 0% |
-| 8.11 Maker Price/Inventory | 20 | 4 | 16 | 20% |
+| 8.11 Maker Price/Inventory | 20 | 12 | 8 | **60%** |
 | 8.12 Exec Ledger | 8 | 6 | 2 | **75%** |
 | 8.13 Pair Arb State | 3 | 0 | 3 | 0% |
 | 8.14 Maker Recovery | 5 | 1 | 4 | 20% |
 | 8.15 Maker Order Mgmt | 13 | 0 | 13 | 0% |
 | 8.16 Payoff/Fees/Ladder | 10 | 3 | 7 | 30% |
-| 8.17 Pair Base Config | 10 | 0 | 10 | 0% |
+| 8.17 Pair Base Config | 10 | 5 | 5 | **50%** |
 | 8.18 Pair Base Recovery | 4 | 0 | 4 | 0% |
 | 8.19 Trade Decision | 1 | 0 | 1 | 0% |
 | 8.20 Maker Loops | 7 | 0 | 7 | 0% |
 | 8.21 Accumulate/Entry | 5 | 0 | 5 | 0% |
 | 8.22 Fill/Apply | 3 | 0 | 3 | 0% |
-| 8.23 Latency/Context | 12 | 0 | 12 | 0% |
+| 8.23 Latency/Context | 12 | 3 | 9 | **25%** |
 | 8.24 Taker Order Track | 8 | 0 | 8 | 0% |
 | 8.25 Order Events | 5 | 0 | 5 | 0% |
 | 8.26 Order Placement | 23 | 0 | 23 | 0% |
 | 8.27 Pair Arb Trading | 9 | 0 | 9 | 0% |
 | 8.28 Hedge/Price | 12 | 0 | 12 | 0% |
-| 8.29 Sniper Position | 26 | 0 | 26 | 0% |
+| 8.29 Sniper Position | 26 | 2 | 24 | 8% |
 | 8.30 Signal | 8 | 0 | 8 | 0% |
 | 8.31 Lifecycle | 5 | 0 | 5 | 0% |
-| **TOTAL** | **~352** | **~48** | **~304** | **~13.6%** |
+| **TOTAL** | **~352** | **~82** | **~270** | **~23.3%** |
 
 ---
 
@@ -692,17 +723,9 @@
 ### Priority 1 — Static/Pure helpers (no `&self`) — DONE
 All Priority 1 functions are now covered in `src/bot_priority1_tests.rs`.
 
-### Priority 2 — Lightweight `&self` methods (read config/state only)
-- `_maker_single_inflight_enabled`, `_maker_submit_pending_ttl_seconds`
-- `_maker_cancel_pending_ttl_seconds`, `_maker_working_missing_ttl_seconds`
-- `_maker_replace_min_interval_seconds`, `_maker_submit_reject_cooldown_seconds`
-- `_pair_arb_imbalance_enter_shares`, `_pair_arb_imbalance_release_shares`
-- `_pair_base_mode_enabled`, `_pair_recovery_enabled`
-- `_pair_base_window_budget`, `_pair_base_merge_budget`, `_pair_base_hard_reserve`
-- `_sniper_stop_loss_mode`, `_sniper_stop_loss_fallback_mode`
-- `_default_entry_reason`, `_active_entry_reason_or_default`
-- `_sniper_is_flat`, `_sniper_is_paired_hedged`
-- `_lat_ms`, `_lat_us`, `_utc_iso`
+### Priority 2 — Lightweight `&self` methods (read config/state only) — DONE
+All Priority 2 functions are now covered in `src/bot_priority2_tests.rs`.
+Includes a reusable `make_test_bot()` helper for constructing `MakerHedgeCapBot` instances without network/file I/O.
 
 ### Priority 3 — Complex logic requiring mock/state setup
 - `_maker_skew_update_state`, `_maker_projected_gap_from_inventory`
@@ -717,17 +740,20 @@ All Priority 1 functions are now covered in `src/bot_priority1_tests.rs`.
 ## 12. How to Run Tests
 
 ```bash
-# Run ALL bot.rs tests (131 tests)
+# Run ALL bot.rs tests (213 tests)
 cargo test --bin polybot bot::
 
 # Run only Priority 1 tests (105 tests)
 cargo test --bin polybot bot_priority1_tests
 
+# Run only Priority 2 tests (82 tests)
+cargo test --bin polybot bot_priority2_tests
+
 # Run only original inline tests (26 tests)
 cargo test --bin polybot bot::tests::
 
 # Run a specific test
-cargo test --bin polybot bot_priority1_tests::rsi_all_gains_is_100
+cargo test --bin polybot bot_priority2_tests::sniper_is_flat_when_no_position
 
 # Run with output
 cargo test --bin polybot bot:: -- --nocapture
