@@ -1384,6 +1384,7 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                     &bg_logger,
                     bg_trade_realized_log_enabled,
                 );
+                let pair_metrics = bot.pair_base_metrics_snapshot(metrics.lp);
                 let end_trade_iso = now_iso_jakarta();
                 let raw_exit_reason = if metrics.exit_reason.trim().is_empty()
                     || metrics.exit_reason.eq_ignore_ascii_case("RUNNING")
@@ -1440,6 +1441,36 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                     exit_price,
                 );
                 bot.persist_state();
+                bg_logger.info(&format!(
+                    "[PAIR_BASE][METRICS] both_side_participation={} pair_entries={} merge_cycles={} merge_success_rate={:.3} maker_recovery_success_rate={:.3} risk_exit_count={} emergency_taker_attempts={} pair_coverage_avg={:.3} pair_coverage_min={:.3} downside_floor_lp={:+.4} downside_floor_fee_net_worst_case={:+.4} upside_ceiling_fee_net_best_case={:+.4} residual_gap_avg={:.4} residual_gap_max={:.4} avg_time_to_flat_s={:.2} max_time_to_flat_s={:.2} avg_time_to_redeploy_s={:.2} max_time_to_redeploy_s={:.2} taker_fee_estimate_total={:.4} settlement_pnl_net_of_fees={:+.4}",
+                    pair_metrics.both_side_participation,
+                    pair_metrics.pair_entry_count,
+                    pair_metrics.merge_cycle_count,
+                    pair_metrics.merge_success_rate,
+                    pair_metrics.maker_recovery_success_rate,
+                    pair_metrics.risk_exit_count,
+                    pair_metrics.emergency_taker_attempt_count,
+                    pair_metrics.pair_coverage_avg,
+                    pair_metrics.pair_coverage_min,
+                    pair_metrics.downside_floor_lp,
+                    pair_metrics.downside_floor_fee_net_worst_case,
+                    pair_metrics.upside_ceiling_fee_net_best_case,
+                    pair_metrics.residual_unmerged_inventory_after_resolution_avg,
+                    pair_metrics.residual_unmerged_inventory_after_resolution_max,
+                    pair_metrics.avg_time_to_flat_after_resolution_seconds,
+                    pair_metrics.max_time_to_flat_after_resolution_seconds,
+                    pair_metrics.avg_time_to_redeploy_capital_seconds,
+                    pair_metrics.max_time_to_redeploy_capital_seconds,
+                    pair_metrics.taker_fee_estimate_total,
+                    pair_metrics.settlement_pnl_net_of_fees
+                ));
+                bg_logger.info(&format!(
+                    "[PAIR_BASE][METRICS] maker_fill_yes={:.2} maker_fill_no={:.2} taker_fill_yes={:.2} taker_fill_no={:.2}",
+                    pair_metrics.maker_fill_yes,
+                    pair_metrics.maker_fill_no,
+                    pair_metrics.taker_fill_yes,
+                    pair_metrics.taker_fill_no
+                ));
                 bg_logger.info(&format!(
                     "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4} cpp={:.4} qYES={:.2} qNO={:.2}",
                     metrics.lp,

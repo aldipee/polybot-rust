@@ -78,6 +78,34 @@ pub struct TradeMetrics {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct PairBaseMetricsSummary {
+    pub both_side_participation: bool,
+    pub pair_entry_count: usize,
+    pub merge_cycle_count: usize,
+    pub merge_success_rate: f64,
+    pub maker_recovery_success_rate: f64,
+    pub risk_exit_count: usize,
+    pub emergency_taker_attempt_count: usize,
+    pub pair_coverage_avg: f64,
+    pub pair_coverage_min: f64,
+    pub downside_floor_lp: f64,
+    pub downside_floor_fee_net_worst_case: f64,
+    pub upside_ceiling_fee_net_best_case: f64,
+    pub residual_unmerged_inventory_after_resolution_avg: f64,
+    pub residual_unmerged_inventory_after_resolution_max: f64,
+    pub avg_time_to_flat_after_resolution_seconds: f64,
+    pub max_time_to_flat_after_resolution_seconds: f64,
+    pub avg_time_to_redeploy_capital_seconds: f64,
+    pub max_time_to_redeploy_capital_seconds: f64,
+    pub taker_fee_estimate_total: f64,
+    pub settlement_pnl_net_of_fees: f64,
+    pub maker_fill_yes: f64,
+    pub maker_fill_no: f64,
+    pub taker_fill_yes: f64,
+    pub taker_fill_no: f64,
+}
+
+#[derive(Debug, Clone, Default)]
 struct SniperOrderFillAgg {
     qty: f64,
     notional: f64,
@@ -241,6 +269,35 @@ fn pair_base_should_latch_risk_exit(reason: &str) -> bool {
     matches!(reason.trim(), "near_expiry" | "latched")
 }
 
+fn pair_base_phase_owns_resolution(phase: PairBasePhaseState) -> bool {
+    matches!(
+        phase,
+        PairBasePhaseState::MergePending | PairBasePhaseState::RiskExitOnly
+    )
+}
+
+fn pair_base_inventory_coverage(q_yes: f64, q_no: f64) -> f64 {
+    let mx = q_yes.max(q_no);
+    if mx <= 1e-9 {
+        return 1.0;
+    }
+    q_yes.min(q_no) / mx
+}
+
+fn pair_base_rate(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    numerator as f64 / denominator as f64
+}
+
+fn pair_base_average(sum: f64, count: u64) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    sum / count as f64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PairBaseSubMinGapPolicy {
     Hold,
@@ -303,6 +360,38 @@ struct PairBaseRuntimeState {
     filled_no: f64,
     state_enter_ts: f64,
     risk_exit_latched: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PairBaseMetricsState {
+    pair_entry_count: u64,
+    merge_cycle_count: u64,
+    merge_resolved_count: u64,
+    maker_recovery_success_count: u64,
+    risk_exit_count: u64,
+    emergency_taker_attempt_count: u64,
+    maker_fill_yes: f64,
+    maker_fill_no: f64,
+    taker_fill_yes: f64,
+    taker_fill_no: f64,
+    taker_fee_estimate_total: f64,
+    pair_coverage_sum: f64,
+    pair_coverage_count: u64,
+    pair_coverage_min: Option<f64>,
+    min_locked_profit: Option<f64>,
+    min_fee_net_worst_case_pnl: Option<f64>,
+    max_fee_net_best_case_pnl: Option<f64>,
+    active_resolution_started_ts: Option<f64>,
+    active_resolution_used_risk_exit: bool,
+    residual_gap_after_resolution_sum: f64,
+    residual_gap_after_resolution_max: f64,
+    resolution_duration_sum: f64,
+    resolution_duration_max: f64,
+    resolution_duration_count: u64,
+    redeploy_started_ts: Option<f64>,
+    redeploy_duration_sum: f64,
+    redeploy_duration_max: f64,
+    redeploy_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -600,6 +689,7 @@ pub struct MakerHedgeCapBot {
     maker_exec_ledger: Arc<Mutex<MakerExecLedger>>,
     pair_arb_pending_imbalance: Arc<Mutex<Option<PairArbPendingImbalance>>>,
     pair_base_state: Arc<Mutex<PairBaseRuntimeState>>,
+    pair_base_metrics: Arc<Mutex<PairBaseMetricsState>>,
 }
 
 impl MakerHedgeCapBot {
@@ -815,6 +905,7 @@ impl MakerHedgeCapBot {
             maker_exec_ledger: Arc::new(Mutex::new(MakerExecLedger::default())),
             pair_arb_pending_imbalance: Arc::new(Mutex::new(None)),
             pair_base_state: Arc::new(Mutex::new(PairBaseRuntimeState::default())),
+            pair_base_metrics: Arc::new(Mutex::new(PairBaseMetricsState::default())),
         };
 
         runtime_flags.insert(
@@ -4770,6 +4861,12 @@ impl MakerHedgeCapBot {
         drop(ledger);
 
         self._apply_fill_finalize(meta);
+        self._pair_base_metrics_record_fill(
+            &candidate.asset_id,
+            candidate.qty,
+            candidate.price,
+            true,
+        );
         MakerExecApplyResult::Applied { canonical_id }
     }
 
@@ -6456,7 +6553,214 @@ impl MakerHedgeCapBot {
             snap.fee_net_best_case_pnl,
             snap.pair_coverage
         ));
+        self._pair_base_metrics_record_fee_snapshot(&snap);
         snap
+    }
+
+    fn _pair_base_metrics_observe_state_snapshot(&self) {
+        let state = match self.state.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        let q_yes = state.q_yes.max(0.0);
+        let q_no = state.q_no.max(0.0);
+        let pair_coverage = pair_base_inventory_coverage(q_yes, q_no);
+        let lp = locked_profit(&state);
+        if let Ok(mut metrics) = self.pair_base_metrics.lock() {
+            metrics.pair_coverage_sum += pair_coverage;
+            metrics.pair_coverage_count += 1;
+            metrics.pair_coverage_min = Some(
+                metrics
+                    .pair_coverage_min
+                    .map(|cur| cur.min(pair_coverage))
+                    .unwrap_or(pair_coverage),
+            );
+            metrics.min_locked_profit = Some(
+                metrics
+                    .min_locked_profit
+                    .map(|cur| cur.min(lp))
+                    .unwrap_or(lp),
+            );
+        }
+    }
+
+    fn _pair_base_metrics_record_fee_snapshot(&self, snap: &PairBaseFeeNetSnapshot) {
+        if let Ok(mut metrics) = self.pair_base_metrics.lock() {
+            metrics.min_fee_net_worst_case_pnl = Some(
+                metrics
+                    .min_fee_net_worst_case_pnl
+                    .map(|cur| cur.min(snap.fee_net_worst_case_pnl))
+                    .unwrap_or(snap.fee_net_worst_case_pnl),
+            );
+            metrics.max_fee_net_best_case_pnl = Some(
+                metrics
+                    .max_fee_net_best_case_pnl
+                    .map(|cur| cur.max(snap.fee_net_best_case_pnl))
+                    .unwrap_or(snap.fee_net_best_case_pnl),
+            );
+        }
+    }
+
+    fn _pair_base_metrics_record_fill(&self, asset_id: &str, qty: f64, price: f64, is_maker: bool) {
+        if qty <= 0.0 || asset_id.trim().is_empty() {
+            return;
+        }
+        let is_yes = self.yes_asset.as_deref() == Some(asset_id);
+        let is_no = self.no_asset.as_deref() == Some(asset_id);
+        if !is_yes && !is_no {
+            return;
+        }
+        if let Ok(mut metrics) = self.pair_base_metrics.lock() {
+            if is_maker {
+                if is_yes {
+                    metrics.maker_fill_yes += qty.max(0.0);
+                } else {
+                    metrics.maker_fill_no += qty.max(0.0);
+                }
+            } else {
+                if is_yes {
+                    metrics.taker_fill_yes += qty.max(0.0);
+                } else {
+                    metrics.taker_fill_no += qty.max(0.0);
+                }
+                let fee_model_enabled = env_bool("POLY_FEE_MODEL_ENABLED", true);
+                let fees_enabled = self.market_fees_enabled.unwrap_or(fee_model_enabled);
+                metrics.taker_fee_estimate_total += self._maker_poly_fee_estimate(
+                    qty.max(0.0),
+                    price.max(0.0),
+                    false,
+                    fee_model_enabled && fees_enabled,
+                );
+            }
+        }
+        self._pair_base_metrics_observe_state_snapshot();
+    }
+
+    fn _pair_base_metrics_record_taker_attempt(&self) {
+        if let Ok(mut metrics) = self.pair_base_metrics.lock() {
+            metrics.emergency_taker_attempt_count += 1;
+        }
+    }
+
+    fn _pair_base_metrics_on_phase_transition(
+        &self,
+        previous_phase: PairBasePhaseState,
+        next_phase: PairBasePhaseState,
+    ) {
+        let now = now_ts_f64();
+        let residual_gap = {
+            let (q_yes, q_no) = self._maker_actual_inventory();
+            (q_yes - q_no).abs()
+        };
+        if let Ok(mut metrics) = self.pair_base_metrics.lock() {
+            if next_phase == PairBasePhaseState::PairResting
+                && previous_phase != PairBasePhaseState::PairResting
+                && !pair_base_phase_owns_resolution(previous_phase)
+            {
+                metrics.pair_entry_count += 1;
+                if let Some(redeploy_started_ts) = metrics.redeploy_started_ts.take() {
+                    let dt = (now - redeploy_started_ts).max(0.0);
+                    metrics.redeploy_duration_sum += dt;
+                    metrics.redeploy_duration_max = metrics.redeploy_duration_max.max(dt);
+                    metrics.redeploy_count += 1;
+                }
+            }
+            if next_phase == PairBasePhaseState::RiskExitOnly
+                && previous_phase != PairBasePhaseState::RiskExitOnly
+            {
+                metrics.risk_exit_count += 1;
+            }
+            if !pair_base_phase_owns_resolution(previous_phase)
+                && pair_base_phase_owns_resolution(next_phase)
+            {
+                metrics.merge_cycle_count += 1;
+                metrics.active_resolution_started_ts = Some(now);
+                metrics.active_resolution_used_risk_exit = next_phase == PairBasePhaseState::RiskExitOnly;
+            } else if pair_base_phase_owns_resolution(previous_phase)
+                && next_phase == PairBasePhaseState::RiskExitOnly
+            {
+                metrics.active_resolution_used_risk_exit = true;
+            }
+            if pair_base_phase_owns_resolution(previous_phase)
+                && matches!(next_phase, PairBasePhaseState::Balanced | PairBasePhaseState::Flat)
+            {
+                if let Some(started_ts) = metrics.active_resolution_started_ts.take() {
+                    let dt = (now - started_ts).max(0.0);
+                    metrics.merge_resolved_count += 1;
+                    metrics.resolution_duration_sum += dt;
+                    metrics.resolution_duration_max = metrics.resolution_duration_max.max(dt);
+                    metrics.resolution_duration_count += 1;
+                    metrics.residual_gap_after_resolution_sum += residual_gap;
+                    metrics.residual_gap_after_resolution_max =
+                        metrics.residual_gap_after_resolution_max.max(residual_gap);
+                    if !metrics.active_resolution_used_risk_exit {
+                        metrics.maker_recovery_success_count += 1;
+                    }
+                    metrics.active_resolution_used_risk_exit = false;
+                    metrics.redeploy_started_ts = Some(now);
+                }
+            }
+        }
+    }
+
+    pub fn pair_base_metrics_snapshot(&self, settlement_lp: f64) -> PairBaseMetricsSummary {
+        let metrics = self
+            .pair_base_metrics
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let both_side_participation =
+            (metrics.maker_fill_yes + metrics.taker_fill_yes) > 1e-9
+                && (metrics.maker_fill_no + metrics.taker_fill_no) > 1e-9;
+        PairBaseMetricsSummary {
+            both_side_participation,
+            pair_entry_count: metrics.pair_entry_count as usize,
+            merge_cycle_count: metrics.merge_cycle_count as usize,
+            merge_success_rate: pair_base_rate(
+                metrics.merge_resolved_count,
+                metrics.merge_cycle_count,
+            ),
+            maker_recovery_success_rate: pair_base_rate(
+                metrics.maker_recovery_success_count,
+                metrics.merge_cycle_count,
+            ),
+            risk_exit_count: metrics.risk_exit_count as usize,
+            emergency_taker_attempt_count: metrics.emergency_taker_attempt_count as usize,
+            pair_coverage_avg: pair_base_average(
+                metrics.pair_coverage_sum,
+                metrics.pair_coverage_count,
+            ),
+            pair_coverage_min: metrics.pair_coverage_min.unwrap_or(1.0),
+            downside_floor_lp: metrics.min_locked_profit.unwrap_or(0.0),
+            downside_floor_fee_net_worst_case: metrics
+                .min_fee_net_worst_case_pnl
+                .unwrap_or(0.0),
+            upside_ceiling_fee_net_best_case: metrics
+                .max_fee_net_best_case_pnl
+                .unwrap_or(0.0),
+            residual_unmerged_inventory_after_resolution_avg: pair_base_average(
+                metrics.residual_gap_after_resolution_sum,
+                metrics.merge_resolved_count,
+            ),
+            residual_unmerged_inventory_after_resolution_max: metrics
+                .residual_gap_after_resolution_max,
+            avg_time_to_flat_after_resolution_seconds: pair_base_average(
+                metrics.resolution_duration_sum,
+                metrics.resolution_duration_count,
+            ),
+            max_time_to_flat_after_resolution_seconds: metrics.resolution_duration_max,
+            avg_time_to_redeploy_capital_seconds: pair_base_average(
+                metrics.redeploy_duration_sum,
+                metrics.redeploy_count,
+            ),
+            max_time_to_redeploy_capital_seconds: metrics.redeploy_duration_max,
+            taker_fee_estimate_total: metrics.taker_fee_estimate_total,
+            settlement_pnl_net_of_fees: settlement_lp - metrics.taker_fee_estimate_total,
+            maker_fill_yes: metrics.maker_fill_yes,
+            maker_fill_no: metrics.maker_fill_no,
+            taker_fill_yes: metrics.taker_fill_yes,
+            taker_fill_no: metrics.taker_fill_no,
+        }
     }
 
     fn _pair_base_live_order_id(&self, asset_id: &str) -> Option<String> {
@@ -6501,8 +6805,11 @@ impl MakerHedgeCapBot {
                 .map(|s| s.chars().take(10).collect::<String>())
                 .unwrap_or_else(|| "-".to_string())
         };
+        let mut previous_phase = PairBasePhaseState::Flat;
+        let mut changed = false;
         if let Ok(mut st) = self.pair_base_state.lock() {
-            let changed = st.phase != phase
+            previous_phase = st.phase;
+            changed = st.phase != phase
                 || st.active_pair_id != pair_id
                 || st.yes_oid != yes_oid
                 || st.no_oid != no_oid;
@@ -6525,6 +6832,10 @@ impl MakerHedgeCapBot {
             st.target_qty = target_qty;
             st.filled_yes = filled_yes;
             st.filled_no = filled_no;
+        }
+        if changed {
+            self._pair_base_metrics_on_phase_transition(previous_phase, phase);
+            self._pair_base_metrics_observe_state_snapshot();
         }
     }
 
@@ -6755,6 +7066,7 @@ impl MakerHedgeCapBot {
                     heavy_asset
                 ));
             }
+            self._pair_base_metrics_record_taker_attempt();
             let hedge_reason = format!("pair_base_{reason}");
             self._pair_base_exact_taker_hedge_step(delta, &hedge_reason);
         } else {
@@ -6774,6 +7086,7 @@ impl MakerHedgeCapBot {
                 reason,
                 missing_asset
             ));
+            self._pair_base_metrics_record_taker_attempt();
             self._emergency_taker_hedge_step(delta, &hedge_reason);
         }
     }
@@ -8776,6 +9089,7 @@ impl MakerHedgeCapBot {
                 }
             }
         }
+        self._pair_base_metrics_record_fill(asset_id, filled, price, false);
         true
     }
 
@@ -16116,10 +16430,12 @@ impl MakerHedgeCapBot {
 #[cfg(test)]
 mod tests {
     use super::{
-        pair_base_early_risk_exit_lead_seconds, pair_base_phase_without_recovery,
-        pair_base_remaining_gap, pair_base_should_force_recovery, pair_base_should_latch_risk_exit,
-        pair_submit_tracks_taker_fallback, MakerExecCandidate, MakerExecLedger,
-        MakerExecRecord, MakerHedgeCapBot, PairBasePhaseState,
+        pair_base_average, pair_base_early_risk_exit_lead_seconds,
+        pair_base_inventory_coverage, pair_base_phase_without_recovery, pair_base_rate,
+        pair_base_remaining_gap, pair_base_should_force_recovery,
+        pair_base_should_latch_risk_exit, pair_submit_tracks_taker_fallback,
+        MakerExecCandidate, MakerExecLedger, MakerExecRecord, MakerHedgeCapBot,
+        PairBasePhaseState,
     };
 
     #[test]
@@ -16128,6 +16444,16 @@ mod tests {
         assert!((downside + 70.0).abs() < 1e-9);
         assert!((upside - (-30.0)).abs() < 1e-9);
         assert!((skew - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pair_base_metric_helpers() {
+        assert!((pair_base_inventory_coverage(10.0, 5.0) - 0.5).abs() < 1e-9);
+        assert!((pair_base_inventory_coverage(0.0, 0.0) - 1.0).abs() < 1e-9);
+        assert!((pair_base_rate(3, 4) - 0.75).abs() < 1e-9);
+        assert_eq!(pair_base_rate(0, 0), 0.0);
+        assert!((pair_base_average(9.0, 3) - 3.0).abs() < 1e-9);
+        assert_eq!(pair_base_average(0.0, 0), 0.0);
     }
 
     #[test]
