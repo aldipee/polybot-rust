@@ -120,9 +120,77 @@ Practical meaning:
 3. near-expiry rescue should become a smaller share of total recovery
 4. PnL may become less noisy because the bot stops waiting for late lucky completion
 
-Date: 2026-03-07
+### Latest post-patch validation on 2026-03-08
+
+Two more live runs were used to validate the current working tree after the post-`0.1.26` settlement-hold and forced-exit patches.
+
+#### `btc-updown-5m-1772965200`
+
+Observed outcome:
+
+1. final inventory stayed flat through rollover: `qYES=25.00 qNO=25.00`
+2. final row was positive: `lp=+1.2500 cost=23.7500 cpp=0.9500`
+3. no `RiskExitOnly` rescue was required
+4. the new settlement-hold path was exercised repeatedly after the book first appeared balanced
+
+Key evidence:
+
+1. logs showed:
+   - `[PAIR_BASE] merge: settling_live_orders ...`
+2. the engine stayed in `MergePending` while unresolved pair-base buy risk still existed
+3. the old bad pattern did not occur:
+   - apparent balance
+   - transition out of recovery
+   - late recovery fill reopening the book
+
+Interpretation:
+
+1. the stale recovery-order late-fill reopen bug is no longer reproducing in this path
+2. this run is the strongest evidence that the settlement-hold fix is doing the intended job
+
+#### `btc-updown-5m-1772965500`
+
+Observed outcome:
+
+1. final inventory stayed flat through rollover: `qYES=5.00 qNO=5.00`
+2. final row was slightly negative: `lp=-0.2500 cost=5.2500 cpp=1.0500`
+3. `forced_negative_economics` escalated at `17:26:19`
+4. the taker-cap override applied immediately on that forced path
+5. terminal taker BUY flattened the book well before the near-expiry stop buffer
+
+Key evidence:
+
+1. `[PAIR_BASE] merge: escalate_risk_exit reason=forced_negative_economics ...`
+2. `[PAIR_BASE] forced-negative-economics taker cap override ... effective_cap=0.99 ...`
+3. taker BUY was sent and later filled
+4. the run then stayed under `risk_exit_latched` until rollover
+
+Interpretation:
+
+1. `forced_negative_economics` is now a real early flatten path, not just an early blocked-exit loop
+2. the engine no longer has to wait for the last near-expiry override window to get a permissive cap in that path
+
+#### Current verdict after these runs
+
+These two runs change the practical Step 1 assessment:
+
+1. the stale recovery-order reopen bug should no longer block progression
+2. `forced_negative_economics` is operationally valid enough to keep
+3. both runs finished flat through rollover
+4. the remaining issues are now secondary:
+   - repeated `risk_exit_action` warning spam while taker is inflight
+   - metrics classification noise
+   - occasional pair-entry timeout churn
+
+Practical conclusion:
+
+1. Step 1 is still formally `PARTIAL`
+2. but this specific blocker is no longer strong enough to hold the next stage
+3. Step 1 should remain the canary baseline while next-stage work begins
+
+Date: 2026-03-08
 Scope: observed runtime behaviour of the current `PAIR_BASE + RECOVERY + RISK_EXIT` Step 1 path
-Reference: user-provided logs across many markets from 2026-03-06 through 2026-03-07
+Reference: user-provided logs across many markets from 2026-03-06 through 2026-03-08
 
 ---
 

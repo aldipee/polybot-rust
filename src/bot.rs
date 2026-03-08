@@ -323,6 +323,18 @@ fn pair_base_phase_without_recovery(
     None
 }
 
+fn pair_base_should_hold_recovery_settlement(
+    phase: PairBasePhaseState,
+    actual_gap: f64,
+    release: f64,
+    unsettled_yes: f64,
+    unsettled_no: f64,
+) -> bool {
+    phase == PairBasePhaseState::MergePending
+        && actual_gap <= release + 1e-6
+        && (unsettled_yes > 1e-6 || unsettled_no > 1e-6)
+}
+
 fn pair_base_should_force_recovery(
     phase: PairBasePhaseState,
     actual_gap: f64,
@@ -415,15 +427,27 @@ fn pair_base_sub_min_gap_policy() -> PairBaseSubMinGapPolicy {
 
 fn pair_base_near_expiry_taker_override_active(
     reason: &str,
+    latched_reason: Option<&str>,
     t_left: f64,
     force_seconds: f64,
     override_max_price: f64,
 ) -> bool {
     let normalized = reason.trim();
-    (normalized == "pair_base_near_expiry" || normalized == "pair_base_latched")
-        && force_seconds > 0.0
-        && override_max_price > 0.0
-        && t_left <= force_seconds + 1e-6
+    let latched_reason = latched_reason.unwrap_or("").trim();
+    let near_expiry_window_active = force_seconds > 0.0 && t_left <= force_seconds + 1e-6;
+    if override_max_price <= 0.0 {
+        return false;
+    }
+    if normalized == "pair_base_forced_negative_economics" {
+        return true;
+    }
+    if normalized == "pair_base_latched" && latched_reason == "forced_negative_economics" {
+        return true;
+    }
+    (normalized == "pair_base_near_expiry" && near_expiry_window_active)
+        || (normalized == "pair_base_latched"
+            && latched_reason != "forced_negative_economics"
+            && near_expiry_window_active)
 }
 
 fn pair_base_effective_taker_cap(base_cap: f64, override_max_price: f64) -> f64 {
@@ -719,6 +743,7 @@ struct PairBaseRuntimeState {
     filled_no: f64,
     state_enter_ts: f64,
     risk_exit_latched: bool,
+    risk_exit_latch_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7812,6 +7837,15 @@ impl MakerHedgeCapBot {
         let light_unsettled = coverage.unsettled_risk;
         let live_light_refresh_reason = coverage.refresh_reason.clone();
         let light_leg_trusted = coverage.covered_risk > 1e-6;
+        let unsettled_yes = self._maker_recovery_unsettled_buy_risk(&ctx.yes_asset);
+        let unsettled_no = self._maker_recovery_unsettled_buy_risk(&ctx.no_asset);
+        let hold_settlement = pair_base_should_hold_recovery_settlement(
+            current_phase,
+            recovery_gap,
+            release,
+            unsettled_yes,
+            unsettled_no,
+        );
         let forced_pair_recovery_reason = if pair_base_should_force_recovery(
             current_phase,
             recovery_gap,
@@ -7834,6 +7868,10 @@ impl MakerHedgeCapBot {
                     coverage.quote_age_ms
                 ))
             }
+        } else if hold_settlement {
+            Some(format!(
+                "settling_live_orders gap={recovery_gap:.2} light_risk={light_unsettled:.2} y_unsettled={unsettled_yes:.2} n_unsettled={unsettled_no:.2}"
+            ))
         } else {
             None
         };
@@ -7866,6 +7904,16 @@ impl MakerHedgeCapBot {
                     "[PAIR_BASE] recovery remain gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side} unsettled_heavy={recovery_unsettled_heavy:.2}"
                 ));
                 self._runtime_ts_set(recovery_log_key, ctx.now + recovery_log_every);
+            }
+            if hold_settlement {
+                self._pair_base_cancel_orders("pair_base recovery settling");
+                self._maker_dbg_idle(
+                    &format!(
+                        "[PAIR_BASE] merge: settling_live_orders gap={recovery_gap:.2} light_risk={light_unsettled:.2} y_unsettled={unsettled_yes:.2} n_unsettled={unsettled_no:.2}",
+                    ),
+                    "pair_base_recovery_settling_live_orders",
+                );
+                return None;
             }
             if light_unsettled > 1e-6 {
                 let recovery_key = MakerOrderKey::buy(recovery_asset_id);
@@ -7930,6 +7978,9 @@ impl MakerHedgeCapBot {
         if let Ok(mut st) = self.pair_base_state.lock() {
             if pair_base_should_latch_risk_exit(reason) {
                 st.risk_exit_latched = true;
+                if reason.trim() != "latched" {
+                    st.risk_exit_latch_reason = Some(reason.trim().to_string());
+                }
             }
         }
         let pair_id = self
@@ -14476,20 +14527,33 @@ impl MakerHedgeCapBot {
             let mut cap = self._hedge_price_cap();
             let base_cap = cap;
             let t_left = (self.expiry_ts as f64 - now_ts_f64()).max(0.0);
+            let latched_reason = self
+                .pair_base_state
+                .lock()
+                .ok()
+                .and_then(|st| st.risk_exit_latch_reason.clone());
             let force_seconds =
                 env_float("PAIR_BASE_NEAR_EXPIRY_FORCE_TAKER_SECONDS", 0.0).max(0.0);
             let override_max_price = env_float("PAIR_BASE_NEAR_EXPIRY_TAKER_MAX_PRICE", 0.0)
                 .clamp(0.0, 0.99);
             if pair_base_near_expiry_taker_override_active(
                 reason,
+                latched_reason.as_deref(),
                 t_left,
                 force_seconds,
                 override_max_price,
             ) {
                 cap = pair_base_effective_taker_cap(cap, override_max_price);
                 if cap > base_cap + 1e-9 {
+                    let override_scope = if reason.trim() == "pair_base_forced_negative_economics"
+                        || matches!(latched_reason.as_deref(), Some("forced_negative_economics"))
+                    {
+                        "forced-negative-economics"
+                    } else {
+                        "near-expiry"
+                    };
                     self.logger.info(&format!(
-                        "[PAIR_BASE] near-expiry taker cap override base_cap={base_cap:.2} override_max={override_max_price:.2} effective_cap={cap:.2} t_left={t_left:.1}s ({reason})"
+                        "[PAIR_BASE] {override_scope} taker cap override base_cap={base_cap:.2} override_max={override_max_price:.2} effective_cap={cap:.2} t_left={t_left:.1}s ({reason})"
                     ));
                 }
             }
@@ -17670,7 +17734,7 @@ mod tests {
         pair_base_effective_risk_exit_configured_seconds,
         pair_base_inventory_coverage, pair_base_phase_without_recovery, pair_base_rate,
         pair_base_recovery_window, pair_base_remaining_gap, pair_base_should_abort_second_leg,
-        pair_base_should_force_recovery,
+        pair_base_should_force_recovery, pair_base_should_hold_recovery_settlement,
         pair_base_should_latch_risk_exit, pair_submit_tracks_taker_fallback,
         pair_base_maker_resolution_adjusted_score,
         MakerExecCandidate, MakerExecLedger, MakerExecRecord, MakerHedgeCapBot,
@@ -17958,6 +18022,38 @@ mod tests {
     }
 
     #[test]
+    fn pair_base_holds_recovery_until_settled_orders_are_dead() {
+        assert!(pair_base_should_hold_recovery_settlement(
+            PairBasePhaseState::MergePending,
+            0.0,
+            1.0,
+            0.0,
+            5.0
+        ));
+        assert!(pair_base_should_hold_recovery_settlement(
+            PairBasePhaseState::MergePending,
+            0.5,
+            1.0,
+            0.0,
+            5.0
+        ));
+        assert!(!pair_base_should_hold_recovery_settlement(
+            PairBasePhaseState::Balanced,
+            0.0,
+            1.0,
+            5.0,
+            5.0
+        ));
+        assert!(!pair_base_should_hold_recovery_settlement(
+            PairBasePhaseState::MergePending,
+            5.0,
+            1.0,
+            5.0,
+            0.0
+        ));
+    }
+
+    #[test]
     fn pair_base_early_risk_exit_lead_is_ahead_of_stop_buffer() {
         assert!((pair_base_early_risk_exit_lead_seconds(15.0, 0.0) - 30.0).abs() < 1e-9);
         assert!((pair_base_early_risk_exit_lead_seconds(8.0, 0.0) - 30.0).abs() < 1e-9);
@@ -17974,26 +18070,51 @@ mod tests {
     fn pair_base_near_expiry_taker_override_is_reason_and_time_gated() {
         assert!(crate::bot::pair_base_near_expiry_taker_override_active(
             "pair_base_near_expiry",
+            None,
             9.5,
             10.0,
             0.85
         ));
         assert!(crate::bot::pair_base_near_expiry_taker_override_active(
             "pair_base_latched",
+            Some("near_expiry"),
             9.5,
             10.0,
             0.85
         ));
+        assert!(crate::bot::pair_base_near_expiry_taker_override_active(
+            "pair_base_forced_negative_economics",
+            None,
+            193.5,
+            45.0,
+            0.85
+        ));
+        assert!(crate::bot::pair_base_near_expiry_taker_override_active(
+            "pair_base_latched",
+            Some("forced_negative_economics"),
+            193.5,
+            45.0,
+            0.85
+        ));
         assert!(!crate::bot::pair_base_near_expiry_taker_override_active(
             "pair_base_near_expiry",
+            None,
             12.0,
             10.0,
             0.85
         ));
         assert!(!crate::bot::pair_base_near_expiry_taker_override_active(
             "pair_base_max_loss",
+            None,
             9.5,
             10.0,
+            0.85
+        ));
+        assert!(!crate::bot::pair_base_near_expiry_taker_override_active(
+            "pair_base_latched",
+            Some("near_expiry"),
+            193.5,
+            45.0,
             0.85
         ));
     }

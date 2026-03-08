@@ -1,6 +1,6 @@
 # TARGET GOAL STATUS
 
-Date: 2026-03-06
+Date: 2026-03-08
 Scope: Status mapping of current code against `TARGET_GOAL.md`
 Reference roadmap: `TARGET_GOAL.md`
 
@@ -38,6 +38,7 @@ That means:
 1. `Milestone 0` is mostly in place
 2. the real `Step 1` now exists as a runnable path under the existing top-level mode
 3. current `v0.1.24` quote-only path remains infrastructure only, not the target wallet behavior
+4. the latest live runs indicate the stale recovery-order reopen bug is closed enough that it should no longer block progression
 
 ---
 
@@ -280,20 +281,48 @@ Status: `PARTIAL`
 Meaning:
 
 1. the actual Step 1 behavior now exists and is runnable
-2. the main remaining gaps are validation and richer settlement metrics
-3. current `v0.1.24` quote-only path remains Milestone 0, not Step 1
+2. the stale recovery-order late-fill reopen bug now appears closed enough in live evidence
+3. the main remaining gaps are empirical validation, some metrics cleanup, and overall recovery quality
+4. current `v0.1.24` quote-only path remains Milestone 0, not Step 1
+
+### Latest live validation
+
+The latest 2026-03-08 runs materially change the practical Step 1 assessment.
+
+Observed evidence:
+
+1. `btc-updown-5m-1772965200`
+   - finished flat: `qYES=25.00 qNO=25.00`
+   - `merge: settling_live_orders ...` appeared repeatedly after apparent balance
+   - the old pattern of false settlement followed by late recovery-fill reopen did not occur
+2. `btc-updown-5m-1772965500`
+   - finished flat: `qYES=5.00 qNO=5.00`
+   - `forced_negative_economics` escalated early
+   - the forced-exit taker override applied immediately
+   - flatten happened long before the near-expiry stop buffer
+
+Practical interpretation:
+
+1. the stale recovery-order reopen bug is no longer the dominant Step 1 control blocker
+2. `forced_negative_economics` is now operationally valid enough to keep
+3. both runs finished flat through rollover
+4. remaining issues are now secondary:
+   - repeated `risk_exit_action` warning spam while taker is inflight
+   - metrics classification noise
+   - occasional pair-entry timeout churn
 
 ---
 
 ## Step 2 Status
 
-Status: `DO NOT START`
+Status: `CAN START WITH STEP 1 CANARY`
 
 Reason:
 
-1. Step 2 assumes Step 1 pair-base and recovery have been empirically validated over real runs
-2. the real Step 1 path now exists, but it still needs run validation and richer settlement metrics
-3. turning on gentle skew before that validation would hide Step 1 defects behind additional behavior
+1. the specific Step 1 stale recovery-order reopen blocker is now closed enough that it should not hold progression
+2. Step 1 is still not formally signed off, so it must remain the canary baseline during next-stage work
+3. empirical validation over the planned 20+ market sample is still required
+4. Step 2 work should not destabilize the current Step 1 baseline while that validation is still pending
 
 ---
 
@@ -305,7 +334,8 @@ Current state:
 
 1. Step 1 now enters `RISK_EXIT` explicitly
 2. emergency taker actions are logged from the pair-base path
-3. the low-level taker implementation still routes through shared helpers rather than a Step 1-specific BUY-dollars / SELL-shares contract
+3. forced-negative-economics and near-expiry paths are now operationally sufficient for progression
+4. the low-level taker implementation still routes through shared helpers rather than a fully isolated Step 1-specific BUY-dollars / SELL-shares contract
 
 Required state:
 
@@ -333,10 +363,12 @@ Current state:
    - `settlement_pnl_net_of_fees`
    - maker/taker fill breakdown
    - emergency taker attempt count
+3. latest live runs validate the control path better than the metrics layer; some metrics classification is still noisy
 
 Required state:
 
 1. use the emitted metrics for the 20+ market Step 1 validation run
+2. clean up obviously noisy classifications as they are discovered, but do not treat that as a progression blocker
 
 ### Blocker 3: Step 1 still needs empirical validation against the roadmap gates
 
@@ -344,6 +376,7 @@ Current state:
 
 1. the Step 1 path is now runnable
 2. the required 20+ market validation against pair coverage, downside floor, maker recovery success, and taker count has not been done yet
+3. latest live runs are strong enough to remove the stale recovery-order reopen bug as a gating concern, but not enough to call Step 1 complete
 
 Required state:
 
@@ -365,6 +398,7 @@ This is the next implementation order against the approved roadmap.
    - maker recovery success
    - taker count
    - fee-net settlement / merge PnL
+3. use the current Step 1 config as the canary baseline while next-stage work begins
 
 ### Checkpoint B: Finish emergency taker semantics
 
@@ -385,5 +419,6 @@ Current status is:
 
 1. `Milestone 0` is complete
 2. the true `Step 1` now exists and is runnable
-3. the main remaining gaps are emergency taker semantics and empirical validation
-4. the next work should be Step 1 validation, not more skew tuning
+3. the stale recovery-order reopen blocker is closed enough to stop holding progression
+4. the main remaining gaps are empirical validation, metrics cleanup, and overall recovery quality
+5. the next work can begin on the next stage, with Step 1 kept as the canary baseline

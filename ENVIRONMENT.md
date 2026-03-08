@@ -263,10 +263,12 @@ Raw secret values are intentionally not copied here.
 - What it does: final stop-new-orders buffer before expiry / rollover.
 - Friendly explanation: this is the last hard quiet period before the market ends.
 
+
 ### `PAIR_BASE_NEAR_EXPIRY_FORCE_TAKER_SECONDS`
 - Current value: `55`
 - What it does: window in which the near-expiry taker price-cap override is allowed.
 - Friendly explanation: once the market is inside the last 55 seconds, terminal taker rescue is allowed to be much more aggressive on price.
+- Current runtime nuance: the same override is also reused immediately for `forced_negative_economics` exits and their latched retries, so Step 1 can escalate earlier without waiting for this window.
 
 ### `PAIR_BASE_NEAR_EXPIRY_RISK_EXIT_SECONDS`
 - Current value: `50`
@@ -277,7 +279,8 @@ Raw secret values are intentionally not copied here.
 - Current value: `1`
 - Effective runtime clamp: `0.99`
 - What it does: maximum temporary taker-buy price allowed in the near-expiry override window.
-- Friendly explanation: this is the “flatten no matter what” switch. With this near `1`, the bot stops self-blocking on price cap near expiry.
+- Friendly explanation: this is the "flatten no matter what" switch. With this near `1`, the bot stops self-blocking on price cap near expiry.
+- Current runtime nuance: this same cap is now applied immediately to `forced_negative_economics` exits and to later `pair_base_latched` retries that originated from that forced-exit path.
 
 ### `PAIR_BASE_SUB_MIN_GAP_POLICY`
 - Current value: `taker_immediate`
@@ -466,3 +469,4 @@ If you want, the next useful documentation step is a second section that says:
 1. which variables are safe for daily tuning
 2. which variables are dangerous and should rarely change
 3. which variables only matter for debugging or rescue behaviour
+
