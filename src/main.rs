@@ -1482,6 +1482,23 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                     pair_metrics.taker_fill_no
                 ));
                 bg_logger.info(&format!(
+                    "[PAIR_BASE][SKEW][METRICS] both_side_participation={} skew_ratio_avg={:.3} skew_ratio_max={:.3} cost_split_yes_avg={:.3} cost_split_no_avg={:.3} downside_floor_lp={:+.4} best_case_upside_lp={:+.4} pair_coverage_avg={:.3} normal_flow_taker_count={} fee_net_worst_case_min={:+.4} fee_net_best_case_max={:+.4} fee_net_pair_cost_avg={:.4} skew_fill_yes={:.2} skew_fill_no={:.2}",
+                    pair_metrics.skew_both_side_participation,
+                    pair_metrics.skew_ratio_avg,
+                    pair_metrics.skew_ratio_max,
+                    pair_metrics.skew_cost_split_yes_avg,
+                    pair_metrics.skew_cost_split_no_avg,
+                    pair_metrics.skew_downside_floor_lp,
+                    pair_metrics.skew_best_case_upside_lp,
+                    pair_metrics.skew_pair_coverage_avg,
+                    pair_metrics.skew_normal_flow_taker_count,
+                    pair_metrics.skew_fee_net_worst_case_min,
+                    pair_metrics.skew_fee_net_best_case_max,
+                    pair_metrics.skew_fee_net_pair_cost_avg,
+                    pair_metrics.skew_fill_yes,
+                    pair_metrics.skew_fill_no
+                ));
+                bg_logger.info(&format!(
                     "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4} cpp={:.4} qYES={:.2} qNO={:.2}",
                     metrics.lp,
                     metrics.total_cost,

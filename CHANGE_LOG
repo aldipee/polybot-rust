@@ -1,3 +1,58 @@
+## Version 0.1.27
+Date: 2026-03-09
+### Changes
+
+#### Sprint 2: Gentle skew overlay is now integrated into the pair-base route
+- **Files:** `src/bot.rs`, `src/main.rs`
+- **Changes:**
+  - added a guarded `PAIR_BASE_SKEW` overlay on top of the Step 1 pair-base engine
+  - added skew overlay state, intended-skew math, cheaper-side selection, and target-ratio sizing
+  - added skew-aware pair-base control so Step 1 reacts only to excess beyond intended skew
+  - added market-end Step 2 skew metrics beside the existing Step 1 metrics
+
+#### Fix 1: Intended skew no longer creates synthetic recovery before skew fills
+- **File:** `src/bot.rs`
+- **Problem:** Arming an intended skew gap before the skew order filled could make Step 1 treat a protected balanced book as if it already had a base-gap mismatch.
+- **Fix:**
+  - `pair_base_base_gap(...)` now treats inventory inside the intended skew envelope as zero base gap
+  - added regression tests for neutral-book YES and NO skew cases
+- **Impact:** Posting a skew quote no longer triggers false recovery or risk-exit before the overlay shares actually fill.
+
+#### Fix 2: Quote-gate failures no longer erase held skew inventory
+- **File:** `src/bot.rs`
+- **Problem:** Temporary quote-gate failures could clear held or partially-filled skew state and route intended overlay inventory back into Step 1 recovery.
+- **Fix:**
+  - gate-failed live skew quotes are canceled without erasing already-filled skew
+  - partially filled skew is preserved as held overlay state with reduced target gap
+- **Impact:** Temporary `spread_too_wide(...)` or `parity_off(...)` conditions stop new skew quoting without unwinding already-held skew inventory.
+
+#### Fix 3: Live skew quotes now block new pair arming
+- **File:** `src/bot.rs`
+- **Problem:** Pair entry could ignore a live `PAIR_BASE_SKEW` quote and try to arm a new pair on the same asset slot.
+- **Fix:**
+  - live skew order ids are now treated as active ownership when deciding whether pair-base can deploy new pair orders
+- **Impact:** Step 2 now preserves the single-overlay invariant while the skew quote is still resting.
+
+#### Fix 4: Step 2 normal-flow taker metrics are scoped to active skew
+- **Files:** `src/bot.rs`, `src/main.rs`
+- **Problem:** Unrelated taker fills could appear in the new skew metrics even when Step 2 was off or never armed.
+- **Fix:**
+  - skew normal-flow taker counting now requires an active skew overlay
+- **Impact:** `[PAIR_BASE][SKEW][METRICS]` is more trustworthy for Step 2 canary evaluation.
+
+### Notes
+- `MAKER_SKEW_ENABLED=false` keeps the current Step 1 baseline unchanged.
+- Step 2 canary path is enabled with:
+  - `MAKER_SKEW_ENABLED=true`
+  - `MAKER_SKEW_TARGET_RATIO=1.2`
+  - `MAKER_SKEW_MAX_RATIO=2.2`
+- This release records the current Sprint 2 code integration. Live canary validation is still pending.
+
+### Validation
+- `cargo check -q`
+- `cargo test -q`
+- `64` tests passed
+
 ## Version 0.1.26
 Date: 2026-03-07
 ### Changes

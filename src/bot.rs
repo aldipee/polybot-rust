@@ -113,6 +113,20 @@ pub struct PairBaseMetricsSummary {
     pub avg_entry_fee_net_edge: f64,
     pub avg_maker_recovery_cost: f64,
     pub avg_taker_recovery_cost: f64,
+    pub skew_both_side_participation: bool,
+    pub skew_ratio_avg: f64,
+    pub skew_ratio_max: f64,
+    pub skew_cost_split_yes_avg: f64,
+    pub skew_cost_split_no_avg: f64,
+    pub skew_downside_floor_lp: f64,
+    pub skew_best_case_upside_lp: f64,
+    pub skew_pair_coverage_avg: f64,
+    pub skew_normal_flow_taker_count: usize,
+    pub skew_fee_net_worst_case_min: f64,
+    pub skew_fee_net_best_case_max: f64,
+    pub skew_fee_net_pair_cost_avg: f64,
+    pub skew_fill_yes: f64,
+    pub skew_fill_no: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -301,8 +315,149 @@ impl PairBasePhaseState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PairBaseSkewSide {
+    #[default]
+    Yes,
+    No,
+}
+
+impl PairBaseSkewSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Yes => "YES",
+            Self::No => "NO",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SkewOverlayOrderState {
+    #[default]
+    Inactive,
+    Quoting,
+    Holding,
+}
+
+impl SkewOverlayOrderState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inactive => "Inactive",
+            Self::Quoting => "Quoting",
+            Self::Holding => "Holding",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SkewOverlayState {
+    enabled: bool,
+    side: PairBaseSkewSide,
+    target_gap_shares: f64,
+    live_oid: Option<String>,
+    state: SkewOverlayOrderState,
+    last_enter_ts: f64,
+}
+
 fn pair_base_remaining_gap(actual_gap: f64, light_unsettled: f64) -> f64 {
     (actual_gap.max(0.0) - light_unsettled.max(0.0)).max(0.0)
+}
+
+fn pair_base_signed_gap(q_yes: f64, q_no: f64) -> f64 {
+    q_yes.max(0.0) - q_no.max(0.0)
+}
+
+fn pair_base_signed_intended_skew_gap(skew: &SkewOverlayState) -> f64 {
+    if !skew.enabled || skew.target_gap_shares <= 1e-6 {
+        return 0.0;
+    }
+    match skew.side {
+        PairBaseSkewSide::Yes => skew.target_gap_shares.max(0.0),
+        PairBaseSkewSide::No => -skew.target_gap_shares.max(0.0),
+    }
+}
+
+fn pair_base_base_gap(q_yes: f64, q_no: f64, skew: &SkewOverlayState) -> f64 {
+    let signed_gap = pair_base_signed_gap(q_yes, q_no);
+    let intended_gap = pair_base_signed_intended_skew_gap(skew);
+    if intended_gap.abs() <= 1e-6 {
+        return signed_gap;
+    }
+    if signed_gap * intended_gap >= -1e-9 && signed_gap.abs() <= intended_gap.abs() + 1e-9 {
+        return 0.0;
+    }
+    signed_gap - intended_gap
+}
+
+fn pair_base_origin_is_pair_or_recovery(origin: &str) -> bool {
+    let origin = origin.trim();
+    origin == "PAIR_BASE_RECOVERY" || origin.starts_with("PAIR_BASE_GTC_")
+}
+
+fn pair_base_origin_is_skew(origin: &str) -> bool {
+    origin.trim() == "PAIR_BASE_SKEW"
+}
+
+fn pair_base_cheaper_side(
+    y_bid: f64,
+    y_ask: f64,
+    n_bid: f64,
+    n_ask: f64,
+) -> Option<PairBaseSkewSide> {
+    const EPS: f64 = 1e-9;
+    if y_ask > 0.0 && n_ask > 0.0 {
+        return Some(if y_ask + EPS < n_ask {
+            PairBaseSkewSide::Yes
+        } else if n_ask + EPS < y_ask {
+            PairBaseSkewSide::No
+        } else {
+            PairBaseSkewSide::Yes
+        });
+    }
+    if y_bid > 0.0 && n_bid > 0.0 {
+        return Some(if y_bid + EPS < n_bid {
+            PairBaseSkewSide::Yes
+        } else if n_bid + EPS < y_bid {
+            PairBaseSkewSide::No
+        } else {
+            PairBaseSkewSide::Yes
+        });
+    }
+    if y_ask > 0.0 || y_bid > 0.0 {
+        return Some(PairBaseSkewSide::Yes);
+    }
+    if n_ask > 0.0 || n_bid > 0.0 {
+        return Some(PairBaseSkewSide::No);
+    }
+    None
+}
+
+fn pair_base_skew_actual_ratio(q_yes: f64, q_no: f64, side: PairBaseSkewSide) -> f64 {
+    let (num, den) = match side {
+        PairBaseSkewSide::Yes => (q_yes.max(0.0), q_no.max(0.0)),
+        PairBaseSkewSide::No => (q_no.max(0.0), q_yes.max(0.0)),
+    };
+    if den > 1e-9 {
+        num / den
+    } else if num > 1e-9 {
+        f64::INFINITY
+    } else {
+        1.0
+    }
+}
+
+fn pair_base_skew_desired_extra(
+    q_yes: f64,
+    q_no: f64,
+    side: PairBaseSkewSide,
+    target_ratio: f64,
+) -> f64 {
+    let target_ratio = target_ratio.max(1.0);
+    let (cheap_qty, other_qty) = match side {
+        PairBaseSkewSide::Yes => (q_yes.max(0.0), q_no.max(0.0)),
+        PairBaseSkewSide::No => (q_no.max(0.0), q_yes.max(0.0)),
+    };
+    (target_ratio * other_qty - cheap_qty).max(0.0)
 }
 
 fn pair_base_phase_without_recovery(
@@ -333,6 +488,33 @@ fn pair_base_should_hold_recovery_settlement(
     phase == PairBasePhaseState::MergePending
         && actual_gap <= release + 1e-6
         && (unsettled_yes > 1e-6 || unsettled_no > 1e-6)
+}
+
+fn pair_base_gate_failed_skew_state(q_yes: f64, q_no: f64, skew: &SkewOverlayState) -> SkewOverlayState {
+    if !skew.enabled && skew.live_oid.is_none() {
+        return SkewOverlayState::default();
+    }
+    let realized_same_side_gap = match skew.side {
+        PairBaseSkewSide::Yes => (q_yes - q_no).max(0.0),
+        PairBaseSkewSide::No => (q_no - q_yes).max(0.0),
+    };
+    let realized_target = realized_same_side_gap.min(skew.target_gap_shares.max(0.0));
+    if realized_target <= 1e-6 {
+        return SkewOverlayState::default();
+    }
+    let mut next = skew.clone();
+    next.enabled = true;
+    next.target_gap_shares = realized_target;
+    next.live_oid = None;
+    next.state = SkewOverlayOrderState::Holding;
+    next
+}
+
+fn pair_base_should_count_skew_normal_flow_taker(
+    phase: PairBasePhaseState,
+    skew: &SkewOverlayState,
+) -> bool {
+    skew.enabled && !pair_base_phase_owns_resolution(phase)
 }
 
 fn pair_base_should_force_recovery(
@@ -744,6 +926,7 @@ struct PairBaseRuntimeState {
     state_enter_ts: f64,
     risk_exit_latched: bool,
     risk_exit_latch_reason: Option<String>,
+    skew_overlay: SkewOverlayState,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -793,6 +976,23 @@ struct PairBaseMetricsState {
     resolved_by_exact_sell_count: u64,
     resolved_by_taker_buy_count: u64,
     fak_no_match_count: u64,
+    skew_snapshot_count: u64,
+    skew_both_side_participation_seen: bool,
+    skew_ratio_sum: f64,
+    skew_ratio_max: f64,
+    skew_cost_split_yes_sum: f64,
+    skew_cost_split_no_sum: f64,
+    skew_downside_floor_lp_min: Option<f64>,
+    skew_best_case_upside_lp_max: Option<f64>,
+    skew_pair_coverage_sum: f64,
+    skew_pair_coverage_count: u64,
+    skew_normal_flow_taker_count: u64,
+    skew_fee_net_worst_case_min: Option<f64>,
+    skew_fee_net_best_case_max: Option<f64>,
+    skew_fee_net_pair_cost_sum: f64,
+    skew_fee_net_pair_cost_count: u64,
+    skew_fill_yes: f64,
+    skew_fill_no: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5275,6 +5475,7 @@ impl MakerHedgeCapBot {
             candidate.price,
             &candidate.side,
             true,
+            Some(&candidate.order_id),
         );
         MakerExecApplyResult::Applied { canonical_id }
     }
@@ -7257,7 +7458,6 @@ impl MakerHedgeCapBot {
 
     fn _pair_base_mode_enabled(&self) -> bool {
         env_bool("PAIR_BASE_ENABLED", false)
-            && !env_bool("MAKER_SKEW_ENABLED", true)
             && !env_bool("MAKER_ARB_ENABLED", true)
             && !env_bool("MAKER_STRETCH_BIAS_ENABLED", false)
     }
@@ -7391,6 +7591,80 @@ impl MakerHedgeCapBot {
         }
     }
 
+    fn _pair_base_metrics_observe_skew_snapshot(&self, total_cost: f64) {
+        let state = match self.state.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        let skew = match self.pair_base_state.lock() {
+            Ok(guard) => guard.skew_overlay.clone(),
+            Err(_) => return,
+        };
+        if !skew.enabled || skew.target_gap_shares <= 1e-6 {
+            return;
+        }
+        let q_yes = state.q_yes.max(0.0);
+        let q_no = state.q_no.max(0.0);
+        let both_side = q_yes > 1e-9 && q_no > 1e-9;
+        let ratio = pair_base_skew_actual_ratio(q_yes, q_no, skew.side);
+        let total_cost = total_cost.max(0.0);
+        let cost_split_yes = if total_cost > 1e-9 {
+            state.c_yes.max(0.0) / total_cost
+        } else {
+            0.5
+        };
+        let cost_split_no = if total_cost > 1e-9 {
+            state.c_no.max(0.0) / total_cost
+        } else {
+            0.5
+        };
+        let downside_floor = locked_profit(&state);
+        let best_case_upside = q_yes.max(q_no) - total_cost;
+        let pair_coverage = pair_base_inventory_coverage(q_yes, q_no);
+        let fee_snap =
+            self._pair_base_fee_net_snapshot(q_yes, q_no, total_cost, 0.0, 0.0, 0.0, 0.0);
+        if let Ok(mut metrics) = self.pair_base_metrics.lock() {
+            metrics.skew_snapshot_count += 1;
+            if both_side {
+                metrics.skew_both_side_participation_seen = true;
+            }
+            if ratio.is_finite() {
+                metrics.skew_ratio_sum += ratio;
+                metrics.skew_ratio_max = metrics.skew_ratio_max.max(ratio);
+            }
+            metrics.skew_cost_split_yes_sum += cost_split_yes;
+            metrics.skew_cost_split_no_sum += cost_split_no;
+            metrics.skew_downside_floor_lp_min = Some(
+                metrics
+                    .skew_downside_floor_lp_min
+                    .map(|cur| cur.min(downside_floor))
+                    .unwrap_or(downside_floor),
+            );
+            metrics.skew_best_case_upside_lp_max = Some(
+                metrics
+                    .skew_best_case_upside_lp_max
+                    .map(|cur| cur.max(best_case_upside))
+                    .unwrap_or(best_case_upside),
+            );
+            metrics.skew_pair_coverage_sum += pair_coverage;
+            metrics.skew_pair_coverage_count += 1;
+            metrics.skew_fee_net_worst_case_min = Some(
+                metrics
+                    .skew_fee_net_worst_case_min
+                    .map(|cur| cur.min(fee_snap.fee_net_worst_case_pnl))
+                    .unwrap_or(fee_snap.fee_net_worst_case_pnl),
+            );
+            metrics.skew_fee_net_best_case_max = Some(
+                metrics
+                    .skew_fee_net_best_case_max
+                    .map(|cur| cur.max(fee_snap.fee_net_best_case_pnl))
+                    .unwrap_or(fee_snap.fee_net_best_case_pnl),
+            );
+            metrics.skew_fee_net_pair_cost_sum += fee_snap.fee_net_pair_cost;
+            metrics.skew_fee_net_pair_cost_count += 1;
+        }
+    }
+
     fn _pair_base_metrics_update_timed_state(
         &self,
         covered_by_live_order: bool,
@@ -7443,6 +7717,7 @@ impl MakerHedgeCapBot {
         price: f64,
         side: &str,
         is_maker: bool,
+        order_id: Option<&str>,
     ) {
         if qty <= 0.0 || asset_id.trim().is_empty() {
             return;
@@ -7458,11 +7733,11 @@ impl MakerHedgeCapBot {
         } else {
             notional
         };
-        let phase = self
+        let (phase, skew_overlay) = self
             .pair_base_state
             .lock()
-            .map(|st| st.phase)
-            .unwrap_or(PairBasePhaseState::Flat);
+            .map(|st| (st.phase, st.skew_overlay.clone()))
+            .unwrap_or((PairBasePhaseState::Flat, SkewOverlayState::default()));
         if let Ok(mut metrics) = self.pair_base_metrics.lock() {
             if is_maker {
                 if is_yes {
@@ -7484,6 +7759,21 @@ impl MakerHedgeCapBot {
                     false,
                     fee_model_enabled && fees_enabled,
                 );
+                if pair_base_should_count_skew_normal_flow_taker(phase, &skew_overlay) {
+                    metrics.skew_normal_flow_taker_count += 1;
+                }
+            }
+            if is_maker
+                && order_id
+                    .zip(skew_overlay.live_oid.as_deref())
+                    .map(|(oid, live)| oid == live)
+                    .unwrap_or(false)
+            {
+                if is_yes {
+                    metrics.skew_fill_yes += qty.max(0.0);
+                } else {
+                    metrics.skew_fill_no += qty.max(0.0);
+                }
             }
             if pair_base_phase_owns_resolution(phase) {
                 if is_maker {
@@ -7527,7 +7817,12 @@ impl MakerHedgeCapBot {
         let t_left = (self.expiry_ts as f64 - now).max(0.0);
         let residual_gap = {
             let (q_yes, q_no) = self._maker_actual_inventory();
-            (q_yes - q_no).abs()
+            let skew = self
+                .pair_base_state
+                .lock()
+                .map(|st| st.skew_overlay.clone())
+                .unwrap_or_default();
+            pair_base_base_gap(q_yes, q_no, &skew).abs()
         };
         let mut cycle_log: Option<String> = None;
         if let Ok(mut metrics) = self.pair_base_metrics.lock() {
@@ -7722,6 +8017,32 @@ impl MakerHedgeCapBot {
                 metrics.recovery_cycle_taker_recovery_cost_sum,
                 metrics.merge_resolved_count,
             ),
+            skew_both_side_participation: metrics.skew_both_side_participation_seen,
+            skew_ratio_avg: pair_base_average(metrics.skew_ratio_sum, metrics.skew_snapshot_count),
+            skew_ratio_max: metrics.skew_ratio_max,
+            skew_cost_split_yes_avg: pair_base_average(
+                metrics.skew_cost_split_yes_sum,
+                metrics.skew_snapshot_count,
+            ),
+            skew_cost_split_no_avg: pair_base_average(
+                metrics.skew_cost_split_no_sum,
+                metrics.skew_snapshot_count,
+            ),
+            skew_downside_floor_lp: metrics.skew_downside_floor_lp_min.unwrap_or(0.0),
+            skew_best_case_upside_lp: metrics.skew_best_case_upside_lp_max.unwrap_or(0.0),
+            skew_pair_coverage_avg: pair_base_average(
+                metrics.skew_pair_coverage_sum,
+                metrics.skew_pair_coverage_count,
+            ),
+            skew_normal_flow_taker_count: metrics.skew_normal_flow_taker_count as usize,
+            skew_fee_net_worst_case_min: metrics.skew_fee_net_worst_case_min.unwrap_or(0.0),
+            skew_fee_net_best_case_max: metrics.skew_fee_net_best_case_max.unwrap_or(0.0),
+            skew_fee_net_pair_cost_avg: pair_base_average(
+                metrics.skew_fee_net_pair_cost_sum,
+                metrics.skew_fee_net_pair_cost_count,
+            ),
+            skew_fill_yes: metrics.skew_fill_yes,
+            skew_fill_no: metrics.skew_fill_no,
         }
     }
 
@@ -7738,10 +8059,56 @@ impl MakerHedgeCapBot {
         ) {
             return None;
         }
-        if !(slot.origin.starts_with("PAIR_BASE_") || slot.origin == "PAIR_BASE_RECOVERY") {
+        if !pair_base_origin_is_pair_or_recovery(&slot.origin) {
             return None;
         }
         slot.order_id
+    }
+
+    fn _pair_base_skew_live_order_id(&self, asset_id: &str) -> Option<String> {
+        if asset_id.trim().is_empty() {
+            return None;
+        }
+        let slot = self._maker_order_slot_get(&MakerOrderKey::buy(asset_id));
+        if !matches!(
+            slot.state,
+            MakerOrderLifecycle::Working
+                | MakerOrderLifecycle::SubmitPending
+                | MakerOrderLifecycle::CancelPending
+        ) {
+            return None;
+        }
+        if !pair_base_origin_is_skew(&slot.origin) {
+            return None;
+        }
+        slot.order_id
+    }
+
+    fn _pair_base_skew_cancel_live(&self, reason: &str) {
+        let (Some(yes), Some(no)) = (&self.yes_asset, &self.no_asset) else {
+            return;
+        };
+        if self._pair_base_skew_live_order_id(yes).is_some() {
+            let _ = self._maker_order_request_cancel(&MakerOrderKey::buy(yes), reason);
+        }
+        if self._pair_base_skew_live_order_id(no).is_some() {
+            let _ = self._maker_order_request_cancel(&MakerOrderKey::buy(no), reason);
+        }
+    }
+
+    fn _pair_base_skew_clear(&self, reason: &str) {
+        let mut should_log = false;
+        if let Ok(mut st) = self.pair_base_state.lock() {
+            if st.skew_overlay.enabled || st.skew_overlay.live_oid.is_some() {
+                should_log = true;
+            }
+            st.skew_overlay = SkewOverlayState::default();
+        }
+        self._pair_base_skew_cancel_live(reason);
+        if should_log {
+            self.logger
+                .info(&format!("[PAIR_BASE][SKEW] clear reason={}", reason));
+        }
     }
 
     fn _pair_base_cancel_orders(&self, reason: &str) {
@@ -7750,6 +8117,208 @@ impl MakerHedgeCapBot {
         };
         let _ = self._maker_order_request_cancel(&MakerOrderKey::buy(yes), reason);
         let _ = self._maker_order_request_cancel(&MakerOrderKey::buy(no), reason);
+    }
+
+    fn _maker_pair_base_try_skew(
+        &self,
+        ctx: &MakerSkewLoopCtx,
+        q_yes: f64,
+        q_no: f64,
+        total_cost: f64,
+        release: f64,
+    ) -> bool {
+        if !env_bool("MAKER_SKEW_ENABLED", true) {
+            return false;
+        }
+        if q_yes <= 1e-6 || q_no <= 1e-6 {
+            self._maker_dbg_idle(
+                "[PAIR_BASE][SKEW] suppress reason=both_side_participation_missing",
+                "pair_base_skew_missing_both_sides",
+            );
+            return false;
+        }
+        let current_skew = self
+            .pair_base_state
+            .lock()
+            .map(|st| st.skew_overlay.clone())
+            .unwrap_or_default();
+        if current_skew.enabled {
+            return false;
+        }
+        if pair_base_base_gap(q_yes, q_no, &current_skew).abs() > release + 1e-6 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE][SKEW] suppress reason=base_gap_open base_gap={:.2} release={:.2}",
+                    pair_base_base_gap(q_yes, q_no, &current_skew).abs(),
+                    release
+                ),
+                "pair_base_skew_base_gap_open",
+            );
+            return false;
+        }
+
+        let Some(side) = pair_base_cheaper_side(ctx.y_bid, ctx.y_ask, ctx.n_bid, ctx.n_ask) else {
+            self._maker_dbg_idle(
+                "[PAIR_BASE][SKEW] suppress reason=missing_prices",
+                "pair_base_skew_missing_prices",
+            );
+            return false;
+        };
+        let target_ratio = env_float("MAKER_SKEW_TARGET_RATIO", 1.2).max(1.0);
+        let max_ratio = env_float("MAKER_SKEW_MAX_RATIO", 2.2).max(target_ratio);
+        let current_ratio = pair_base_skew_actual_ratio(q_yes, q_no, side);
+        if current_ratio > max_ratio + 1e-6 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE][SKEW] suppress reason=max_ratio actual={:.3} max={:.3}",
+                    current_ratio, max_ratio
+                ),
+                "pair_base_skew_max_ratio",
+            );
+            return false;
+        }
+
+        let (Some(yes), Some(no)) = (&self.yes_asset, &self.no_asset) else {
+            return false;
+        };
+        let (skew_asset, other_asset, ask_hint) = match side {
+            PairBaseSkewSide::Yes => (
+                yes.as_str(),
+                no.as_str(),
+                if ctx.y_ask > 0.0 { ctx.y_ask } else { ctx.y_bid },
+            ),
+            PairBaseSkewSide::No => (
+                no.as_str(),
+                yes.as_str(),
+                if ctx.n_ask > 0.0 { ctx.n_ask } else { ctx.n_bid },
+            ),
+        };
+        let min_entry_edge_ticks =
+            env_int("MIN_ENTRY_EDGE_TICKS", self.cfg.entry_edge_ticks).max(0);
+        let entry_edge = min_entry_edge_ticks as f64 * self.cfg.tick.max(0.0001);
+        let Some(price) = self._maker_bid_cross_ask_safe(skew_asset, other_asset, entry_edge) else {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE][SKEW] suppress reason=no_safe_bid side={} ask_hint={:.3}",
+                    side.as_str(),
+                    ask_hint
+                ),
+                "pair_base_skew_no_safe_bid",
+            );
+            return false;
+        };
+        let pair_budget = self._pair_base_window_budget();
+        let hard_reserve = self._pair_base_hard_reserve();
+        let usable_budget = (pair_budget - total_cost - hard_reserve).max(0.0);
+        let budget_px = ask_hint.max(price).max(1e-9);
+        let budget_qty = round_down(usable_budget / budget_px, 0.01).max(0.0);
+        let desired_extra = round_down(
+            pair_base_skew_desired_extra(q_yes, q_no, side, target_ratio)
+                .min(self.cfg.clip_shares.max(self.cfg.min_shares))
+                .min(budget_qty),
+            0.01,
+        )
+        .max(0.0);
+        if desired_extra + 1e-6 < self.cfg.min_shares.max(1.0) {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE][SKEW] suppress reason=size_below_min desired={:.2} min={:.2} usable={:.2}",
+                    desired_extra,
+                    self.cfg.min_shares.max(1.0),
+                    usable_budget
+                ),
+                "pair_base_skew_size_below_min",
+            );
+            return false;
+        }
+        let fee_snap = match side {
+            PairBaseSkewSide::Yes => {
+                self._pair_base_log_fee_net(
+                    "skew_entry",
+                    "pair_base_skew",
+                    q_yes,
+                    q_no,
+                    total_cost,
+                    desired_extra,
+                    price,
+                    0.0,
+                    0.0,
+                )
+            }
+            PairBaseSkewSide::No => {
+                self._pair_base_log_fee_net(
+                    "skew_entry",
+                    "pair_base_skew",
+                    q_yes,
+                    q_no,
+                    total_cost,
+                    0.0,
+                    0.0,
+                    desired_extra,
+                    price,
+                )
+            }
+        };
+        if fee_snap.fee_net_worst_case_pnl < -1e-6 {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE][SKEW] suppress reason=negative_floor worst_case={:+.4}",
+                    fee_snap.fee_net_worst_case_pnl
+                ),
+                "pair_base_skew_negative_floor",
+            );
+            return false;
+        }
+
+        let oid = self._maker_order_upsert_gtc(
+            &MakerOrderKey::buy(skew_asset),
+            price,
+            desired_extra,
+            "PAIR_BASE_SKEW",
+        );
+        let live_oid = self._pair_base_skew_live_order_id(skew_asset).or(oid.clone());
+        if live_oid.is_none() {
+            self._maker_dbg_idle(
+                &format!(
+                    "[PAIR_BASE][SKEW] suppress reason=submit_none side={} size={:.2} price={:.3}",
+                    side.as_str(),
+                    desired_extra,
+                    price
+                ),
+                "pair_base_skew_submit_none",
+            );
+            return false;
+        }
+        if let Ok(mut st) = self.pair_base_state.lock() {
+            st.skew_overlay = SkewOverlayState {
+                enabled: true,
+                side,
+                target_gap_shares: desired_extra,
+                live_oid: live_oid.clone(),
+                state: if live_oid.is_some() {
+                    SkewOverlayOrderState::Quoting
+                } else {
+                    SkewOverlayOrderState::Holding
+                },
+                last_enter_ts: now_ts_f64(),
+            };
+        }
+        self.logger.info(&format!(
+            "[PAIR_BASE][SKEW] enter side={} target_gap={:.2} price={:.3} oid={} state={}",
+            side.as_str(),
+            desired_extra,
+            price,
+            live_oid
+                .as_deref()
+                .map(|s| s.chars().take(10).collect::<String>())
+                .unwrap_or_else(|| "-".to_string()),
+            if live_oid.is_some() {
+                SkewOverlayOrderState::Quoting.as_str()
+            } else {
+                SkewOverlayOrderState::Holding.as_str()
+            }
+        ));
+        true
     }
 
     fn _pair_base_set_phase(
@@ -7806,14 +8375,14 @@ impl MakerHedgeCapBot {
         ctx: &MakerSkewLoopCtx,
     ) -> Option<PairBaseRecoveryState> {
         let (
-            recovery_mode,
-            recovery_gap,
+            _recovery_mode,
+            _recovery_gap,
             recovery_heavy_side,
             recovery_side,
             recovery_asset,
-            recovery_unsettled_heavy,
+            _recovery_unsettled_heavy,
         ) = self._maker_recovery_mode_snapshot();
-        let (current_phase, _active_pair_id, _current_target_qty, state_enter_ts) = self
+        let (current_phase, _active_pair_id, _current_target_qty, state_enter_ts, skew_overlay) = self
             .pair_base_state
             .lock()
             .map(|st| {
@@ -7822,15 +8391,40 @@ impl MakerHedgeCapBot {
                     st.active_pair_id.clone(),
                     st.target_qty,
                     st.state_enter_ts,
+                    st.skew_overlay.clone(),
                 )
             })
-            .unwrap_or((PairBasePhaseState::Flat, None, 0.0, 0.0));
+            .unwrap_or((
+                PairBasePhaseState::Flat,
+                None,
+                0.0,
+                0.0,
+                SkewOverlayState::default(),
+            ));
         let release = self._pair_arb_imbalance_release_shares();
-        let recovery_asset_id = recovery_asset.as_deref().unwrap_or(if recovery_side == "YES" {
-            ctx.yes_asset.as_str()
-        } else {
-            ctx.no_asset.as_str()
-        });
+        let fallback_recovery_asset_id =
+            recovery_asset.as_deref().unwrap_or(if recovery_side == "YES" {
+                ctx.yes_asset.as_str()
+            } else {
+                ctx.no_asset.as_str()
+            });
+        let (q_yes, q_no) = self._maker_actual_inventory();
+        let adjusted_signed_gap = pair_base_base_gap(q_yes, q_no, &skew_overlay);
+        let adjusted_gap = adjusted_signed_gap.abs();
+        let (adjusted_heavy_side, adjusted_light_side, recovery_asset_id) =
+            if adjusted_gap > 1e-6 {
+                if adjusted_signed_gap > 0.0 {
+                    ("YES".to_string(), "NO".to_string(), ctx.no_asset.as_str())
+                } else {
+                    ("NO".to_string(), "YES".to_string(), ctx.yes_asset.as_str())
+                }
+            } else {
+                (
+                    recovery_heavy_side.clone(),
+                    recovery_side.clone(),
+                    fallback_recovery_asset_id,
+                )
+            };
         let trusted_age_s = (pair_base_recovery_live_order_ttl_ms() / 1000.0).max(0.2);
         let coverage = self._pair_base_light_coverage_state(recovery_asset_id);
         let light_oid = coverage.oid.clone();
@@ -7839,16 +8433,21 @@ impl MakerHedgeCapBot {
         let light_leg_trusted = coverage.covered_risk > 1e-6;
         let unsettled_yes = self._maker_recovery_unsettled_buy_risk(&ctx.yes_asset);
         let unsettled_no = self._maker_recovery_unsettled_buy_risk(&ctx.no_asset);
+        let adjusted_unsettled_heavy = if adjusted_heavy_side == "YES" {
+            unsettled_yes
+        } else {
+            unsettled_no
+        };
         let hold_settlement = pair_base_should_hold_recovery_settlement(
             current_phase,
-            recovery_gap,
+            adjusted_gap,
             release,
             unsettled_yes,
             unsettled_no,
         );
         let forced_pair_recovery_reason = if pair_base_should_force_recovery(
             current_phase,
-            recovery_gap,
+            adjusted_gap,
             release,
             light_leg_trusted,
         ) {
@@ -7870,38 +8469,51 @@ impl MakerHedgeCapBot {
             }
         } else if hold_settlement {
             Some(format!(
-                "settling_live_orders gap={recovery_gap:.2} light_risk={light_unsettled:.2} y_unsettled={unsettled_yes:.2} n_unsettled={unsettled_no:.2}"
+                "settling_live_orders gap={adjusted_gap:.2} light_risk={light_unsettled:.2} y_unsettled={unsettled_yes:.2} n_unsettled={unsettled_no:.2}"
             ))
         } else {
             None
         };
-        let effective_recovery_mode = recovery_mode || forced_pair_recovery_reason.is_some();
         let recovery_active_key = "__pair_base_recovery_mode_active";
         let recovery_heavy_key = "__pair_base_recovery_heavy_yes";
         let recovery_log_key = "__pair_base_recovery_mode_log_until";
         let recovery_log_every = 5.0;
+        let was_active = self._runtime_ts_get(recovery_active_key) > 0.0;
+        let effective_recovery_mode = if was_active || current_phase == PairBasePhaseState::MergePending
+        {
+            adjusted_gap > release + 1e-6 || adjusted_unsettled_heavy > 1e-6
+        } else {
+            adjusted_gap + 1e-6 >= self._pair_arb_imbalance_enter_shares()
+        } || forced_pair_recovery_reason.is_some();
         if effective_recovery_mode {
             self._maker_ladder_cancel_all("pair_base recovery");
             self._maker_cancel_strategy_orders(Some(recovery_asset_id), "pair_base recovery");
             if self._runtime_ts_get(recovery_active_key) <= 0.0 {
                 if let Some(reason) = forced_pair_recovery_reason.as_deref() {
                     self.logger.info(&format!(
-                        "[PAIR_BASE] recovery enter gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side} reason={reason}"
+                        "[PAIR_BASE] recovery enter gap={adjusted_gap:.2} heavy={} light={} reason={reason}",
+                        adjusted_heavy_side,
+                        adjusted_light_side
                     ));
                 } else {
                     self.logger.info(&format!(
-                        "[PAIR_BASE] recovery enter gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side}"
+                        "[PAIR_BASE] recovery enter gap={adjusted_gap:.2} heavy={} light={}",
+                        adjusted_heavy_side,
+                        adjusted_light_side
                     ));
                 }
                 self._runtime_ts_set(recovery_active_key, 1.0);
                 self._runtime_ts_set(
                     recovery_heavy_key,
-                    if recovery_heavy_side == "YES" { 1.0 } else { 0.0 },
+                    if adjusted_heavy_side == "YES" { 1.0 } else { 0.0 },
                 );
                 self._runtime_ts_set(recovery_log_key, ctx.now + recovery_log_every);
             } else if ctx.now >= self._runtime_ts_get(recovery_log_key) {
                 self.logger.info(&format!(
-                    "[PAIR_BASE] recovery remain gap={recovery_gap:.2} heavy={recovery_heavy_side} light={recovery_side} unsettled_heavy={recovery_unsettled_heavy:.2}"
+                    "[PAIR_BASE] recovery remain gap={adjusted_gap:.2} heavy={} light={} unsettled_heavy={:.2}",
+                    adjusted_heavy_side,
+                    adjusted_light_side,
+                    adjusted_unsettled_heavy
                 ));
                 self._runtime_ts_set(recovery_log_key, ctx.now + recovery_log_every);
             }
@@ -7909,7 +8521,7 @@ impl MakerHedgeCapBot {
                 self._pair_base_cancel_orders("pair_base recovery settling");
                 self._maker_dbg_idle(
                     &format!(
-                        "[PAIR_BASE] merge: settling_live_orders gap={recovery_gap:.2} light_risk={light_unsettled:.2} y_unsettled={unsettled_yes:.2} n_unsettled={unsettled_no:.2}",
+                        "[PAIR_BASE] merge: settling_live_orders gap={adjusted_gap:.2} light_risk={light_unsettled:.2} y_unsettled={unsettled_yes:.2} n_unsettled={unsettled_no:.2}",
                     ),
                     "pair_base_recovery_settling_live_orders",
                 );
@@ -7925,7 +8537,7 @@ impl MakerHedgeCapBot {
                     let _ = self._maker_order_request_cancel(&recovery_key, &reason);
                     self._maker_dbg_idle(
                         &format!(
-                            "[PAIR_BASE] merge: requoting_light_leg reason={} gap={recovery_gap:.2} light_risk={light_unsettled:.2}",
+                            "[PAIR_BASE] merge: requoting_light_leg reason={} gap={adjusted_gap:.2} light_risk={light_unsettled:.2}",
                             reason
                         ),
                         "pair_base_recovery_refresh",
@@ -7941,7 +8553,7 @@ impl MakerHedgeCapBot {
                     );
                     self._maker_dbg_idle(
                         &format!(
-                            "[PAIR_BASE] merge: waiting_light_leg reason=unsettled gap={recovery_gap:.2} light_risk={light_unsettled:.2} covered={:.2} book_age_ms={:.0} quote_age_ms={:.0}",
+                            "[PAIR_BASE] merge: waiting_light_leg reason=unsettled gap={adjusted_gap:.2} light_risk={light_unsettled:.2} covered={:.2} book_age_ms={:.0} quote_age_ms={:.0}",
                             coverage.covered_risk,
                             coverage.book_age_ms,
                             coverage.quote_age_ms
@@ -7955,7 +8567,7 @@ impl MakerHedgeCapBot {
             self._maker_ladder_cancel_all("pair_base recovery settled");
             self._maker_cancel_strategy_orders(None, "pair_base recovery settled");
             self.logger.info(&format!(
-                "[PAIR_BASE] recovery exit gap={recovery_gap:.2} threshold={:.2}",
+                "[PAIR_BASE] recovery exit gap={adjusted_gap:.2} threshold={:.2}",
                 self._pair_arb_imbalance_release_shares()
             ));
             self._runtime_ts_set(recovery_active_key, 0.0);
@@ -7964,14 +8576,15 @@ impl MakerHedgeCapBot {
         }
         Some(PairBaseRecoveryState {
             mode: effective_recovery_mode,
-            gap: recovery_gap,
-            heavy_side: recovery_heavy_side,
-            light_side: recovery_side,
+            gap: adjusted_gap,
+            heavy_side: adjusted_heavy_side,
+            light_side: adjusted_light_side,
             light_asset_id: recovery_asset_id.to_string(),
         })
     }
 
     fn _maker_pair_base_risk_exit_step(&self, reason: &str, total_cost: f64, allow_taker: bool) {
+        self._pair_base_skew_clear("pair_base risk_exit");
         let (q_yes, q_no) = self._maker_actual_inventory();
         let gap = (q_yes - q_no).abs();
         let delta = q_yes - q_no;
@@ -8455,7 +9068,7 @@ impl MakerHedgeCapBot {
         let stop_new_after_s = env_float("MAKER_SKEW_STOP_NEW_AFTER_SECONDS", 290.0).max(1.0);
         let t_into_s = (now - self.start_ts as f64).max(0.0);
         let (downside, upside, skew_ratio) = Self::_maker_payoff_envelope(q_yes, q_no, total_cost);
-        let (current_phase, active_pair_id, current_target_qty, risk_exit_latched) = self
+        let (current_phase, active_pair_id, current_target_qty, risk_exit_latched, mut skew_overlay) = self
             .pair_base_state
             .lock()
             .map(|st| {
@@ -8464,9 +9077,10 @@ impl MakerHedgeCapBot {
                     st.active_pair_id.clone(),
                     st.target_qty,
                     st.risk_exit_latched,
+                    st.skew_overlay.clone(),
                 )
             })
-            .unwrap_or((PairBasePhaseState::Flat, None, 0.0, false));
+            .unwrap_or((PairBasePhaseState::Flat, None, 0.0, false, SkewOverlayState::default()));
         let refresh_s = if current_phase == PairBasePhaseState::MergePending
             || current_phase == PairBasePhaseState::RiskExitOnly
         {
@@ -8532,6 +9146,26 @@ impl MakerHedgeCapBot {
         };
         let yq = self._best_bid_ask(yes).unwrap_or((0.0, 0.0));
         let nq = self._best_bid_ask(no).unwrap_or((0.0, 0.0));
+        let skew_yes_oid = self._pair_base_skew_live_order_id(yes);
+        let skew_no_oid = self._pair_base_skew_live_order_id(no);
+        if skew_overlay.enabled {
+            let live_oid = match skew_overlay.side {
+                PairBaseSkewSide::Yes => skew_yes_oid.clone(),
+                PairBaseSkewSide::No => skew_no_oid.clone(),
+            };
+            let next_state = if live_oid.is_some() {
+                SkewOverlayOrderState::Quoting
+            } else {
+                SkewOverlayOrderState::Holding
+            };
+            if let Ok(mut st) = self.pair_base_state.lock() {
+                if st.skew_overlay.enabled {
+                    st.skew_overlay.live_oid = live_oid.clone();
+                    st.skew_overlay.state = next_state;
+                    skew_overlay = st.skew_overlay.clone();
+                }
+            }
+        }
         let include_open_buys = env_bool("MAKER_EFFECTIVE_Q_INCLUDE_OPEN_BUYS", true);
         let q_yes_eff = if include_open_buys {
             q_yes + self._maker_order_open_buy_remaining(yes)
@@ -8562,12 +9196,41 @@ impl MakerHedgeCapBot {
             skew_ratio,
         };
 
-        let actual_gap = (q_yes - q_no).abs();
+        let current_book_fee_snap =
+            self._pair_base_fee_net_snapshot(q_yes, q_no, total_cost, 0.0, 0.0, 0.0, 0.0);
+        if skew_overlay.enabled {
+            let signed_gap = pair_base_signed_gap(q_yes, q_no);
+            let intended_gap = pair_base_signed_intended_skew_gap(&skew_overlay);
+            let current_ratio = pair_base_skew_actual_ratio(q_yes, q_no, skew_overlay.side);
+            let max_ratio = env_float("MAKER_SKEW_MAX_RATIO", 2.2)
+                .max(env_float("MAKER_SKEW_TARGET_RATIO", 1.2).max(1.0));
+            let sign_flipped = signed_gap.abs() > 1e-6
+                && intended_gap.abs() > 1e-6
+                && signed_gap.signum() != intended_gap.signum();
+            if sign_flipped {
+                self._pair_base_skew_clear("sign_flip");
+                skew_overlay = SkewOverlayState::default();
+            } else if current_ratio > max_ratio + 1e-6 {
+                self._pair_base_skew_clear("max_ratio_exceeded");
+                skew_overlay = SkewOverlayState::default();
+            } else if current_book_fee_snap.fee_net_worst_case_pnl < -1e-6 {
+                self._pair_base_skew_clear("negative_floor");
+                skew_overlay = SkewOverlayState::default();
+            }
+        }
+
+        let actual_gap_signed = pair_base_base_gap(q_yes, q_no, &skew_overlay);
+        let actual_gap = actual_gap_signed.abs();
         let has_inventory = q_yes > 1e-6 || q_no > 1e-6;
         let release = self._pair_arb_imbalance_release_shares();
         let live_yes_oid = self._pair_base_live_order_id(yes);
         let live_no_oid = self._pair_base_live_order_id(no);
         let pair_orders_live = live_yes_oid.is_some() || live_no_oid.is_some();
+        let skew_yes_oid = self._pair_base_skew_live_order_id(yes);
+        let skew_no_oid = self._pair_base_skew_live_order_id(no);
+        let skew_orders_live = skew_yes_oid.is_some() || skew_no_oid.is_some();
+        let pair_or_skew_orders_live = pair_orders_live || skew_orders_live;
+        self._pair_base_metrics_observe_skew_snapshot(total_cost);
         if risk_exit_latched {
             if actual_gap > release + 1e-6 {
                 self._maker_pair_base_risk_exit_step("latched", total_cost, true);
@@ -8606,8 +9269,7 @@ impl MakerHedgeCapBot {
             let max_loss_limit =
                 env_float("PAIR_BASE_MAX_WORST_CASE_LOSS_USDC", self._pair_base_window_budget() * 0.5)
                     .max(0.0);
-            let fee_snap =
-                self._pair_base_fee_net_snapshot(q_yes, q_no, total_cost, 0.0, 0.0, 0.0, 0.0);
+            let fee_snap = current_book_fee_snap.clone();
             if actual_gap > release + 1e-6 && fee_snap.fee_net_worst_case_pnl <= -max_loss_limit {
                 self._maker_pair_base_risk_exit_step(
                     &format!(
@@ -8634,13 +9296,14 @@ impl MakerHedgeCapBot {
                     Some(pair_id),
                     self._pair_base_live_order_id(yes),
                     self._pair_base_live_order_id(no),
-                    (q_yes - q_no).abs(),
+                    actual_gap,
                     q_yes,
                     q_no,
                 );
                 return;
             };
             if recovery.mode {
+                self._pair_base_skew_clear("pair_base recovery");
                 self._maker_pair_base_recovery_step(&ctx, total_cost, &recovery);
                 return;
             }
@@ -8690,11 +9353,51 @@ impl MakerHedgeCapBot {
 
         let (ok, why) = self._maker_quote_only_allowed(yes, no);
         if !ok {
+            if skew_orders_live {
+                let reason = format!("PAIR_BASE skew gate: {why}");
+                let next_skew = pair_base_gate_failed_skew_state(q_yes, q_no, &skew_overlay);
+                self._pair_base_skew_cancel_live(&reason);
+                if let Ok(mut st) = self.pair_base_state.lock() {
+                    st.skew_overlay = next_skew.clone();
+                    skew_overlay = next_skew.clone();
+                }
+                if next_skew.enabled {
+                    self.logger.info(&format!(
+                        "[PAIR_BASE][SKEW] hold reason=gate_failed {} target_gap={:.2} state={}",
+                        why,
+                        next_skew.target_gap_shares,
+                        next_skew.state.as_str()
+                    ));
+                } else {
+                    self.logger
+                        .info(&format!("[PAIR_BASE][SKEW] clear reason={}", reason));
+                }
+            } else if skew_overlay.enabled {
+                self.logger
+                    .info(&format!("[PAIR_BASE][SKEW] hold reason=gate_failed {}", why));
+            }
             self._maker_dbg_idle(
                 &format!("[PAIR_BASE] idle: {why}"),
                 &format!("pair_base_idle_{}", why.split('(').next().unwrap_or("unknown")),
             );
             self._pair_base_cancel_orders(&format!("PAIR_BASE gate: {why}"));
+            return;
+        }
+
+        if !risk_exit_latched
+            && current_phase != PairBasePhaseState::RiskExitOnly
+            && current_phase != PairBasePhaseState::MergePending
+            && !pair_or_skew_orders_live
+            && self._maker_pair_base_try_skew(&ctx, q_yes, q_no, total_cost, release)
+        {
+            return;
+        }
+
+        if skew_orders_live {
+            self._maker_dbg_idle(
+                "[PAIR_BASE] idle: no_pair_edge reason=live_skew_order",
+                "pair_base_idle_live_skew_order",
+            );
             return;
         }
 
@@ -10326,7 +11029,7 @@ impl MakerHedgeCapBot {
                 }
             }
         }
-        self._pair_base_metrics_record_fill(asset_id, filled, price, side, false);
+        self._pair_base_metrics_record_fill(asset_id, filled, price, side, false, None);
         true
     }
 
@@ -17734,12 +18437,15 @@ mod tests {
         pair_base_effective_risk_exit_configured_seconds,
         pair_base_inventory_coverage, pair_base_phase_without_recovery, pair_base_rate,
         pair_base_recovery_window, pair_base_remaining_gap, pair_base_should_abort_second_leg,
+        pair_base_gate_failed_skew_state,
+        pair_base_should_count_skew_normal_flow_taker,
         pair_base_should_force_recovery, pair_base_should_hold_recovery_settlement,
-        pair_base_should_latch_risk_exit, pair_submit_tracks_taker_fallback,
+        pair_base_should_latch_risk_exit, pair_base_base_gap, pair_base_cheaper_side,
+        pair_base_skew_desired_extra, pair_submit_tracks_taker_fallback,
         pair_base_maker_resolution_adjusted_score,
         MakerExecCandidate, MakerExecLedger, MakerExecRecord, MakerHedgeCapBot,
         PairBasePhaseState, PairBaseRecoveryActionKind, PairBaseRecoveryCandidateScore,
-        PairBaseRecoveryWindow,
+        PairBaseRecoveryWindow, PairBaseSkewSide, SkewOverlayState,
     };
 
     #[test]
@@ -17758,6 +18464,117 @@ mod tests {
         assert_eq!(pair_base_rate(0, 0), 0.0);
         assert!((pair_base_average(9.0, 3) - 3.0).abs() < 1e-9);
         assert_eq!(pair_base_average(0.0, 0), 0.0);
+    }
+
+    #[test]
+    fn pair_base_skew_desired_extra_math() {
+        assert!((pair_base_skew_desired_extra(20.0, 20.0, PairBaseSkewSide::Yes, 1.2) - 4.0).abs() < 1e-9);
+        assert!((pair_base_skew_desired_extra(25.0, 25.0, PairBaseSkewSide::Yes, 1.2) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pair_base_base_gap_treats_intended_yes_skew_as_zero_base_gap() {
+        let skew = SkewOverlayState {
+            enabled: true,
+            side: PairBaseSkewSide::Yes,
+            target_gap_shares: 5.0,
+            ..Default::default()
+        };
+        assert!((pair_base_base_gap(25.0, 25.0, &skew) - 0.0).abs() < 1e-9);
+        assert!((pair_base_base_gap(30.0, 25.0, &skew) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pair_base_base_gap_treats_intended_no_skew_as_zero_base_gap() {
+        let skew = SkewOverlayState {
+            enabled: true,
+            side: PairBaseSkewSide::No,
+            target_gap_shares: 5.0,
+            ..Default::default()
+        };
+        assert!((pair_base_base_gap(25.0, 25.0, &skew) - 0.0).abs() < 1e-9);
+        assert!((pair_base_base_gap(25.0, 30.0, &skew) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pair_base_quote_gate_preserves_realized_skew_after_cancel() {
+        let held = SkewOverlayState {
+            enabled: true,
+            side: PairBaseSkewSide::Yes,
+            target_gap_shares: 5.0,
+            state: super::SkewOverlayOrderState::Holding,
+            ..Default::default()
+        };
+        let quoting = SkewOverlayState {
+            enabled: true,
+            side: PairBaseSkewSide::Yes,
+            target_gap_shares: 5.0,
+            live_oid: Some("0xabc".to_string()),
+            state: super::SkewOverlayOrderState::Quoting,
+            ..Default::default()
+        };
+        let held_next = pair_base_gate_failed_skew_state(30.0, 25.0, &held);
+        assert!(held_next.enabled);
+        assert!((held_next.target_gap_shares - 5.0).abs() < 1e-9);
+        assert_eq!(held_next.state, super::SkewOverlayOrderState::Holding);
+
+        let partial_next = pair_base_gate_failed_skew_state(27.0, 25.0, &quoting);
+        assert!(partial_next.enabled);
+        assert!((partial_next.target_gap_shares - 2.0).abs() < 1e-9);
+        assert_eq!(partial_next.state, super::SkewOverlayOrderState::Holding);
+        assert_eq!(partial_next.live_oid, None);
+
+        let empty_next = pair_base_gate_failed_skew_state(25.0, 25.0, &quoting);
+        assert!(!empty_next.enabled);
+        assert_eq!(empty_next.live_oid, None);
+
+        let default_next = pair_base_gate_failed_skew_state(25.0, 25.0, &SkewOverlayState::default());
+        assert!(!default_next.enabled);
+    }
+
+    #[test]
+    fn pair_base_skew_normal_flow_taker_requires_active_skew_overlay() {
+        let inactive = SkewOverlayState::default();
+        assert!(!pair_base_should_count_skew_normal_flow_taker(
+            PairBasePhaseState::Balanced,
+            &inactive
+        ));
+        assert!(!pair_base_should_count_skew_normal_flow_taker(
+            PairBasePhaseState::Flat,
+            &inactive
+        ));
+
+        let active = SkewOverlayState {
+            enabled: true,
+            side: PairBaseSkewSide::Yes,
+            target_gap_shares: 5.0,
+            state: super::SkewOverlayOrderState::Holding,
+            ..Default::default()
+        };
+        assert!(pair_base_should_count_skew_normal_flow_taker(
+            PairBasePhaseState::Balanced,
+            &active
+        ));
+        assert!(!pair_base_should_count_skew_normal_flow_taker(
+            PairBasePhaseState::MergePending,
+            &active
+        ));
+        assert!(!pair_base_should_count_skew_normal_flow_taker(
+            PairBasePhaseState::RiskExitOnly,
+            &active
+        ));
+    }
+
+    #[test]
+    fn pair_base_cheaper_side_prefers_lower_ask_then_yes_tie_break() {
+        assert_eq!(
+            pair_base_cheaper_side(0.4, 0.45, 0.3, 0.5),
+            Some(PairBaseSkewSide::Yes)
+        );
+        assert_eq!(
+            pair_base_cheaper_side(0.4, 0.45, 0.3, 0.45),
+            Some(PairBaseSkewSide::Yes)
+        );
     }
 
     #[test]
