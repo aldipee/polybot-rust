@@ -262,6 +262,7 @@ Raw secret values are intentionally not copied here.
 - Current value: `15`
 - What it does: final stop-new-orders buffer before expiry / rollover.
 - Friendly explanation: this is the last hard quiet period before the market ends.
+- Current runtime nuance: when `MARKET_SLUG` is auto-generated in timestamp mode, startup inside this buffer now selects the next market slot instead of attaching to the nearly-expired current slot.
 
 
 ### `PAIR_BASE_NEAR_EXPIRY_FORCE_TAKER_SECONDS`
@@ -431,6 +432,112 @@ Raw secret values are intentionally not copied here.
 - Effective default: `0.10`
 - What it does: minimum score advantage required before scored recovery is allowed to choose `taker_buy_light`.
 - Friendly explanation: this stops the scorer from flipping into taker rescue on tiny score differences. If the taker path is only marginally better than maker or waiting, Step 1 keeps the safer non-taker behavior.
+
+---
+
+## Settlement Shaper Canary Controls
+
+These keys only matter when `EXEC_MODE=SETTLEMENT_SHAPER`.
+
+For the keys below:
+
+1. current value in the checked-in `.env`: not set
+2. effective value when unset: the built-in Sprint 3 canary default shown below
+
+### Role / Hysteresis
+
+- `FAV_UNDERDOG_SWITCH_MIN_DIFF`
+  Default: `0.01`
+  What it does: minimum ranked-price gap required before a favorite/underdog flip is even considered.
+- `FAV_UNDERDOG_SWITCH_CONFIRM_UPDATES`
+  Default: `3`
+  What it does: number of consecutive qualifying updates required before the role assignment actually flips.
+
+### Phase Budget Slices
+
+- `SETTLEMENT_SHAPER_BUDGET_SEED_MIN_FRACTION`
+  Default: `0.10`
+- `SETTLEMENT_SHAPER_BUDGET_SEED_MAX_FRACTION`
+  Default: `0.15`
+- `SETTLEMENT_SHAPER_BUDGET_EARLY_MIN_FRACTION`
+  Default: `0.15`
+- `SETTLEMENT_SHAPER_BUDGET_EARLY_MAX_FRACTION`
+  Default: `0.20`
+- `SETTLEMENT_SHAPER_BUDGET_MAIN_MIN_FRACTION`
+  Default: `0.45`
+- `SETTLEMENT_SHAPER_BUDGET_MAIN_MAX_FRACTION`
+  Default: `0.55`
+- `SETTLEMENT_SHAPER_BUDGET_FINISH_MIN_FRACTION`
+  Default: `0.15`
+- `SETTLEMENT_SHAPER_BUDGET_FINISH_MAX_FRACTION`
+  Default: `0.20`
+- `SETTLEMENT_SHAPER_BUDGET_FREEZE_MIN_FRACTION`
+  Default: `0.05`
+- `SETTLEMENT_SHAPER_BUDGET_FREEZE_MAX_FRACTION`
+  Default: `0.10`
+
+Friendly explanation: these ten keys split the usable market budget across `SeedBothSides`, `EarlyBuild`, `MainAccumulation`, `FinishShape`, and the late freeze / repair reserve so the mode does not spend the whole window too early.
+
+### Shape Bands And Regime Thresholds
+
+- `SETTLEMENT_SHAPER_PAIR_COVERAGE_SOFT_MIN`
+  Default: `0.80`
+  What it does: below this, the controller treats coverage as clearly unhealthy.
+- `SETTLEMENT_SHAPER_PAIR_COVERAGE_GOOD`
+  Default: `0.90`
+  What it does: threshold for a healthy paired book and optionality eligibility.
+- `SETTLEMENT_SHAPER_SHARE_SKEW_TARGET_LOW`
+  Default: `1.05`
+- `SETTLEMENT_SHAPER_SHARE_SKEW_TARGET_HIGH`
+  Default: `1.20`
+- `SETTLEMENT_SHAPER_SHARE_SKEW_SOFT_CAP`
+  Default: `1.30`
+- `SETTLEMENT_SHAPER_SHARE_SKEW_HARD_CAP`
+  Default: `1.40`
+  Friendly explanation: these define the healthy skew band and the soft/hard limits beyond it.
+- `SETTLEMENT_SHAPER_FAVORITE_COST_FRACTION_LOW`
+  Default: `0.60`
+- `SETTLEMENT_SHAPER_FAVORITE_COST_FRACTION_HIGH`
+  Default: `0.67`
+- `SETTLEMENT_SHAPER_UNDERDOG_SHARE_FRACTION_LOW`
+  Default: `0.51`
+- `SETTLEMENT_SHAPER_UNDERDOG_SHARE_FRACTION_HIGH`
+  Default: `0.60`
+  Friendly explanation: these define the healthy target band for dollars on the favorite and shares on the underdog.
+- `SETTLEMENT_SHAPER_VWAP_SUM_GREAT`
+  Default: `0.94`
+- `SETTLEMENT_SHAPER_VWAP_SUM_GOOD`
+  Default: `0.97`
+- `SETTLEMENT_SHAPER_VWAP_SUM_STOP_OVERLAY`
+  Default: `1.00`
+  Friendly explanation: these thresholds classify live/inventory cost quality into green, good, caution, and stop-overlay regimes.
+
+### Target Centers
+
+- `SETTLEMENT_SHAPER_TARGET_PAIR_COVERAGE`
+  Default: `0.90`
+- `SETTLEMENT_SHAPER_TARGET_SHARE_SKEW_RATIO`
+  Default: `1.10`
+- `SETTLEMENT_SHAPER_TARGET_FAVORITE_COST_FRACTION`
+  Default: `0.635`
+- `SETTLEMENT_SHAPER_TARGET_UNDERDOG_SHARE_FRACTION`
+  Default: `0.555`
+
+Friendly explanation: these are the neutral centers used by `ShapeRepair` and normal-path action scoring when the controller measures target gaps.
+
+### Clip Ladder
+
+- `SETTLEMENT_SHAPER_CLIP_LADDER_SMALL`
+  Default: `5,10,20,25`
+  What it does: comma-separated small-clip ladder used by entry repair, shape repair, and underdog overlay.
+- `SETTLEMENT_SHAPER_CLIP_LADDER_MEDIUM`
+  Default: `40`
+  What it does: medium clip used in stronger healthy-book repair / size-up cases.
+- `SETTLEMENT_SHAPER_CLIP_LADDER_LARGE`
+  Default: `80`
+  What it does: large clip reserved for main-accumulation favorite-side size-up only.
+
+Friendly explanation: the settlement-shaper controller no longer emits arbitrary share sizes. It snaps actions onto this ladder so canary behavior is predictable and metrics are comparable by bucket.
 
 ---
 

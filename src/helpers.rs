@@ -145,6 +145,22 @@ pub fn generate_market_slug_from_now(
     generate_market_slug_from_now_with_style(&asset, segment_name, step_seconds, "TIMESTAMP")
 }
 
+fn startup_timestamp_slot_ts(now_ts: i64, step_seconds: i64, rollover_buffer_seconds: i64) -> Option<i64> {
+    if step_seconds <= 0 {
+        return None;
+    }
+    let slot_start_ts = now_ts - now_ts.rem_euclid(step_seconds);
+    let elapsed_in_slot = now_ts.rem_euclid(step_seconds);
+    let rollover_buffer_seconds = rollover_buffer_seconds.clamp(0, step_seconds.saturating_sub(1));
+    if elapsed_in_slot > 0 {
+        let remaining_in_slot = step_seconds - elapsed_in_slot;
+        if remaining_in_slot <= rollover_buffer_seconds {
+            return Some(slot_start_ts + step_seconds);
+        }
+    }
+    Some(slot_start_ts)
+}
+
 pub fn generate_market_slug_from_now_with_style(
     asset_hint: &str,
     segment_name: &str,
@@ -195,7 +211,11 @@ pub fn generate_market_slug_from_now_with_style(
         return None;
     }
     let now_ts = Utc::now().timestamp();
-    let slot_ts = now_ts - now_ts.rem_euclid(step);
+    let rollover_buffer_seconds = env::var("STOP_BUFFER_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(segment_defaults(&seg).stop_buffer);
+    let slot_ts = startup_timestamp_slot_ts(now_ts, step, rollover_buffer_seconds)?;
     Some(format!("{asset}-updown-{seg_slug}-{slot_ts}"))
 }
 
@@ -559,4 +579,30 @@ pub fn _format_1d_slug_et(prefix: &str, dt_et: DateTime<chrono_tz::Tz>) -> Strin
 
 pub fn _increment_human_slug(slug: &str, segment_name: &str) -> Option<String> {
     increment_human_slug(slug, segment_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_timestamp_slot_ts;
+
+    #[test]
+    fn startup_timestamp_slot_keeps_current_slot_when_outside_rollover_buffer() {
+        assert_eq!(startup_timestamp_slot_ts(1_770_000_200, 300, 60), Some(1_770_000_000));
+    }
+
+    #[test]
+    fn startup_timestamp_slot_uses_next_slot_inside_rollover_buffer() {
+        assert_eq!(startup_timestamp_slot_ts(1_770_000_299, 300, 60), Some(1_770_000_300));
+        assert_eq!(startup_timestamp_slot_ts(1_770_000_240, 300, 60), Some(1_770_000_300));
+    }
+
+    #[test]
+    fn startup_timestamp_slot_keeps_exact_boundary_on_current_slot() {
+        assert_eq!(startup_timestamp_slot_ts(1_770_000_300, 300, 60), Some(1_770_000_300));
+    }
+
+    #[test]
+    fn startup_timestamp_slot_clamps_large_rollover_buffer() {
+        assert_eq!(startup_timestamp_slot_ts(1_770_000_001, 300, 999), Some(1_770_000_300));
+    }
 }

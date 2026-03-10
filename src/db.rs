@@ -1119,6 +1119,23 @@ WHERE COALESCE(trim(updated_at), '') = '';
         Ok(())
     }
 
+    pub fn update_trade_settlement_fields(
+        &self,
+        trade_id: &str,
+        claim_status: Option<&str>,
+        meta_data: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = open_conn(&self.engine)?;
+        conn.execute(
+            "UPDATE trade
+             SET claim_status = $1,
+                 meta_data = $2
+             WHERE trade_id = $3",
+            &[&claim_status, &meta_data, &trade_id],
+        )?;
+        Ok(())
+    }
+
     pub fn touch_trade_validation_checked(
         &self,
         trade_id: &str,
