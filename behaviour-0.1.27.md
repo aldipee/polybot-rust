@@ -4,393 +4,314 @@
 
 Scope: Sprint 3 only  
 Mode: `EXEC_MODE=SETTLEMENT_SHAPER`  
-Date: 2026-03-10
+Date: 2026-03-11
 
 This file is not a design target.
 It is a concrete runtime behaviour note for the current `SETTLEMENT_SHAPER` canary.
 
 ---
 
+## Update Note
+
+This note now reflects the latest live canary on 2026-03-11 after the recent controller fixes for:
+
+1. maker BUY precision quantization
+2. exact-to-lot repair sizing
+3. sub-lot / no-legal-repair rest fallback into `PairResting`
+4. paired-growth mild rebuild allowance
+5. paired-growth family live-order waiting and stale-cancel handling
+6. maker-style near-expiry rollover
+
+Those fixes materially improved runtime mechanics.
+
+The latest run proves that:
+
+1. routing into `SETTLEMENT_SHAPER` still works
+2. seed submission still works
+3. startup asymmetry ownership still works
+4. exact repair sizing is still in place
+5. maker-style rollover still works
+
+But the current live behaviour is still not a Sprint 3 wallet match.
+The newest dominant blocker is now:
+
+1. a one-leg seed outcome leaves the bot in true `EntryRepair`
+2. `EntryRepair` correctly detects the missing side as startup asymmetry
+3. the actual missing-side repair is then rejected every tick as `hard_skew_breach`
+4. the bot remains one-sided for the full market and rolls over without ever restoring two-sided participation
+
+### Code Update After That Canary
+
+That specific startup blocker is now patched in code:
+
+1. true missing-side `EntryRepair` can now bypass the normal hard-skew reject path when the projected action restores both-side participation
+2. settlement-shaper builder orders now bypass the generic maker recovery gate, so paired growth and directional-step no longer inherit the old `skip heavy-side BUY during recovery` / `skip light-side BUY stacking during recovery` rules
+3. directional-step now uses a settlement-shaper core-build gate instead of repair-style target-pressure rejection, including a blocked-rebuild `inventory_vwap_sum` allowance when the projected book improves the current held book
+4. late-phase near-target books now treat near-exact partial-fill one-lot surplus states as already reached, so a book like `49.99 / 45.00` should rest instead of trying to buy another full underdog lot just because the surplus is short by `0.01`
+5. that late-phase directional-step gate is now patched in code: near-target blocked-rest states can tolerate a small additional `inventory_vwap_sum` drift when the projected step reaches the good coverage / target-skew envelope
+6. healthy two-sided books with poor held `inventory_vwap_sum` now stay in `PairResting` instead of falling into `ShapeRepair -> inventory_quality_poor`; that keeps late books like `45.00 / 44.99` in the builder lane so paired growth, directional-step, or hold can decide the next move
+7. a fresh live canary is still required to confirm that the latest dominant blocker has moved from `inventory_quality_poor -> ShapeRepair` to the next true runtime issue
+
+---
+
 ## Executive Summary
 
-The current Sprint 3 implementation is not yet behaving like the intended settlement-shaping wallet.
+`SETTLEMENT_SHAPER` is still canary-stable mechanically.
 
-What works now:
+What the latest run proved:
 
-1. the bot routes correctly into `SETTLEMENT_SHAPER`
-2. startup auto-slug rollover is fixed
-3. flat startup can seed both sides
-4. one-leg startup fills can trigger `EntryRepair`
-5. post-expiry it waits for resolution instead of using the old pre-expiry flatten path
+1. routing into `SETTLEMENT_SHAPER` works
+2. seed both sides works
+3. startup asymmetry ownership works
+4. exact repair sizing is preserved
+5. rollover near expiry works like `MAKER_SKEW_ARB`
 
 What is still wrong:
 
-1. the bot often trades only at the opening
-2. after the opening seed, it frequently falls into repeated `ShapeRepair` hold loops
-3. it is not yet acting like a high-frequency inventory builder
-4. it is not yet reliably building toward the Sprint 3 final shape:
+1. startup asymmetry is no longer the dominant blocker; the bot can now recover into a real two-sided base and keep building for several rungs
+2. the newest dominant blocker was a late healthy book around `45.00 / 44.99` being misclassified as `ShapeRepair -> inventory_quality_poor`
+3. once it entered that lane, the repair planner looped on `hard_skew_breach` and `shape_worsens` instead of staying in the normal settlement-shaper builder
+4. the final live book can still collapse back to a balanced hold instead of the Sprint 3 fingerprint:
    - more dollars on the favorite
    - more shares on the underdog
-   - high pair coverage
+   - high coverage
    - mild skew
-   - hold to settlement
+   - held to settlement
 
-The current canary behaves more like:
+The current code behaves more like:
 
 1. seed both sides
-2. repair startup asymmetry if one leg fills first
-3. evaluate target drift against fixed target centers
-4. block most follow-on shaping because the next trade is either:
-   - below the 5-share maker minimum
-   - blocked by hard skew
-   - or blocked by `stop_overlay` / `repair_only`
+2. recover any startup asymmetry through `EntryRepair`
+3. build a real two-sided base through paired growth and bounded repair
+4. reach a late balanced or near-balanced book such as `45.00 / 44.99`
+5. risk dropping that late book into `ShapeRepair -> inventory_quality_poor` instead of keeping it in `PairResting`
+6. stall on repair-style `hard_skew_breach` / `shape_worsens` holds until rollover
 
-That is a valid canary for routing and ownership.
-It is not yet a valid Sprint 3 behavioural match.
-
----
-
-## Current Observed Pattern
-
-Across the latest live Sprint 3 runs, the dominant pattern is:
-
-1. `DiscoveryArm`
-2. seed both sides with a single small maker pair
-3. if one leg fills first, run `EntryRepair` on the missing side
-4. once both sides exist, switch to `ShapeRepair`
-5. then hold for the rest of the market because the next shaping action is blocked
-
-In practical terms:
-
-1. the bot is proving it can enter the market
-2. it is not proving it can keep accumulating into the intended final wallet shape
+That is still useful progress.
+It is not yet the intended settlement-shaping controller.
 
 ---
 
-## Concrete Runtime Evidence
+## Latest Live Canary
 
-### Case A: balanced-ish market, seed then sub-min hold
+Market:
 
-Observed market shape:
+1. `btc-updown-5m-1773186600`
+2. start `2026-03-11 06:49 WIB`
+3. stop reason `ROLLOVER`
 
-1. YES around `0.48`
-2. NO around `0.51`
+Final live book before rollover:
 
-Observed behaviour:
+1. `qYES=14.98`
+2. `qNO=0.00`
+3. `total_cost=7.34`
+4. `pair_coverage=0.000`
+5. `skew=inf`
+6. `inventory_vwap_sum=inf`
 
-1. seed both sides fired
-2. one side filled first, then `EntryRepair` completed the missing side
-3. final live inventory became `qYES=5`, `qNO=5`
-4. after that, `ShapeRepair` repeatedly logged:
-   - `reason=sub_min_best_action action=hold`
-   - raw requested shaping clips around `3.9 -> 1.6`
+Final owner state near rollover:
+
+1. `owner=EntryRepair`
+2. `owner_reason=startup_asymmetry`
+3. repeated holds with:
+   - `hard_skew_breach`
+   - occasional `spread_too_wide`
+
+That final state is a one-sided stranded book.
+It is not the Sprint 3 target shape.
+
+---
+
+## What Worked In The Latest Run
+
+### 1. Seed submission still behaved correctly
+
+Observed sequence:
+
+1. `SeedBothSides` submitted a paired maker entry with:
+   - `clip=15.00`
+   - `y_bid=0.490`
+   - `n_bid=0.480`
+2. the YES seed leg filled in three chunks
+3. the NO seed leg did not become inventory
 
 Interpretation:
 
-1. with maker minimum `5` shares, the controller could not place the next shaping trade
-2. the remaining shape drift was real, but it was below the executable maker lot size
-3. the bot therefore held for the rest of the market
+1. paired seed submission is still live
+2. exact clip sizing is still present
+3. the one-leg seed case remains the most important live startup failure mode
 
-This means:
+### 2. Ownership transfer into `EntryRepair` still behaved correctly
 
-1. the bot entered correctly
-2. the bot did not continue building inventory after the initial `5/5`
+Observed sequence:
 
-### Case B: asymmetric market, seed then hard-skew block
-
-Observed market shape:
-
-1. YES around `0.85`
-2. NO around `0.14`
-
-Observed behaviour:
-
-1. seed both sides fired with `5/5`
-2. one side filled first, then `EntryRepair` completed the missing side
-3. final live inventory again became `qYES=5`, `qNO=5`
-4. cost split became heavily favorite-weighted:
-   - `favorite_cost_fraction=0.859`
-   - `underdog_share_fraction=0.500`
-5. after that, `ShapeRepair` repeatedly logged:
-   - `reason=hard_skew_breach side=NO trigger=favorite_cost_drift`
+1. once the book was `qYES~=15`, `qNO=0`, owner switched:
+   - `PairResting -> EntryRepair`
+2. owner reason was:
+   - `startup_asymmetry`
+3. the hold logs consistently named:
+   - `missing_side=NO`
 
 Interpretation:
 
-1. the controller wanted to buy more underdog shares to reduce favorite-cost drift
-2. but the next underdog buy would push the projected book through the hard skew guard
-3. so the controller blocked itself and held
+1. the owner split is still correct
+2. the controller knows this is a true missing-side recovery case
+3. the failure is not in ownership detection
 
-This means:
+### 3. Foreground rollover is still correct
 
-1. the bot entered correctly
-2. it then got stuck trying to repair toward a target it could not safely reach
+Observed sequence:
 
----
+1. near expiry the log shows:
+   - `Expiring in 15s -> stopping for rollover.`
+2. run exits with:
+   - `reason=ROLLOVER`
 
-## Why Increasing `MAX_TOTAL_COST` To 120 Did Not Fix It
+Interpretation:
 
-Increasing total budget from `60` to `120` did not materially change the behaviour because the live blocker was not only the total budget.
-
-### 1. Seed size did not scale with the higher budget
-
-The runtime config still showed:
-
-1. `min_shares=5`
-2. `clip_shares=5`
-
-So the opening seed stayed:
-
-1. `clip=5`
-2. one maker order per side
-
-That means higher total budget did not automatically produce a larger opening inventory.
-
-### 2. Fixed target centers are not feasibility-aware
-
-The controller still evaluates drift using fixed target centers:
-
-1. `target_favorite_cost_fraction = 0.635`
-2. `target_underdog_share_fraction = 0.555`
-
-Those targets are treated as active drifts even when:
-
-1. current side prices are extremely asymmetric
-2. maker lot size is fixed at `5`
-3. hard skew cap is fixed at `1.40`
-4. the next valid 5-share action cannot move the book toward those centers without breaking another hard rule
-
-So the controller keeps seeing `favorite_cost_drift`, even when the next legal trade is not actually viable.
-
-### 3. `stop_overlay` disables the normal optional builder paths
-
-In the same runs, the logs repeatedly showed:
-
-1. `market_regime=stop_overlay`
-2. `optionality=repair_only`
-
-That means:
-
-1. favorite-size-up stayed off
-2. underdog-overlay stayed off
-3. only repair-style actions remained eligible
-
-If the remaining drift is not repairable with a legal 5-share maker order, the bot just holds.
+1. settlement shaper now stops in the same near-expiry window as the old maker flow
+2. that part is still working as intended
 
 ---
 
-## Main Mismatch Against Sprint 3
+## Current Dominant Failure Modes
 
-Sprint 3 does not describe a "seed once, then mostly hold" wallet.
+### Failure Mode 1: missing-side `EntryRepair` is still blocked by `hard_skew_breach`
 
-Sprint 3 intends a mode that:
+Observed evidence during the latest run:
 
-1. holds both sides
-2. spends more dollars on the favorite
-3. ends with more shares on the underdog
-4. keeps pair coverage high
-5. keeps skew mild
-6. keeps shaping through the market
-7. then holds to settlement
+1. after ownership moved to `EntryRepair`, every repair tick logged:
+   - `missing_side=NO`
+   - `trigger=startup_asymmetry`
+   - `reason=hard_skew_breach`
+2. there was no real `SETTLEMENT_SHAPER_ENTRY_REPAIR` submit after the one-leg seed outcome
+3. this persisted through:
+   - `SeedBothSides`
+   - `EarlyBuild`
+   - `MainAccumulation`
+   - `FinishShape`
+   - `FreezeRepairOnly`
 
-The current canary is not yet doing item 6 reliably.
+Interpretation:
 
-The current implementation is therefore:
+1. the controller correctly recognizes a true missing-side startup recovery state
+2. the actual repair admission logic is still applying the normal hard-skew gate
+3. that gate should not own a true missing-side recovery for the entire market
 
-1. correct as a mode boundary and early controller canary
-2. incorrect as a final Sprint 3 behavioural match
+Practical effect:
 
----
+1. the missing side is never restored
+2. the bot remains one-sided until rollover
 
-## Exact Current Failure Modes
+### Failure Mode 2: the bot can stay one-sided through every phase
 
-### Failure Mode 1: opening inventory is too small
+Observed evidence:
 
-Current behaviour:
+1. at `06:50:04` the live book was already:
+   - `qYES=14.98`
+   - `qNO=0.00`
+2. the same stranded state was still present after:
+   - the `EarlyBuild` phase transition at `06:50:30`
+   - the `MainAccumulation` phase transition at `06:51:00`
+   - `FinishShape`
+   - `FreezeRepairOnly`
 
-1. the mode often starts from `5/5`
-2. the next Sprint 3 shaping action then needs to clear a 5-share maker lot boundary
-3. many target drifts after `5/5` are smaller than that
+Interpretation:
 
-Observed effect:
+1. phase progression is working
+2. but phase progression alone does not help if the core missing-side repair is gated off
+3. the mode can therefore spend an entire market in a stranded startup state
 
-1. `sub_min_best_action action=hold`
+Practical effect:
 
-Result:
+1. the bot never reaches a real two-sided book
+2. no later Sprint 3 shaping behavior can even begin
 
-1. the bot seeds correctly
-2. then it cannot legally place the next maker shaping order
+### Failure Mode 3: favorite/underdog changes do not unblock repair
 
-### Failure Mode 2: target centers are treated as mandatory even when unreachable
+Observed evidence:
 
-Current behaviour:
+1. favorite side flipped several times during the run:
+   - `YES -> NO`
+   - `NO -> YES`
+   - `YES -> NO`
+2. even when projected missing-side repair quality improved materially:
+   - projected `inventory_vwap_sum` dropped as low as about `0.800`
+3. the planner still rejected the repair on the same `hard_skew_breach` reason
 
-1. `ShapeRepair` continues to measure drift against fixed centers
-2. it does not first ask whether those centers are reachable under:
-   - current price ratio
-   - 5-share lot size
-   - current budget
-   - hard skew cap
+Interpretation:
 
-Observed effect:
-
-1. persistent `favorite_cost_drift`
-2. repeated blocked repair attempts
-
-Result:
-
-1. the controller keeps wanting a trade
-2. then rejects the only available next trade
-
-### Failure Mode 3: hard-skew check blocks the only available next step
-
-Current behaviour:
-
-1. in some markets the only obvious way to reduce favorite-cost drift is to buy more underdog
-2. but doing so from a tiny `5/5` book in 5-share steps can immediately jump the share ratio too far
-
-Observed effect:
-
-1. repeated `reason=hard_skew_breach`
-
-Result:
-
-1. the controller has no legal follow-up path
-2. the run stalls after the opening seed
-
-### Failure Mode 4: `stop_overlay` removes non-repair accumulation paths
-
-Current behaviour:
-
-1. when `market_snapshot_vwap_sum > 1.00`, the mode goes to `repair_only`
-2. that shuts down optional builder paths
-
-Observed effect:
-
-1. no favorite-size-up
-2. no underdog-overlay
-3. only repair logic remains
-
-Result:
-
-1. if repair cannot act, nothing else acts
+1. this is not just a stale favorite-role issue
+2. the repair gate itself is too strict for a true missing-side recovery
 
 ---
 
-## Practical Interpretation
+## Detailed Runtime Interpretation
 
-Right now the Sprint 3 canary should be interpreted as:
+### Seed And One-Leg Fill
 
-1. a proof that the new mode boundary works
-2. a proof that settlement-shaper can seed and repair startup asymmetry
-3. a proof that it can carry inventory to settlement ownership
+This part is behaving partly correctly.
 
-It should not be interpreted as:
+The run started with a one-leg seed fill, then:
 
-1. proof that the Sprint 3 inventory-building policy is complete
-2. proof that the bot can actively shape through the full market
-3. proof that the target final book logic is aligned with the wallet
+1. `SeedBothSides` submitted a `15 / 15` paired entry
+2. the YES leg filled almost completely
+3. the NO leg never established inventory
+4. owner switched to `EntryRepair`
 
----
+This is still strong evidence that the startup controller split is correct:
 
-## What Must Change Next
+1. startup asymmetry is not being blurred into generic `ShapeRepair`
+2. the missing side is being identified explicitly
+3. the failure starts after that point
 
-These are the concrete behaviour fixes still required for Sprint 3 alignment.
+### EntryRepair Admission Logic
 
-### 1. Feasible target envelope, not fixed unconditional center
+This is the real blocker in the latest canary.
 
-The controller must stop treating `0.635 / 0.555` as always-live targets.
+Once `EntryRepair` owned the state, the controller repeatedly evaluated the missing-side NO buy and then refused it with:
 
-It needs a feasible target envelope derived from:
+1. `reason=hard_skew_breach`
+2. `missing_side=NO`
+3. `trigger=startup_asymmetry`
 
-1. current favorite / underdog prices
-2. 5-share maker lot size
-3. available budget
-4. hard skew cap
+That means the bug is no longer in:
 
-If the fixed center is infeasible, the controller should target the best feasible nearby shape instead.
+1. seed submission
+2. owner routing
+3. basic missing-side detection
 
-### 2. Seed sizing must scale beyond `5/5`
+It is now inside the missing-side repair admission logic itself.
 
-Raising total budget alone is not enough if opening size remains fixed at `5`.
+### Why This Matters
 
-The mode needs to size the opening two-sided seed so that:
+Sprint 3 cannot behave like the wallet if the mode can spend a full market in a one-sided startup state.
 
-1. the next legal 5-share actions are still available
-2. the initial book is already inside a reachable shaping region
-3. the bot does not start from a book that is too tiny to shape further
+Before any of the normal shaping goals matter, the bot must be able to restore:
 
-### 3. No permanent drift reason when no legal next trade exists
+1. two-sided participation
+2. non-zero `pair_coverage`
+3. a live base book that later phases can shape
 
-If the next legal 5-share trade is impossible under the skew cap, the controller should not keep behaving like:
-
-1. "target still demands action"
-2. "but every action is blocked"
-
-It needs an explicit state like:
-
-1. feasible target reached
-2. no legal next shaping block
-3. pair resting until conditions change
-
-### 4. PairResting should own normal accumulation once the book is healthy
-
-After `5/5` with both sides live, normal shaping should not look like a permanent repair loop.
-
-The normal path needs to become:
-
-1. healthy two-sided book
-2. `PairResting`
-3. phase-appropriate size-up / shaping actions
-4. back to resting
-
-not:
-
-1. healthy two-sided book
-2. `ShapeRepair`
-3. repeated hold logs forever
+The latest run shows that this still is not guaranteed.
 
 ---
 
-## Current Verdict
+## Current Behaviour Conclusion
 
-For Sprint 3, version `0.1.27` should be described as:
+`SETTLEMENT_SHAPER` is still improving, but the current live bottleneck has moved again.
 
-Status: `PARTIAL`
+The latest dominant blocker is now:
 
-More precise description:
+1. one-leg seed fill
+2. correct transfer to `EntryRepair`
+3. missing-side repair rejected as `hard_skew_breach`
+4. one-sided hold until rollover
 
-1. mode boundary is implemented
-2. startup bootstrap is implemented
-3. startup asymmetry repair is implemented
-4. hold-to-resolution ownership is implemented
-5. continuous Sprint 3 shaping is not implemented correctly yet
+So the next controller fix should be:
 
-The most honest behavioural summary is:
+1. let true missing-side startup recovery bypass or relax the normal hard-skew gate
+2. preserve maker-first behavior
+3. restore two-sided participation before directional shape logic is allowed to dominate
 
-1. the bot can now enter the market under Sprint 3
-2. but it still does not behave like the intended settlement-shaping inventory builder
-3. opening-only trading is still a real current limitation
-
----
-
-## Short Operator Read
-
-If the bot currently:
-
-1. seeds at the open
-2. repairs one missing leg
-3. then stops trading for the rest of the market
-
-that is not operator error.
-
-That is the current Sprint 3 behaviour.
-
-The remaining problem is inside the controller:
-
-1. fixed targets
-2. tiny opening size
-3. 5-share maker floor
-4. hard-skew block
-5. `repair_only` gating
-
-Until those are changed, increasing total budget by itself will not make the mode behave like the final Sprint 3 wallet.
+That is the most important live blocker now.

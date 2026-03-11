@@ -16,6 +16,18 @@ and use it to replace the current pair-repair / protected-floor objective with t
 
 This sprint is not a tuning pass. It is a strategy-objective rewrite and a new mode boundary.
 
+## Current Canary Requirements
+The long-term Sprint 3 target still includes settlement accounting and redemption support.
+However, the current live canary requirements are now:
+
+1. foreground near-expiry rollover must match `MAKER_SKEW_ARB`
+   - stop trading inside the normal stop-buffer window
+   - let `main` advance to the next market immediately
+   - do not keep the foreground market loop pinned waiting through expiry
+2. one-sided paired-growth books must not get trapped in indefinite `ShapeRepair`
+   - if the remaining repair is below one maker lot, the controller needs a lot-aware fallback
+   - that fallback should route back to `PairResting` or an explicit healthy-rest state, not repeat `sub_min_best_action=hold` forever
+
 ## Different Strategy From The Current Protected-Floor Bot
 The current bot was shaped around:
 
@@ -271,6 +283,12 @@ Add a new module for the normal end-of-window path:
 3. redeem winning tokens
 4. mark losing side to zero
 5. compute fee-adjusted realized settlement PnL
+
+Current canary requirement:
+
+1. keep `SettlementRedeem` and settlement accounting implemented
+2. but let the foreground market loop roll over near expiry like `MAKER_SKEW_ARB`
+3. do not block the next market by waiting for resolution in the foreground trading loop
 
 ## Window Lifecycle
 ### Phase A: Discovery / Arm
@@ -708,18 +726,26 @@ Do not build this all at once.
 Current status:
 
 1. Sprint 3 implementation started
-2. `EXEC_MODE=SETTLEMENT_SHAPER` now exists as a read-only canary route with its own loop, runtime state, and startup/phase logs
+2. `EXEC_MODE=SETTLEMENT_SHAPER` now exists as a live canary route with its own loop, runtime state, startup/phase logs, and bounded maker actions
 3. Mode Boundary And Routing is complete for the first canary boundary PR
-4. Workstream A derived metrics foundation is complete in the read-only canary
+4. Workstream A derived metrics foundation is complete in the live canary
 5. Workstream G stable favorite / underdog detection with hysteresis and midpoint -> ask/bid proxy -> fair-price fallback pricing is live in the canary
-6. Workstream C phase-local budget ceilings and phase-specific handler routing are live in the read-only canary
-7. Workstream B `SettlementRedeem` state ownership after resolution is live in the read-only canary
-8. Workstream B resolved-market settlement accounting is live in the canary, including final metrics / trade-row settlement reporting
-9. Workstream D owner split is live, `EntryRepair` / `ShapeRepair` have bounded maker execution slices, normal-path repair no longer requires `fee_net_worst_case_pnl >= 0`, sub-min shape repair now compares multiple action families, Workstream E clip ladder support plus distinct favorite-side size-up and underdog overlay are live, and Workstream F explicit `vwap_sum` regime gating now controls normal optionality
-10. Workstream H metrics and canary instrumentation is complete, including final-state metrics, distribution counters, per-phase action summaries, and internal consistency checks surfaced in runtime/final logs
-11. Config And Docs env allowlist and operator documentation are complete for the live settlement-shaper canary surface
-12. Current next task: canary readiness / operator rollout docs once the first real `EXEC_MODE=SETTLEMENT_SHAPER` run is exercised; Workstream G stretch overlay gating remains intentionally deferred
-13. Checklist below remains the concrete build order for the new mode
+6. Workstream C phase-local budget ceilings and phase-specific handler routing are live in the canary
+7. Workstream B `SettlementRedeem` state ownership and resolved-market settlement accounting are live, and foreground near-expiry rollover now matches `MAKER_SKEW_ARB`
+8. Workstream D owner split is live, `EntryRepair` / `ShapeRepair` have bounded maker execution slices, normal-path repair no longer requires `fee_net_worst_case_pnl >= 0`, sub-min shape repair now compares multiple action families, Workstream E clip ladder support plus distinct favorite-side size-up and underdog overlay are live, and Workstream F explicit `vwap_sum` regime gating now controls normal optionality
+9. Workstream H metrics and canary instrumentation is complete, including final-state metrics, distribution counters, per-phase action summaries, and internal consistency checks surfaced in runtime/final logs
+10. Real live canaries have now exercised startup seed, entry repair, balanced base build, one additional paired-growth step, and next-market rollover
+11. Repair sizing no longer rounds `EntryRepair` / `ShapeRepair` clips up to the next ladder rung; repair intents now round down to the nearest maker lot inside the allowed bucket cap
+12. Owner routing now returns no-legal-repair books to `PairResting` with explicit rest reasons, instead of leaving them in indefinite `ShapeRepair` loops
+13. Paired growth now has a narrow blocked-rebuild `inventory_vwap_sum` allowance, so `PairResting` is no longer hard-stopped at `vwap_sum_good` when recovering from `repair_blocked_sub_lot_rest`, `repair_blocked_inventory_quality_rest`, or `repair_blocked_hard_skew_rest`
+14. Paired growth now waits on existing family live orders, ignores already-filled family slots in asymmetry detection, and only records a fresh paired-growth action when both legs are actually live
+15. Config And Docs env allowlist, operator documentation, and `behaviour-0.1.27.md` are complete for the live settlement-shaper canary surface
+16. True missing-side startup recovery now bypasses the normal hard-skew reject path, settlement-shaper builder orders now bypass the generic maker recovery gate, and directional-step now uses a settlement-shaper core-build allowance instead of repair-style target-pressure rejection
+17. Directional-step now also has a near-target blocked-rest `inventory_vwap_sum` allowance, so late-phase one-lot underdog steps can stay live when they reach good coverage and target skew even if projected held `vwap_sum` is slightly above the generic rebuild ceiling
+18. Near-target partial-fill books now treat an almost-exact one-lot underdog surplus as already achieved, so a live state like `49.99 / 45.00` should rest instead of asking for one more full underdog lot
+19. Healthy late books with poor held `inventory_vwap_sum` now stay in `PairResting` instead of falling into `ShapeRepair -> inventory_quality_poor`, so the late builder keeps ownership for books like `45.00 / 44.99`
+20. Current next task: run a fresh live canary to validate that a late healthy book no longer flips into `ShapeRepair -> inventory_quality_poor` and instead stays in `PairResting` for directional build or clean rest; Workstream G stretch overlay gating remains intentionally deferred
+21. Checklist below remains the concrete build order for the new mode
 
 ### Mode Boundary And Routing
 - [x] Add `EXEC_MODE=SETTLEMENT_SHAPER` to the runtime mode dispatch
@@ -757,10 +783,10 @@ Completed in this pass:
 
 ### Workstream B: Discovery / Settlement Ownership
 Completed in this pass:
-1. the canary now waits past expiry for a real resolution signal
-2. `SettlementRedeem` phase ownership activates only after a valid resolved snapshot is observed
-3. resolved-market settlement accounting now latches winner, payout, and loser-zeroed settled shares into runtime state
-4. final metrics and trade-row reporting now surface settlement claim status, winner, payout, and realized settlement PnL
+1. `SettlementRedeem` phase ownership activates only after a valid resolved snapshot is observed
+2. resolved-market settlement accounting now latches winner, payout, and loser-zeroed settled shares into runtime state
+3. final metrics and trade-row reporting now surface settlement claim status, winner, payout, and realized settlement PnL
+4. foreground near-expiry rollover now stops like `MAKER_SKEW_ARB`, so the next market can start without waiting through expiry in the trading loop
 
 - [x] Add a dedicated `SETTLEMENT_SHAPER` runtime state object
 - [x] Add Discovery / Arm lifecycle for the new mode
@@ -799,6 +825,12 @@ Completed in this pass:
 5. normal-path repair now uses target-shape pressure instead of a hard non-negative `fee_net_worst_case_pnl` gate, while still blocking hard-skew worsening actions
 6. sub-min `ShapeRepair` now compares `hold`, `continue shaping`, `exact heavy-side sell`, and `taker buy light side`, then executes the best-scoring target-shape action
 7. focused tests now cover sub-min raw-gap planning, exact heavy-side sell shape improvement, and candidate choice away from flatten-first behavior
+8. repair intents now keep lot-quantized exact sizing instead of rounding up to the next ladder rung
+9. sub-lot and no-legal-repair books now route back to `PairResting` with explicit rest reasons instead of staying in indefinite `ShapeRepair`
+10. paired growth now allows a mild `inventory_vwap_sum` overrun when rebuilding from blocked repair-rest states, including `repair_blocked_sub_lot_rest`, instead of stopping strictly at `vwap_sum_good`
+11. paired growth now waits on existing family live orders, ignores filled family slots for asymmetry detection, and no longer counts a missing leg as a fresh paired-growth submit
+12. true missing-side startup recovery now bypasses the normal hard-skew rejection path, so EntryRepair can restore both-side participation after a one-leg seed fill
+13. settlement-shaper builder orders now bypass the generic maker recovery gate, and directional-step now uses a settlement-shaper core-build allowance instead of repair-style target-pressure rejection
 
 - [x] Add `EntryRepair` as a separate controller for:
   - one side missing
@@ -819,11 +851,14 @@ Completed in this pass:
   - exact heavy-side sell
   - taker buy light side
 - [x] Add tests proving recovery repairs toward target shape, not merely equal shares
+- [x] Add a lot-aware fallback so one-sided paired-growth books do not remain trapped in `weak_coverage -> ShapeRepair -> sub_min_best_action=hold`
+- [x] Allow true missing-side startup recovery to bypass the normal hard-skew reject path so EntryRepair can restore the missing leg after a one-leg seed fill
+- [x] Stop settlement-shaper paired growth / directional-step from inheriting the generic maker recovery gate, and let directional-step use a blocked-rebuild core-build allowance when it improves the current held book
 
 ### Workstream E: Size Ladder And Aggressive Size-Up
 Completed in this pass:
 1. settlement-shaper clip buckets now exist as explicit `small` / `medium` / `large` ladder choices
-2. `EntryRepair` and `ShapeRepair` now quantize requested size onto the ladder instead of emitting arbitrary clip sizes
+2. builder / overlay intents still use the explicit ladder, while repair intents now round down to the nearest maker lot inside the allowed bucket cap
 3. ladder gating keeps `EntryRepair` on small clips, allows medium coverage repair only in healthy main-build conditions, and reserves `80` for future favorite-side size-up
 4. runtime config / submit logs now surface the active clip ladder and chosen clip bucket
 5. `PairResting` now owns a distinct favorite-side size-up maker path with origin/logging separate from `ShapeRepair`
@@ -896,15 +931,15 @@ Completed in this pass:
 - [x] Add new env keys to `src/env_contract.rs`
 - [x] Document all Sprint 3 env keys in `ENVIRONMENT.md`
 - [ ] Update `TARGET_GOAL_STATUS.md` when Sprint 3 has a real runnable canary
-- [ ] Add a `behaviour-<version>.md` note once the first `SETTLEMENT_SHAPER` canary is run
+- [x] Add a `behaviour-<version>.md` note once the first `SETTLEMENT_SHAPER` canary is run
 
 ### Canary Readiness Criteria
-- [ ] New mode compiles and tests pass
+- [x] New mode compiles and tests pass
 - [x] Final logs expose the active phase, target state, and settlement result
-- [ ] No hidden fallback into `MAKER_SKEW_ARB` behavior when `EXEC_MODE=SETTLEMENT_SHAPER`
-- [ ] Metrics are emitted and internally coherent
-- [ ] First canary can be run with `EXEC_MODE=SETTLEMENT_SHAPER`
-- [ ] Baseline comparison remains possible with `EXEC_MODE=MAKER_SKEW_ARB`
+- [x] No hidden fallback into `MAKER_SKEW_ARB` behavior when `EXEC_MODE=SETTLEMENT_SHAPER`
+- [x] Metrics are emitted and internally coherent
+- [x] First canary can be run with `EXEC_MODE=SETTLEMENT_SHAPER`
+- [x] Baseline comparison remains possible with `EXEC_MODE=MAKER_SKEW_ARB`
 
 ## Initial Config Shape
 Sprint 3 should aim for a first config surface like:
@@ -980,3 +1015,5 @@ That means Sprint 3 is a strategy-objective rewrite and should be built as:
 not as a small patch on Step 2.
 
 The implementation should be a target-state controller, not a collection of heuristics.
+
+

@@ -4,7 +4,7 @@ use crate::db::TradeDecisionUpsert;
 use crate::env_utils::{env_bool, env_float, env_int};
 use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
 use crate::helpers::{
-    clamp, cost_per_pair, iso_to_epoch, load_state, locked_profit, q_down, q_up, round_down,
+    clamp, cost_per_pair, iso_to_epoch, load_state, locked_profit, q_down, round_down,
     round_up, save_state, segment_defaults, BotState, OpenOrderState,
     SniperEntryBreakoutAnchorState,
 };
@@ -879,6 +879,13 @@ struct SettlementShaperCoreBuildDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+struct SettlementShaperPairOrderAsymmetry {
+    live_side: SettlementShaperSide,
+    state: MakerOrderLifecycle,
+    age_s: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct SettlementShaperPhaseBudgetBand {
     min_fraction: f64,
     max_fraction: f64,
@@ -1216,9 +1223,9 @@ fn settlement_shaper_entry_repair_clip(
     let present_qty =
         settlement_shaper_side_qty(metrics.q_yes, metrics.q_no, missing_side.opposite()).max(0.0);
     if present_qty <= 1e-9 {
-        return min_clip;
+        return 0.0;
     }
-    present_qty.min(max_clip).max(min_clip)
+    present_qty.min(max_clip).max(0.0)
 }
 
 fn settlement_shaper_round_down_to_lot(
@@ -1321,6 +1328,10 @@ fn settlement_shaper_preferred_rung(
     }
 }
 
+fn settlement_shaper_directional_surplus_tolerance(lot: f64) -> f64 {
+    (lot.max(1.0) * 0.001).clamp(0.02, 0.05)
+}
+
 fn settlement_shaper_directional_goal_state(
     metrics: &SettlementShaperMetricsSnapshot,
     preferred_rung: SettlementShaperPreferredRung,
@@ -1340,9 +1351,11 @@ fn settlement_shaper_directional_goal_state(
         .map(|side| settlement_shaper_side_qty(metrics.q_yes, metrics.q_no, side.opposite()))
         .unwrap_or(0.0);
     let underdog_surplus = underdog_qty - favorite_qty;
+    let surplus_tolerance = settlement_shaper_directional_surplus_tolerance(lot);
     SettlementShaperDirectionalGoalState {
         favorite_has_dollar_lead: favorite_cost > underdog_cost + 1e-9,
-        underdog_has_one_lot_surplus: underdog_surplus + 1e-9 >= lot.max(1.0),
+        underdog_has_one_lot_surplus: underdog_surplus + surplus_tolerance + 1e-9
+            >= lot.max(1.0),
         directional_shape_feasible: preferred_rung.feasible,
         current_underdog_surplus: underdog_surplus,
     }
@@ -1384,13 +1397,31 @@ fn settlement_shaper_core_build_decision(
     } else {
         reachable_balanced_qty.max(current_base)
     };
+    let base_gap = (build_target_base - current_base).max(0.0);
 
-    if build_target_base > current_base + 1e-9 {
+    if base_gap + 1e-9 >= lot {
         return Some(SettlementShaperCoreBuildDecision {
             mode: SettlementShaperCoreBuildMode::PairedGrowth,
             reason: "building_paired_base",
             side: None,
             clip: lot,
+            preferred_rung,
+            goal_state,
+        });
+    }
+
+    if base_gap > 1e-9
+        && metrics.pair_coverage + 1e-9 >= cfg.pair_coverage_soft_min
+        && metrics.share_skew_ratio <= cfg.share_skew_target_high + 1e-9
+        && metrics.inventory_vwap_sum <= cfg.vwap_sum_good + 1e-9
+        && goal_state.favorite_has_dollar_lead
+        && goal_state.underdog_has_one_lot_surplus
+    {
+        return Some(SettlementShaperCoreBuildDecision {
+            mode: SettlementShaperCoreBuildMode::RestUnreachable,
+            reason: "shape_healthy_rest",
+            side: None,
+            clip: 0.0,
             preferred_rung,
             goal_state,
         });
@@ -1573,8 +1604,12 @@ fn settlement_shaper_shape_repair_plan(
 fn settlement_shaper_shape_repair_reason(
     metrics: &SettlementShaperMetricsSnapshot,
     cfg: &SettlementShaperConfigSnapshot,
+    min_shares: f64,
 ) -> Option<&'static str> {
-    if metrics.pair_coverage.is_finite() && metrics.pair_coverage < cfg.pair_coverage_good {
+    if metrics.pair_coverage.is_finite()
+        && metrics.pair_coverage < cfg.pair_coverage_good
+        && !settlement_shaper_is_near_target_sub_lot_healthy_hold(metrics, cfg, min_shares)
+    {
         return Some("weak_coverage");
     }
     if metrics.share_skew_ratio.is_finite()
@@ -1588,6 +1623,60 @@ fn settlement_shaper_shape_repair_reason(
         return Some("inventory_quality_poor");
     }
     None
+}
+
+fn settlement_shaper_has_two_sided_participation(
+    metrics: &SettlementShaperMetricsSnapshot,
+) -> bool {
+    settlement_shaper_has_side_participation(metrics.q_yes, metrics.cost_yes)
+        && settlement_shaper_has_side_participation(metrics.q_no, metrics.cost_no)
+}
+
+fn settlement_shaper_coverage_repair_qty_to_good(
+    metrics: &SettlementShaperMetricsSnapshot,
+    cfg: &SettlementShaperConfigSnapshot,
+) -> Option<f64> {
+    let lighter_side = settlement_shaper_lighter_share_side(metrics)?;
+    let heavy_qty = settlement_shaper_side_qty(metrics.q_yes, metrics.q_no, lighter_side.opposite());
+    let light_qty = settlement_shaper_side_qty(metrics.q_yes, metrics.q_no, lighter_side);
+    Some(((cfg.pair_coverage_good * heavy_qty.max(0.0)) - light_qty.max(0.0)).max(0.0))
+}
+
+fn settlement_shaper_repair_blocked_rest_reason(
+    metrics: &SettlementShaperMetricsSnapshot,
+    cfg: &SettlementShaperConfigSnapshot,
+    min_shares: f64,
+) -> Option<&'static str> {
+    let lot = min_shares.max(1.0);
+    if !settlement_shaper_has_two_sided_participation(metrics) {
+        return None;
+    }
+
+    if metrics.pair_coverage.is_finite()
+        && metrics.pair_coverage + 1e-9 < cfg.pair_coverage_good
+        && metrics.share_skew_ratio.is_finite()
+        && metrics.share_skew_ratio <= cfg.share_skew_soft_cap + 1e-9
+        && settlement_shaper_coverage_repair_qty_to_good(metrics, cfg)
+            .map(|needed| needed > 1e-9 && needed + 1e-9 < lot)
+            .unwrap_or(false)
+    {
+        return Some("repair_blocked_sub_lot_rest");
+    }
+
+    let inventory_poor = settlement_shaper_vwap_regime(metrics.inventory_vwap_sum, cfg)
+        == SettlementShaperVwapRegime::StopOverlay;
+    let healthy_structure = metrics.pair_coverage.is_finite()
+        && metrics.pair_coverage + 1e-9 >= cfg.pair_coverage_good
+        && metrics.share_skew_ratio.is_finite()
+        && metrics.share_skew_ratio <= cfg.share_skew_target_high + 1e-9;
+    if !inventory_poor || !healthy_structure {
+        return None;
+    }
+
+    // Healthy two-sided books with poor held quality should stay in the
+    // builder lane. Let PairResting choose paired growth, directional step,
+    // or hold instead of handing these states to ShapeRepair.
+    Some("repair_blocked_inventory_quality_rest")
 }
 
 fn settlement_shaper_owner_decision_for_phase(
@@ -1623,7 +1712,16 @@ fn settlement_shaper_owner_decision_for_phase(
                     owner: SettlementShaperControlOwner::EntryRepair,
                     reason,
                 }
-            } else if let Some(reason) = settlement_shaper_shape_repair_reason(metrics, cfg) {
+            } else if let Some(reason) =
+                settlement_shaper_repair_blocked_rest_reason(metrics, cfg, min_shares)
+            {
+                SettlementShaperOwnerDecision {
+                    owner: SettlementShaperControlOwner::PairResting,
+                    reason,
+                }
+            } else if let Some(reason) =
+                settlement_shaper_shape_repair_reason(metrics, cfg, min_shares)
+            {
                 SettlementShaperOwnerDecision {
                     owner: SettlementShaperControlOwner::ShapeRepair,
                     reason,
@@ -1897,19 +1995,12 @@ fn settlement_shaper_settlement_state_from_resolution(
     })
 }
 
-fn settlement_shaper_should_rollover_flat_market(
-    q_yes: f64,
-    q_no: f64,
-    total_cost: f64,
+fn settlement_shaper_should_stop_for_rollover(
     seconds_left: f64,
     stop_buffer_seconds: i64,
 ) -> bool {
-    let flat_eps = 1e-6;
-    if q_yes.abs() > flat_eps || q_no.abs() > flat_eps || total_cost.abs() > flat_eps {
-        return false;
-    }
     let rollover_seconds_left = seconds_left - 10.0;
-    rollover_seconds_left <= stop_buffer_seconds.max(0) as f64
+    rollover_seconds_left < stop_buffer_seconds.max(0) as f64
 }
 
 fn settlement_shaper_phase_handler_for_phase(
@@ -2242,10 +2333,51 @@ fn settlement_shaper_small_ladder_max(cfg: &SettlementShaperConfigSnapshot) -> f
         .fold(0.0, f64::max)
 }
 
+fn settlement_shaper_clip_lot_size(cfg: &SettlementShaperConfigSnapshot) -> f64 {
+    let lot = cfg
+        .clip_ladder_small
+        .iter()
+        .copied()
+        .filter(|clip| clip.is_finite() && *clip > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    if lot.is_finite() { lot } else { 1.0 }
+}
+
 fn settlement_shaper_ladder_max(cfg: &SettlementShaperConfigSnapshot) -> f64 {
     settlement_shaper_small_ladder_max(cfg)
         .max(cfg.clip_ladder_medium)
         .max(cfg.clip_ladder_large)
+}
+
+fn settlement_shaper_clip_bucket_cap(
+    bucket: SettlementShaperClipBucket,
+    cfg: &SettlementShaperConfigSnapshot,
+) -> f64 {
+    match bucket {
+        SettlementShaperClipBucket::Small => settlement_shaper_small_ladder_max(cfg),
+        SettlementShaperClipBucket::Medium => settlement_shaper_small_ladder_max(cfg)
+            .max(cfg.clip_ladder_medium.max(0.0)),
+        SettlementShaperClipBucket::Large => settlement_shaper_small_ladder_max(cfg)
+            .max(cfg.clip_ladder_medium.max(0.0))
+            .max(cfg.clip_ladder_large.max(0.0)),
+    }
+}
+
+fn settlement_shaper_repair_clip_bucket(
+    requested_clip: f64,
+    max_bucket: SettlementShaperClipBucket,
+    cfg: &SettlementShaperConfigSnapshot,
+) -> SettlementShaperClipBucket {
+    let requested_clip = requested_clip.max(0.0);
+    let small_cap = settlement_shaper_clip_bucket_cap(SettlementShaperClipBucket::Small, cfg);
+    if max_bucket == SettlementShaperClipBucket::Small || requested_clip <= small_cap + 1e-9 {
+        return SettlementShaperClipBucket::Small;
+    }
+    let medium_cap = settlement_shaper_clip_bucket_cap(SettlementShaperClipBucket::Medium, cfg);
+    if max_bucket == SettlementShaperClipBucket::Medium || requested_clip <= medium_cap + 1e-9 {
+        return SettlementShaperClipBucket::Medium;
+    }
+    SettlementShaperClipBucket::Large
 }
 
 fn settlement_shaper_max_clip_bucket(
@@ -2302,6 +2434,24 @@ fn settlement_shaper_clip_choice(
 ) -> SettlementShaperClipChoice {
     let requested_clip = requested_clip.max(0.0);
     let max_bucket = settlement_shaper_max_clip_bucket(intent, phase, metrics, cfg);
+    if matches!(
+        intent,
+        SettlementShaperClipIntent::EntryRepair
+            | SettlementShaperClipIntent::ShapeRepairCoverage
+            | SettlementShaperClipIntent::ShapeRepairFraction
+    ) {
+        let bucket = settlement_shaper_repair_clip_bucket(requested_clip, max_bucket, cfg);
+        let clip = settlement_shaper_round_down_to_lot(
+            requested_clip.min(settlement_shaper_clip_bucket_cap(bucket, cfg)),
+            settlement_shaper_clip_lot_size(cfg),
+        );
+        return SettlementShaperClipChoice {
+            requested_clip,
+            clip,
+            bucket,
+        };
+    }
+
     let mut ladder: Vec<(SettlementShaperClipBucket, f64)> = cfg
         .clip_ladder_small
         .iter()
@@ -2496,6 +2646,134 @@ fn settlement_shaper_optionality_policy(
     } else {
         SettlementShaperOptionalityPolicy::Normal
     }
+}
+
+fn settlement_shaper_paired_growth_vwap_allowed(
+    owner_reason: &'static str,
+    current_metrics: &SettlementShaperMetricsSnapshot,
+    projected_metrics: &SettlementShaperMetricsSnapshot,
+    cfg: &SettlementShaperConfigSnapshot,
+) -> bool {
+    if projected_metrics.inventory_vwap_sum <= cfg.vwap_sum_good + 1e-9 {
+        return true;
+    }
+    if !matches!(
+        owner_reason,
+        "repair_blocked_sub_lot_rest"
+            | "repair_blocked_inventory_quality_rest"
+            | "repair_blocked_hard_skew_rest"
+    ) {
+        return false;
+    }
+
+    let current_vwap = current_metrics.inventory_vwap_sum;
+    if !current_vwap.is_finite() {
+        return false;
+    }
+
+    let projected_vwap = projected_metrics.inventory_vwap_sum;
+    let mild_rebuild_ceiling = cfg.vwap_sum_stop_overlay + 0.01;
+    let mild_worsening_allowed = projected_vwap <= mild_rebuild_ceiling + 1e-9
+        && projected_vwap <= current_vwap + 0.01 + 1e-9;
+    let improving_current_book = projected_vwap + 1e-9 < current_vwap;
+
+    mild_worsening_allowed || improving_current_book
+}
+
+fn settlement_shaper_directional_goal_pressure(
+    metrics: &SettlementShaperMetricsSnapshot,
+    cfg: &SettlementShaperConfigSnapshot,
+) -> f64 {
+    let Some(favorite_side) = metrics.favorite_side else {
+        return 0.0;
+    };
+    let lot = settlement_shaper_clip_lot_size(cfg).max(1.0);
+    let favorite_cost = settlement_shaper_side_cost(metrics.cost_yes, metrics.cost_no, favorite_side);
+    let underdog_cost =
+        settlement_shaper_side_cost(metrics.cost_yes, metrics.cost_no, favorite_side.opposite());
+    let favorite_qty = settlement_shaper_side_qty(metrics.q_yes, metrics.q_no, favorite_side);
+    let underdog_qty = settlement_shaper_side_qty(metrics.q_yes, metrics.q_no, favorite_side.opposite());
+    let favorite_shortfall = (underdog_cost - favorite_cost).max(0.0);
+    let underdog_surplus = underdog_qty - favorite_qty;
+    let surplus_shortfall = ((lot - underdog_surplus).max(0.0)) / lot;
+    favorite_shortfall + surplus_shortfall
+}
+
+fn settlement_shaper_directional_step_vwap_allowed(
+    owner_reason: &'static str,
+    current_metrics: &SettlementShaperMetricsSnapshot,
+    projected_metrics: &SettlementShaperMetricsSnapshot,
+    cfg: &SettlementShaperConfigSnapshot,
+) -> bool {
+    if settlement_shaper_paired_growth_vwap_allowed(
+        owner_reason,
+        current_metrics,
+        projected_metrics,
+        cfg,
+    ) {
+        return true;
+    }
+
+    if !matches!(
+        owner_reason,
+        "repair_blocked_sub_lot_rest"
+            | "repair_blocked_inventory_quality_rest"
+            | "repair_blocked_hard_skew_rest"
+    ) {
+        return false;
+    }
+
+    let current_vwap = current_metrics.inventory_vwap_sum;
+    if !current_vwap.is_finite() {
+        return false;
+    }
+
+    let projected_vwap = projected_metrics.inventory_vwap_sum;
+    let projected_hits_core_shape = projected_metrics.pair_coverage + 1e-9 >= cfg.pair_coverage_good
+        && projected_metrics.share_skew_ratio <= cfg.target_share_skew_ratio + 0.02 + 1e-9;
+    if !projected_hits_core_shape {
+        return false;
+    }
+
+    projected_vwap <= current_vwap + 0.03 + 1e-9
+        && projected_vwap <= cfg.vwap_sum_stop_overlay + 0.10 + 1e-9
+}
+
+fn settlement_shaper_directional_step_goal_reject_reason(
+    current_metrics: &SettlementShaperMetricsSnapshot,
+    projected_metrics: &SettlementShaperMetricsSnapshot,
+    cfg: &SettlementShaperConfigSnapshot,
+) -> Option<&'static str> {
+    let Some(favorite_side) = current_metrics.favorite_side else {
+        return Some("missing_favorite_side");
+    };
+    let current_favorite_lead = settlement_shaper_side_cost(
+        current_metrics.cost_yes,
+        current_metrics.cost_no,
+        favorite_side,
+    ) - settlement_shaper_side_cost(
+        current_metrics.cost_yes,
+        current_metrics.cost_no,
+        favorite_side.opposite(),
+    );
+    let projected_favorite_lead = settlement_shaper_side_cost(
+        projected_metrics.cost_yes,
+        projected_metrics.cost_no,
+        favorite_side,
+    ) - settlement_shaper_side_cost(
+        projected_metrics.cost_yes,
+        projected_metrics.cost_no,
+        favorite_side.opposite(),
+    );
+    if current_favorite_lead > 1e-9 && projected_favorite_lead <= 1e-9 {
+        return Some("favorite_dollar_lead_lost");
+    }
+    let current_pressure = settlement_shaper_directional_goal_pressure(current_metrics, cfg);
+    let projected_pressure = settlement_shaper_directional_goal_pressure(projected_metrics, cfg);
+    if projected_pressure + 1e-9 >= current_pressure {
+        return Some("directional_goal_not_improving");
+    }
+    None
 }
 
 fn settlement_shaper_underdog_overlay_candidate_clips(
@@ -3178,14 +3456,133 @@ fn settlement_shaper_target_pressure(
         + directional_penalty
 }
 
+fn settlement_shaper_is_near_target_sub_lot_healthy_hold(
+    metrics: &SettlementShaperMetricsSnapshot,
+    cfg: &SettlementShaperConfigSnapshot,
+    min_shares: f64,
+) -> bool {
+    if metrics.yes_ref_bid <= 0.0 || metrics.no_ref_bid <= 0.0 {
+        return false;
+    }
+    if !metrics.pair_coverage.is_finite() || metrics.pair_coverage + 1e-9 < cfg.pair_coverage_soft_min
+    {
+        return false;
+    }
+    if !metrics.share_skew_ratio.is_finite()
+        || metrics.share_skew_ratio > cfg.share_skew_target_high + 1e-9
+    {
+        return false;
+    }
+    if !metrics.inventory_vwap_sum.is_finite() || metrics.inventory_vwap_sum > cfg.vwap_sum_good + 1e-9
+    {
+        return false;
+    }
+    let Some(plan) = settlement_shaper_shape_repair_plan(
+        metrics,
+        cfg,
+        metrics.yes_ref_bid,
+        metrics.no_ref_bid,
+        min_shares,
+        min_shares,
+    ) else {
+        return true;
+    };
+    plan.sub_min
+}
+
+fn settlement_shaper_origin_owns_recovery(origin: &str) -> bool {
+    origin.starts_with("SETTLEMENT_SHAPER_")
+}
+
+fn settlement_shaper_maker_slot_family_live(
+    slot: &MakerOrderSlot,
+    origin_prefix: &str,
+) -> bool {
+    let outstanding = match slot.state {
+        MakerOrderLifecycle::SubmitPending => slot.remaining.max(slot.size).max(0.0),
+        MakerOrderLifecycle::Working | MakerOrderLifecycle::CancelPending => {
+            slot.remaining.max(0.0)
+        }
+        MakerOrderLifecycle::Idle => 0.0,
+    };
+    slot.order_id.is_some()
+        && !origin_prefix.trim().is_empty()
+        && slot.origin.starts_with(origin_prefix)
+        && outstanding > 1e-6
+        && matches!(
+            slot.state,
+            MakerOrderLifecycle::Working
+                | MakerOrderLifecycle::SubmitPending
+                | MakerOrderLifecycle::CancelPending
+        )
+}
+
+fn settlement_shaper_pair_submit_leg_is_new(
+    live_oid: Option<&str>,
+    prev_slot: &MakerOrderSlot,
+) -> bool {
+    let Some(live_oid) = live_oid.filter(|oid| !oid.trim().is_empty()) else {
+        return false;
+    };
+    prev_slot.order_id.as_deref() != Some(live_oid) || prev_slot.state != MakerOrderLifecycle::Working
+}
+
+fn maker_order_lifecycle_label(state: MakerOrderLifecycle) -> &'static str {
+    match state {
+        MakerOrderLifecycle::Idle => "Idle",
+        MakerOrderLifecycle::SubmitPending => "SubmitPending",
+        MakerOrderLifecycle::Working => "Working",
+        MakerOrderLifecycle::CancelPending => "CancelPending",
+    }
+}
+
+fn settlement_shaper_pair_order_asymmetry(
+    yes_slot: &MakerOrderSlot,
+    no_slot: &MakerOrderSlot,
+    origin_prefix: &str,
+    now: f64,
+) -> Option<SettlementShaperPairOrderAsymmetry> {
+    let yes_live = settlement_shaper_maker_slot_family_live(yes_slot, origin_prefix);
+    let no_live = settlement_shaper_maker_slot_family_live(no_slot, origin_prefix);
+    match (yes_live, no_live) {
+        (true, false) => Some(SettlementShaperPairOrderAsymmetry {
+            live_side: SettlementShaperSide::Yes,
+            state: yes_slot.state,
+            age_s: (now - yes_slot.last_submit_ts).max(0.0),
+        }),
+        (false, true) => Some(SettlementShaperPairOrderAsymmetry {
+            live_side: SettlementShaperSide::No,
+            state: no_slot.state,
+            age_s: (now - no_slot.last_submit_ts).max(0.0),
+        }),
+        _ => None,
+    }
+}
+
+fn settlement_shaper_allows_missing_side_bootstrap_hard_skew(
+    current: &SettlementShaperMetricsSnapshot,
+    projected: &SettlementShaperMetricsSnapshot,
+) -> bool {
+    let current_has_exactly_one_side =
+        (current.q_yes > 1e-9 && current.q_no <= 1e-9) || (current.q_no > 1e-9 && current.q_yes <= 1e-9);
+    let projected_has_both_sides = projected.q_yes > 1e-9 && projected.q_no > 1e-9;
+    current_has_exactly_one_side
+        && projected_has_both_sides
+        && projected.pair_coverage > current.pair_coverage + 1e-9
+        && projected.share_skew_ratio < current.share_skew_ratio
+}
+
 fn settlement_shaper_repair_economics_policy(
     current: &SettlementShaperMetricsSnapshot,
     projected: &SettlementShaperMetricsSnapshot,
     projected_worst_case_pnl: f64,
     cfg: &SettlementShaperConfigSnapshot,
 ) -> SettlementShaperRepairEconomicsPolicy {
+    let allow_missing_side_bootstrap_hard_skew =
+        settlement_shaper_allows_missing_side_bootstrap_hard_skew(current, projected);
     if projected.share_skew_ratio.is_finite()
         && projected.share_skew_ratio > cfg.share_skew_hard_cap + 1e-9
+        && !allow_missing_side_bootstrap_hard_skew
     {
         return SettlementShaperRepairEconomicsPolicy::RejectHardSkewBreach;
     }
@@ -4628,6 +5025,58 @@ impl MakerHedgeCapBot {
         }
     }
 
+    fn _tick_size_decimals(tick_size: TickSize) -> u32 {
+        match tick_size {
+            TickSize::ZeroPointOne => 1,
+            TickSize::ZeroPointZeroOne => 2,
+            TickSize::ZeroPointZeroZeroOne => 3,
+            TickSize::ZeroPointZeroZeroZeroOne => 4,
+        }
+    }
+
+    fn _gcd_u64(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        a.max(1)
+    }
+
+    fn _maker_limit_buy_size_quantum(price: f64, tick_size: TickSize) -> f64 {
+        if !price.is_finite() || price <= 0.0 {
+            return 0.01;
+        }
+        let price_dp = Self::_tick_size_decimals(tick_size);
+        let denom = 10_u64.pow(price_dp);
+        let price_units = (q_down(price.max(0.0), price_dp) * denom as f64).round() as u64;
+        if price_units == 0 {
+            return 0.01;
+        }
+        let gcd = Self::_gcd_u64(price_units, denom);
+        ((denom / gcd) as f64 / 100.0).max(0.01)
+    }
+
+    fn _maker_limit_exchange_quantized_size(
+        side: ClobSide,
+        price: f64,
+        size: f64,
+        tick_size: TickSize,
+    ) -> f64 {
+        let size = q_down(size.max(0.0), 2).max(0.0);
+        if size <= 0.0 {
+            return 0.0;
+        }
+        let quantum = match side {
+            ClobSide::Buy => Self::_maker_limit_buy_size_quantum(price, tick_size),
+            ClobSide::Sell => 0.01,
+        };
+        if !quantum.is_finite() || quantum <= 0.010_000_001 {
+            return size;
+        }
+        q_down(round_down(size, quantum).max(0.0), 2).max(0.0)
+    }
+
     fn _value_f64(v: Option<&Value>) -> Option<f64> {
         v.and_then(|x| match x {
             Value::Number(n) => n.as_f64(),
@@ -5367,6 +5816,18 @@ impl MakerHedgeCapBot {
         }
     }
 
+    fn _settlement_shaper_pair_order_asymmetry(
+        &self,
+        now: f64,
+        yes_asset: &str,
+        no_asset: &str,
+        origin_prefix: &str,
+    ) -> Option<SettlementShaperPairOrderAsymmetry> {
+        let yes_slot = self._maker_order_slot_get(&MakerOrderKey::buy(yes_asset));
+        let no_slot = self._maker_order_slot_get(&MakerOrderKey::buy(no_asset));
+        settlement_shaper_pair_order_asymmetry(&yes_slot, &no_slot, origin_prefix, now)
+    }
+
     fn _settlement_shaper_favorite_size_up_decision(
         &self,
         phase: SettlementShaperPhase,
@@ -5944,6 +6405,17 @@ impl MakerHedgeCapBot {
             metrics,
             cfg,
         );
+        if clip_choice.clip + 1e-9 < self.cfg.min_shares.max(1.0) {
+            self._settlement_shaper_cancel_stale_entry_repair_orders(None);
+            self.logger.info(&format!(
+                "[SETTLEMENT_SHAPER][ENTRY_REPAIR] hold phase={} reason=sub_min_missing_side_gap missing_side={} requested_clip={:.2} trigger={}",
+                phase.as_str(),
+                missing_side.as_str(),
+                clip_choice.requested_clip,
+                owner_reason
+            ));
+            return phase_control;
+        }
         let projected_metrics = settlement_shaper_projected_metrics_after_buy(
             metrics,
             y_bid,
@@ -6603,15 +7075,22 @@ impl MakerHedgeCapBot {
             clip,
             cfg,
         );
-        if projected_metrics.inventory_vwap_sum > cfg.vwap_sum_good + 1e-9 {
+        if !settlement_shaper_paired_growth_vwap_allowed(
+            owner_reason,
+            metrics,
+            &projected_metrics,
+            cfg,
+        ) {
             self._settlement_shaper_cancel_stale_paired_growth_orders();
             self.logger.info(&format!(
-                "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason=projected_inventory_vwap_too_high trigger={} clip={:.2} projected_inventory_vwap_sum={:.3} preferred_base={:.2}",
+                "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason=projected_inventory_vwap_too_high trigger={} clip={:.2} current_inventory_vwap_sum={:.3} projected_inventory_vwap_sum={:.3} normal_vwap_ceiling={:.3} preferred_base={:.2}",
                 phase.as_str(),
                 decision.mode.as_str(),
                 owner_reason,
                 clip,
+                metrics.inventory_vwap_sum,
                 projected_metrics.inventory_vwap_sum,
+                cfg.vwap_sum_good,
                 decision.preferred_rung.balanced_base_qty
             ));
             return phase_control;
@@ -6622,10 +7101,117 @@ impl MakerHedgeCapBot {
             self._settlement_shaper_cancel_stale_paired_growth_orders();
             return phase_control;
         }
+        let asymmetry_timeout_s = self.cfg.stale_seconds.max(1) as f64;
         let yes_key = MakerOrderKey::buy(yes_asset);
         let no_key = MakerOrderKey::buy(no_asset);
-        let prev_yes_slot = self._maker_order_slot_get(&yes_key);
-        let prev_no_slot = self._maker_order_slot_get(&no_key);
+        let yes_slot = self._maker_order_slot_get(&yes_key);
+        let no_slot = self._maker_order_slot_get(&no_key);
+        let yes_live = settlement_shaper_maker_slot_family_live(
+            &yes_slot,
+            "SETTLEMENT_SHAPER_PAIRED_GROWTH",
+        );
+        let no_live = settlement_shaper_maker_slot_family_live(
+            &no_slot,
+            "SETTLEMENT_SHAPER_PAIRED_GROWTH",
+        );
+        if yes_live && no_live {
+            let yes_age_s = (now - yes_slot.last_submit_ts).max(0.0);
+            let no_age_s = (now - no_slot.last_submit_ts).max(0.0);
+            let max_age_s = yes_age_s.max(no_age_s);
+            if max_age_s >= asymmetry_timeout_s
+                && yes_slot.state != MakerOrderLifecycle::CancelPending
+                && no_slot.state != MakerOrderLifecycle::CancelPending
+            {
+                let _ = self._maker_order_request_cancel(
+                    &yes_key,
+                    &format!(
+                        "SETTLEMENT_SHAPER paired growth stale both_live yes_age_s={yes_age_s:.1} no_age_s={no_age_s:.1}"
+                    ),
+                );
+                let _ = self._maker_order_request_cancel(
+                    &no_key,
+                    &format!(
+                        "SETTLEMENT_SHAPER paired growth stale both_live yes_age_s={yes_age_s:.1} no_age_s={no_age_s:.1}"
+                    ),
+                );
+                self.logger.info(&format!(
+                    "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason=paired_growth_live_orders_stale_cancel trigger={} yes_state={} no_state={} yes_age_s={:.1} no_age_s={:.1} clip={:.2}",
+                    phase.as_str(),
+                    decision.mode.as_str(),
+                    owner_reason,
+                    maker_order_lifecycle_label(yes_slot.state),
+                    maker_order_lifecycle_label(no_slot.state),
+                    yes_age_s,
+                    no_age_s,
+                    clip
+                ));
+            } else {
+                self.logger.info(&format!(
+                    "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason=awaiting_paired_growth_live_orders trigger={} yes_state={} no_state={} yes_age_s={:.1} no_age_s={:.1} clip={:.2}",
+                    phase.as_str(),
+                    decision.mode.as_str(),
+                    owner_reason,
+                    maker_order_lifecycle_label(yes_slot.state),
+                    maker_order_lifecycle_label(no_slot.state),
+                    yes_age_s,
+                    no_age_s,
+                    clip
+                ));
+            }
+            return phase_control;
+        }
+        if let Some(asymmetry) = self._settlement_shaper_pair_order_asymmetry(
+            now,
+            yes_asset,
+            no_asset,
+            "SETTLEMENT_SHAPER_PAIRED_GROWTH",
+        ) {
+            let live_asset = match asymmetry.live_side {
+                SettlementShaperSide::Yes => yes_asset,
+                SettlementShaperSide::No => no_asset,
+            };
+            let live_key = MakerOrderKey::buy(live_asset);
+            if asymmetry.state != MakerOrderLifecycle::CancelPending
+                && asymmetry.age_s >= asymmetry_timeout_s
+            {
+                let _ = self._maker_order_request_cancel(
+                    &live_key,
+                    &format!(
+                        "SETTLEMENT_SHAPER asymmetric paired growth stale live_side={} age_s={:.1}",
+                        asymmetry.live_side.as_str(),
+                        asymmetry.age_s
+                    ),
+                );
+                self.logger.info(&format!(
+                    "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason=asymmetric_submit_stale_cancel trigger={} live_side={} age_s={:.1} clip={:.2}",
+                    phase.as_str(),
+                    decision.mode.as_str(),
+                    owner_reason,
+                    asymmetry.live_side.as_str(),
+                    asymmetry.age_s,
+                    clip
+                ));
+            } else {
+                self.logger.info(&format!(
+                    "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason=awaiting_asymmetric_submit_resolution trigger={} live_side={} live_state={} age_s={:.1} clip={:.2}",
+                    phase.as_str(),
+                    decision.mode.as_str(),
+                    owner_reason,
+                    asymmetry.live_side.as_str(),
+                    match asymmetry.state {
+                        MakerOrderLifecycle::Idle => "Idle",
+                        MakerOrderLifecycle::SubmitPending => "SubmitPending",
+                        MakerOrderLifecycle::Working => "Working",
+                        MakerOrderLifecycle::CancelPending => "CancelPending",
+                    },
+                    asymmetry.age_s,
+                    clip
+                ));
+            }
+            return phase_control;
+        }
+        let prev_yes_slot = yes_slot;
+        let prev_no_slot = no_slot;
         let submit_started = now_ts_f64();
         let (y_oid, n_oid) = self._maker_submit_pair_orders(
             size_int,
@@ -6636,20 +7222,19 @@ impl MakerHedgeCapBot {
             "SETTLEMENT_SHAPER_PAIRED_GROWTH",
         );
         let submit_elapsed_ms = ((now_ts_f64() - submit_started).max(0.0)) * 1000.0;
-        if y_oid.is_some() ^ n_oid.is_some() {
-            let reason =
-                format!("SETTLEMENT_SHAPER asymmetric paired growth submit elapsed_ms={submit_elapsed_ms:.0}");
-            if y_oid.is_some() {
-                let _ = self._maker_order_request_cancel(&yes_key, &reason);
-            }
-            if n_oid.is_some() {
-                let _ = self._maker_order_request_cancel(&no_key, &reason);
-            }
+        if let Some(asymmetry) = self._settlement_shaper_pair_order_asymmetry(
+            now_ts_f64(),
+            yes_asset,
+            no_asset,
+            "SETTLEMENT_SHAPER_PAIRED_GROWTH",
+        ) {
             self.logger.info(&format!(
-                "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason=asymmetric_submit trigger={} clip={:.2}",
+                "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason=asymmetric_submit trigger={} live_side={} age_s={:.1} elapsed_ms={submit_elapsed_ms:.0} clip={:.2}",
                 phase.as_str(),
                 decision.mode.as_str(),
                 owner_reason,
+                asymmetry.live_side.as_str(),
+                asymmetry.age_s,
                 clip
             ));
             return phase_control;
@@ -6657,11 +7242,9 @@ impl MakerHedgeCapBot {
 
         let yes_live = self._maker_order_slot_get(&yes_key).order_id.or(y_oid);
         let no_live = self._maker_order_slot_get(&no_key).order_id.or(n_oid);
-        let yes_new = yes_live.as_deref() != prev_yes_slot.order_id.as_deref()
-            || prev_yes_slot.state != MakerOrderLifecycle::Working;
-        let no_new = no_live.as_deref() != prev_no_slot.order_id.as_deref()
-            || prev_no_slot.state != MakerOrderLifecycle::Working;
-        if yes_new || no_new {
+        let yes_new = settlement_shaper_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
+        let no_new = settlement_shaper_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
+        if yes_new && no_new {
             let clip_bucket = settlement_shaper_bucket_for_clip(clip, cfg);
             self.logger.info(&format!(
                 "[SETTLEMENT_SHAPER][PAIRED_GROWTH] submit phase={} pair_sum={:.3} clip={:.2} clip_bucket={} trigger={} current_base={:.2} preferred_base={:.2} preferred_directional={:.2}/{:.2} projected_inventory_vwap_sum={:.3}",
@@ -6797,7 +7380,12 @@ impl MakerHedgeCapBot {
         );
         if projected_metrics.pair_coverage + 1e-9 < cfg.pair_coverage_good
             || projected_metrics.share_skew_ratio > cfg.share_skew_target_high + 1e-9
-            || projected_metrics.inventory_vwap_sum > cfg.vwap_sum_good + 1e-9
+            || !settlement_shaper_directional_step_vwap_allowed(
+                owner_reason,
+                metrics,
+                &projected_metrics,
+                cfg,
+            )
         {
             self._settlement_shaper_cancel_stale_directional_step_orders(None);
             self.logger.info(&format!(
@@ -6834,19 +7422,17 @@ impl MakerHedgeCapBot {
                 bid,
             ),
         };
-        let economics_policy = settlement_shaper_repair_economics_policy(
+        if let Some(reason) = settlement_shaper_directional_step_goal_reject_reason(
             metrics,
             &projected_metrics,
-            projected_fee_snap.fee_net_worst_case_pnl,
             cfg,
-        );
-        if !economics_policy.allows_submit() {
+        ) {
             self._settlement_shaper_cancel_stale_directional_step_orders(None);
             self.logger.info(&format!(
                 "[SETTLEMENT_SHAPER][PAIR_RESTING] hold phase={} builder_mode={} reason={} trigger={} side={} clip={:.2} projected_worst_case={:+.4}",
                 phase.as_str(),
                 decision.mode.as_str(),
-                economics_policy.as_str(),
+                reason,
                 owner_reason,
                 side.as_str(),
                 clip,
@@ -7311,6 +7897,53 @@ impl MakerHedgeCapBot {
             ));
             return phase_control;
         }
+        let asymmetry_timeout_s = self.cfg.stale_seconds.max(1) as f64;
+        if let Some(asymmetry) = self._settlement_shaper_pair_order_asymmetry(
+            now,
+            yes_asset,
+            no_asset,
+            "SETTLEMENT_SHAPER_SEED_BOTH_SIDES",
+        ) {
+            let live_asset = match asymmetry.live_side {
+                SettlementShaperSide::Yes => yes_asset,
+                SettlementShaperSide::No => no_asset,
+            };
+            let live_key = MakerOrderKey::buy(live_asset);
+            if asymmetry.state != MakerOrderLifecycle::CancelPending
+                && asymmetry.age_s >= asymmetry_timeout_s
+            {
+                let _ = self._maker_order_request_cancel(
+                    &live_key,
+                    &format!(
+                        "SETTLEMENT_SHAPER asymmetric seed stale live_side={} age_s={:.1}",
+                        asymmetry.live_side.as_str(),
+                        asymmetry.age_s
+                    ),
+                );
+                self.logger.info(&format!(
+                    "[SETTLEMENT_SHAPER][SEED_BOTH_SIDES] hold phase={} reason=asymmetric_submit_stale_cancel live_side={} age_s={:.1} trigger={}",
+                    phase.as_str(),
+                    asymmetry.live_side.as_str(),
+                    asymmetry.age_s,
+                    owner_reason
+                ));
+            } else {
+                self.logger.info(&format!(
+                    "[SETTLEMENT_SHAPER][SEED_BOTH_SIDES] hold phase={} reason=awaiting_asymmetric_submit_resolution live_side={} live_state={} age_s={:.1} trigger={}",
+                    phase.as_str(),
+                    asymmetry.live_side.as_str(),
+                    match asymmetry.state {
+                        MakerOrderLifecycle::Idle => "Idle",
+                        MakerOrderLifecycle::SubmitPending => "SubmitPending",
+                        MakerOrderLifecycle::Working => "Working",
+                        MakerOrderLifecycle::CancelPending => "CancelPending",
+                    },
+                    asymmetry.age_s,
+                    owner_reason
+                ));
+            }
+            return phase_control;
+        }
 
         let yes_key = MakerOrderKey::buy(yes_asset);
         let no_key = MakerOrderKey::buy(no_asset);
@@ -7326,19 +7959,17 @@ impl MakerHedgeCapBot {
             "SETTLEMENT_SHAPER_SEED_BOTH_SIDES",
         );
         let submit_elapsed_ms = ((now_ts_f64() - submit_started).max(0.0)) * 1000.0;
-        if y_oid.is_some() ^ n_oid.is_some() {
-            let reason = format!(
-                "SETTLEMENT_SHAPER asymmetric seed submit elapsed_ms={submit_elapsed_ms:.0}"
-            );
-            if y_oid.is_some() {
-                let _ = self._maker_order_request_cancel(&yes_key, &reason);
-            }
-            if n_oid.is_some() {
-                let _ = self._maker_order_request_cancel(&no_key, &reason);
-            }
+        if let Some(asymmetry) = self._settlement_shaper_pair_order_asymmetry(
+            now_ts_f64(),
+            yes_asset,
+            no_asset,
+            "SETTLEMENT_SHAPER_SEED_BOTH_SIDES",
+        ) {
             self.logger.info(&format!(
-                "[SETTLEMENT_SHAPER][SEED_BOTH_SIDES] hold phase={} reason=asymmetric_submit elapsed_ms={submit_elapsed_ms:.0} trigger={}",
+                "[SETTLEMENT_SHAPER][SEED_BOTH_SIDES] hold phase={} reason=asymmetric_submit live_side={} age_s={:.1} elapsed_ms={submit_elapsed_ms:.0} trigger={}",
                 phase.as_str(),
+                asymmetry.live_side.as_str(),
+                asymmetry.age_s,
                 owner_reason
             ));
             return phase_control;
@@ -7933,7 +8564,6 @@ impl MakerHedgeCapBot {
     fn _run_settlement_shaper_loop(&self) -> String {
         let mut last_log = 0.0;
         let mut stale_logged = false;
-        let mut resolution_wait_logged = false;
         self.logger.info(
             "[SETTLEMENT_SHAPER] limited canary active; EntryRepair, ShapeRepair, favorite-side size-up, and underdog-overlay maker actions enabled, all other owners remain observe-only",
         );
@@ -7947,6 +8577,21 @@ impl MakerHedgeCapBot {
                 .lock()
                 .map(|s| (s.c_yes + s.c_no, s.q_yes, s.q_no))
                 .unwrap_or((0.0, 0.0, 0.0));
+
+            if settlement_shaper_should_stop_for_rollover(seconds_left, self.cfg.stop_buffer_seconds)
+            {
+                self.logger.info(&format!(
+                    "[SETTLEMENT_SHAPER] Expiring in {:.0}s -> stopping for rollover.",
+                    (seconds_left - 10.0).max(0.0)
+                ));
+                self._settlement_shaper_cancel_stale_entry_repair_orders(None);
+                self._settlement_shaper_cancel_stale_shape_repair_orders(None);
+                self._settlement_shaper_cancel_stale_favorite_size_up_orders(None);
+                self._settlement_shaper_cancel_stale_underdog_overlay_orders(None);
+                self.cancel_all_orders_exchange("expiry");
+                self._set_exit_reason("ROLLOVER");
+                break;
+            }
 
             let step = self._settlement_shaper_step(now, qy, qn, total_cost);
             let snapshot = &step.metrics;
@@ -8110,41 +8755,6 @@ impl MakerHedgeCapBot {
                     target_gaps
                 ));
                 last_log = now;
-            }
-
-            if !step.resolution.market_resolved && seconds_left <= 0.0 {
-                if !resolution_wait_logged {
-                    self.logger.info(&format!(
-                        "[SETTLEMENT_SHAPER] freeze hold waiting_for_resolution t_left={:.1}s",
-                        seconds_left
-                    ));
-                    resolution_wait_logged = true;
-                }
-            } else if resolution_wait_logged && seconds_left > 0.0 {
-                resolution_wait_logged = false;
-            }
-
-            if step.settlement.claim_status == SettlementShaperClaimStatus::None
-                && !step.resolution.market_resolved
-                && settlement_shaper_should_rollover_flat_market(
-                    qy,
-                    qn,
-                    total_cost,
-                    seconds_left,
-                    self.cfg.stop_buffer_seconds,
-                )
-            {
-                self.logger.info(&format!(
-                    "[SETTLEMENT_SHAPER] flat market expiring in {:.0}s -> stopping for rollover.",
-                    (seconds_left - 10.0).max(0.0)
-                ));
-                self._settlement_shaper_cancel_stale_entry_repair_orders(None);
-                self._settlement_shaper_cancel_stale_shape_repair_orders(None);
-                self._settlement_shaper_cancel_stale_favorite_size_up_orders(None);
-                self._settlement_shaper_cancel_stale_underdog_overlay_orders(None);
-                self.cancel_all_orders_exchange("settlement_shaper_flat_rollover");
-                self._set_exit_reason("SETTLEMENT_SHAPER_FLAT_ROLLOVER");
-                break;
             }
 
             if step.settlement.claim_status == SettlementShaperClaimStatus::Accounted
@@ -12915,7 +13525,9 @@ impl MakerHedgeCapBot {
             recovery_asset,
             _recovery_unsettled_heavy,
         ) = self._maker_recovery_mode_snapshot();
-        if recovery_active {
+        let settlement_shaper_origin_owns_recovery =
+            settlement_shaper_origin_owns_recovery(origin);
+        if recovery_active && !settlement_shaper_origin_owns_recovery {
             if let Some(light_asset_id) = recovery_asset.as_deref() {
                 if key.asset_id != light_asset_id {
                     // Always block heavy-side BUY during recovery
@@ -12928,7 +13540,7 @@ impl MakerHedgeCapBot {
                     ));
                     return None;
                 }
-                // Light-side: one-flight — block stacking if a recovery order is already unsettled
+                // Light-side: one-flight ? block stacking if a recovery order is already unsettled
                 let light_unsettled = self._maker_recovery_unsettled_buy_risk(light_asset_id);
                 if light_unsettled > 1e-6 && !self._maker_recovery_light_requote_ready(light_asset_id)
                 {
@@ -12969,6 +13581,16 @@ impl MakerHedgeCapBot {
                     }
                 }
             }
+        }
+        let tick_size = Self::_tick_size_from_f64(self.cfg.tick.max(0.0001));
+        target_size = Self::_maker_limit_exchange_quantized_size(
+            ClobSide::Buy,
+            target_price,
+            target_size,
+            tick_size,
+        );
+        if target_size <= 0.0 {
+            return None;
         }
         if slot.state == MakerOrderLifecycle::SubmitPending
             && now - slot.last_submit_ts < submit_ttl
@@ -13523,6 +14145,7 @@ impl MakerHedgeCapBot {
             return (None, None);
         }
         let qty = size_int as f64;
+        let tick_size = Self::_tick_size_from_f64(self.cfg.tick.max(0.0001));
         let (yes, no) = match (&self.yes_asset, &self.no_asset) {
             (Some(y), Some(n)) => (y.as_str(), n.as_str()),
             _ => return (None, None),
@@ -13536,10 +14159,25 @@ impl MakerHedgeCapBot {
         let cancel_other_on_no_oid =
             pair_base_ack_controls && pair_base_entry_cancel_other_on_no_oid();
         let ack_timeout_ms = pair_base_entry_ack_timeout_ms();
+        let use_limit_precision = matches!(resolved.as_str(), "GTC" | "GTD");
+        let y_qty = if use_limit_precision {
+            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, y_px, qty, tick_size)
+        } else {
+            qty
+        };
+        let n_qty = if use_limit_precision {
+            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, n_px, qty, tick_size)
+        } else {
+            qty
+        };
+        if y_qty <= 0.0 || n_qty <= 0.0 {
+            return (None, None);
+        }
         let (y_oid, n_oid) = if resolved == "GTC" && self._maker_single_inflight_enabled() {
             let y_key = MakerOrderKey::buy(yes);
             let n_key = MakerOrderKey::buy(no);
-            let y_oid = self._maker_order_upsert_gtc(&y_key, y_px, qty, &format!("{origin}_YES"));
+            let y_oid =
+                self._maker_order_upsert_gtc(&y_key, y_px, y_qty, &format!("{origin}_YES"));
             let first_leg_elapsed_ms = ((now_ts_f64() - decide_ts).max(0.0)) * 1000.0;
             if pair_base_should_abort_second_leg(
                 require_both_acks,
@@ -13566,7 +14204,7 @@ impl MakerHedgeCapBot {
                 (y_oid, None)
             } else {
                 let n_oid =
-                    self._maker_order_upsert_gtc(&n_key, n_px, qty, &format!("{origin}_NO"));
+                    self._maker_order_upsert_gtc(&n_key, n_px, n_qty, &format!("{origin}_NO"));
                 if require_both_acks && cancel_other_on_no_oid && y_oid.is_some() && n_oid.is_none() {
                     let _ = self._maker_order_request_cancel(
                         &y_key,
@@ -13583,13 +14221,13 @@ impl MakerHedgeCapBot {
                 "asset_id": yes,
                 "side": "BUY",
                 "price": y_px,
-                "size": qty,
+                "size": y_qty,
             });
             let signed_n = json!({
                 "asset_id": no,
                 "side": "BUY",
                 "price": n_px,
-                "size": qty,
+                "size": n_qty,
             });
             let resps = self._post_orders_compat(&[signed_y, signed_n], &resolved, post_only);
             (
@@ -13599,7 +14237,7 @@ impl MakerHedgeCapBot {
         };
         if let Some(oid) = &y_oid {
             if track_taker_fallback {
-                self._remember_taker_order(oid, yes, qty, y_px, "BUY");
+                self._remember_taker_order(oid, yes, y_qty, y_px, "BUY");
             } else {
                 self._forget_taker_order(oid);
             }
@@ -13610,7 +14248,7 @@ impl MakerHedgeCapBot {
                     "asset_id": yes,
                     "side": "BUY",
                     "px_limit": y_px,
-                    "size": qty,
+                    "size": y_qty,
                     "decision_ts": decide_ts,
                     "decision_ns": decide_ns,
                     "post_start_ts": decide_ts,
@@ -13621,7 +14259,7 @@ impl MakerHedgeCapBot {
         }
         if let Some(oid) = &n_oid {
             if track_taker_fallback {
-                self._remember_taker_order(oid, no, qty, n_px, "BUY");
+                self._remember_taker_order(oid, no, n_qty, n_px, "BUY");
             } else {
                 self._forget_taker_order(oid);
             }
@@ -13632,7 +14270,7 @@ impl MakerHedgeCapBot {
                     "asset_id": no,
                     "side": "BUY",
                     "px_limit": n_px,
-                    "size": qty,
+                    "size": n_qty,
                     "decision_ts": decide_ts,
                     "decision_ns": decide_ns,
                     "post_start_ts": decide_ts,
@@ -19438,12 +20076,20 @@ impl MakerHedgeCapBot {
             .get("price")
             .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok()))
             .unwrap_or(0.0);
-        let size = signed_order
+        let mut size = signed_order
             .get("size")
             .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok()))
             .unwrap_or(0.0);
         if price <= 0.0 || size <= 0.0 {
             return None;
+        }
+        let clob_order_type = Self::_clob_order_type(order_type);
+        if matches!(clob_order_type, ClobOrderType::Gtc | ClobOrderType::Gtd) {
+            let tick_size_guess = Self::_tick_size_from_f64(self.cfg.tick.max(0.0001));
+            size = Self::_maker_limit_exchange_quantized_size(side, price, size, tick_size_guess);
+            if size <= 0.0 {
+                return None;
+            }
         }
         if post_only.unwrap_or(false) {
             if let Some((bid, ask)) = self._best_bid_ask(&asset_id) {
@@ -19457,7 +20103,6 @@ impl MakerHedgeCapBot {
             }
         }
 
-        let clob_order_type = Self::_clob_order_type(order_type);
         let local_fallback = || {
             let oid = crate::db::new_uuid();
             let row = json!({
@@ -19488,6 +20133,28 @@ impl MakerHedgeCapBot {
             .unwrap_or_else(|_| Self::_tick_size_from_f64(self.cfg.tick.max(0.0001)));
         let neg_risk = rt.block_on(client.get_neg_risk(&asset_id)).unwrap_or(false);
         let fee_rate_bps = rt.block_on(client.get_fee_rate_bps(&asset_id)).ok();
+        let normalized_size = if matches!(clob_order_type, ClobOrderType::Gtc | ClobOrderType::Gtd)
+        {
+            Self::_maker_limit_exchange_quantized_size(side, price, size, tick_size)
+        } else {
+            size
+        };
+        if normalized_size <= 0.0 {
+            return None;
+        }
+        if (normalized_size - size).abs() > 1e-9 {
+            self.logger.info(&format!(
+                "[CLOB][PRECISION] quantized limit order asset={} side={} price={:.3} requested_size={:.4} normalized_size={:.4} order_type={} post_only={}",
+                asset_id,
+                side_u,
+                price,
+                size,
+                normalized_size,
+                order_type.to_ascii_uppercase(),
+                post_only.unwrap_or(false),
+            ));
+        }
+        size = normalized_size;
         let prep_end_ns = now_ns();
         let prep_end_ts = now_ts_f64();
 
@@ -19615,18 +20282,26 @@ impl MakerHedgeCapBot {
         } else {
             0.01
         };
-        let mut dp = env_int("SIZE_DECIMALS", 6);
-        dp = dp.clamp(0, 8);
-        let dp = dp as u32;
-
-        let mut size = q_down(size.max(0.0), dp);
         let price = round_down(price.max(0.0), tick);
+        let tick_size = Self::_tick_size_from_f64(tick);
+        let mut size =
+            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, price, size, tick_size);
         if size < self.cfg.min_shares || price <= 0.0 {
             return None;
         }
         if price * size < self.min_maker_notional {
-            let need_size = q_up(self.min_maker_notional / price, dp);
-            size = size.max(need_size).max(self.cfg.min_shares);
+            let need_size = Self::_maker_limit_exchange_quantized_size(
+                ClobSide::Buy,
+                price,
+                self.min_maker_notional / price,
+                tick_size,
+            );
+            size = Self::_maker_limit_exchange_quantized_size(
+                ClobSide::Buy,
+                price,
+                size.max(need_size).max(self.cfg.min_shares),
+                tick_size,
+            );
             if price * size < self.min_maker_notional {
                 return None;
             }
@@ -19714,6 +20389,7 @@ impl MakerHedgeCapBot {
         let mut px = clamp(price, tick, 0.99);
         px = round_down(px, tick);
         px = clamp(px, tick, 0.99);
+        let tick_size = Self::_tick_size_from_f64(tick);
 
         let min_int = ((self.cfg.min_shares - 1e-12).ceil() as i64).max(1);
         let mut sz_int = (size + 1e-12).floor() as i64;
@@ -19724,6 +20400,11 @@ impl MakerHedgeCapBot {
         if sz_int < min_int {
             sz_int = min_int;
         }
+        let size =
+            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, px, sz_int as f64, tick_size);
+        if size + 1e-9 < min_int as f64 {
+            return None;
+        }
         if self.cfg.dry_run {
             let oid = format!("DRY_LIMIT_GTC_{}", (now_ts_f64() * 1000.0) as i64);
             if let Ok(mut s) = self.state.lock() {
@@ -19732,14 +20413,14 @@ impl MakerHedgeCapBot {
                     OpenOrderState {
                         order_id: Some(oid.clone()),
                         price: Some(px),
-                        size: Some(sz_int as f64),
+                        size: Some(size),
                         ts: Some(now_ts_f64()),
                     },
                 );
                 let _ = save_state(&self.state_file, &mut s);
             }
             self.logger.info(&format!(
-                "[DRY] limit bid GTC asset={} px={px:.3} size={} post_only={post_only:?}",
+                "[DRY] limit bid GTC asset={} px={px:.3} size={size:.2} post_only={post_only:?}",
                 asset_id
                     .chars()
                     .rev()
@@ -19747,8 +20428,7 @@ impl MakerHedgeCapBot {
                     .collect::<String>()
                     .chars()
                     .rev()
-                    .collect::<String>(),
-                sz_int
+                    .collect::<String>()
             ));
             return Some(oid);
         }
@@ -19759,7 +20439,7 @@ impl MakerHedgeCapBot {
             "asset_id": asset_id,
             "side": "BUY",
             "price": px,
-            "size": sz_int,
+            "size": size,
         });
         let oid = self._post_order_compat(&signed, "GTC", post_only)?;
         if let Ok(mut s) = self.state.lock() {
@@ -19768,7 +20448,7 @@ impl MakerHedgeCapBot {
                 OpenOrderState {
                     order_id: Some(oid.clone()),
                     price: Some(px),
-                    size: Some(sz_int as f64),
+                    size: Some(size),
                     ts: Some(now_ts_f64()),
                 },
             );
@@ -19781,7 +20461,7 @@ impl MakerHedgeCapBot {
                 "asset_id": asset_id,
                 "side": "BUY",
                 "px_limit": px,
-                "size": sz_int,
+                "size": size,
                 "decision_ts": decide_ts,
                 "decision_ns": decide_ns,
                 "post_start_ts": decide_ts,
@@ -19808,7 +20488,9 @@ impl MakerHedgeCapBot {
         let mut px = clamp(price, tick, 0.99);
         px = round_down(px, tick);
         px = clamp(px, tick, 0.99);
-        let size = round_down(size.max(0.0), 0.01);
+        let tick_size = Self::_tick_size_from_f64(tick);
+        let size =
+            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, px, size, tick_size);
         if size < 0.01 {
             return None;
         }
@@ -24653,11 +25335,16 @@ mod tests {
         settlement_shaper_market_snapshot_price,
         settlement_shaper_min_balanced_base_qty,
         settlement_shaper_owner_decision_for_phase,
+        settlement_shaper_pair_order_asymmetry,
+        settlement_shaper_pair_submit_leg_is_new,
         settlement_shaper_optionality_policy,
+        settlement_shaper_paired_growth_vwap_allowed,
         settlement_shaper_preferred_rung,
         settlement_shaper_projected_metrics_after_exact_sell,
         settlement_shaper_projected_metrics_after_buy, settlement_shaper_repair_economics_policy,
+        settlement_shaper_allows_missing_side_bootstrap_hard_skew,
         settlement_shaper_seed_pair_size, settlement_shaper_should_seed_both_sides,
+        settlement_shaper_shape_repair_reason,
         settlement_shaper_shape_repair_plan, settlement_shaper_target_pressure,
         settlement_shaper_metrics_consistency_issues, settlement_shaper_metrics_summary_from_runtime,
         settlement_shaper_metrics_snapshot, settlement_shaper_pair_coverage,
@@ -24666,7 +25353,7 @@ mod tests {
         settlement_shaper_next_phase, settlement_shaper_resolution_state_from_rtds_fields,
         settlement_shaper_resolution_winner_from_diff,
         settlement_shaper_settlement_state_from_resolution,
-        settlement_shaper_should_rollover_flat_market,
+        settlement_shaper_should_stop_for_rollover,
         settlement_shaper_phase_from_t_into_s, settlement_shaper_provisional_favorite_side,
         settlement_shaper_role_hysteresis_next,
         settlement_shaper_share_skew_ratio, settlement_shaper_skew_gap,
@@ -24692,7 +25379,8 @@ mod tests {
         SettlementShaperPricingSource,
         SettlementShaperSubMinActionCandidate,
         SettlementShaperSubMinActionKind, SettlementShaperTargetGaps,
-        SettlementShaperVwapRegime, SkewOverlayState,
+        SettlementShaperVwapRegime, SkewOverlayState, ClobSide, TickSize,
+        MakerOrderLifecycle, MakerOrderSlot,
     };
 
     #[test]
@@ -24894,26 +25582,11 @@ mod tests {
     }
 
     #[test]
-    fn settlement_shaper_rollover_flat_market_requires_flat_inventory() {
-        assert!(!settlement_shaper_should_rollover_flat_market(
-            1.0, 0.0, 0.0, 5.0, 15
-        ));
-        assert!(!settlement_shaper_should_rollover_flat_market(
-            0.0, 0.0, 1.0, 5.0, 15
-        ));
-    }
-
-    #[test]
-    fn settlement_shaper_rollover_flat_market_uses_stop_buffer_window() {
-        assert!(settlement_shaper_should_rollover_flat_market(
-            0.0, 0.0, 0.0, 24.0, 15
-        ));
-        assert!(!settlement_shaper_should_rollover_flat_market(
-            0.0, 0.0, 0.0, 26.0, 15
-        ));
-        assert!(settlement_shaper_should_rollover_flat_market(
-            0.0, 0.0, 0.0, 0.0, 15
-        ));
+    fn settlement_shaper_rollover_matches_market_loop_stop_buffer() {
+        assert!(settlement_shaper_should_stop_for_rollover(24.0, 15));
+        assert!(!settlement_shaper_should_stop_for_rollover(25.0, 15));
+        assert!(!settlement_shaper_should_stop_for_rollover(26.0, 15));
+        assert!(settlement_shaper_should_stop_for_rollover(0.0, 15));
     }
 
     #[test]
@@ -25209,7 +25882,7 @@ mod tests {
             SettlementShaperSide::Yes,
             5.0,
             25.0
-        ) - 5.0).abs() < 1e-9);
+        ) - 3.0).abs() < 1e-9);
     }
 
     #[test]
@@ -25318,6 +25991,168 @@ mod tests {
         assert_eq!(decision.mode, SettlementShaperCoreBuildMode::RestUnreachable);
         assert_eq!(decision.reason, "directional_target_unreachable_with_budget");
         assert!((decision.preferred_rung.balanced_base_qty - 85.0).abs() < 1e-9, "{decision:?}");
+    }
+
+    #[test]
+    fn settlement_shaper_core_build_decision_rests_when_base_gap_is_sub_lot_and_shape_is_healthy() {
+        let cfg = settlement_shaper_default_config();
+        let metrics = settlement_shaper_metrics_snapshot(
+            44.50,
+            49.99,
+            27.30,
+            15.80,
+            0.61,
+            0.62,
+            0.31,
+            0.32,
+            Some(SettlementShaperSide::Yes),
+            &cfg,
+        );
+
+        let decision = settlement_shaper_core_build_decision(&metrics, 115.0, 5.0, &cfg)
+            .expect("healthy rest decision");
+        assert_eq!(decision.mode, SettlementShaperCoreBuildMode::RestUnreachable);
+        assert_eq!(decision.reason, "shape_healthy_rest");
+    }
+
+    #[test]
+    fn settlement_shaper_core_build_decision_rests_when_partial_fill_already_reaches_one_lot_surplus() {
+        let cfg = settlement_shaper_default_config();
+        let metrics = settlement_shaper_metrics_snapshot(
+            49.99,
+            45.00,
+            14.95,
+            33.55,
+            0.18,
+            0.19,
+            0.83,
+            0.84,
+            Some(SettlementShaperSide::No),
+            &cfg,
+        );
+
+        let decision = settlement_shaper_core_build_decision(&metrics, 115.0, 5.0, &cfg)
+            .expect("near-target rest decision");
+        assert_eq!(decision.mode, SettlementShaperCoreBuildMode::RestUnreachable);
+        assert_eq!(decision.reason, "shape_healthy_rest");
+        assert!(decision.goal_state.favorite_has_dollar_lead, "{decision:?}");
+        assert!(decision.goal_state.underdog_has_one_lot_surplus, "{decision:?}");
+    }
+
+    #[test]
+    fn settlement_shaper_owner_decision_skips_shape_repair_for_near_target_sub_lot_books() {
+        let cfg = settlement_shaper_default_config();
+        let metrics = settlement_shaper_metrics_snapshot(
+            44.50,
+            49.99,
+            27.30,
+            15.80,
+            0.61,
+            0.62,
+            0.31,
+            0.32,
+            Some(SettlementShaperSide::Yes),
+            &cfg,
+        );
+
+        assert_eq!(
+            settlement_shaper_shape_repair_reason(&metrics, &cfg, 5.0),
+            None
+        );
+        let decision = settlement_shaper_owner_decision_for_phase(
+            SettlementShaperPhase::FinishShape,
+            &metrics,
+            115.0,
+            5.0,
+            &cfg,
+        );
+        assert_eq!(decision.owner, SettlementShaperControlOwner::PairResting);
+        assert_eq!(decision.reason, "repair_blocked_sub_lot_rest");
+    }
+
+    #[test]
+    fn settlement_shaper_pair_order_asymmetry_detects_family_scoped_live_side() {
+        let yes_slot = MakerOrderSlot {
+            state: MakerOrderLifecycle::Working,
+            order_id: Some("yes-oid".to_string()),
+            remaining: 5.0,
+            last_submit_ts: 95.0,
+            origin: "SETTLEMENT_SHAPER_PAIRED_GROWTH_YES".to_string(),
+            ..MakerOrderSlot::default()
+        };
+        let no_slot = MakerOrderSlot {
+            state: MakerOrderLifecycle::Idle,
+            origin: "SETTLEMENT_SHAPER_ENTRY_REPAIR".to_string(),
+            ..MakerOrderSlot::default()
+        };
+
+        let asymmetry = settlement_shaper_pair_order_asymmetry(
+            &yes_slot,
+            &no_slot,
+            "SETTLEMENT_SHAPER_PAIRED_GROWTH",
+            100.0,
+        )
+        .expect("paired growth asymmetry");
+        assert_eq!(asymmetry.live_side, SettlementShaperSide::Yes);
+        assert_eq!(asymmetry.state, MakerOrderLifecycle::Working);
+        assert!((asymmetry.age_s - 5.0).abs() < 1e-9);
+
+        assert!(
+            settlement_shaper_pair_order_asymmetry(
+                &yes_slot,
+                &no_slot,
+                "SETTLEMENT_SHAPER_SEED_BOTH_SIDES",
+                100.0,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn settlement_shaper_pair_order_asymmetry_ignores_filled_family_slot() {
+        let yes_slot = MakerOrderSlot {
+            state: MakerOrderLifecycle::Working,
+            order_id: Some("yes-oid".to_string()),
+            size: 5.0,
+            remaining: 0.0,
+            last_submit_ts: 95.0,
+            origin: "SETTLEMENT_SHAPER_PAIRED_GROWTH_YES".to_string(),
+            ..MakerOrderSlot::default()
+        };
+        let no_slot = MakerOrderSlot::default();
+
+        assert!(
+            settlement_shaper_pair_order_asymmetry(
+                &yes_slot,
+                &no_slot,
+                "SETTLEMENT_SHAPER_PAIRED_GROWTH",
+                100.0,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn settlement_shaper_pair_submit_leg_is_new_requires_live_oid() {
+        let prev_slot = MakerOrderSlot {
+            state: MakerOrderLifecycle::Idle,
+            ..MakerOrderSlot::default()
+        };
+        assert!(!settlement_shaper_pair_submit_leg_is_new(None, &prev_slot));
+
+        let working_prev = MakerOrderSlot {
+            state: MakerOrderLifecycle::Working,
+            order_id: Some("same-oid".to_string()),
+            ..MakerOrderSlot::default()
+        };
+        assert!(!settlement_shaper_pair_submit_leg_is_new(
+            Some("same-oid"),
+            &working_prev,
+        ));
+        assert!(settlement_shaper_pair_submit_leg_is_new(
+            Some("new-oid"),
+            &working_prev,
+        ));
     }
 
     #[test]
@@ -25479,7 +26314,7 @@ mod tests {
     }
 
     #[test]
-    fn settlement_shaper_clip_choice_quantizes_entry_repair_to_small_ladder() {
+    fn settlement_shaper_clip_choice_lot_quantizes_entry_repair_without_rounding_up() {
         let cfg = settlement_shaper_default_config();
         let metrics = SettlementShaperMetricsSnapshot {
             pair_coverage: 0.92,
@@ -25497,7 +26332,27 @@ mod tests {
         );
 
         assert_eq!(choice.bucket, SettlementShaperClipBucket::Small);
-        assert!((choice.clip - 20.0).abs() < 1e-9);
+        assert!((choice.clip - 15.0).abs() < 1e-9);
+
+        let exact = settlement_shaper_clip_choice(
+            15.0,
+            SettlementShaperClipIntent::EntryRepair,
+            SettlementShaperPhase::EarlyBuild,
+            &metrics,
+            &cfg,
+        );
+        assert_eq!(exact.bucket, SettlementShaperClipBucket::Small);
+        assert!((exact.clip - 15.0).abs() < 1e-9);
+
+        let sub_min = settlement_shaper_clip_choice(
+            4.9,
+            SettlementShaperClipIntent::EntryRepair,
+            SettlementShaperPhase::EarlyBuild,
+            &metrics,
+            &cfg,
+        );
+        assert_eq!(sub_min.bucket, SettlementShaperClipBucket::Small);
+        assert!(sub_min.clip.abs() < 1e-9);
     }
 
     #[test]
@@ -25528,7 +26383,7 @@ mod tests {
         );
 
         assert_eq!(choice.bucket, SettlementShaperClipBucket::Medium);
-        assert!((choice.clip - 40.0).abs() < 1e-9);
+        assert!((choice.clip - 25.0).abs() < 1e-9);
     }
 
     #[test]
@@ -25869,6 +26724,299 @@ mod tests {
     }
 
     #[test]
+    fn settlement_shaper_paired_growth_vwap_gate_keeps_normal_builder_strict() {
+        let cfg = settlement_shaper_default_config();
+        let current = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 0.995,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+        let projected = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.006,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+
+        assert!(!settlement_shaper_paired_growth_vwap_allowed(
+            "building_paired_base",
+            &current,
+            &projected,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn settlement_shaper_paired_growth_vwap_gate_allows_mild_rebuild_overrun_when_rest_rebuild_is_blocked() {
+        let cfg = settlement_shaper_default_config();
+        let current = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.000,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+        let projected = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.006,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+
+        assert!(settlement_shaper_paired_growth_vwap_allowed(
+            "repair_blocked_inventory_quality_rest",
+            &current,
+            &projected,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn settlement_shaper_paired_growth_vwap_gate_allows_mild_rebuild_overrun_for_sub_lot_rest() {
+        let cfg = settlement_shaper_default_config();
+        let current = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.005,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+        let projected = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.004,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+
+        assert!(settlement_shaper_paired_growth_vwap_allowed(
+            "repair_blocked_sub_lot_rest",
+            &current,
+            &projected,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn settlement_shaper_paired_growth_vwap_gate_allows_rebuild_that_improves_expensive_book() {
+        let cfg = settlement_shaper_default_config();
+        let current = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.038,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+        let projected = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.020,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+
+        assert!(settlement_shaper_paired_growth_vwap_allowed(
+            "repair_blocked_hard_skew_rest",
+            &current,
+            &projected,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn settlement_shaper_paired_growth_vwap_gate_rejects_large_worsening_even_in_rebuild_mode() {
+        let cfg = settlement_shaper_default_config();
+        let current = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.000,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+        let projected = SettlementShaperMetricsSnapshot {
+            inventory_vwap_sum: 1.040,
+            ..SettlementShaperMetricsSnapshot::default()
+        };
+
+        assert!(!settlement_shaper_paired_growth_vwap_allowed(
+            "repair_blocked_inventory_quality_rest",
+            &current,
+            &projected,
+            &cfg,
+        ));
+    }
+
+
+    #[test]
+    fn settlement_shaper_directional_step_vwap_gate_allows_rebuild_from_balanced_expensive_book() {
+        let cfg = settlement_shaper_default_config();
+        let current = settlement_shaper_metrics_snapshot(
+            45.0,
+            45.0,
+            20.45,
+            25.25,
+            0.44,
+            0.45,
+            0.54,
+            0.55,
+            Some(SettlementShaperSide::No),
+            &cfg,
+        );
+        let projected = settlement_shaper_projected_metrics_after_buy(
+            &current,
+            0.44,
+            0.45,
+            0.54,
+            0.55,
+            SettlementShaperSide::Yes,
+            5.0,
+            0.44,
+            &cfg,
+        );
+
+        assert!(super::settlement_shaper_directional_step_vwap_allowed(
+            "repair_blocked_inventory_quality_rest",
+            &current,
+            &projected,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn settlement_shaper_directional_step_vwap_gate_allows_near_target_sub_lot_rest_finish_step() {
+        let cfg = settlement_shaper_default_config();
+        let current = settlement_shaper_metrics_snapshot(
+            55.0,
+            44.99,
+            29.75,
+            23.70,
+            0.47,
+            0.48,
+            0.67,
+            0.68,
+            Some(SettlementShaperSide::No),
+            &cfg,
+        );
+        let projected = settlement_shaper_projected_metrics_after_buy(
+            &current,
+            0.47,
+            0.48,
+            0.67,
+            0.68,
+            SettlementShaperSide::No,
+            5.0,
+            0.67,
+            &cfg,
+        );
+
+        assert!(super::settlement_shaper_directional_step_vwap_allowed(
+            "repair_blocked_sub_lot_rest",
+            &current,
+            &projected,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn settlement_shaper_directional_step_vwap_gate_rejects_large_near_target_worsening() {
+        let cfg = settlement_shaper_default_config();
+        let current = settlement_shaper_metrics_snapshot(
+            55.0,
+            44.99,
+            29.75,
+            23.70,
+            0.47,
+            0.48,
+            0.67,
+            0.68,
+            Some(SettlementShaperSide::No),
+            &cfg,
+        );
+        let projected = settlement_shaper_projected_metrics_after_buy(
+            &current,
+            0.47,
+            0.48,
+            0.95,
+            0.96,
+            SettlementShaperSide::No,
+            5.0,
+            0.95,
+            &cfg,
+        );
+
+        assert!(!super::settlement_shaper_directional_step_vwap_allowed(
+            "repair_blocked_sub_lot_rest",
+            &current,
+            &projected,
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn settlement_shaper_directional_step_goal_reject_reason_allows_goal_improvement() {
+        let cfg = settlement_shaper_default_config();
+        let current = settlement_shaper_metrics_snapshot(
+            45.0,
+            45.0,
+            20.45,
+            25.25,
+            0.44,
+            0.45,
+            0.54,
+            0.55,
+            Some(SettlementShaperSide::No),
+            &cfg,
+        );
+        let projected = settlement_shaper_projected_metrics_after_buy(
+            &current,
+            0.44,
+            0.45,
+            0.54,
+            0.55,
+            SettlementShaperSide::Yes,
+            5.0,
+            0.44,
+            &cfg,
+        );
+
+        assert_eq!(
+            super::settlement_shaper_directional_step_goal_reject_reason(
+                &current,
+                &projected,
+                &cfg,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn settlement_shaper_directional_step_goal_reject_reason_blocks_losing_favorite_dollar_lead() {
+        let cfg = settlement_shaper_default_config();
+        let current = settlement_shaper_metrics_snapshot(
+            45.0,
+            45.0,
+            24.90,
+            25.00,
+            0.50,
+            0.51,
+            0.49,
+            0.50,
+            Some(SettlementShaperSide::No),
+            &cfg,
+        );
+        let projected = settlement_shaper_projected_metrics_after_buy(
+            &current,
+            0.50,
+            0.51,
+            0.49,
+            0.50,
+            SettlementShaperSide::Yes,
+            5.0,
+            0.50,
+            &cfg,
+        );
+
+        assert_eq!(
+            super::settlement_shaper_directional_step_goal_reject_reason(
+                &current,
+                &projected,
+                &cfg,
+            ),
+            Some("favorite_dollar_lead_lost")
+        );
+    }
+
+    #[test]
+    fn settlement_shaper_origin_owns_recovery_matches_settlement_prefix() {
+        assert!(super::settlement_shaper_origin_owns_recovery(
+            "SETTLEMENT_SHAPER_PAIRED_GROWTH_YES"
+        ));
+        assert!(super::settlement_shaper_origin_owns_recovery(
+            "SETTLEMENT_SHAPER_DIRECTIONAL_STEP"
+        ));
+        assert!(!super::settlement_shaper_origin_owns_recovery(
+            "PAIR_BASE_RECOVERY"
+        ));
+    }
+
+    #[test]
     fn settlement_shaper_repair_economics_allows_mild_negative_floor_when_shape_improves() {
         let cfg = settlement_shaper_default_config();
         let current = settlement_shaper_metrics_snapshot(
@@ -25974,6 +27122,42 @@ mod tests {
             settlement_shaper_repair_economics_policy(&current, &projected, 1.00, &cfg),
             SettlementShaperRepairEconomicsPolicy::RejectHardSkewBreach
         );
+    }
+
+    #[test]
+    fn settlement_shaper_repair_economics_allows_missing_side_bootstrap_over_hard_skew() {
+        let cfg = settlement_shaper_default_config();
+        let current = settlement_shaper_metrics_snapshot(
+            14.98,
+            0.0,
+            7.34,
+            0.0,
+            0.49,
+            0.50,
+            0.48,
+            0.49,
+            Some(SettlementShaperSide::Yes),
+            &cfg,
+        );
+        let projected = settlement_shaper_projected_metrics_after_buy(
+            &current,
+            0.49,
+            0.50,
+            0.48,
+            0.49,
+            SettlementShaperSide::No,
+            10.0,
+            0.48,
+            &cfg,
+        );
+
+        assert!(projected.share_skew_ratio > cfg.share_skew_hard_cap);
+        assert!(settlement_shaper_allows_missing_side_bootstrap_hard_skew(
+            &current,
+            &projected
+        ));
+        assert!(settlement_shaper_repair_economics_policy(&current, &projected, -0.50, &cfg)
+            .allows_submit());
     }
 
     #[test]
@@ -26093,6 +27277,123 @@ mod tests {
 
         assert_eq!(owner.owner, SettlementShaperControlOwner::EntryRepair);
         assert_eq!(owner.reason, "startup_asymmetry");
+    }
+
+    #[test]
+    fn settlement_shaper_owner_decision_routes_sub_lot_weak_coverage_back_to_pair_resting() {
+        let cfg = settlement_shaper_default_config();
+        let metrics = settlement_shaper_metrics_snapshot(
+            25.0,
+            20.0,
+            13.70,
+            8.75,
+            0.58,
+            0.59,
+            0.44,
+            0.45,
+            Some(SettlementShaperSide::Yes),
+            &cfg,
+        );
+
+        let owner = settlement_shaper_owner_decision_for_phase(
+            SettlementShaperPhase::EarlyBuild,
+            &metrics,
+            115.0,
+            5.0,
+            &cfg,
+        );
+
+        assert_eq!(owner.owner, SettlementShaperControlOwner::PairResting);
+        assert_eq!(owner.reason, "repair_blocked_sub_lot_rest");
+    }
+
+    #[test]
+    fn settlement_shaper_owner_decision_routes_expensive_balanced_books_to_rest() {
+        let cfg = settlement_shaper_default_config();
+        let metrics = settlement_shaper_metrics_snapshot(
+            20.0,
+            20.0,
+            9.80,
+            10.95,
+            0.49,
+            0.50,
+            0.55,
+            0.56,
+            Some(SettlementShaperSide::No),
+            &cfg,
+        );
+
+        let owner = settlement_shaper_owner_decision_for_phase(
+            SettlementShaperPhase::EarlyBuild,
+            &metrics,
+            115.0,
+            5.0,
+            &cfg,
+        );
+
+        assert_eq!(owner.owner, SettlementShaperControlOwner::PairResting);
+        assert_eq!(owner.reason, "repair_blocked_inventory_quality_rest");
+    }
+
+    #[test]
+    fn settlement_shaper_owner_decision_keeps_inventory_poor_near_balanced_books_in_builder_lane() {
+        let cfg = settlement_shaper_default_config();
+        let metrics = settlement_shaper_metrics_snapshot(
+            45.0,
+            44.99,
+            21.50,
+            24.55,
+            0.42,
+            0.43,
+            0.57,
+            0.58,
+            Some(SettlementShaperSide::No),
+            &cfg,
+        );
+
+        let build = settlement_shaper_core_build_decision(&metrics, 115.0, 5.0, &cfg)
+            .expect("expected late-book directional build decision");
+        assert_eq!(build.mode, SettlementShaperCoreBuildMode::DirectionalStep);
+        assert_eq!(build.reason, "building_directional_surplus");
+
+        let owner = settlement_shaper_owner_decision_for_phase(
+            SettlementShaperPhase::MainAccumulation,
+            &metrics,
+            115.0,
+            5.0,
+            &cfg,
+        );
+
+        assert_eq!(owner.owner, SettlementShaperControlOwner::PairResting);
+        assert_eq!(owner.reason, "repair_blocked_inventory_quality_rest");
+    }
+
+    #[test]
+    fn settlement_shaper_owner_decision_keeps_full_lot_coverage_repairs_in_shape_repair() {
+        let cfg = settlement_shaper_default_config();
+        let metrics = settlement_shaper_metrics_snapshot(
+            30.0,
+            20.0,
+            14.70,
+            8.80,
+            0.49,
+            0.50,
+            0.44,
+            0.45,
+            Some(SettlementShaperSide::Yes),
+            &cfg,
+        );
+
+        let owner = settlement_shaper_owner_decision_for_phase(
+            SettlementShaperPhase::EarlyBuild,
+            &metrics,
+            115.0,
+            5.0,
+            &cfg,
+        );
+
+        assert_eq!(owner.owner, SettlementShaperControlOwner::ShapeRepair);
+        assert_eq!(owner.reason, "weak_coverage");
     }
 
     #[test]
@@ -26806,6 +28107,63 @@ mod tests {
     }
 
     #[test]
+    fn maker_limit_exchange_quantized_size_respects_buy_amount_precision() {
+        assert!(
+            (MakerHedgeCapBot::_maker_limit_exchange_quantized_size(
+                ClobSide::Buy,
+                0.61,
+                4.51,
+                TickSize::ZeroPointZeroOne,
+            ) - 4.0)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (MakerHedgeCapBot::_maker_limit_exchange_quantized_size(
+                ClobSide::Buy,
+                0.50,
+                4.51,
+                TickSize::ZeroPointZeroOne,
+            ) - 4.50)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (MakerHedgeCapBot::_maker_limit_exchange_quantized_size(
+                ClobSide::Buy,
+                0.25,
+                4.51,
+                TickSize::ZeroPointZeroOne,
+            ) - 4.48)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(
+            MakerHedgeCapBot::_maker_limit_exchange_quantized_size(
+                ClobSide::Buy,
+                0.611,
+                5.0,
+                TickSize::ZeroPointZeroZeroOne,
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn maker_limit_exchange_quantized_size_keeps_sell_sizes_at_two_decimals() {
+        assert!(
+            (MakerHedgeCapBot::_maker_limit_exchange_quantized_size(
+                ClobSide::Sell,
+                0.611,
+                4.519,
+                TickSize::ZeroPointZeroZeroOne,
+            ) - 4.51)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
     fn maker_exec_aliases_prefer_tx_then_trade_then_match() {
         let candidate = MakerExecCandidate {
             order_id: "oid-1".to_string(),
@@ -27366,4 +28724,8 @@ mod tests {
         ));
     }
 }
+
+
+
+
 
