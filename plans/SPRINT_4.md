@@ -60,10 +60,10 @@ Sprint 4 is a distinct behavioral track:
 
 ## Status
 - Overall status: `IN PROGRESS`
-- Target outcome: `WALLET-CLONE CANARY`
+- Target outcome: `SECOND_WALLET-CLONE CANARY`
 - Dependency on Sprint 3: `REUSE PARTS ONLY`
 - Recommended runtime boundary: `NEW MODE`
-- Current dominant reason: `FIRST_SPRINT_4_CANARY_NOT_RUN`
+- Current dominant reason: `POST_CANARY_PAIRBUILD_HARDENING`
 
 ## Required Runtime Boundary
 Sprint 4 should land behind a separate top-level path.
@@ -208,6 +208,42 @@ Required policy:
 4. poor CPP may reduce optional add size, but must not stop required two-sided completion
 5. Sprint 4 should remain willing to build inventory aggressively through most of the market even when the next clip is not individually attractive in isolation
 6. profitability should be judged at the market-population level and repeated-fill level, not as a per-clip hard veto
+
+### 10. Post-Canary PairBuild Hardening Requirement
+After the first reviewed Sprint 4 canary, the remaining gap is no longer startup ownership.
+
+The remaining gap is `PairBuild` quality.
+
+Required hardening:
+
+1. wallet-clone live maker orders must not be canceled on the shared generic `STALE_SECONDS` horizon alone
+2. `PairBuild` must use a wallet-clone-specific stale / live-order timeout policy for:
+   - lighter-side-first live orders
+   - paired-growth live orders
+   - asymmetric submit-resolution cleanup
+3. the runtime must not send exchange-invalid sub-minimum maker orders after final quantization
+4. minimum maker notional must be re-checked after the final exchange-precision size is computed, not only before that path
+5. optional normal-flow `PairedGrowth` must use projected matched-book cost quality, not only current inventory cost quality
+6. if projected post-add paired inventory would become too expensive, the bot should:
+   - reduce clip first
+   - then suppress optional paired growth
+   - but still allow startup completion and required lighter-side recovery
+7. when the live book is materially skewed, lighter-side-first ownership should dominate until the skew returns inside a tighter normal band
+
+Not acceptable after this hardening pass:
+
+1. repeated stale-cancel / repost churn on still-viable resting maker orders
+2. exchange rejects for sub-minimum maker notional
+3. normal paired-growth continuing to add optional inventory while projected paired cost is already above a small acceptable band over payout
+
+Expected next-canary targets after this hardening pass:
+
+1. `both_by_30s=true`
+2. `both_by_60s=true`
+3. `unmatched_size <= 2`
+4. `share_skew <= 1.03`
+5. `combined_avg_paid <= 1.005`
+6. materially fewer `*_stale_cancel` events than the first reviewed canary
 
 ## Required State Model
 Sprint 4 should use a simpler mechanical state flow than Sprint 3.
@@ -517,6 +553,50 @@ Tasks:
 Acceptance:
 - [ ] core Sprint 4 state and gating behavior is covered by Rust tests
 
+### Workstream J: Post-Canary PairBuild Hardening
+Status: `IN_PROGRESS`
+
+Objective:
+Move Sprint 4 from "mechanically live" to "closer wallet clone" by fixing the remaining `PairBuild` churn and economics gaps shown by the first reviewed canary.
+
+Protected scope:
+- Keep `PreArm`, `OpenBoth`, `SeedCompletion`, `Taper`, and `HoldSettleRollover` unchanged unless a later canary disproves them.
+- Focus this workstream on mid-market `PairBuild` persistence, repair behavior, and paired economics.
+
+Tasks:
+- [x] Add wallet-clone-specific stale timeout policy for:
+  - lighter-side-first live orders
+  - paired-growth live orders
+  - asymmetric submit-resolution cleanup
+- [x] Stop using the shared generic `STALE_SECONDS` horizon as the only stale-cancel rule for wallet-clone `PairBuild`
+- [x] Re-check minimum maker notional after final exchange quantization in the wallet-clone submit path
+- [x] Block exchange-invalid sub-minimum maker orders before venue submission
+- [x] Replace time-only stale cancel behavior with quality-aware persistence for `PairBuild` orders:
+  - keep "aged but still acceptable" orders live
+  - cancel only when economically invalid, quote inputs are unusable, or taper / rollover requires withdrawal
+- [x] Preserve good opposite-side live orders during asymmetric updates instead of canceling for symmetry alone
+- [x] Add per-side repost hysteresis and dedup:
+  - no repeated same-side replace without a fill, meaningful quote move, or cooldown expiry
+  - do not repost at the same price immediately after canceling it
+- [x] Add projected post-add paired-cost guard for optional `PairedGrowth` only
+- [x] Keep startup completion exempt from that optional paired-growth cost guard
+- [x] Keep required lighter-side recovery exempt from that optional paired-growth cost guard
+- [x] Make lighter-side recovery use smaller clips and stronger price discipline when cost quality weakens
+- [x] Make lighter-side-first dominate while the book remains materially skewed and suppress competing paired-growth during repair
+- [ ] If still needed after the above, split `PairBuild` internally into `PairedGrowth` and `LighterRepair` behaviors without redesigning the outer Sprint 4 lifecycle
+- [ ] Add explicit logs for:
+  - wallet-clone-specific stale timeout decisions
+  - persistence / cancel-validity decisions
+  - asymmetric refresh preservation decisions
+  - repost hysteresis suppressions
+  - projected paired-cost suppression
+  - blocked sub-minimum maker orders
+
+Acceptance:
+- [ ] first reviewed canary defects are addressed in code
+- [ ] next canary is expected to reduce churn and improve paired economics without weakening startup or taper
+- [ ] next canary should show materially fewer stale-cancel / repost loops, no invalid sub-minimum maker orders, and a lower final paired `combined_avg_paid` than the current reviewed baseline
+
 ## Public / Config Additions
 Add a Sprint 4 env surface and document it.
 
@@ -561,6 +641,9 @@ Required canary review areas:
 6. final-minute suppression
 7. paired vs unmatched inventory
 8. whether CPP stayed informational instead of suppressing normal inventory building
+9. stale-cancel / repost churn in `PairBuild`
+10. exchange-invalid maker-order rejects
+11. projected paired-cost quality versus final combined average paid
 
 ## Acceptance Criteria
 Sprint 4 is complete only when all are true:
@@ -575,6 +658,9 @@ Sprint 4 is complete only when all are true:
 8. clone metrics are emitted and coherent
 9. canary behavior can be compared directly against the review fingerprint
 10. CPP / cost-quality logic never collapses aggressive high-frequency participation
+11. wallet-clone `PairBuild` no longer churns viable resting maker orders on a generic stale horizon
+12. wallet-clone normal flow no longer leaks sub-minimum maker orders to the exchange
+13. paired-growth economics are close enough that final paired inventory quality is at or near break-even on canary review
 
 ## Assumptions
 1. Existing maker order lifecycle, book freshness, and fill-accounting infrastructure can be reused.

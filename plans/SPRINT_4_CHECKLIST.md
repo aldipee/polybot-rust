@@ -6,7 +6,7 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 ## Current Status
 - Overall status: `IN PROGRESS`
 - Recommended boundary: `NEW MODE`
-- Current blocker: `FIRST_SPRINT_4_CANARY_NOT_RUN`
+- Current blocker: `POST_CANARY_PAIRBUILD_HARDENING`
 
 ## Phase 0: Boundary And Objective Isolation
 - [x] Add Sprint 4 runtime mode dispatch
@@ -66,6 +66,30 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 - [x] Prefer smaller or lighter-side clips before going idle on mediocre CPP
 - [x] Add paired-growth submit / rest / suppress logs
 
+## Phase 4A: Post-Canary PairBuild Hardening
+- [x] Add wallet-clone-specific stale timeout policy for lighter-side live orders
+- [x] Add wallet-clone-specific stale timeout policy for paired-growth live orders
+- [x] Add wallet-clone-specific stale timeout policy for asymmetric submit-resolution cleanup
+- [x] Stop using the shared generic `STALE_SECONDS` horizon as the only stale-cancel rule for wallet-clone `PairBuild`
+- [x] Re-check minimum maker notional after final exchange quantization in the wallet-clone submit path
+- [x] Block exchange-invalid sub-minimum maker orders before venue submission
+- [x] Replace time-only stale cancel behavior with quality-aware persistence for `PairBuild`
+- [x] Preserve good opposite-side live orders during asymmetric refresh instead of canceling for symmetry alone
+- [x] Add per-side repost hysteresis and dedup
+- [x] Add projected post-add paired-cost guard for optional `PairedGrowth` only
+- [x] Keep startup completion exempt from optional paired-growth cost suppression
+- [x] Keep required lighter-side recovery exempt from optional paired-growth cost suppression
+- [x] Make lighter-side recovery use smaller clips when cost quality weakens
+- [x] Make lighter-side-first dominate while the book remains materially skewed
+- [ ] If needed, split `PairBuild` internally into `PairedGrowth` and `LighterRepair`
+- [ ] Add logs for:
+  - wallet-clone-specific stale timeout decisions
+  - persistence / cancel-validity decisions
+  - asymmetric refresh preservation decisions
+  - repost hysteresis suppressions
+  - projected paired-cost suppression
+  - blocked sub-minimum maker orders
+
 ## Phase 5: Taper
 - [x] Add late `Taper` owner/state or equivalent late-phase controller
 - [x] Reduce new expansion after `240s`
@@ -98,8 +122,9 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 ## Phase 7: Config And Docs
 - [x] Add Sprint 4 env keys to `src/env_contract.rs`
 - [x] Document Sprint 4 env keys in `ENVIRONMENT.md`
-- [ ] Document Sprint 4 behavior note once first canary is run
+- [x] Document Sprint 4 behavior note once first canary is run
 - [x] Update `TARGET_GOAL_STATUS.md` only after Sprint 4 is truly runnable
+- [x] Create Sprint 4 high-level behavior note after first canary review
 
 ## Tests
 - [x] Unit test Sprint 4 mode routing
@@ -108,6 +133,14 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 - [x] Unit test owner routing from one-sided `OpenBoth` into `SeedCompletion`
 - [x] Unit test owner routing back to `PairBuild` when both sides are live
 - [x] Unit test `PairBuild` decision routing for paired growth, lighter-side recovery, and CPP throttling
+- [x] Unit test wallet-clone-specific stale timeout policy
+- [x] Unit test post-quantization minimum-maker-notional guard
+- [x] Unit test quality-aware persistence for `PairBuild`
+- [x] Unit test asymmetric refresh preserves a good opposite-side live order
+- [x] Unit test per-side repost hysteresis / dedup
+- [x] Unit test projected paired-cost suppression for optional `PairedGrowth`
+- [x] Unit test lighter-side recovery clips down when cost quality weakens
+- [x] Unit test lighter-side-first ownership dominance while skew remains materially stretched
 - [ ] Unit test startup missing-side bypass over normal shape gating
 - [ ] Unit test opening without favorite/underdog dependency
 - [x] Unit test taper suppression after `240s`
@@ -118,8 +151,8 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 - [x] Run `cargo check -q`
 - [x] Run targeted Sprint 4 tests
 - [x] Run `cargo test -q` for behavior-changing implementation
-- [ ] Run first Sprint 4 canary
-- [ ] Review first canary for:
+- [x] Run first Sprint 4 canary
+- [x] Review first canary for:
   - participation
   - seed timing
   - second-side timing
@@ -128,6 +161,14 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
   - late taper
   - final-minute quieting
   - whether CPP stayed informational and did not suppress aggressive inventory building
+- [ ] Run second Sprint 4 canary after PairBuild hardening
+- [ ] Review second canary for:
+  - stale-cancel / repost churn
+  - exchange-invalid maker-order rejects
+  - unmatched size
+  - share skew
+  - combined average paid
+  - whether startup and taper stayed intact
 
 ## Done Criteria
 - [x] Sprint 4 has a separate runnable mode
@@ -138,5 +179,8 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 - [x] normal flow stays maker-first and `BUY`-only
 - [x] late taper behavior is visible and measurable
 - [x] Sprint 4 metrics are emitted and coherent
-- [ ] first canary is reviewable against the wallet-clone fingerprint
+- [x] first canary is reviewable against the wallet-clone fingerprint
 - [ ] CPP logic does not collapse aggressive high-frequency participation
+- [ ] wallet-clone `PairBuild` no longer churns viable resting maker orders on a generic stale horizon
+- [ ] wallet-clone normal flow no longer leaks sub-minimum maker orders to the exchange
+- [ ] final paired inventory quality is at or near break-even on reviewed canaries
