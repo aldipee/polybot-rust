@@ -1358,6 +1358,19 @@ fn wallet_clone_pair_build_decision(
     })
 }
 
+fn wallet_clone_seed_completion_live_order_timeout_seconds(stale_seconds: f64) -> f64 {
+    (stale_seconds.max(1.0) * 2.0).max(6.0)
+}
+
+fn wallet_clone_seed_completion_bypasses_open_both_reject_cooldown(
+    origin: &str,
+    slot: &MakerOrderSlot,
+) -> bool {
+    origin.starts_with("WALLET_CLONE_SEED_COMPLETION")
+        && slot.last_reject_ts > 0.0
+        && slot.last_reject_origin.starts_with("WALLET_CLONE_OPEN_BOTH")
+}
+
 fn wallet_clone_taper_mode(
     t_into_s: f64,
     cfg: &WalletCloneConfigSnapshot,
@@ -5344,6 +5357,7 @@ struct MakerOrderSlot {
     last_cancel_ts: f64,
     last_reject_ts: f64,
     consecutive_rejects: u32,
+    last_reject_origin: String,
     origin: String,
     replace_target: Option<MakerOrderReplaceTarget>,
 }
@@ -6736,6 +6750,27 @@ impl MakerHedgeCapBot {
             "WALLET_CLONE_OPEN_BOTH",
         );
         let submit_elapsed_ms = ((now_ts_f64() - submit_started).max(0.0)) * 1000.0;
+        let yes_live = self._maker_order_slot_get(&yes_key).order_id.or(y_oid.clone());
+        let no_live = self._maker_order_slot_get(&no_key).order_id.or(n_oid.clone());
+        let yes_new =
+            settlement_shaper_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
+        let no_new =
+            settlement_shaper_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
+        if yes_new || no_new {
+            let (attempt_count, first_submit) =
+                self._wallet_clone_note_open_both_submit(now_ts_f64());
+            self.logger.info(&format!(
+                "[WALLET_CLONE][OPEN_BOTH] submit attempt={} t_into={:.1}s y_bid={:.3} n_bid={:.3} pair_sum={:.3} clip={} post_only=true neutral=true favorite_gating=false elapsed_ms={:.0} first_submit={}",
+                attempt_count,
+                t_into_s.max(0.0),
+                y_bid,
+                n_bid,
+                pair_sum,
+                size_int,
+                submit_elapsed_ms,
+                first_submit
+            ));
+        }
         if let Some(asymmetry) = self._settlement_shaper_pair_order_asymmetry(
             now_ts_f64(),
             yes_asset,
@@ -6755,8 +6790,6 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        let yes_live = self._maker_order_slot_get(&yes_key).order_id.or(y_oid);
-        let no_live = self._maker_order_slot_get(&no_key).order_id.or(n_oid);
         if yes_live.is_none() && no_live.is_none() {
             self._wallet_clone_log_open_both_hold(
                 "no_pair_orders_live",
@@ -6767,24 +6800,7 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        let yes_new =
-            settlement_shaper_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
-        let no_new =
-            settlement_shaper_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
-        if yes_new || no_new {
-            let (attempt_count, first_submit) = self._wallet_clone_note_open_both_submit(now_ts_f64());
-            self.logger.info(&format!(
-                "[WALLET_CLONE][OPEN_BOTH] submit attempt={} t_into={:.1}s y_bid={:.3} n_bid={:.3} pair_sum={:.3} clip={} post_only=true neutral=true favorite_gating=false elapsed_ms={:.0} first_submit={}",
-                attempt_count,
-                t_into_s.max(0.0),
-                y_bid,
-                n_bid,
-                pair_sum,
-                size_int,
-                submit_elapsed_ms,
-                first_submit
-            ));
-        } else {
+        if !yes_new && !no_new {
             self._wallet_clone_clear_open_both_hold();
         }
     }
@@ -7054,6 +7070,14 @@ impl MakerHedgeCapBot {
         self._wallet_clone_cancel_order_family("WALLET_CLONE_PAIR_BUILD", active_side, reason)
     }
 
+    fn _wallet_clone_cancel_seed_completion_orders(
+        &self,
+        active_side: Option<SettlementShaperSide>,
+        reason: &str,
+    ) -> bool {
+        self._wallet_clone_cancel_order_family("WALLET_CLONE_SEED_COMPLETION", active_side, reason)
+    }
+
     fn _wallet_clone_cancel_taper_orders(
         &self,
         active_side: Option<SettlementShaperSide>,
@@ -7109,6 +7133,10 @@ impl MakerHedgeCapBot {
         let no_live = settlement_shaper_has_side_participation(q_no, cost_no);
         let missing_side = wallet_clone_seed_completion_missing_side(q_yes, cost_yes, q_no, cost_no);
         if yes_live && no_live {
+            let _ = self._wallet_clone_cancel_seed_completion_orders(
+                None,
+                "wallet_clone_seed_completion_restored",
+            );
             let should_log = self
                 .wallet_clone_state
                 .lock()
@@ -7192,7 +7220,7 @@ impl MakerHedgeCapBot {
 
     fn _wallet_clone_seed_completion_handler(
         &self,
-        _now: f64,
+        now: f64,
         t_into_s: f64,
         total_cost: f64,
         q_yes: f64,
@@ -7201,9 +7229,18 @@ impl MakerHedgeCapBot {
         cost_no: f64,
         cfg: &WalletCloneConfigSnapshot,
     ) {
+        let (total_cost, q_yes, q_no, cost_yes, cost_no) = self
+            .state
+            .lock()
+            .map(|s| (s.c_yes + s.c_no, s.q_yes, s.q_no, s.c_yes, s.c_no))
+            .unwrap_or((total_cost, q_yes, q_no, cost_yes, cost_no));
         let Some(missing_side) =
             wallet_clone_seed_completion_missing_side(q_yes, cost_yes, q_no, cost_no)
         else {
+            let _ = self._wallet_clone_cancel_seed_completion_orders(
+                None,
+                "wallet_clone_seed_completion_restored",
+            );
             self._wallet_clone_clear_seed_completion_hold();
             return;
         };
@@ -7324,6 +7361,66 @@ impl MakerHedgeCapBot {
         };
         let key = MakerOrderKey::buy(missing_asset);
         let prev_slot = self._maker_order_slot_get(&key);
+        let live_order_timeout_s = wallet_clone_seed_completion_live_order_timeout_seconds(
+            self.cfg.stale_seconds.max(1) as f64,
+        );
+        if settlement_shaper_maker_slot_family_live(&prev_slot, "WALLET_CLONE_SEED_COMPLETION") {
+            let age_s = (now - prev_slot.last_submit_ts).max(0.0);
+            if age_s >= live_order_timeout_s && prev_slot.state != MakerOrderLifecycle::CancelPending {
+                let _ =
+                    self._maker_order_request_cancel(&key, "wallet_clone_seed_completion_stale");
+                self._wallet_clone_log_seed_completion_hold(
+                    "missing_side_live_order_stale_cancel",
+                    missing_side,
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+            } else {
+                self._wallet_clone_log_seed_completion_hold(
+                    &format!(
+                        "awaiting_missing_side_live_order:{}",
+                        maker_order_lifecycle_label(prev_slot.state)
+                    ),
+                    missing_side,
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+            }
+            return;
+        }
+        if prev_slot.order_id.is_some()
+            && matches!(
+                prev_slot.state,
+                MakerOrderLifecycle::Working
+                    | MakerOrderLifecycle::SubmitPending
+                    | MakerOrderLifecycle::CancelPending
+            )
+        {
+            if prev_slot.state != MakerOrderLifecycle::CancelPending {
+                let _ =
+                    self._maker_order_request_cancel(&key, "wallet_clone_seed_completion_handoff");
+            }
+            self._wallet_clone_log_seed_completion_hold(
+                &format!(
+                    "awaiting_missing_side_handoff:{}:{}",
+                    prev_slot.origin,
+                    maker_order_lifecycle_label(prev_slot.state)
+                ),
+                missing_side,
+                t_into_s,
+                time_since_first_side_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
         let oid = self._maker_order_upsert_gtc(
             &key,
             missing_bid,
@@ -7385,6 +7482,38 @@ impl MakerHedgeCapBot {
                 return;
             }
         };
+        let yes_key = MakerOrderKey::buy(yes_asset);
+        let no_key = MakerOrderKey::buy(no_asset);
+        let yes_slot = self._maker_order_slot_get(&yes_key);
+        let no_slot = self._maker_order_slot_get(&no_key);
+        for (side, slot) in [
+            (SettlementShaperSide::Yes, &yes_slot),
+            (SettlementShaperSide::No, &no_slot),
+        ] {
+            if !settlement_shaper_maker_slot_family_live(slot, "WALLET_CLONE_SEED_COMPLETION") {
+                continue;
+            }
+            let age_s = (now - slot.last_submit_ts).max(0.0);
+            let _ = self._wallet_clone_cancel_seed_completion_orders(
+                None,
+                "wallet_clone_pair_build_seed_completion_handoff",
+            );
+            self._wallet_clone_log_pair_build_state(
+                "rest",
+                &format!(
+                    "awaiting_seed_completion_handoff:{}:{}:{:.1}",
+                    side.as_str(),
+                    maker_order_lifecycle_label(slot.state),
+                    age_s
+                ),
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
         if !self.market_connected.load(Ordering::SeqCst) {
             self._wallet_clone_log_pair_build_state(
                 "hold",
@@ -7494,9 +7623,6 @@ impl MakerHedgeCapBot {
                 return;
             }
         };
-
-        let yes_key = MakerOrderKey::buy(yes_asset);
-        let no_key = MakerOrderKey::buy(no_asset);
         let yes_slot = self._maker_order_slot_get(&yes_key);
         let no_slot = self._maker_order_slot_get(&no_key);
         for (side, key, slot) in [
@@ -7537,7 +7663,6 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-
         let asymmetry_timeout_s = self.cfg.stale_seconds.max(1) as f64;
         if decision.mode == WalletClonePairBuildMode::LighterSideFirst {
             let active_side = decision.side.unwrap_or(SettlementShaperSide::Yes);
@@ -16504,6 +16629,7 @@ impl MakerHedgeCapBot {
             slot.remaining = size.max(0.0);
             slot.last_submit_ts = now;
             slot.origin = origin.to_string();
+            slot.last_reject_origin.clear();
             slot.replace_target = None;
             slot.consecutive_rejects = 0;
         }
@@ -16531,7 +16657,7 @@ impl MakerHedgeCapBot {
         }
     }
 
-    fn _maker_order_on_submit_reject(&self, key: &MakerOrderKey, reason: &str) {
+    fn _maker_order_on_submit_reject(&self, key: &MakerOrderKey, origin: &str, reason: &str) {
         if !self._maker_single_inflight_enabled() {
             return;
         }
@@ -16540,6 +16666,7 @@ impl MakerHedgeCapBot {
             let slot = slots.entry(key.clone()).or_default();
             slot.last_reject_ts = now;
             slot.consecutive_rejects = slot.consecutive_rejects.saturating_add(1);
+            slot.last_reject_origin = origin.to_string();
             if slot.order_id.is_some() {
                 slot.state = MakerOrderLifecycle::Working;
             } else {
@@ -17078,6 +17205,7 @@ impl MakerHedgeCapBot {
             && slot.state == MakerOrderLifecycle::Idle
             && reject_cooldown > 0.0
             && slot.last_reject_ts > 0.0
+            && !wallet_clone_seed_completion_bypasses_open_both_reject_cooldown(origin, &slot)
         {
             // Backoff: base cooldown * 2^(consecutive_rejects-1), capped at max
             let max_reject_cooldown =
@@ -17182,7 +17310,7 @@ impl MakerHedgeCapBot {
             self._maker_order_on_submit_ack(&oid, key, target_price, target_size, &target_origin);
             return Some(oid);
         }
-        self._maker_order_on_submit_reject(key, "post_order returned no oid");
+        self._maker_order_on_submit_reject(key, &target_origin, "post_order returned no oid");
         self._maker_order_reconcile_asset(&key.asset_id, Some(price));
         None
     }
@@ -28870,6 +28998,195 @@ mod tests {
         MakerOrderLifecycle, MakerOrderSlot,
     };
 
+    struct WalletCloneNoopLogger;
+
+    impl super::LogLike for WalletCloneNoopLogger {
+        fn info(&self, _msg: &str) {}
+        fn warning(&self, _msg: &str) {}
+        fn error(&self, _msg: &str) {}
+    }
+
+    fn make_wallet_clone_test_bot() -> MakerHedgeCapBot {
+        let mut cfg = super::BotConfig::default();
+        cfg.dry_run = true;
+        cfg.market_data_stale_seconds = 8;
+        cfg.stale_seconds = 3;
+        cfg.max_total_cost = 20.0;
+        cfg.reserve_usd = 2.0;
+        let logger: super::Arc<dyn super::LogLike> = super::Arc::new(WalletCloneNoopLogger);
+        MakerHedgeCapBot {
+            cfg,
+            logger,
+            market_slug: "wallet-clone-test".to_string(),
+            signal_hub: None,
+            state_file: super::PathBuf::from("__wallet_clone_test_state_nonexistent.json"),
+            state: super::Arc::new(super::Mutex::new(super::BotState::default())),
+            start_trade_iso: "2024-01-01T00:00:00Z".to_string(),
+            first_entry_fill_iso: super::Arc::new(super::Mutex::new(None)),
+            first_entry_reason: super::Arc::new(super::Mutex::new(None)),
+            pending_entry_reason: super::Arc::new(super::Mutex::new(None)),
+            active_entry_reason: super::Arc::new(super::Mutex::new(None)),
+            stop_loss_category: super::Arc::new(super::Mutex::new(None)),
+            exit_reason: super::Arc::new(super::Mutex::new("RUNNING".to_string())),
+            stop_flag: super::Arc::new(super::AtomicBool::new(false)),
+            wallet_address: "0xtest".to_string(),
+            min_maker_notional: 1.0,
+            min_taker_notional: 1.0,
+            reconcile_sell_credit_mult: 1.0,
+            first_clip_shares: 0.0,
+            first_hedge_full: false,
+            start_ts: 0,
+            expiry_ts: 300,
+            warmup_seconds: 0,
+            max_spread_ticks: 6,
+            parity_tolerance: 0.025,
+            unhedged_timeout_seconds: 2.0,
+            hedge_slippage_ticks: 1,
+            hedge_taker_order_type: "FAK".to_string(),
+            taker_order_ttl_seconds: 120,
+            taker_fill_fallback_from_order_events: true,
+            taker_strict_inflight: true,
+            last_taker_hedge_ts: 0.0,
+            taker_hedge_min_interval: 1.0,
+            exec_mode: "WALLET_CLONE".to_string(),
+            loop_wait_seconds_maker: 1.0,
+            loop_wait_seconds_taker: 0.2,
+            loop_wait_seconds_sniper: 0.05,
+            sniper_stop_certainty: super::SniperStopCertaintyConfig::from_env(),
+            condition_id: None,
+            market_fees_enabled: None,
+            yes_asset: Some("yes_asset_id".to_string()),
+            no_asset: Some("no_asset_id".to_string()),
+            runtime_flags: super::HashMap::new(),
+            market_last_update_ts: super::Arc::new(super::Mutex::new(0.0)),
+            best_quotes: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            market_connected: super::Arc::new(super::AtomicBool::new(true)),
+            user_connected: super::Arc::new(super::AtomicBool::new(true)),
+            book_cache: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            debug_last_ts: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            fsm_state: super::Arc::new(super::Mutex::new("ACCUMULATE".to_string())),
+            active_signal_context: super::Arc::new(super::Mutex::new(None)),
+            order_exec_context: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            submit_timing_cache: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            taker_orders: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            latency_log: None,
+            clob_rt: None,
+            clob_client: None,
+            clob_api_creds: None,
+            balance_allowance_cache: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            reconcile_suspect_yes: super::Arc::new(super::Mutex::new(None)),
+            reconcile_suspect_no: super::Arc::new(super::Mutex::new(None)),
+            reconcile_last_ts: super::Arc::new(super::Mutex::new(0.0)),
+            exchange_orders_cache: super::Arc::new(super::Mutex::new(Vec::new())),
+            binance_feed: None,
+            sniper_filters: super::Arc::new(super::Mutex::new(super::SniperFilterEngine::new(
+                "",
+            ))),
+            sniper_filters_persist_enabled: false,
+            sniper_filters_state_path: None,
+            sniper_filters_persist_min_interval_ms: 250,
+            sniper_trade_decision: super::Arc::new(super::Mutex::new(None)),
+            sniper_order_fill_agg: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            maker_skew_state: super::Arc::new(super::Mutex::new(
+                super::MakerSkewArbState::default(),
+            )),
+            maker_ladder_open_orders: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            maker_order_slots: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            maker_order_index: super::Arc::new(super::Mutex::new(super::HashMap::new())),
+            maker_exec_ledger: super::Arc::new(super::Mutex::new(MakerExecLedger::default())),
+            pair_arb_pending_imbalance: super::Arc::new(super::Mutex::new(None)),
+            pair_base_state: super::Arc::new(super::Mutex::new(
+                super::PairBaseRuntimeState::default(),
+            )),
+            pair_base_metrics: super::Arc::new(super::Mutex::new(
+                super::PairBaseMetricsState::default(),
+            )),
+            wallet_clone_state: super::Arc::new(super::Mutex::new(
+                WalletCloneRuntimeState::default(),
+            )),
+            wallet_clone_cfg: wallet_clone_config_defaults(),
+            settlement_shaper_state: super::Arc::new(super::Mutex::new(
+                super::SettlementShaperRuntimeState::default(),
+            )),
+            settlement_shaper_cfg: super::settlement_shaper_default_config(),
+        }
+    }
+
+    fn wallet_clone_test_set_inventory(
+        bot: &MakerHedgeCapBot,
+        q_yes: f64,
+        q_no: f64,
+        cost_yes: f64,
+        cost_no: f64,
+    ) {
+        if let Ok(mut state) = bot.state.lock() {
+            state.q_yes = q_yes;
+            state.q_no = q_no;
+            state.c_yes = cost_yes;
+            state.c_no = cost_no;
+        }
+    }
+
+    fn wallet_clone_test_set_quote(
+        bot: &MakerHedgeCapBot,
+        asset_id: &str,
+        bid: f64,
+        ask: f64,
+        ts: f64,
+    ) {
+        if let Ok(mut quotes) = bot.best_quotes.lock() {
+            quotes.insert(asset_id.to_string(), (bid, ask, ts));
+        }
+    }
+
+    fn wallet_clone_test_set_slot(
+        bot: &MakerHedgeCapBot,
+        asset_id: &str,
+        order_id: &str,
+        origin: &str,
+        state: MakerOrderLifecycle,
+        remaining: f64,
+        last_submit_ts: f64,
+    ) {
+        let key = super::MakerOrderKey::buy(asset_id);
+        if let Ok(mut slots) = bot.maker_order_slots.lock() {
+            slots.insert(
+                key,
+                MakerOrderSlot {
+                    state,
+                    order_id: Some(order_id.to_string()),
+                    size: remaining,
+                    remaining,
+                    last_submit_ts,
+                    origin: origin.to_string(),
+                    ..MakerOrderSlot::default()
+                },
+            );
+        }
+    }
+
+    fn wallet_clone_test_slot(bot: &MakerHedgeCapBot, asset_id: &str) -> MakerOrderSlot {
+        bot._maker_order_slot_get(&super::MakerOrderKey::buy(asset_id))
+    }
+
+    fn wallet_clone_test_set_reject_cooldown(
+        bot: &MakerHedgeCapBot,
+        asset_id: &str,
+        last_reject_ts: f64,
+        consecutive_rejects: u32,
+        last_reject_origin: &str,
+    ) {
+        let key = super::MakerOrderKey::buy(asset_id);
+        if let Ok(mut slots) = bot.maker_order_slots.lock() {
+            let slot = slots.entry(key).or_default();
+            slot.state = MakerOrderLifecycle::Idle;
+            slot.order_id = None;
+            slot.last_reject_ts = last_reject_ts;
+            slot.consecutive_rejects = consecutive_rejects;
+            slot.last_reject_origin = last_reject_origin.to_string();
+        }
+    }
+
     #[test]
     fn maker_payoff_envelope_math() {
         let (downside, upside, skew) = MakerHedgeCapBot::_maker_payoff_envelope(120.0, 80.0, 150.0);
@@ -29212,6 +29529,237 @@ mod tests {
             wallet_clone_seed_completion_repair_size(15.0, 5.0, 0.41, 2.0, 0.0),
             None
         );
+    }
+
+    #[test]
+    fn wallet_clone_seed_completion_success_cancels_live_repair_family() {
+        let bot = make_wallet_clone_test_bot();
+        if let Ok(mut st) = bot.wallet_clone_state.lock() {
+            st.open_both_first_fill_ts = 1.0;
+        }
+        wallet_clone_test_set_slot(
+            &bot,
+            "no_asset_id",
+            "repair-no",
+            "WALLET_CLONE_SEED_COMPLETION",
+            MakerOrderLifecycle::Working,
+            10.0,
+            2.0,
+        );
+
+        bot._wallet_clone_note_seed_completion_progress(3.0, 3.0, 10.0, 10.0, 4.9, 5.7);
+
+        let slot = wallet_clone_test_slot(&bot, "no_asset_id");
+        assert_eq!(slot.state, MakerOrderLifecycle::CancelPending);
+        assert!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.seed_completion_both_sides_ts > 0.0)
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_cleans_seed_completion_before_budget_gate() {
+        let bot = make_wallet_clone_test_bot();
+        let now = super::now_ts_f64();
+        wallet_clone_test_set_quote(&bot, "yes_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_slot(
+            &bot,
+            "no_asset_id",
+            "repair-no",
+            "WALLET_CLONE_SEED_COMPLETION",
+            MakerOrderLifecycle::Working,
+            10.0,
+            now - 1.0,
+        );
+
+        let cfg = wallet_clone_config_defaults();
+        bot._wallet_clone_pair_build_handler(now, 40.0, 20.0, 10.0, 10.0, 5.0, 5.0, &cfg);
+
+        let slot = wallet_clone_test_slot(&bot, "no_asset_id");
+        assert_eq!(slot.state, MakerOrderLifecycle::CancelPending);
+        assert!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| {
+                    st.pair_build_last_hold_reason
+                        .starts_with("rest:awaiting_seed_completion_handoff")
+                })
+                .unwrap_or(false)
+        );
+
+        if let Ok(mut slots) = bot.maker_order_slots.lock() {
+            slots.insert(
+                super::MakerOrderKey::buy("no_asset_id"),
+                MakerOrderSlot::default(),
+            );
+        }
+        wallet_clone_test_set_quote(&bot, "yes_asset_id", 0.49, 0.50, super::now_ts_f64());
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.49, 0.50, super::now_ts_f64());
+        bot._wallet_clone_pair_build_handler(now, 40.0, 20.0, 10.0, 10.0, 5.0, 5.0, &cfg);
+        assert_eq!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.pair_build_last_hold_reason.clone())
+                .unwrap_or_default(),
+            "hold:phase_budget_exhausted"
+        );
+    }
+
+    #[test]
+    fn wallet_clone_seed_completion_does_not_resubmit_when_missing_side_order_is_live() {
+        let bot = make_wallet_clone_test_bot();
+        let now = super::now_ts_f64();
+        if let Ok(mut st) = bot.wallet_clone_state.lock() {
+            st.open_both_first_fill_ts = now - 2.0;
+        }
+        wallet_clone_test_set_inventory(&bot, 10.0, 0.0, 4.9, 0.0);
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.57, 0.58, now);
+        wallet_clone_test_set_slot(
+            &bot,
+            "no_asset_id",
+            "repair-no",
+            "WALLET_CLONE_SEED_COMPLETION",
+            MakerOrderLifecycle::Working,
+            10.0,
+            now - 1.0,
+        );
+
+        let cfg = wallet_clone_config_defaults();
+        bot._wallet_clone_seed_completion_handler(now, 51.0, 4.9, 10.0, 0.0, 4.9, 0.0, &cfg);
+
+        let slot = wallet_clone_test_slot(&bot, "no_asset_id");
+        assert_eq!(slot.state, MakerOrderLifecycle::Working);
+        assert_eq!(slot.order_id.as_deref(), Some("repair-no"));
+        assert!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| {
+                    st.seed_completion_last_hold_reason
+                        .starts_with("awaiting_missing_side_live_order")
+                })
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn wallet_clone_seed_completion_rechecks_live_inventory_before_submitting() {
+        let bot = make_wallet_clone_test_bot();
+        if let Ok(mut st) = bot.wallet_clone_state.lock() {
+            st.open_both_first_fill_ts = 59.0;
+        }
+        wallet_clone_test_set_inventory(&bot, 10.0, 10.0, 4.9, 5.7);
+        wallet_clone_test_set_slot(
+            &bot,
+            "no_asset_id",
+            "repair-no",
+            "WALLET_CLONE_SEED_COMPLETION",
+            MakerOrderLifecycle::Working,
+            10.0,
+            60.0,
+        );
+
+        let cfg = wallet_clone_config_defaults();
+        bot._wallet_clone_seed_completion_handler(61.0, 61.0, 4.9, 10.0, 0.0, 4.9, 0.0, &cfg);
+
+        let slot = wallet_clone_test_slot(&bot, "no_asset_id");
+        assert_eq!(slot.state, MakerOrderLifecycle::CancelPending);
+        assert_eq!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.seed_completion_last_hold_reason.clone())
+                .unwrap_or_default(),
+            ""
+        );
+    }
+
+    #[test]
+    fn wallet_clone_seed_completion_bypasses_open_both_reject_cooldown() {
+        let bot = make_wallet_clone_test_bot();
+        let now = super::now_ts_f64();
+        wallet_clone_test_set_reject_cooldown(
+            &bot,
+            "no_asset_id",
+            now,
+            1,
+            "WALLET_CLONE_OPEN_BOTH_NO",
+        );
+
+        let oid = bot._maker_order_upsert_gtc(
+            &super::MakerOrderKey::buy("no_asset_id"),
+            0.55,
+            10.0,
+            "WALLET_CLONE_SEED_COMPLETION",
+        );
+
+        assert!(oid.is_some());
+        let slot = wallet_clone_test_slot(&bot, "no_asset_id");
+        assert_eq!(slot.state, MakerOrderLifecycle::Working);
+        assert_eq!(slot.origin, "WALLET_CLONE_SEED_COMPLETION");
+        assert_eq!(slot.consecutive_rejects, 0);
+    }
+
+    #[test]
+    fn wallet_clone_note_open_both_submit_tracks_attempts_and_first_submit() {
+        let bot = make_wallet_clone_test_bot();
+        let (attempt_count, first_submit) = bot._wallet_clone_note_open_both_submit(10.0);
+        assert_eq!(attempt_count, 1);
+        assert!(first_submit);
+        let (attempt_count, first_submit) = bot._wallet_clone_note_open_both_submit(12.0);
+        assert_eq!(attempt_count, 2);
+        assert!(!first_submit);
+        let state = bot.wallet_clone_state.lock().expect("wallet clone state");
+        assert_eq!(state.open_both_attempt_count, 2);
+        assert_eq!(state.open_both_first_submit_ts, 10.0);
+    }
+
+    #[test]
+    fn wallet_clone_seed_completion_waits_longer_before_repricing_live_order() {
+        let bot = make_wallet_clone_test_bot();
+        let now = super::now_ts_f64();
+        if let Ok(mut st) = bot.wallet_clone_state.lock() {
+            st.open_both_first_fill_ts = now - 2.0;
+        }
+        wallet_clone_test_set_inventory(&bot, 10.0, 0.0, 4.9, 0.0);
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.57, 0.58, now);
+        wallet_clone_test_set_slot(
+            &bot,
+            "no_asset_id",
+            "repair-no",
+            "WALLET_CLONE_SEED_COMPLETION",
+            MakerOrderLifecycle::Working,
+            10.0,
+            now - 4.0,
+        );
+
+        let cfg = wallet_clone_config_defaults();
+        bot._wallet_clone_seed_completion_handler(now, 8.0, 4.9, 10.0, 0.0, 4.9, 0.0, &cfg);
+
+        let slot = wallet_clone_test_slot(&bot, "no_asset_id");
+        assert_eq!(slot.state, MakerOrderLifecycle::Working);
+        assert_eq!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.seed_completion_last_hold_reason.clone())
+                .unwrap_or_default(),
+            "awaiting_missing_side_live_order:Working"
+        );
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_expensive_book_keeps_paired_growth_with_smaller_clip() {
+        let cfg = wallet_clone_config_defaults();
+        let decision = wallet_clone_pair_build_decision(
+            100.0, 100.0, 52.5, 52.5, 0.48, 0.49, 0.48, 0.49, 120.0, 105.0, 5.0, &cfg, false,
+        )
+        .expect("paired growth decision");
+
+        assert_eq!(decision.mode, WalletClonePairBuildMode::PairedGrowth);
+        assert_eq!(decision.cpp_hint, WalletClonePairBuildCppHint::Small);
+        assert_eq!(decision.clip_bucket, "small");
+        assert!(decision.requested_clip > decision.clip as f64);
     }
 
     #[test]
