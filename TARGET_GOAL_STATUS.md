@@ -413,6 +413,18 @@ This is the next implementation order against the approved roadmap.
 
 ---
 
+## Sprint 4 Status
+
+Sprint 4 wallet-clone status is now:
+
+1. `EXEC_MODE=WALLET_CLONE` is a separate runnable top-level path
+2. `PreArm`, `OpenBoth`, `SeedCompletion`, `PairBuild`, `Taper`, and clone metrics are implemented behind that mode
+3. the Sprint 4 operator config surface is documented in `ENVIRONMENT.md` and enforced in `src/env_contract.rs`
+4. Sprint 4 is runnable, but it is not yet empirically validated because the first live canary has not been run
+5. the next gating task for Sprint 4 is canary validation and an observed behavior note, not more hidden config work
+
+---
+
 ## Bottom Line
 
 Current status is:
@@ -420,5 +432,6 @@ Current status is:
 1. `Milestone 0` is complete
 2. the true `Step 1` now exists and is runnable
 3. the stale recovery-order reopen blocker is closed enough to stop holding progression
-4. the main remaining gaps are empirical validation, metrics cleanup, and overall recovery quality
-5. the next work can begin on the next stage, with Step 1 kept as the canary baseline
+4. Sprint 4 wallet-clone mode is now also runnable behind its own mode boundary
+5. the main remaining gaps are empirical validation, metrics cleanup, and overall recovery quality
+6. the next work can begin on the next stage, with Step 1 kept as the canary baseline and Sprint 4 awaiting its first canary

@@ -1,3 +1,49 @@
+## Version 0.1.28
+Date: 2026-03-11
+### Changes
+
+#### Sprint 4: Wallet-clone runtime is now runnable behind its own mode boundary
+- **Files:** `src/bot.rs`, `src/env_contract.rs`, `ENVIRONMENT.md`, `plans/SPRINT_4.md`, `plans/SPRINT_4_CHECKLIST.md`, `TARGET_GOAL_STATUS.md`
+- **Changes:**
+  - added a dedicated `EXEC_MODE=WALLET_CLONE` runtime path instead of routing Sprint 4 through the older market / settlement-shaper loops
+  - implemented the Sprint 4 wallet-clone control flow with `PreArm`, `OpenBoth`, `SeedCompletion`, `PairBuild`, `Taper`, and rollover ownership
+  - added wallet-clone config parsing, env allowlist coverage, operator docs, and runtime logs / metrics for startup timing, fill cadence, maker share, paired vs unmatched size, and late-window activity
+
+#### Fix 1: Wallet-clone startup no longer reuses generic paired quote-gating
+- **File:** `src/bot.rs`
+- **Problem:** Generic parity / spread quote gates were too strict for a wallet-clone startup path that is supposed to seed both sides aggressively and repair the missing side fast.
+- **Fix:**
+  - startup readiness now uses wallet-clone-specific quote checks based on quote freshness and sane pair sum rather than the stricter paired parity / spread path
+  - `SeedCompletion` keeps its missing-side quote health check and bypasses hard-skew / shape / CPP gating during startup completion
+- **Impact:** Wallet-clone startup is less likely to stall flat or stay one-sided because a generic paired-book quality gate said the book was not "clean enough."
+
+#### Fix 2: Wallet-clone budget and fill metrics are now wired to live behavior
+- **File:** `src/bot.rs`
+- **Problem:** The Sprint 4 config surface existed, but several wallet-clone controls were still effectively parse-only and the metrics were still inferred from inventory deltas.
+- **Fix:**
+  - phase budget fractions now actively bound `OpenBoth`, `PairBuild`, and `Taper`
+  - `PairBuild` now uses the configured minimum budget target to stay aggressive without turning CPP into a hard stop
+  - wallet-clone metrics now record actual fill events instead of inferring fill counts from inventory changes
+  - unsupported `WALLET_CLONE_BUY_ONLY_NORMAL_FLOW=false` now fails closed instead of pretending non-buy normal flow is implemented
+- **Impact:** Operators can tune Sprint 4 with a real env surface, and the end-of-market wallet-clone metrics are materially closer to observed executed behavior.
+
+#### Fix 3: Flat books after 30 seconds now stay in live startup seeding
+- **File:** `src/bot.rs`
+- **Problem:** If wallet-clone entered `PairBuild` with zero inventory on both sides, ownership could route back to `OpenBoth` while the main loop only ran the open-both handler during the `OpenBoth` phase.
+- **Fix:**
+  - wallet-clone now treats `OpenBoth` as a live owner even after the phase has advanced to `PairBuild`
+  - added regression coverage for flat `PairBuild` routing
+- **Impact:** A market that stays flat through the first 30 seconds continues active paired seeding instead of falling into an inactive owner branch.
+
+### Notes
+- This release records the current Sprint 4 wallet-clone runtime and config surface.
+- Live wallet-clone canary validation is still required before claiming an observed wallet-behavior match or production readiness.
+
+### Validation
+- `cargo check -q`
+- `cargo test -q wallet_clone`
+- `cargo test -q`
+
 ## Version 0.1.27
 Date: 2026-03-09
 ### Changes

@@ -59,11 +59,11 @@ Sprint 4 is a distinct behavioral track:
 6. aggressive rather than conservative
 
 ## Status
-- Overall status: `NOT STARTED`
+- Overall status: `IN PROGRESS`
 - Target outcome: `WALLET-CLONE CANARY`
 - Dependency on Sprint 3: `REUSE PARTS ONLY`
 - Recommended runtime boundary: `NEW MODE`
-- Current dominant reason: `SPRINT_3 OBJECTIVE MISMATCH`
+- Current dominant reason: `FIRST_SPRINT_4_CANARY_NOT_RUN`
 
 ## Required Runtime Boundary
 Sprint 4 should land behind a separate top-level path.
@@ -324,136 +324,138 @@ Out of scope:
 ## Workstreams
 
 ### Workstream A: Mode Boundary And Objective Isolation
-Status: `NOT STARTED`
+Status: `COMPLETE`
 
 Objective:
 Create a clean Sprint 4 wallet-clone path without hidden Sprint 3 shaping assumptions.
 
 Tasks:
-- [ ] Add dedicated top-level runtime dispatch for the Sprint 4 mode
-- [ ] Ensure Sprint 4 does not route through Sprint 3 target-shape scoring
-- [ ] Add Sprint 4 startup logs showing:
+- [x] Add dedicated top-level runtime dispatch for the Sprint 4 mode
+- [x] Ensure Sprint 4 does not route through Sprint 3 target-shape scoring
+- [x] Add Sprint 4 startup logs showing:
   - mode
   - phase controller
   - pre-arm status
   - clip family
   - clone timing targets
-- [ ] Keep existing `MAKER_SKEW_ARB` and `SETTLEMENT_SHAPER` behavior unchanged
+- [x] Keep existing `MAKER_SKEW_ARB` and `SETTLEMENT_SHAPER` behavior unchanged
 
 Acceptance:
-- [ ] Sprint 4 can run without invoking favorite-dollar / underdog-share controller goals
-- [ ] Logs make the objective difference from Sprint 3 explicit
+- [x] Sprint 4 can run without invoking favorite-dollar / underdog-share controller goals
+- [x] Logs make the objective difference from Sprint 3 explicit
 
 ### Workstream B: Pre-Arm Lifecycle
-Status: `NOT STARTED`
+Status: `COMPLETE`
 
 Objective:
 Make the engine ready before the market opens.
 
 Tasks:
-- [ ] Add pre-open market discovery and asset mapping ownership
-- [ ] Add readiness checks for:
+- [x] Require pre-open selected-market and asset-mapping readiness
+- [x] Add readiness checks for:
   - next market selected
   - asset IDs available
   - market/user feed freshness
   - initial quote inputs available
-- [ ] Add explicit pre-arm hold reasons
-- [ ] Ensure market-open does not start with fresh discovery by default
+- [x] Add explicit pre-arm hold reasons
+- [x] Ensure market-open does not start with fresh discovery by default
 
 Acceptance:
-- [ ] Sprint 4 can enter the market already armed
-- [ ] startup logs show pre-arm completed before opening actions
+- [x] Sprint 4 can enter the market already armed
+- [x] startup logs show pre-arm completed before opening actions
 
 ### Workstream C: Open-Both Seed Engine
-Status: `NOT STARTED`
+Status: `COMPLETE`
 
 Objective:
 Submit both sides immediately and neutrally at market start.
 
 Tasks:
-- [ ] Add `OpenBoth` owner/state
-- [ ] Submit paired maker `BUY` orders on both sides immediately at window start
-- [ ] Use small seed clips
-- [ ] Avoid favorite/underdog gating during opening
-- [ ] Add explicit paired-open logs and metrics
+- [x] Add `OpenBoth` owner/state
+- [x] Submit paired maker `BUY` orders on both sides immediately at window start
+- [x] Use small seed clips
+- [x] Avoid favorite/underdog gating during opening
+- [x] Add explicit paired-open logs and metrics
 
 Acceptance:
-- [ ] both sides are attempted immediately at market start
-- [ ] opening behavior remains maker-first and neutral
+- [x] both sides are attempted immediately at market start
+- [x] opening behavior remains maker-first and neutral
 
 ### Workstream D: Seed Completion Ownership
-Status: `NOT STARTED`
+Status: `COMPLETE`
 
 Objective:
 Treat one-sided startup fills as normal startup completion.
 
 Tasks:
-- [ ] Add `SeedCompletion` owner/state distinct from Sprint 3 `ShapeRepair`
-- [ ] Route true one-sided startup books into `SeedCompletion`
-- [ ] Ignore normal shape targets while in `SeedCompletion`
-- [ ] Ignore hard skew vetoes for true missing-side restoration unless the action worsens missing-side completion
-- [ ] Ignore hard CPP profitability vetoes for true missing-side restoration
-- [ ] Allow `SeedCompletion` to borrow from later phase budgets
-- [ ] Add explicit timing counters:
+- [x] Add `SeedCompletion` owner/state distinct from Sprint 3 `ShapeRepair`
+- [x] Route true one-sided startup books into `SeedCompletion`
+- [x] Ignore normal shape targets while in `SeedCompletion`
+- [x] Ignore hard skew vetoes for true missing-side restoration unless the action worsens missing-side completion
+- [x] Ignore hard CPP profitability vetoes for true missing-side restoration
+- [x] Require only missing-side quote health during `SeedCompletion`, not paired parity/spread readiness
+- [x] Allow `SeedCompletion` to borrow from later phase budgets
+- [x] Add explicit timing counters:
   - time to first side
   - time to second side
   - both sides by `30s`
   - both sides by `60s`
 
 Acceptance:
-- [ ] missing-side startup recovery is not blocked by normal shape gates
-- [ ] logs clearly distinguish startup completion from two-sided shape repair
+- [x] missing-side startup recovery is not blocked by normal shape gates
+- [x] logs clearly distinguish startup completion from two-sided shape repair
 
 ### Workstream E: Continuous Pair Build And Replenishment
-Status: `NOT STARTED`
+Status: `COMPLETE`
 
 Objective:
 Make normal flow look like a continuous paired accumulator.
 
 Tasks:
-- [ ] Add `PairBuild` owner/state
-- [ ] Repost two-sided maker quotes after fills
-- [ ] keep paired growth active through the main window
-- [ ] add both sides while reasonably balanced
-- [ ] add the lighter side first when imbalance stretches
-- [ ] prevent one-shot seed then long idle behavior
-- [ ] ensure CPP is only a light clip-sizing hint, not a hard normal-flow veto
-- [ ] prefer smaller or lighter-side clips before choosing idle when CPP is mediocre
+- [x] Add `PairBuild` owner/state
+- [x] Repost two-sided maker quotes after fills
+- [x] keep paired growth active through the main window
+- [x] add both sides while reasonably balanced
+- [x] add the lighter side first when imbalance stretches
+- [x] prevent one-shot seed then long idle behavior
+- [x] ensure CPP is only a light clip-sizing hint, not a hard normal-flow veto
+- [x] prefer smaller or lighter-side clips before choosing idle when CPP is mediocre
 
 Acceptance:
-- [ ] normal flow shows repeated paired or near-paired replenishment
-- [ ] build logic remains maker-first
+- [x] normal flow shows repeated paired or near-paired replenishment
+- [x] build logic remains maker-first
 
 ### Workstream F: Late Taper And Final-Minute Suppression
-Status: `NOT STARTED`
+Status: `COMPLETE`
 
 Objective:
 Match the observed late quieting profile.
 
 Tasks:
-- [ ] Add `Taper` owner/state or equivalent late-phase policy
-- [ ] sharply reduce new accumulation after `240s`
-- [ ] allow only small maintenance/repair after `240s`
-- [ ] suppress almost all new activity in the final `30s`
-- [ ] preserve current foreground rollover stop-buffer behavior
+- [x] Add `Taper` owner/state or equivalent late-phase policy
+- [x] sharply reduce new accumulation after `240s`
+- [x] allow only small maintenance/repair after `240s`
+- [x] suppress almost all new activity in the final `30s`
+- [x] preserve current foreground rollover stop-buffer behavior
 
 Acceptance:
-- [ ] late logs show taper ownership and reduced activity
-- [ ] final-minute activity is intentionally minimal
+- [x] late logs show taper ownership and reduced activity
+- [x] final-minute activity is intentionally minimal
 
 ### Workstream G: Clone Metrics And Reviewability
-Status: `NOT STARTED`
+Status: `COMPLETE`
 
 Objective:
 Measure Sprint 4 against the clone fingerprint, not Sprint 3 shape goals.
 
 Tasks:
-- [ ] Add metrics for:
-  - market participation rate
+- [x] Add startup timing metrics for:
   - first-fill latency
   - first-opposite-side latency
   - percent both-sides-positive by `30s`
   - percent both-sides-positive by `60s`
+- [x] Add broader clone metrics for:
+  - market participation rate
   - fills per market
   - maker fill share
   - fill distribution by window segment
@@ -462,55 +464,55 @@ Tasks:
   - unmatched size
   - average two-sided cost quality
   - average realized combined paid price by market
-- [ ] Add simple suppression metrics for:
+- [x] Add simple suppression metrics for:
   - skipped optional adds
   - startup-completion blocked count
-- [ ] Emit dedicated final Sprint 4 metrics summary
-- [ ] keep Sprint 3 metrics separate
+- [x] Emit dedicated final Sprint 4 metrics summary
+- [x] keep Sprint 3 metrics separate
 
 Acceptance:
-- [ ] the canary can be judged directly against the wallet-clone review
-- [ ] metrics do not depend on favorite-dollar / underdog-share success
+- [x] the canary can be judged directly against the wallet-clone review
+- [x] metrics do not depend on favorite-dollar / underdog-share success
 
 ### Workstream H: Config Surface
-Status: `NOT STARTED`
+Status: `COMPLETE`
 
 Objective:
 Expose the Sprint 4 knobs that are tuning knobs, not hidden logic switches.
 
 Tasks:
-- [ ] Add new Sprint 4 env keys to `src/env_contract.rs`
-- [ ] Document Sprint 4 env keys in `ENVIRONMENT.md`
-- [ ] Expose controls for:
+- [x] Add new Sprint 4 env keys to `src/env_contract.rs`
+- [x] Document Sprint 4 env keys in `ENVIRONMENT.md`
+- [x] Expose controls for:
   - pre-arm lead time
   - small clip family
   - large clip family
   - phase budget slices
   - taper timing
   - startup completion time targets
-  - clone maker cadence
+  - clone maker cadence via the shared maker refresh / replace knobs
 
 Acceptance:
-- [ ] operator-facing knobs exist for timing and sizing
-- [ ] core ownership logic does not depend on undocumented env flags
+- [x] operator-facing knobs exist for timing and sizing
+- [x] core ownership logic does not depend on undocumented env flags
 
 ### Workstream I: Tests
-Status: `NOT STARTED`
+Status: `IN PROGRESS`
 
 Objective:
 Add deterministic coverage for Sprint 4 behavior.
 
 Tasks:
-- [ ] Add phase-boundary tests for Sprint 4 timing
-- [ ] Add state-routing tests:
-  - `PreArm -> OpenBoth`
-  - `OpenBoth -> SeedCompletion`
-  - `SeedCompletion -> PairBuild`
-  - `PairBuild -> Taper`
+- [x] Add phase-boundary tests for Sprint 4 timing
+- [x] Add `PreArm -> OpenBoth` timing/routing coverage
+- [x] Add owner-routing coverage for one-sided `OpenBoth -> SeedCompletion`
+- [x] Add owner-routing coverage for returning to `PairBuild` when both sides are live
+- [x] Add `PairBuild` decision coverage for paired growth, lighter-side recovery, and CPP throttling
+- [ ] Add `PairBuild -> Taper` routing coverage
 - [ ] Add tests proving one-sided startup repair bypasses normal shape gating
 - [ ] Add tests proving favorite/underdog does not gate opening or seed completion
-- [ ] Add tests proving late taper suppresses normal expansion
-- [ ] Add tests for clone metrics helper outputs
+- [x] Add tests proving late taper suppresses normal expansion
+- [x] Add tests for clone metrics helper outputs
 
 Acceptance:
 - [ ] core Sprint 4 state and gating behavior is covered by Rust tests

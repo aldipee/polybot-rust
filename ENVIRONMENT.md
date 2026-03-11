@@ -114,7 +114,7 @@ Raw secret values are intentionally not copied here.
 ### `EXEC_MODE`
 - Current value: `MAKER_SKEW_ARB`
 - What it does: selects the top-level engine.
-- Friendly explanation: even though the top-level mode name still says `MAKER_SKEW_ARB`, current Step 1 logic routes into the `PAIR_BASE + RECOVERY + RISK_EXIT` path when the skew features below are disabled.
+- Friendly explanation: the main production baseline still uses `MAKER_SKEW_ARB` with the Step 1 pair-base overlays disabled, but Sprint 4 also adds `EXEC_MODE=WALLET_CLONE` as a separate wallet-clone runtime.
 
 ### `DRY_RUN`
 - Current value: `false`
@@ -538,6 +538,95 @@ Friendly explanation: these are the neutral centers used by `ShapeRepair` and no
   What it does: large clip reserved for main-accumulation favorite-side size-up only.
 
 Friendly explanation: the settlement-shaper controller no longer emits arbitrary share sizes. It snaps actions onto this ladder so canary behavior is predictable and metrics are comparable by bucket.
+
+---
+
+## Wallet Clone Controls
+
+These keys only matter when `EXEC_MODE=WALLET_CLONE`.
+
+For the keys below:
+
+1. current value in the checked-in `.env`: not set
+2. effective value when unset: the built-in Sprint 4 default shown below
+
+### Startup And Timing
+
+- `WALLET_CLONE_PREARM_LEAD_SECONDS`
+  Default: `20`
+  What it does: how early the wallet-clone path starts enforcing pre-open readiness checks.
+- `WALLET_CLONE_TARGET_BOTH_SIDES_BY_30S`
+  Default: `0.80`
+  What it does: operator target used in logs and metrics for startup completion by 30 seconds.
+- `WALLET_CLONE_TARGET_BOTH_SIDES_BY_60S`
+  Default: `0.95`
+  What it does: operator target used in logs and metrics for startup completion by 60 seconds.
+- `WALLET_CLONE_TAPER_START_SECONDS`
+  Default: `240`
+  What it does: point in the 300-second market when aggressive expansion gives way to taper maintenance.
+- `WALLET_CLONE_FINAL_QUIET_SECONDS`
+  Default: `30`
+  What it does: final quiet window where almost all new expansion is suppressed.
+
+Friendly explanation: these keys define the wallet-clone rhythm. The path should be armed before open, aggressive through most of the market, lighter after 240 seconds, and nearly silent in the last 30 seconds.
+
+### Clip Sizing
+
+- `WALLET_CLONE_SEED_CLIP_SMALL`
+  Default: `15`
+  What it does: small paired seed clip used by `OpenBoth`.
+- `WALLET_CLONE_REPAIR_CLIP_SMALL`
+  Default: `15`
+  What it does: small missing-side repair clip used by `SeedCompletion`.
+- `WALLET_CLONE_CLIP_LADDER_LARGE`
+  Default: `40,80`
+  What it does: comma-separated large clip ladder used by `PairBuild` for aggressive replenishment.
+
+Friendly explanation: Sprint 4 does not use a single giant opener. It uses small startup clips and then scales into repeated larger passive adds.
+
+### Phase Budget Slices
+
+- `WALLET_CLONE_BUDGET_SEED_MIN_FRACTION`
+  Default: `0.10`
+- `WALLET_CLONE_BUDGET_SEED_MAX_FRACTION`
+  Default: `0.15`
+- `WALLET_CLONE_BUDGET_EARLY_MIN_FRACTION`
+  Default: `0.15`
+- `WALLET_CLONE_BUDGET_EARLY_MAX_FRACTION`
+  Default: `0.20`
+- `WALLET_CLONE_BUDGET_MAIN_MIN_FRACTION`
+  Default: `0.45`
+- `WALLET_CLONE_BUDGET_MAIN_MAX_FRACTION`
+  Default: `0.55`
+- `WALLET_CLONE_BUDGET_LATE_MIN_FRACTION`
+  Default: `0.15`
+- `WALLET_CLONE_BUDGET_LATE_MAX_FRACTION`
+  Default: `0.20`
+- `WALLET_CLONE_BUDGET_TAPER_MIN_FRACTION`
+  Default: `0.05`
+- `WALLET_CLONE_BUDGET_TAPER_MAX_FRACTION`
+  Default: `0.10`
+
+Friendly explanation: these ten keys split the usable market budget across startup, early build, main build, late build, and taper reserve without reintroducing Sprint 3 shape goals.
+
+### Behavior Guardrail
+
+- `WALLET_CLONE_BUY_ONLY_NORMAL_FLOW`
+  Default: `true`
+  What it does: keeps normal wallet-clone flow on the observed `BUY`-only path instead of adding live sell-style shaping or exits.
+
+Friendly explanation: this is not a conservative profitability gate. It is just a guardrail that keeps Sprint 4 on the observed wallet behavior instead of drifting back into controller-style cleanup logic. Setting it to `false` is currently unsupported and the wallet-clone loop will fail closed instead of pretending a non-buy path exists.
+
+### Shared Maker Cadence
+
+Wallet-clone reuses the existing general maker cadence controls instead of adding a second competing cadence surface:
+
+- `ENTRY_EDGE_TICKS`
+- `PAIR_BASE_REFRESH_SECONDS`
+- `REPLACE_IF_PRICE_MOVES_TICKS`
+- `STALE_SECONDS`
+
+Friendly explanation: Sprint 4 gets its own timing and sizing knobs above, but quote refresh speed and reprice cadence still come from the shared maker controls already documented earlier in this file.
 
 ---
 
