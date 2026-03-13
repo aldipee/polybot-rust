@@ -583,6 +583,8 @@ Tasks:
 - [x] Keep required lighter-side recovery exempt from that optional paired-growth cost guard
 - [x] Make lighter-side recovery use smaller clips and stronger price discipline when cost quality weakens
 - [x] Make lighter-side-first dominate while the book remains materially skewed and suppress competing paired-growth during repair
+- [x] Fast-cancel broken paired-growth asymmetry when one live leg is orphaned by a recent counterpart submit reject
+- [x] Add projected repaired-book pay-up discipline so lighter-side recovery clips down or holds before recreating an expensive paired book
 - [ ] If still needed after the above, split `PairBuild` internally into `PairedGrowth` and `LighterRepair` behaviors without redesigning the outer Sprint 4 lifecycle
 - [ ] Add explicit logs for:
   - wallet-clone-specific stale timeout decisions

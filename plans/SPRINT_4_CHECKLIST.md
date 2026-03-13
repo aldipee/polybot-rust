@@ -81,6 +81,8 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 - [x] Keep required lighter-side recovery exempt from optional paired-growth cost suppression
 - [x] Make lighter-side recovery use smaller clips when cost quality weakens
 - [x] Make lighter-side-first dominate while the book remains materially skewed
+- [x] Fast-cancel broken paired-growth asymmetry when one live leg is orphaned by a recent counterpart submit reject
+- [x] Add projected repaired-book pay-up discipline so lighter-side recovery clips down or holds before rebuilding an expensive paired book
 - [ ] If needed, split `PairBuild` internally into `PairedGrowth` and `LighterRepair`
 - [ ] Add logs for:
   - wallet-clone-specific stale timeout decisions
@@ -141,6 +143,8 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 - [x] Unit test projected paired-cost suppression for optional `PairedGrowth`
 - [x] Unit test lighter-side recovery clips down when cost quality weakens
 - [x] Unit test lighter-side-first ownership dominance while skew remains materially stretched
+- [x] Unit test broken paired-growth asymmetry cancels on the short wallet-clone horizon
+- [x] Unit test projected repaired-book cap blocks extreme lighter-side pay-up
 - [ ] Unit test startup missing-side bypass over normal shape gating
 - [ ] Unit test opening without favorite/underdog dependency
 - [x] Unit test taper suppression after `240s`

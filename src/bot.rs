@@ -1417,8 +1417,16 @@ fn wallet_clone_pair_build_paired_live_order_timeout_seconds(
 fn wallet_clone_pair_build_asymmetry_timeout_seconds(
     stale_seconds: f64,
     decision: &WalletClonePairBuildDecision,
+    broken_submit: bool,
 ) -> f64 {
     let base = stale_seconds.max(1.0);
+    if broken_submit && decision.mode == WalletClonePairBuildMode::PairedGrowth {
+        return if decision.clip_bucket == "large" || decision.requested_clip >= 10.0 {
+            1.5
+        } else {
+            1.0
+        };
+    }
     let timeout = match decision.mode {
         WalletClonePairBuildMode::LighterSideFirst => (base * 2.0).max(6.0),
         WalletClonePairBuildMode::PairedGrowth => match decision.cpp_hint {
@@ -1432,6 +1440,40 @@ fn wallet_clone_pair_build_asymmetry_timeout_seconds(
     } else {
         timeout
     }
+}
+
+fn wallet_clone_pair_build_broken_submit_recent_reject_grace_seconds() -> f64 {
+    2.0
+}
+
+fn wallet_clone_pair_build_broken_asymmetry(
+    live_side: SettlementShaperSide,
+    yes_slot: &MakerOrderSlot,
+    no_slot: &MakerOrderSlot,
+    now: f64,
+    reject_cooldown: f64,
+    max_reject_cooldown: f64,
+) -> bool {
+    let missing_slot = match live_side {
+        SettlementShaperSide::Yes => no_slot,
+        SettlementShaperSide::No => yes_slot,
+    };
+    if !missing_slot.order_id.is_none()
+        || missing_slot.last_reject_ts <= 0.0
+        || !wallet_clone_origin_is_pair_build(&missing_slot.last_reject_origin)
+    {
+        return false;
+    }
+    let reject_age = (now - missing_slot.last_reject_ts).max(0.0);
+    let effective_cooldown = maker_order_effective_reject_cooldown_seconds(
+        &missing_slot.last_reject_origin,
+        missing_slot,
+        reject_cooldown,
+        max_reject_cooldown,
+    );
+    let recent_reject_grace = wallet_clone_pair_build_broken_submit_recent_reject_grace_seconds();
+    reject_age + 1e-9 >= effective_cooldown
+        && reject_age <= effective_cooldown + recent_reject_grace + 1e-9
 }
 
 fn wallet_clone_pair_build_buy_order_is_economically_invalid(
@@ -1538,6 +1580,28 @@ fn wallet_clone_pair_build_reject_cooldown_seconds(
     }
 }
 
+fn maker_order_effective_reject_cooldown_seconds(
+    origin: &str,
+    slot: &MakerOrderSlot,
+    reject_cooldown: f64,
+    max_reject_cooldown: f64,
+) -> f64 {
+    if reject_cooldown <= 0.0 || slot.last_reject_ts <= 0.0 {
+        return 0.0;
+    }
+    if wallet_clone_seed_completion_bypasses_open_both_reject_cooldown(origin, slot) {
+        return 0.0;
+    }
+    let base_cooldown =
+        wallet_clone_pair_build_reject_cooldown_seconds(origin, slot).unwrap_or(reject_cooldown);
+    let max_cooldown = max_reject_cooldown.max(reject_cooldown);
+    if slot.consecutive_rejects <= 1 {
+        base_cooldown
+    } else {
+        (base_cooldown * 2.0_f64.powi((slot.consecutive_rejects - 1).min(6) as i32)).min(max_cooldown)
+    }
+}
+
 fn wallet_clone_pair_build_cpp_pace_seconds(
     decision: &WalletClonePairBuildDecision,
     under_min_target: bool,
@@ -1614,6 +1678,55 @@ fn wallet_clone_pair_build_lighter_clip_after_cost_quality(
         WalletClonePairBuildCppHint::Normal => lighter_clip,
         WalletClonePairBuildCppHint::Medium => lighter_clip.min(cfg.repair_clip_small.max(min_lot)),
         WalletClonePairBuildCppHint::Small => lighter_clip.min(min_lot),
+    }
+}
+
+fn wallet_clone_pair_build_lighter_clip_after_projected_cost(
+    decision: &WalletClonePairBuildDecision,
+    q_yes: f64,
+    q_no: f64,
+    cost_yes: f64,
+    cost_no: f64,
+    side: SettlementShaperSide,
+    price: f64,
+    min_lot: f64,
+    cfg: &WalletCloneConfigSnapshot,
+) -> f64 {
+    if decision.mode != WalletClonePairBuildMode::LighterSideFirst {
+        return decision.clip.max(0) as f64;
+    }
+    let requested_clip = decision.clip.max(0) as f64;
+    if requested_clip <= min_lot + 1e-9 || price <= 0.0 || !price.is_finite() {
+        return requested_clip;
+    }
+    let projected_inventory_vwap_sum = wallet_clone_pair_build_projected_repair_inventory_vwap_sum(
+        q_yes,
+        q_no,
+        cost_yes,
+        cost_no,
+        side,
+        price,
+        requested_clip,
+    );
+    if !projected_inventory_vwap_sum.is_finite() || projected_inventory_vwap_sum <= 1.01 + 1e-9 {
+        return requested_clip;
+    }
+    if !decision.inventory_vwap_sum.is_finite() {
+        return requested_clip;
+    }
+    if decision.inventory_vwap_sum.is_finite()
+        && projected_inventory_vwap_sum + 1e-9 < decision.inventory_vwap_sum
+    {
+        return requested_clip;
+    }
+    let reduced_clip = settlement_shaper_round_down_to_lot(
+        requested_clip.min(cfg.repair_clip_small.max(min_lot)),
+        min_lot,
+    );
+    if reduced_clip + 1e-9 < requested_clip {
+        reduced_clip
+    } else {
+        requested_clip
     }
 }
 
@@ -1708,6 +1821,55 @@ fn wallet_clone_pair_build_lighter_price_discipline_block(
     let projected_worsens_cost = projected_inventory_vwap_sum
         > current_inventory_vwap_sum + max_worsening + 1e-9;
     if projected_worsens_cost && payup_ticks > max_payup_ticks + 1e-9 {
+        Some(projected_inventory_vwap_sum)
+    } else {
+        None
+    }
+}
+
+fn wallet_clone_pair_build_lighter_extreme_projected_cost_block(
+    decision: &WalletClonePairBuildDecision,
+    q_yes: f64,
+    q_no: f64,
+    cost_yes: f64,
+    cost_no: f64,
+    side: SettlementShaperSide,
+    price: f64,
+    tick_size: f64,
+) -> Option<f64> {
+    if decision.mode != WalletClonePairBuildMode::LighterSideFirst {
+        return None;
+    }
+    let (side_qty, side_cost) = match side {
+        SettlementShaperSide::Yes => (q_yes.max(0.0), cost_yes.max(0.0)),
+        SettlementShaperSide::No => (q_no.max(0.0), cost_no.max(0.0)),
+    };
+    if side_qty <= 1e-9 || decision.clip <= 0 || price <= 0.0 || !price.is_finite() {
+        return None;
+    }
+    let projected_inventory_vwap_sum = wallet_clone_pair_build_projected_repair_inventory_vwap_sum(
+        q_yes,
+        q_no,
+        cost_yes,
+        cost_no,
+        side,
+        price,
+        decision.clip as f64,
+    );
+    if !projected_inventory_vwap_sum.is_finite() {
+        return None;
+    }
+    let current_side_avg = side_cost / side_qty;
+    let tick = tick_size.max(0.0001);
+    let payup_ticks = ((price - current_side_avg) / tick).max(0.0);
+    let (projected_cap, max_payup_ticks) = match decision.clip_bucket {
+        "large" => (1.02, 2.0),
+        "medium" => (1.025, 2.0),
+        _ => (1.03, 3.0),
+    };
+    if projected_inventory_vwap_sum > projected_cap + 1e-9
+        && payup_ticks > max_payup_ticks + 1e-9
+    {
         Some(projected_inventory_vwap_sum)
     } else {
         None
@@ -8108,7 +8270,7 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        let decision = match wallet_clone_pair_build_decision(
+        let mut decision = match wallet_clone_pair_build_decision(
             q_yes,
             q_no,
             cost_yes,
@@ -8137,6 +8299,29 @@ impl MakerHedgeCapBot {
                 return;
             }
         };
+        if decision.mode == WalletClonePairBuildMode::LighterSideFirst {
+            let side = decision.side.unwrap_or(SettlementShaperSide::Yes);
+            let side_bid = match side {
+                SettlementShaperSide::Yes => y_bid,
+                SettlementShaperSide::No => n_bid,
+            };
+            let min_lot = self.cfg.min_shares.max(1.0);
+            let adjusted_clip = wallet_clone_pair_build_lighter_clip_after_projected_cost(
+                &decision,
+                q_yes,
+                q_no,
+                cost_yes,
+                cost_no,
+                side,
+                side_bid,
+                min_lot,
+                cfg,
+            );
+            if adjusted_clip + 1e-9 < decision.clip as f64 {
+                decision.clip = adjusted_clip as i64;
+                decision.clip_bucket = wallet_clone_pair_build_clip_bucket(adjusted_clip, cfg);
+            }
+        }
         let yes_slot = self._maker_order_slot_get(&yes_key);
         let no_slot = self._maker_order_slot_get(&no_key);
         for (side, key, slot) in [
@@ -8241,7 +8426,7 @@ impl MakerHedgeCapBot {
                         prev_slot.price,
                         active_bid,
                         price_tick,
-                    );
+                    ) || prev_slot.remaining > decision.clip as f64 + 1e-9;
                 if age_s >= lighter_live_timeout_s
                     && economically_invalid
                     && prev_slot.state != MakerOrderLifecycle::CancelPending
@@ -8307,11 +8492,37 @@ impl MakerHedgeCapBot {
                     price_tick,
                 )
             {
+                    self._wallet_clone_log_pair_build_state(
+                        "hold",
+                        &format!(
+                            "lighter_side_price_discipline_{}:{:.3}",
+                            decision.cpp_hint.as_str(),
+                        projected_inventory_vwap_sum
+                    ),
+                    Some(decision),
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                    );
+                return;
+            }
+            if let Some(projected_inventory_vwap_sum) =
+                wallet_clone_pair_build_lighter_extreme_projected_cost_block(
+                    &decision,
+                    q_yes,
+                    q_no,
+                    cost_yes,
+                    cost_no,
+                    active_side,
+                    active_bid,
+                    price_tick,
+                )
+            {
                 self._wallet_clone_log_pair_build_state(
                     "hold",
                     &format!(
-                        "lighter_side_price_discipline_{}:{:.3}",
-                        decision.cpp_hint.as_str(),
+                        "lighter_side_projected_cost_cap:{:.3}",
                         projected_inventory_vwap_sum
                     ),
                     Some(decision),
@@ -8443,6 +8654,17 @@ impl MakerHedgeCapBot {
             no_asset,
             "WALLET_CLONE_PAIR_BUILD",
         ) {
+            let reject_cooldown = self._maker_submit_reject_cooldown_seconds();
+            let max_reject_cooldown = env_float("MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS", 60.0)
+                .max(reject_cooldown);
+            let broken_submit = wallet_clone_pair_build_broken_asymmetry(
+                asymmetry.live_side,
+                &yes_slot,
+                &no_slot,
+                now,
+                reject_cooldown,
+                max_reject_cooldown,
+            );
             let live_asset = match asymmetry.live_side {
                 SettlementShaperSide::Yes => yes_asset,
                 SettlementShaperSide::No => no_asset,
@@ -8464,14 +8686,19 @@ impl MakerHedgeCapBot {
             let asymmetry_timeout_s = wallet_clone_pair_build_asymmetry_timeout_seconds(
                 self.cfg.stale_seconds as f64,
                 &decision,
+                broken_submit,
             );
             if asymmetry.state != MakerOrderLifecycle::CancelPending
-                && economically_invalid
+                && (economically_invalid || broken_submit)
                 && asymmetry.age_s >= asymmetry_timeout_s
             {
                 let _ = self._maker_order_request_cancel(
                     &live_key,
-                    "wallet_clone_pair_build_asymmetric_submit_invalid",
+                    if broken_submit {
+                        "wallet_clone_pair_build_asymmetric_submit_broken"
+                    } else {
+                        "wallet_clone_pair_build_asymmetric_submit_invalid"
+                    },
                 );
                 self._wallet_clone_pair_build_note_side_cancel(
                     asymmetry.live_side,
@@ -8481,7 +8708,12 @@ impl MakerHedgeCapBot {
                 self._wallet_clone_log_pair_build_state(
                     "rest",
                     &format!(
-                        "asymmetric_submit_invalid_cancel:{}:{:.1}",
+                        "{}:{}:{:.1}",
+                        if broken_submit {
+                            "asymmetric_submit_broken_cancel"
+                        } else {
+                            "asymmetric_submit_invalid_cancel"
+                        },
                         asymmetry.live_side.as_str(),
                         asymmetry.age_s
                     ),
@@ -17971,35 +18203,14 @@ impl MakerHedgeCapBot {
             && reject_cooldown > 0.0
             && slot.last_reject_ts > 0.0
         {
-            let effective_cooldown =
-                if wallet_clone_seed_completion_bypasses_open_both_reject_cooldown(origin, &slot) {
-                    0.0
-                } else if let Some(wallet_clone_base_cooldown) =
-                    wallet_clone_pair_build_reject_cooldown_seconds(origin, &slot)
-                {
-                    let max_reject_cooldown =
-                        env_float("MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS", 60.0)
-                            .max(reject_cooldown);
-                    if slot.consecutive_rejects <= 1 {
-                        wallet_clone_base_cooldown
-                    } else {
-                        (wallet_clone_base_cooldown
-                            * 2.0_f64.powi((slot.consecutive_rejects - 1).min(6) as i32))
-                        .min(max_reject_cooldown)
-                    }
-                } else {
-                    // Backoff: base cooldown * 2^(consecutive_rejects-1), capped at max
-                    let max_reject_cooldown =
-                        env_float("MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS", 60.0)
-                            .max(reject_cooldown);
-                    if slot.consecutive_rejects <= 1 {
-                        reject_cooldown
-                    } else {
-                        (reject_cooldown
-                            * 2.0_f64.powi((slot.consecutive_rejects - 1).min(6) as i32))
-                        .min(max_reject_cooldown)
-                    }
-                };
+            let max_reject_cooldown = env_float("MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS", 60.0)
+                .max(reject_cooldown);
+            let effective_cooldown = maker_order_effective_reject_cooldown_seconds(
+                origin,
+                &slot,
+                reject_cooldown,
+                max_reject_cooldown,
+            );
             if now - slot.last_reject_ts < effective_cooldown {
                 return None;
             }
@@ -30597,11 +30808,18 @@ mod tests {
 
     #[test]
     fn wallet_clone_pair_build_timeout_policy_uses_wallet_clone_specific_horizons() {
-        let cfg = wallet_clone_config_defaults();
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 5.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
         let lighter = wallet_clone_pair_build_decision(
             30.0, 60.0, 14.1, 28.2, 0.47, 0.48, 0.46, 0.47, 100.0, 42.3, 5.0, &cfg, false,
         )
         .expect("lighter-side decision");
+        let small_paired = wallet_clone_pair_build_decision(
+            5.0, 5.0, 2.4, 2.5, 0.46, 0.47, 0.47, 0.48, 100.0, 4.9, 5.0, &cfg, false,
+        )
+        .expect("small paired-growth decision");
         let paired = wallet_clone_pair_build_decision(
             20.0, 20.0, 9.2, 9.4, 0.46, 0.47, 0.47, 0.48, 100.0, 18.6, 5.0, &cfg, false,
         )
@@ -30616,11 +30834,23 @@ mod tests {
             7.0
         );
         assert_eq!(
+            super::wallet_clone_pair_build_paired_live_order_timeout_seconds(3.0, &small_paired),
+            6.0
+        );
+        assert_eq!(
+            super::wallet_clone_pair_build_asymmetry_timeout_seconds(3.0, &small_paired, false),
+            5.0
+        );
+        assert_eq!(
+            super::wallet_clone_pair_build_asymmetry_timeout_seconds(3.0, &small_paired, true),
+            1.0
+        );
+        assert_eq!(
             super::wallet_clone_pair_build_paired_live_order_timeout_seconds(3.0, &paired),
             8.0
         );
         assert_eq!(
-            super::wallet_clone_pair_build_asymmetry_timeout_seconds(3.0, &paired),
+            super::wallet_clone_pair_build_asymmetry_timeout_seconds(3.0, &paired, false),
             6.0
         );
         assert_eq!(
@@ -30628,8 +30858,16 @@ mod tests {
             9.0
         );
         assert_eq!(
-            super::wallet_clone_pair_build_asymmetry_timeout_seconds(3.0, &expensive_paired),
+            super::wallet_clone_pair_build_asymmetry_timeout_seconds(3.0, &expensive_paired, false),
             6.0
+        );
+        assert_eq!(
+            super::wallet_clone_pair_build_asymmetry_timeout_seconds(3.0, &paired, true),
+            1.5
+        );
+        assert_eq!(
+            super::wallet_clone_pair_build_asymmetry_timeout_seconds(3.0, &expensive_paired, true),
+            1.5
         );
     }
 
@@ -31300,6 +31538,170 @@ mod tests {
     }
 
     #[test]
+    fn wallet_clone_pair_build_broken_asymmetry_cancels_quickly_after_counterpart_reject() {
+        let bot = make_wallet_clone_test_bot();
+        let now = super::now_ts_f64();
+        wallet_clone_test_set_quote(&bot, "yes_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_slot_with_price(
+            &bot,
+            "yes_asset_id",
+            "pair-yes",
+            "WALLET_CLONE_PAIR_BUILD_YES",
+            MakerOrderLifecycle::Working,
+            0.49,
+            5.0,
+            now - 1.2,
+        );
+        wallet_clone_test_set_reject_cooldown(
+            &bot,
+            "no_asset_id",
+            now - 1.2,
+            1,
+            "WALLET_CLONE_PAIR_BUILD_NO",
+        );
+
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 5.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
+        bot._wallet_clone_pair_build_handler(now, 90.0, 5.0, 5.0, 5.0, 2.5, 2.5, &cfg);
+
+        let yes_slot = wallet_clone_test_slot(&bot, "yes_asset_id");
+        assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+        assert_eq!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.pair_build_last_hold_reason.clone())
+                .unwrap_or_default(),
+            "rest:asymmetric_submit_broken_cancel:YES:1.2"
+        );
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_broken_asymmetry_waits_for_repeated_reject_cooldown() {
+        let bot = make_wallet_clone_test_bot();
+        let now = super::now_ts_f64();
+        wallet_clone_test_set_quote(&bot, "yes_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_slot_with_price(
+            &bot,
+            "yes_asset_id",
+            "pair-yes",
+            "WALLET_CLONE_PAIR_BUILD_YES",
+            MakerOrderLifecycle::Working,
+            0.49,
+            5.0,
+            now - 3.0,
+        );
+        wallet_clone_test_set_reject_cooldown(
+            &bot,
+            "no_asset_id",
+            now - 1.2,
+            2,
+            "WALLET_CLONE_PAIR_BUILD_NO",
+        );
+
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 5.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
+        bot._wallet_clone_pair_build_handler(now, 90.0, 5.0, 5.0, 5.0, 2.5, 2.5, &cfg);
+
+        let yes_slot = wallet_clone_test_slot(&bot, "yes_asset_id");
+        assert_eq!(yes_slot.state, MakerOrderLifecycle::Working);
+        assert_eq!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.pair_build_last_hold_reason.clone())
+                .unwrap_or_default(),
+            "rest:awaiting_asymmetric_submit_resolution:YES:Working:3.0"
+        );
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_broken_asymmetry_cancels_after_repeated_reject_cooldown() {
+        let bot = make_wallet_clone_test_bot();
+        let now = super::now_ts_f64();
+        wallet_clone_test_set_quote(&bot, "yes_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_slot_with_price(
+            &bot,
+            "yes_asset_id",
+            "pair-yes",
+            "WALLET_CLONE_PAIR_BUILD_YES",
+            MakerOrderLifecycle::Working,
+            0.49,
+            5.0,
+            now - 3.0,
+        );
+        wallet_clone_test_set_reject_cooldown(
+            &bot,
+            "no_asset_id",
+            now - 2.4,
+            2,
+            "WALLET_CLONE_PAIR_BUILD_NO",
+        );
+
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 5.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
+        bot._wallet_clone_pair_build_handler(now, 90.0, 5.0, 5.0, 5.0, 2.5, 2.5, &cfg);
+
+        let yes_slot = wallet_clone_test_slot(&bot, "yes_asset_id");
+        assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+        assert_eq!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.pair_build_last_hold_reason.clone())
+                .unwrap_or_default(),
+            "rest:asymmetric_submit_broken_cancel:YES:3.0"
+        );
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_broken_asymmetry_ignores_stale_old_rejects() {
+        let bot = make_wallet_clone_test_bot();
+        let now = super::now_ts_f64();
+        wallet_clone_test_set_quote(&bot, "yes_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.49, 0.50, now);
+        wallet_clone_test_set_slot_with_price(
+            &bot,
+            "yes_asset_id",
+            "pair-yes",
+            "WALLET_CLONE_PAIR_BUILD_YES",
+            MakerOrderLifecycle::Working,
+            0.49,
+            5.0,
+            now - 7.0,
+        );
+        wallet_clone_test_set_reject_cooldown(
+            &bot,
+            "no_asset_id",
+            now - 7.0,
+            1,
+            "WALLET_CLONE_PAIR_BUILD_NO",
+        );
+
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 5.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
+        bot._wallet_clone_pair_build_handler(now, 90.0, 5.0, 5.0, 5.0, 2.5, 2.5, &cfg);
+
+        let yes_slot = wallet_clone_test_slot(&bot, "yes_asset_id");
+        assert_eq!(yes_slot.state, MakerOrderLifecycle::Working);
+        assert_eq!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.pair_build_last_hold_reason.clone())
+                .unwrap_or_default(),
+            "rest:awaiting_asymmetric_submit_resolution:YES:Working:7.0"
+        );
+    }
+
+    #[test]
     fn wallet_clone_note_open_both_submit_tracks_attempts_and_first_submit() {
         let bot = make_wallet_clone_test_bot();
         let (attempt_count, first_submit) = bot._wallet_clone_note_open_both_submit(10.0);
@@ -31474,6 +31876,157 @@ mod tests {
                 .unwrap_or_default(),
             "hold:projected_paired_cost_too_high:1.013"
         );
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_reduces_large_lighter_repair_clip_when_projected_cost_is_high() {
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 5.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
+
+        let decision = wallet_clone_pair_build_decision(
+            25.0, 15.0, 10.0, 9.1, 0.27, 0.28, 0.72, 0.73, 80.0, 19.1, 5.0, &cfg, false,
+        )
+        .expect("lighter-side decision");
+
+        assert_eq!(decision.mode, WalletClonePairBuildMode::LighterSideFirst);
+        assert_eq!(decision.clip, 10);
+
+        let adjusted = super::wallet_clone_pair_build_lighter_clip_after_projected_cost(
+            &decision,
+            25.0,
+            15.0,
+            10.0,
+            9.1,
+            SettlementShaperSide::No,
+            0.72,
+            5.0,
+            &cfg,
+        );
+        assert_eq!(adjusted, 5.0);
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_keeps_large_lighter_repair_when_it_improves_current_cost() {
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 5.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
+
+        let decision = super::WalletClonePairBuildDecision {
+            mode: super::WalletClonePairBuildMode::LighterSideFirst,
+            side: Some(SettlementShaperSide::No),
+            clip: 10,
+            requested_clip: 10.0,
+            clip_bucket: "large",
+            cpp_hint: super::WalletClonePairBuildCppHint::Normal,
+            pair_sum: 0.99,
+            pair_coverage: 0.60,
+            skew_ratio: 25.0 / 15.0,
+            current_base: 15.0,
+            qty_gap: 10.0,
+            inventory_vwap_sum: 1.13,
+            market_snapshot_vwap_sum: 0.99,
+        };
+        let projected = super::wallet_clone_pair_build_projected_repair_inventory_vwap_sum(
+            25.0,
+            15.0,
+            12.5,
+            9.45,
+            SettlementShaperSide::No,
+            0.55,
+            10.0,
+        );
+        assert!(projected > 1.01);
+        assert!(projected < decision.inventory_vwap_sum);
+
+        let adjusted = super::wallet_clone_pair_build_lighter_clip_after_projected_cost(
+            &decision,
+            25.0,
+            15.0,
+            12.5,
+            9.45,
+            SettlementShaperSide::No,
+            0.55,
+            5.0,
+            &cfg,
+        );
+        assert_eq!(adjusted, 10.0);
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_keeps_large_lighter_repair_when_current_book_is_one_sided() {
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 10.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
+
+        let decision = super::WalletClonePairBuildDecision {
+            mode: super::WalletClonePairBuildMode::LighterSideFirst,
+            side: Some(SettlementShaperSide::No),
+            clip: 10,
+            requested_clip: 10.0,
+            clip_bucket: "large",
+            cpp_hint: super::WalletClonePairBuildCppHint::Normal,
+            pair_sum: 0.99,
+            pair_coverage: 0.0,
+            skew_ratio: f64::INFINITY,
+            current_base: 0.0,
+            qty_gap: 10.0,
+            inventory_vwap_sum: f64::INFINITY,
+            market_snapshot_vwap_sum: 0.99,
+        };
+        let projected = super::wallet_clone_pair_build_projected_repair_inventory_vwap_sum(
+            10.0,
+            0.0,
+            4.8,
+            0.0,
+            SettlementShaperSide::No,
+            0.70,
+            10.0,
+        );
+        assert!(projected.is_finite());
+        assert!(projected > 1.01);
+
+        let adjusted = super::wallet_clone_pair_build_lighter_clip_after_projected_cost(
+            &decision,
+            10.0,
+            0.0,
+            4.8,
+            0.0,
+            SettlementShaperSide::No,
+            0.70,
+            5.0,
+            &cfg,
+        );
+        assert_eq!(adjusted, 10.0);
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_blocks_extreme_large_lighter_repair_even_with_normal_cpp_hint() {
+        let mut bot = make_wallet_clone_test_bot();
+        bot.cfg.max_total_cost = 80.0;
+        bot.cfg.reserve_usd = 10.0;
+        let now = super::now_ts_f64();
+        wallet_clone_test_set_quote(&bot, "yes_asset_id", 0.27, 0.28, now);
+        wallet_clone_test_set_quote(&bot, "no_asset_id", 0.72, 0.73, now);
+
+        let mut cfg = wallet_clone_config_defaults();
+        cfg.seed_clip_small = 5.0;
+        cfg.repair_clip_small = 5.0;
+        cfg.large_clip_ladder = [7.0, 10.0];
+
+        bot._wallet_clone_pair_build_handler(now, 143.0, 19.1, 25.0, 15.0, 10.0, 9.1, &cfg);
+
+        assert_eq!(
+            bot.wallet_clone_state
+                .lock()
+                .map(|st| st.pair_build_last_hold_reason.clone())
+                .unwrap_or_default(),
+            "hold:lighter_side_projected_cost_cap:1.035"
+        );
+        assert!(wallet_clone_test_slot(&bot, "no_asset_id").order_id.is_none());
     }
 
     #[test]
