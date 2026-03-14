@@ -4,7 +4,7 @@
 
 Scope: Sprint 4 only  
 Mode: `EXEC_MODE=WALLET_CLONE`  
-Date: 2026-03-11
+Date: 2026-03-12
 
 This file is not a design target.
 It is a concrete runtime note for the current Sprint 4 wallet-clone path in the working tree.
@@ -37,15 +37,18 @@ That canary confirms:
 2. Both startup targets were met in the reviewed run:
    - `both_by_30s=true`
    - `both_by_60s=true`
-3. `Taper` and final quiet behavior are also working as intended.
+3. `Taper`, final quiet, and rollover ownership are also working as intended.
 4. The main remaining problems are no longer startup ownership bugs.
-5. The main remaining problems are `PairBuild` churn, minimum-order enforcement leakage, and still-weak paired economics.
+5. The main remaining problems are now:
+   - slow `PairBuild` asymmetric leg cleanup
+   - expensive lighter-side repair after asymmetric fills
+   - still-weak paired economics at market end
 
 ---
 
 ## Executive Summary
 
-The Sprint 4 runtime is now structurally runnable and has been through a real wallet-clone canary review.
+The Sprint 4 runtime is now structurally runnable and has been through multiple real wallet-clone canary reviews.
 
 The current code path can:
 
@@ -59,7 +62,7 @@ The current code path can:
 The current code path does **not** yet prove:
 
 1. that `PairBuild` is economically close enough to the target wallet
-2. that stale-order handling in live maker flow is tuned correctly
+2. that paired-growth asymmetry is neutralized fast enough in live maker flow
 3. that the wallet-clone path is production-ready
 
 ---
@@ -72,48 +75,70 @@ Relative to Sprint 4 requirements, the current tree is approximately:
 2. mechanically aligned on startup ownership and missing-side repair
 3. materially closer to an aggressive inventory builder than the older settlement-shaper path
 4. now backed by one real canary, but still not behaviorally close enough to declare wallet match
+5. strong enough on startup and taper, but still not good enough on `PairBuild` economics
 
 ---
 
 ## Latest Live Canary
 
-Reviewed run date: 2026-03-11
+Reviewed run date: 2026-03-12
 
 Observed headline metrics from the reviewed run:
 
 1. `market_participated=true`
-2. `fills_per_market=23`
-3. `total_fill_shares=135.00`
-4. `maker_fill_share=0.778`
-5. `paired_size=65.00`
+2. `fills_per_market=12`
+3. `total_fill_shares=55.00`
+4. `maker_fill_share=0.818`
+5. `paired_size=25.00`
 6. `unmatched_size=5.00`
-7. `pair_coverage=0.929`
-8. `share_skew=1.077`
-9. `combined_avg_paid=1.019`
-10. `fills_after_taper_start=0`
+7. `pair_coverage=0.833`
+8. `share_skew=1.200`
+9. `combined_avg_paid=1.079`
+10. `fills_after_taper_start=1`
 11. `fills_after_final_quiet=0`
+12. `fill_events_by_segment=0-30s:2,30-60s:0,60-180s:9,180-240s:0,240-300s:1`
+13. `fill_shares_by_segment=0-30s:10.00,30-60s:0.00,60-180s:40.00,180-240s:0.00,240-300s:5.00`
+14. `skipped_optional_adds=763`
+15. `startup_completion_blocked=2`
 
 What the canary confirms:
 
 1. Startup is materially improved.
-2. `OpenBoth` produced the first fill at roughly `3.4s`.
-3. `SeedCompletion` restored the missing side by roughly `6.6s`.
-4. The bot traded actively through the main window.
-5. Taper and final quiet suppressed late activity correctly.
+2. `OpenBoth` submitted at roughly `5.9s` with:
+   - `y_bid=0.541`
+   - `n_bid=0.451`
+   - `pair_sum=0.992`
+   - `clip=5`
+3. The first live fill was `NO 5 @ 0.45` at roughly `8.8s`.
+4. `SeedCompletion` restored the missing YES side with `YES 5 @ 0.561` by roughly `15.3s`.
+5. Both startup targets were met:
+   - `both_by_30s=true`
+   - `both_by_60s=true`
+6. Taper began at roughly `240.1s` and rollover took ownership at roughly `275.2s`.
 
 What the canary still shows:
 
-1. `PairBuild` is still canceling viable resting maker orders too aggressively.
-   - repeated `lighter_side_live_order_stale_cancel`
-   - repeated `asymmetric_submit_stale_cancel`
-   - many of those cancels occur around the current `STALE_SECONDS` horizon
-2. The bot still leaks exchange-invalid small orders in some paths.
-   - reviewed run included `invalid amount for a marketable BUY order ($0.3), min size: $1`
-3. The bot is still not economically clean enough in normal flow.
-   - paired inventory ended slightly above break-even cost
-   - residual unmatched inventory remained at market end
-4. The remaining gap is no longer "can it trade at all?"
-5. The remaining gap is "can `PairBuild` accumulate paired inventory without churn and overpaying?"
+1. `PairBuild` is still spending too long in broken asymmetric states.
+   - repeated `awaiting_asymmetric_submit_resolution:*`
+   - many of those waits lasted about `5s` before an `*_invalid_cancel`
+   - this means one paired-growth leg can remain live too long after the opposite leg rejects
+2. That slow asymmetry cleanup is now the main path into bad economics.
+   - the book reached about `10 YES / 10 NO / total_cost=10.10`
+   - later a YES leg filled and the book moved to about `15 YES / 10 NO / total_cost=12.10`
+   - lighter-side repair then had to chase NO back to parity
+3. Lighter-side repair is still allowed to pay up too much after those asymmetric fills.
+   - the reviewed run bought `NO` aggressively enough to reach `25 YES / 25 NO`
+   - but only at about `total_cost=26.10`
+   - that is why the paired core itself ended too expensive
+4. After the expensive repair, projected-cost gating mostly froze normal paired growth on a bad book.
+   - repeated `projected_paired_cost_too_high:*`
+   - `inventory_vwap_sum` sat around `1.044`
+5. Taper still added a late unmatched tail.
+   - the book went from about `25 YES / 25 NO` before taper maintenance
+   - to about `25 YES / 30 NO / total_cost=30.20` during taper
+6. The minimum-notional guard is firing locally, but the operator logs are still noisy.
+   - reviewed run logged `[CLOB][PRECISION] skip post-only sub-min maker notional ...`
+   - then still logged a generic `[MAKER_ORD] submit reject ... post_order returned no oid`
 
 ---
 
@@ -273,8 +298,8 @@ This reviewed configuration is effectively saying:
 The most important current tradeoff in this profile is:
 
 1. it is aggressive enough to participate and build inventory
-2. but `STALE_SECONDS=3` is currently too short for the live maker behavior seen in this canary
-3. that short stale timeout is likely one of the direct causes of cancel/repost churn in `PairBuild`
+2. but `PairBuild` still waits too long to unwind broken one-leg paired-growth states
+3. that delay is now a more important live problem than the older simple stale-cancel churn
 
 ---
 
@@ -284,21 +309,28 @@ The dominant remaining gap is no longer hidden config wiring, missing controller
 
 The dominant remaining gaps after the reviewed canary are:
 
-1. `PairBuild` stale timeout policy is too aggressive for live maker resting orders.
-2. Wallet-clone normal flow can still leak sub-minimum notional orders to the exchange.
-3. Paired-growth economics are still too weak:
-   - `combined_avg_paid` finished above `1.00`
-   - residual unmatched size remained
-4. The next validation loop should focus on:
-   - reducing stale cancel / repost churn
-   - hardening minimum-notional enforcement
-   - improving post-startup paired-growth cost quality
+1. `PairBuild` asymmetric submit cleanup is too slow.
+   - broken paired-growth states sit in `awaiting_asymmetric_submit_resolution:*` for too long
+   - that leaves one live leg exposed to an extra fill
+2. Lighter-side repair is still too willing to overpay after those asymmetric fills.
+   - the run repaired back to `25 / 25`
+   - but only after raising the paired core to `combined_avg_paid=1.044` during the main window
+3. The final market-end economics are still not acceptable.
+   - final `paired_size=25`
+   - final `unmatched_size=5`
+   - final `share_skew=1.200`
+   - final `combined_avg_paid=1.079`
+4. Taper maintenance is still capable of adding late unmatched inventory even when final quiet stays clean.
+5. The next validation loop should focus on:
+   - canceling orphaned paired-growth legs much faster
+   - hard-capping lighter-side pay-up after asymmetric fills
+   - cleaning taper/noise telemetry around min-notional skips and late-order counters
 
-After the first reviewed canary, `0.1.28` should be read as:
+After the latest reviewed canary, `0.1.28` should be read as:
 
 1. Sprint 4 runtime implemented
 2. config surface implemented
 3. metrics surface implemented
-4. first live canary reviewed
+4. repeated live canaries reviewed
 5. startup and taper behavior acceptable
-6. `PairBuild` still needs more work before claiming wallet-clone match
+6. `PairBuild` still needs substantial asymmetry and economics work before claiming wallet-clone match

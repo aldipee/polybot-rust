@@ -12,7 +12,7 @@ The Sprint 4 objective is:
 5. keep accumulating through most of the window with continuous two-sided replenishment
 6. taper late and mostly stop in the last minute
 7. stay maker-heavy and `BUY`-only in the normal path
-8. stay aggressive in normal flow rather than waiting for ideal projected economics
+8. stay aggressive in normal flow only while paired cost, tail, and repair reserve remain inside the allowed bands
 
 This sprint is not an optimization pass.
 It is a behavior-clone sprint.
@@ -63,7 +63,17 @@ Sprint 4 is a distinct behavioral track:
 - Target outcome: `SECOND_WALLET-CLONE CANARY`
 - Dependency on Sprint 3: `REUSE PARTS ONLY`
 - Recommended runtime boundary: `NEW MODE`
-- Current dominant reason: `POST_CANARY_PAIRBUILD_HARDENING`
+- Current dominant reason: `CONSULTATION_RULE_INTEGRATION_AND_SECOND_CANARY`
+
+## Working Metric Definitions
+Use these working definitions consistently across Sprint 4 planning, code, and canary review.
+
+1. `paired_size = min(qYES, qNO)`
+2. `tail_size = abs(qYES - qNO)`
+3. `share_skew_ratio = max(qYES, qNO) / min(qYES, qNO)` when both sides are positive
+4. `worst_case_settlement_floor = min(qYES, qNO) - total_cost`
+5. `projected_paired_cost` means the projected paired average paid after the next action is applied
+6. `below_snapshot` means the optional buy price is strictly better than the same-side snapshot price at decision time
 
 ## Required Runtime Boundary
 Sprint 4 should land behind a separate top-level path.
@@ -173,21 +183,21 @@ Sprint 4 should not optimize for as a first-class normal-path target:
 3. preferred final settlement pattern
 
 ### 8. Aggression Requirement
-Sprint 4 must behave like an aggressive inventory builder, not a conservative filter.
+Sprint 4 must behave like an aggressive inventory builder inside cheap-pair regimes, not like a conservative filter and not like a participation-at-any-price bot.
 
 Required normal-path policy:
 
-1. participation is preferred over selectivity
-2. both-side completion is preferred over shape neatness
-3. paired replenishment is preferred over waiting for ideal projected CPP or perfect projected shape
-4. the controller should keep building unless a hard budget, hard venue constraint, or explicit emergency-risk rule blocks the action
+1. both-side completion is preferred over shape neatness
+2. paired replenishment is preferred over exact-equality cosmetics
+3. participation is preferred only while projected paired cost remains in the allowed bands and repair reserve remains intact
+4. the controller should keep building while the next action preserves acceptable paired cost, tail, and worst-case settlement floor
+5. heavy-side growth must stop once remaining budget is no longer enough to fund likely lighter-side repair
 
 Not allowed as an always-on normal-path veto:
 
-1. hard CPP profitability gate
-2. hard projected shape-perfectness gate
-3. favorite/underdog target-pressure gate
-4. mild temporary imbalance by itself
+1. exact equality as a primary controller objective
+2. favorite/underdog target-pressure gate
+3. mild temporary imbalance by itself
 
 Allowed hard blockers:
 
@@ -196,20 +206,46 @@ Allowed hard blockers:
 3. stale or invalid market data
 4. explicit hard budget breach
 5. explicit terminal emergency policy
+6. projected paired cost outside the allowed regime for the requested action
+7. optional heavy-side growth that would strand a repair tail
 
-### 9. CPP / Cost-Quality Requirement
-CPP, combined paid price, and similar two-sided cost-quality measures are informational quality signals, not the core controller.
+### 9. Paired-Cost / Floor Requirement
+Projected paired cost and worst-case settlement floor are first-class Sprint 4 control variables.
 
 Required policy:
 
-1. `OpenBoth` must not require CPP profitability to seed both sides
-2. `SeedCompletion` must not require CPP profitability to restore the missing side
-3. `PairBuild` may use CPP only as a light clip-sizing hint, not as a standing stop rule
-4. poor CPP may reduce optional add size, but must not stop required two-sided completion
-5. Sprint 4 should remain willing to build inventory aggressively through most of the market even when the next clip is not individually attractive in isolation
-6. profitability should be judged at the market-population level and repeated-fill level, not as a per-clip hard veto
+1. `OpenBoth` must not require paired-cost profitability to seed both sides
+2. `SeedCompletion` must not require paired-cost profitability to restore the missing side
+3. `PairBuild` must gate optional growth on `projected_paired_cost`, not only on current held-book cost
+4. `PairBuild` must evaluate `worst_case_settlement_floor` and `tail_size`, not just exact equality
+5. once `projected_paired_cost > 1.00`, optional growth stops
+6. `1.00 - 1.02` is repair-only territory
+7. above `1.02`, default behavior is freeze / skip unless a later consultation-approved emergency repair exception is added explicitly
+8. after `240s`, only actions that improve floor or reduce tail should remain available
 
-### 10. Post-Canary PairBuild Hardening Requirement
+Recommended operating bands:
+
+1. `< 0.94`: strong paired growth
+2. `0.94 - 0.98`: normal paired growth
+3. `0.98 - 1.00`: maintenance / reduced growth
+4. `1.00 - 1.02`: repair-only
+5. `> 1.02`: freeze / skip by default
+
+### 10. Consultation-Derived Economic Rule Requirement
+Sprint 4 should absorb the strongest rule signals from the trader analysis and consultant review.
+
+Required policy:
+
+1. trade both sides or skip the market
+2. optional buys must be below same-side snapshot price
+3. optional buys must require non-negative `edge_model_minus_price` or an explicit documented fallback if that signal is not available live
+4. meaningful size-up should begin only in a clearly positive edge band, with `0.05` as the recommended starting threshold
+5. default skew should remain mild and should favor the higher-priced side when any extra size is justified
+6. if directional overlay survives after `60s`, it should not fight the sign of `binance_delta_from_start`
+7. lighter-side repair should be exact-gap or smallest-valid-repair based, not repeated blind `5/10` retries
+8. the engine should not claim clone-complete status until the cheap-pair rule, tail rule, and below-snapshot rule are all explicit in code and metrics
+
+### 11. Post-Canary PairBuild Hardening Requirement
 After the first reviewed Sprint 4 canary, the remaining gap is no longer startup ownership.
 
 The remaining gap is `PairBuild` quality.
@@ -229,6 +265,10 @@ Required hardening:
    - then suppress optional paired growth
    - but still allow startup completion and required lighter-side recovery
 7. when the live book is materially skewed, lighter-side-first ownership should dominate until the skew returns inside a tighter normal band
+8. exact-gap repair and repair-budget reserve should prevent cheap paired cores from being stranded by a losing tail
+9. opposite-side live order preservation during lighter-side repair must be conditional:
+   - preserve only if the remaining size and price are still compatible with the repair target
+   - otherwise hand it off and repair cleanly
 
 Not acceptable after this hardening pass:
 
@@ -321,7 +361,10 @@ Required policy:
 
 1. keep early activation strong
 2. keep main volume concentrated before `240s`
-3. sharply reduce new activity after `240s`
+3. use `0-210s` as the normal paired-growth band
+4. use `210-240s` as reduced-growth / maintenance band
+5. use `240-270s` as repair-first / taper band
+6. use `270-300s` as no-optional-adds band
 
 ## Clip And Sizing Requirements
 Observed behavior implies:
@@ -332,9 +375,10 @@ Observed behavior implies:
 
 Sprint 4 should support:
 
-1. small clips around `10-15`
-2. repeated passive replenishment
-3. optional larger passive clip family around `40-80`
+1. opener clips around `12-24`
+2. exact-gap lighter-side repair rounded up to the smallest valid repair size
+3. repeated passive replenishment
+4. optional larger passive clip family around `40-80` only in the strongest paired-cost regimes
 
 Large clips must not replace the many-fill engine.
 
@@ -599,6 +643,43 @@ Acceptance:
 - [ ] next canary is expected to reduce churn and improve paired economics without weakening startup or taper
 - [ ] next canary should show materially fewer stale-cancel / repost loops, no invalid sub-minimum maker orders, and a lower final paired `combined_avg_paid` than the current reviewed baseline
 
+### Workstream K: Consultation Rule Integration
+Status: `IN_PROGRESS`
+
+Objective:
+Translate the consultation-derived rule set into explicit Sprint 4 code and canary criteria.
+
+Tasks:
+- [ ] Make `projected_paired_cost`, `tail_size`, and `worst_case_settlement_floor` first-class `PairBuild` decision inputs
+- [ ] Gate optional adds on below-snapshot price quality
+- [ ] Gate optional adds on non-negative `edge_model_minus_price` when that live signal exists, or document and implement an explicit fallback
+- [ ] Add the recommended paired-cost regime map:
+  - `< 0.94`
+  - `0.94 - 0.98`
+  - `0.98 - 1.00`
+  - `1.00 - 1.02`
+  - `> 1.02`
+- [ ] Add repair-budget reserve so heavy-side growth cannot strand the likely lighter-side repair
+- [ ] Replace fixed lighter-side repair behavior with exact-gap or smallest-valid-repair sizing
+- [ ] Tighten time-band policy to:
+  - `0-210s` normal growth
+  - `210-240s` reduced growth
+  - `240-270s` repair-first
+  - `270-300s` no optional adds
+- [ ] Make late `PairBuild` decisions evaluate settlement floor and tail ahead of average-cost cosmetics
+- [ ] Clarify and implement when an opposite-side live order may be preserved versus canceled during lighter-side repair
+- [ ] Add canary reporting for:
+  - below-snapshot fill rate
+  - tail at expiry
+  - worst-case settlement floor
+  - paired-cost band occupancy
+
+Acceptance:
+- [ ] Sprint 4 decisions are explainable in terms of paired cost, floor, and tail rather than exact equality or fill count
+- [ ] optional growth no longer occurs above `projected_paired_cost > 1.00`
+- [ ] late canaries show controlled tail and acceptable worst-case settlement floor even when paired core cost is good
+- [ ] the consultation-derived rules are visible in code, metrics, and canary review notes
+
 ## Public / Config Additions
 Add a Sprint 4 env surface and document it.
 
@@ -646,6 +727,8 @@ Required canary review areas:
 9. stale-cancel / repost churn in `PairBuild`
 10. exchange-invalid maker-order rejects
 11. projected paired-cost quality versus final combined average paid
+12. below-snapshot optional fill rate
+13. tail size and worst-case settlement floor at expiry
 
 ## Acceptance Criteria
 Sprint 4 is complete only when all are true:
@@ -662,7 +745,9 @@ Sprint 4 is complete only when all are true:
 10. CPP / cost-quality logic never collapses aggressive high-frequency participation
 11. wallet-clone `PairBuild` no longer churns viable resting maker orders on a generic stale horizon
 12. wallet-clone normal flow no longer leaks sub-minimum maker orders to the exchange
-13. paired-growth economics are close enough that final paired inventory quality is at or near break-even on canary review
+13. optional adds respect the cheap-pair rule, below-snapshot rule, and non-negative-edge rule or an explicit documented fallback
+14. heavy-side growth no longer strands a repair tail because repair reserve is enforced
+15. final paired inventory quality is at or near break-even and the remaining tail does not wipe out the paired edge on reviewed canaries
 
 ## Assumptions
 1. Existing maker order lifecycle, book freshness, and fill-accounting infrastructure can be reused.

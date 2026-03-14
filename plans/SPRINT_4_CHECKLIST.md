@@ -6,7 +6,7 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 ## Current Status
 - Overall status: `IN PROGRESS`
 - Recommended boundary: `NEW MODE`
-- Current blocker: `POST_CANARY_PAIRBUILD_HARDENING`
+- Current blocker: `CONSULTATION_RULE_INTEGRATION_AND_SECOND_CANARY`
 
 ## Phase 0: Boundary And Objective Isolation
 - [x] Add Sprint 4 runtime mode dispatch
@@ -92,6 +92,35 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
   - projected paired-cost suppression
   - blocked sub-minimum maker orders
 
+## Phase 4B: Consultation Rule Integration
+- [ ] Make `projected_paired_cost`, `tail_size`, and `worst_case_settlement_floor` explicit Sprint 4 decision inputs
+- [ ] Add below-snapshot gate for optional buys
+- [ ] Add non-negative `edge_model_minus_price` gate for optional buys when the live signal exists
+- [ ] If the live model signal does not exist, document and implement the explicit fallback rule
+- [ ] Add size-up band beginning around `edge_model_minus_price >= 0.05`
+- [ ] Add paired-cost regime map:
+  - `< 0.94`
+  - `0.94 - 0.98`
+  - `0.98 - 1.00`
+  - `1.00 - 1.02`
+  - `> 1.02`
+- [ ] Stop optional growth above `projected_paired_cost > 1.00`
+- [ ] Default-freeze or skip above `projected_paired_cost > 1.02`, unless an explicit approved repair exception is added
+- [ ] Add repair-budget reserve before heavy-side growth
+- [ ] Replace fixed lighter-side repair clips with exact-gap or smallest-valid-repair sizing
+- [ ] Tighten time-band policy to:
+  - `0-210s` normal growth
+  - `210-240s` reduced growth
+  - `240-270s` repair-first
+  - `270-300s` no optional adds
+- [ ] Add explicit late policy that floor and tail improvement beat average-cost cosmetics after `240s`
+- [ ] Clarify when opposite-side live orders may be preserved during lighter-side repair versus canceled for clean repair ownership
+- [ ] Add canary metrics for:
+  - below-snapshot optional fill rate
+  - paired-cost band occupancy
+  - tail at expiry
+  - worst-case settlement floor at expiry
+
 ## Phase 5: Taper
 - [x] Add late `Taper` owner/state or equivalent late-phase controller
 - [x] Reduce new expansion after `240s`
@@ -145,6 +174,13 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 - [x] Unit test lighter-side-first ownership dominance while skew remains materially stretched
 - [x] Unit test broken paired-growth asymmetry cancels on the short wallet-clone horizon
 - [x] Unit test projected repaired-book cap blocks extreme lighter-side pay-up
+- [ ] Unit test below-snapshot gating for optional buys
+- [ ] Unit test optional-growth block above `projected_paired_cost > 1.00`
+- [ ] Unit test repair-only behavior in the `1.00 - 1.02` band
+- [ ] Unit test repair-budget reserve blocks heavy-side growth when likely repair cannot be funded
+- [ ] Unit test exact-gap / smallest-valid-repair sizing
+- [ ] Unit test late `240s+` floor/tail-first behavior
+- [ ] Unit test non-negative-edge gate or documented fallback behavior
 - [ ] Unit test startup missing-side bypass over normal shape gating
 - [ ] Unit test opening without favorite/underdog dependency
 - [x] Unit test taper suppression after `240s`
@@ -172,6 +208,9 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
   - unmatched size
   - share skew
   - combined average paid
+  - below-snapshot optional fill rate
+  - worst-case settlement floor
+  - whether the remaining tail still wipes out the paired edge
   - whether startup and taper stayed intact
 
 ## Done Criteria
@@ -187,4 +226,7 @@ The design target is [SPRINT_4.md](C:/Works/aldipranata.com/polybot-sprint-4/pla
 - [ ] CPP logic does not collapse aggressive high-frequency participation
 - [ ] wallet-clone `PairBuild` no longer churns viable resting maker orders on a generic stale horizon
 - [ ] wallet-clone normal flow no longer leaks sub-minimum maker orders to the exchange
-- [ ] final paired inventory quality is at or near break-even on reviewed canaries
+- [ ] optional growth respects the cheap-pair rule, below-snapshot rule, and non-negative-edge rule or explicit fallback
+- [ ] repair reserve prevents heavy-side growth from stranding the likely repair tail
+- [ ] exact-gap lighter-side repair no longer leaves avoidable residual tails
+- [ ] final paired inventory quality is at or near break-even and the remaining tail does not wipe out the paired edge on reviewed canaries

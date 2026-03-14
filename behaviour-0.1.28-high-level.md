@@ -5,7 +5,7 @@
 Audience: non-technical operator, reviewer, or stakeholder  
 Scope: Sprint 4 only  
 Mode: `EXEC_MODE=WALLET_CLONE`  
-Date: 2026-03-11  
+Date: 2026-03-12  
 Reference: based on the latest technical runtime note in `behaviour-0.1.28.md`
 
 This document explains the current wallet-clone behaviour in plain language.
@@ -41,7 +41,7 @@ That means:
 3. the bot can seed both sides
 4. the bot can repair one-sided startup fills
 5. the bot can taper and roll over correctly
-6. but the normal `PairBuild` phase still churns too much and still overpays too often
+6. but the normal `PairBuild` phase still mishandles one-leg asymmetry and still overpays too often when repairing back to balance
 
 So the mode is real and much stronger than before, but it is still a canary, not a finished wallet clone.
 
@@ -76,7 +76,7 @@ This means:
 3. become nearly silent in the final quiet window
 
 In the current canary, Goal A and Goal C are working much better than before.
-Goal B is active, but still not economically clean enough.
+Goal B is active, but it still gets into bad one-leg states and then pays too much to get back out.
 
 ---
 
@@ -235,28 +235,27 @@ It is no longer a missing stub.
 
 But it still has two important live problems:
 
-1. it cancels resting maker orders too aggressively
-2. it still lets some expensive additions through
+1. one paired-growth leg can stay live too long after the opposite leg rejects
+2. lighter-side repair can still pay up too much after that asymmetry
 
-That is why the mode now looks mechanically alive but not yet economically clean.
+That is why the mode now looks mechanically alive but still not economically safe enough.
 
 ## F. Why PairBuild Is Still The Main Problem
 
 The reviewed run repeatedly showed:
 
-1. `lighter_side_live_order_stale_cancel`
-2. `asymmetric_submit_stale_cancel`
-3. repeated re-submission of the lighter side
-4. expensive fills while trying to rebalance
+1. `awaiting_asymmetric_submit_resolution:*`
+2. later `*_invalid_cancel:*`
+3. then expensive lighter-side fills while trying to restore parity
 
 Plain-language meaning:
 
-1. the bot is still giving up on resting maker orders too early
-2. it then reposts again
-3. that creates churn
-4. churn makes it easier to overpay
+1. one half of a paired-growth attempt can stay live too long after the other half fails
+2. that surviving leg can fill and pull the book out of balance
+3. once the book is skewed, the lighter-side repair path is still willing to pay up too much
+4. the bot then ends with a paired book that is balanced but too expensive
 
-This is why the run ended active but not clean.
+This is why the run ended operational but economically weak.
 
 ## G. Taper Logic
 
@@ -268,13 +267,17 @@ Its job is to:
 2. allow only small maintenance if needed
 3. go mostly quiet in the final quiet window
 
-In the reviewed run, this part behaved correctly.
+In the reviewed run, this part mostly behaved correctly.
 
 Observed good signs:
 
 1. the bot moved to `Taper` at the expected late point
 2. it emitted `final_quiet_rest`
-3. it placed no meaningful new activity after final quiet
+3. it placed no activity after final quiet
+
+Observed caveat:
+
+1. taper maintenance still added a late unmatched `NO` tail before final quiet
 
 ## H. Rollover Logic
 
@@ -312,8 +315,13 @@ So the run did not fail at discovery or readiness.
 Once live:
 
 1. the bot entered `OpenBoth`
-2. it posted a paired maker opener
-3. the first fill arrived around `3.4s`
+2. it posted a paired maker opener at about `5.9s`
+3. the opening pair was roughly:
+   - `YES bid 0.541`
+   - `NO bid 0.451`
+   - `pair sum 0.992`
+   - `clip 5`
+4. the first actual fill was `NO 5 @ 0.45` around `8.8s`
 
 That means the mode is no longer failing at the first trade.
 
@@ -321,10 +329,11 @@ That means the mode is no longer failing at the first trade.
 
 The startup outcome was briefly asymmetric:
 
-1. YES filled first
-2. NO lagged
+1. NO filled first
+2. YES lagged
 3. the bot switched to `SeedCompletion`
-4. the missing NO side was restored by about `6.6s`
+4. the missing YES side was restored with `YES 5 @ 0.561`
+5. both sides were live by about `15.3s`
 
 This is the clearest improvement versus earlier wallet-clone canaries.
 
@@ -336,17 +345,21 @@ Observed good signs:
 
 1. it kept trading through the main window
 2. it used both paired-growth and lighter-side-first actions
-3. it accumulated meaningful size
+3. it did reach a balanced `25 YES / 25 NO` paired core before taper
 
 Observed bad signs:
 
-1. frequent stale cancels
-2. repeated lighter-side reposts
-3. some very expensive NO fills later in the run
+1. repeated `awaiting_asymmetric_submit_resolution:*` waits of about `5s`
+2. the book first reached about `10 YES / 10 NO / total_cost=10.10`
+3. a later YES fill pulled the book to about `15 YES / 10 NO / total_cost=12.10`
+4. lighter-side repair then had to chase NO all the way back to parity
+5. the key expensive repair was a `10 NO @ 0.70` catch-up fill around `143s`
+6. the book returned to `25 YES / 25 NO`, but only at about `total_cost=26.10`
+7. after that, the projected-cost guard mostly froze further paired growth on an expensive book
 
-So the builder was live, but still rough.
+So the builder was live, but it still creates bad economics after one-leg paired-growth failures.
 
-### 5. Late behaviour worked
+### 5. Late behaviour mostly worked
 
 After about `240s`:
 
@@ -354,8 +367,9 @@ After about `240s`:
 2. it reduced activity
 3. it went quiet in the final quiet window
 4. it rolled over correctly near expiry
+5. but taper maintenance still added one late `NO` tail, moving the book from about `25 / 25` to `25 / 30`
 
-So the late lifecycle is currently one of the stronger parts of the mode.
+So the late lifecycle is still one of the stronger parts of the mode, but it is not perfectly clean yet.
 
 ---
 
@@ -363,22 +377,24 @@ So the late lifecycle is currently one of the stronger parts of the mode.
 
 The final reviewed state before rollover was approximately:
 
-1. `qYES=70`
-2. `qNO=65`
-3. `total_cost=67.50`
-4. `paired_size=65`
+1. `qYES=25`
+2. `qNO=30`
+3. `total_cost=30.20`
+4. `paired_size=25`
 5. `unmatched_size=5`
-6. `combined_avg_paid=1.019`
+6. `pair_coverage=0.833`
+7. `share_skew=1.200`
+8. `combined_avg_paid=1.079`
 
 Plain-language meaning:
 
 1. the bot built a real two-sided book
-2. the final book was not catastrophically skewed
-3. but the paired inventory was still slightly too expensive
-4. and there was still a small unmatched tail
+2. it did restore balance in the middle of the market
+3. but the final paired inventory was much too expensive
+4. and taper finished with an extra `NO` tail
 
 So this is no longer a dead or frozen bot.
-It is an active bot that still needs cleaner `PairBuild` economics.
+It is an active bot that still needs much cleaner `PairBuild` asymmetry handling and repair discipline.
 
 ---
 
@@ -392,7 +408,7 @@ Good news:
 2. the mode opened correctly
 3. the mode repaired startup asymmetry correctly
 4. the mode stayed active through the market
-5. the mode tapered correctly
+5. the mode reached a real `25 / 25` paired core before taper
 6. the mode rolled over correctly
 
 So the architecture is much stronger than before.
@@ -402,7 +418,7 @@ The remaining problem is more focused now.
 
 ## What Is The Main Problem In One Sentence
 
-The bot can now build and repair inventory, but `PairBuild` still churns too much and still pays too much to be a close wallet-clone match.
+The bot can now build and repair inventory, but `PairBuild` still leaves broken one-leg paired-growth states alive too long and then pays too much to repair them.
 
 ---
 
@@ -414,7 +430,7 @@ If you are not reading code, the practical takeaway is:
 2. it can enter the market
 3. it can recover one-sided startup outcomes
 4. it can stay active for most of the market
-5. but it still does not build inventory cleanly enough
+5. but it still does not build inventory cheaply enough once one side of a paired build gets stranded
 
 That is why the correct label today is still:
 
@@ -427,10 +443,10 @@ That is why the correct label today is still:
 
 The next desired behaviour is simple:
 
-1. let good resting maker orders live longer before canceling them
-2. stop leaking sub-minimum exchange-invalid orders
-3. make normal `PairBuild` adds more selective once paired cost quality becomes weak
-4. keep startup completion and taper behaviour exactly as they are unless the next canary disproves them
+1. cancel orphaned paired-growth legs much faster after the opposite leg rejects
+2. put a harder economic cap on lighter-side repair after those asymmetric fills
+3. clean the noisy min-notional and taper-order telemetry
+4. keep startup completion and the overall taper lifecycle exactly as they are unless the next canary disproves them
 
 If those things improve, the next canary has a realistic chance of looking much closer to the target wallet.
 
@@ -452,7 +468,7 @@ It can:
 But it still cannot reliably do the most important economic next step well enough:
 
 1. keep `PairBuild` calm
-2. avoid unnecessary cancel/repost churn
-3. finish with cheaper, cleaner paired inventory
+2. unwind broken one-leg paired-growth states quickly
+3. finish with cheaper, cleaner paired inventory after repair
 
 That is the current real-world behaviour in one page.
