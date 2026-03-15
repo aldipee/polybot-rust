@@ -4,7 +4,7 @@
 
 Scope: Sprint 4 only  
 Mode: `EXEC_MODE=WALLET_CLONE`  
-Date: 2026-03-12
+Date: 2026-03-15
 
 This file is not a design target.
 It is a concrete runtime note for the current Sprint 4 wallet-clone path in the working tree.
@@ -29,20 +29,25 @@ The main current-tree changes are:
 6. Wallet-clone metrics now count actual fill events instead of inferring fills from raw inventory deltas.
 7. A flat market that reaches `PairBuild` with `qYES=0` and `qNO=0` now keeps `OpenBoth` live instead of falling through to an inactive owner branch.
 
-The latest live canary has now been reviewed.
+The latest reviewed canary on `2026-03-15` ended balanced and tail-free, but it still did not prove profitability.
 
-That canary confirms:
+That canary and the current-tree follow-up fixes confirm:
 
-1. `OpenBoth` and `SeedCompletion` now work mechanically in live flow.
+1. `OpenBoth`, `SeedCompletion`, `PairBuild`, `Taper`, and rollover are all mechanically live.
 2. Both startup targets were met in the reviewed run:
    - `both_by_30s=true`
    - `both_by_60s=true`
-3. `Taper`, final quiet, and rollover ownership are also working as intended.
-4. The main remaining problems are no longer startup ownership bugs.
-5. The main remaining problems are now:
-   - slow `PairBuild` asymmetric leg cleanup
-   - expensive lighter-side repair after asymmetric fills
-   - still-weak paired economics at market end
+3. The latest reviewed run ended with:
+   - `paired_size=20.00`
+   - `unmatched_size=0.00`
+   - `tail_at_expiry=0.00`
+4. The current tree now blocks duplicate `OpenBoth` resubmits while both startup seed legs are already live.
+5. The current tree now treats taper paired-growth `suppress` as a real no-submit return.
+6. The main remaining problem is no longer expiry-tail handling.
+7. The main remaining problems are now:
+   - expensive startup basis after asymmetric early fills
+   - almost complete mid-market `PairBuild` freeze once paired cost is above `1.00`
+   - balanced but still unprofitable market-end books
 
 ---
 
@@ -61,8 +66,8 @@ The current code path can:
 
 The current code path does **not** yet prove:
 
-1. that `PairBuild` is economically close enough to the target wallet
-2. that paired-growth asymmetry is neutralized fast enough in live maker flow
+1. that startup seeding stays economically clean after asymmetric early fills
+2. that `PairBuild` can average down instead of freezing once paired cost is already too high
 3. that the wallet-clone path is production-ready
 
 ---
@@ -74,71 +79,73 @@ Relative to Sprint 4 requirements, the current tree is approximately:
 1. runnable as an isolated wallet-clone mode
 2. mechanically aligned on startup ownership and missing-side repair
 3. materially closer to an aggressive inventory builder than the older settlement-shaper path
-4. now backed by one real canary, but still not behaviorally close enough to declare wallet match
-5. strong enough on startup and taper, but still not good enough on `PairBuild` economics
+4. now backed by multiple real canaries, with the latest finishing balanced and tail-free but still below the settlement floor
+5. strong enough on startup, taper, and rollover lifecycle, but still not good enough on startup cost discipline or `PairBuild` economics
 
 ---
 
 ## Latest Live Canary
 
-Reviewed run date: 2026-03-12
+Reviewed run date: 2026-03-15
 
 Observed headline metrics from the reviewed run:
 
 1. `market_participated=true`
-2. `fills_per_market=12`
-3. `total_fill_shares=55.00`
-4. `maker_fill_share=0.818`
-5. `paired_size=25.00`
-6. `unmatched_size=5.00`
-7. `pair_coverage=0.833`
-8. `share_skew=1.200`
-9. `combined_avg_paid=1.079`
-10. `fills_after_taper_start=1`
+2. `fills_per_market=8`
+3. `total_fill_shares=40.00`
+4. `maker_fill_share=0.625`
+5. `paired_size=20.00`
+6. `unmatched_size=0.00`
+7. `pair_coverage=1.000`
+8. `share_skew=1.000`
+9. `combined_avg_paid=1.058`
+10. `worst_case_settlement_floor=-1.15`
 11. `fills_after_final_quiet=0`
-12. `fill_events_by_segment=0-30s:2,30-60s:0,60-180s:9,180-240s:0,240-300s:1`
-13. `fill_shares_by_segment=0-30s:10.00,30-60s:0.00,60-180s:40.00,180-240s:0.00,240-300s:5.00`
-14. `skipped_optional_adds=763`
-15. `startup_completion_blocked=2`
+12. `fills_after_taper_start=4`
+13. `new_orders_after_taper_start=1`
+14. `fill_events_by_segment=0-30s:3,30-60s:1,60-180s:0,180-240s:0,240-300s:4`
+15. `fill_shares_by_segment=0-30s:15.00,30-60s:5.00,60-180s:0.00,180-240s:0.00,240-300s:20.00`
+16. `paired_cost_band_occupancy_rate=strong_growth:0.000,normal_growth:0.000,reduced_growth:0.000,repair_only:0.003,freeze:0.997`
+17. `tail_at_expiry=0.00`
+18. `startup_completion_blocked=2`
 
 What the canary confirms:
 
-1. Startup is materially improved.
-2. `OpenBoth` submitted at roughly `5.9s` with:
-   - `y_bid=0.541`
-   - `n_bid=0.451`
-   - `pair_sum=0.992`
+1. Startup is still mechanically improved.
+2. `OpenBoth` submitted immediately after open at roughly:
+   - `y_bid=0.520`
+   - `n_bid=0.470`
+   - `pair_sum=0.990`
    - `clip=5`
-3. The first live fill was `NO 5 @ 0.45` at roughly `8.8s`.
-4. `SeedCompletion` restored the missing YES side with `YES 5 @ 0.561` by roughly `15.3s`.
-5. Both startup targets were met:
+3. `SeedCompletion` still restored the missing side and both startup targets were met:
    - `both_by_30s=true`
    - `both_by_60s=true`
-6. Taper began at roughly `240.1s` and rollover took ownership at roughly `275.2s`.
+4. The latest reviewed run finished balanced and tail-free:
+   - `paired_size=20.00`
+   - `unmatched_size=0.00`
+   - `tail_at_expiry=0.00`
+5. Final quiet and rollover ownership still worked as intended.
+6. The reviewed run exposed two execution bugs that the current tree now blocks:
+   - duplicate `OpenBoth` resubmits while both startup seed legs were already live
+   - taper paired-growth `suppress` falling through to submit anyway
 
 What the canary still shows:
 
-1. `PairBuild` is still spending too long in broken asymmetric states.
-   - repeated `awaiting_asymmetric_submit_resolution:*`
-   - many of those waits lasted about `5s` before an `*_invalid_cancel`
-   - this means one paired-growth leg can remain live too long after the opposite leg rejects
-2. That slow asymmetry cleanup is now the main path into bad economics.
-   - the book reached about `10 YES / 10 NO / total_cost=10.10`
-   - later a YES leg filled and the book moved to about `15 YES / 10 NO / total_cost=12.10`
-   - lighter-side repair then had to chase NO back to parity
-3. Lighter-side repair is still allowed to pay up too much after those asymmetric fills.
-   - the reviewed run bought `NO` aggressively enough to reach `25 YES / 25 NO`
-   - but only at about `total_cost=26.10`
-   - that is why the paired core itself ended too expensive
-4. After the expensive repair, projected-cost gating mostly froze normal paired growth on a bad book.
-   - repeated `projected_paired_cost_too_high:*`
-   - `inventory_vwap_sum` sat around `1.044`
-5. Taper still added a late unmatched tail.
-   - the book went from about `25 YES / 25 NO` before taper maintenance
-   - to about `25 YES / 30 NO / total_cost=30.20` during taper
-6. The minimum-notional guard is firing locally, but the operator logs are still noisy.
-   - reviewed run logged `[CLOB][PRECISION] skip post-only sub-min maker notional ...`
-   - then still logged a generic `[MAKER_ORD] submit reject ... post_order returned no oid`
+1. Startup can still become too expensive very early.
+   - the reviewed run reached about `10 YES / 0 NO` before missing-side restoration
+   - by the time the book first became balanced at about `10 YES / 10 NO`, `total_cost` was already about `10.80`
+2. Once the paired core moved above `1.00`, `PairBuild` spent almost the entire market in `repair_only` / `freeze`.
+   - `paired_cost_band_occupancy_rate ... freeze=0.997`
+   - `fill_shares_by_segment=60-180s:0.00,180-240s:0.00`
+3. Because of that freeze, the mode can finish perfectly balanced and still be locked negative.
+   - final inventory was `20 YES / 20 NO`
+   - final `total_cost=21.15`
+   - final `worst_case_settlement_floor=-1.15`
+4. Taper before the current-tree fix could still log `suppress` and then submit anyway.
+   - the reviewed run showed late paired-growth submits after `suppress`
+   - the current tree now blocks that path
+5. Operator telemetry is still noisy in some skip/suppress counters.
+   - `skipped_optional_adds=152` is still not a clean direct measure of one distinct behavior
 
 ---
 
@@ -298,8 +305,8 @@ This reviewed configuration is effectively saying:
 The most important current tradeoff in this profile is:
 
 1. it is aggressive enough to participate and build inventory
-2. but `PairBuild` still waits too long to unwind broken one-leg paired-growth states
-3. that delay is now a more important live problem than the older simple stale-cancel churn
+2. but startup basis can still become too expensive before both sides are restored
+3. and once paired cost is already bad, `PairBuild` still freezes too hard instead of averaging down
 
 ---
 
@@ -309,22 +316,26 @@ The dominant remaining gap is no longer hidden config wiring, missing controller
 
 The dominant remaining gaps after the reviewed canary are:
 
-1. `PairBuild` asymmetric submit cleanup is too slow.
-   - broken paired-growth states sit in `awaiting_asymmetric_submit_resolution:*` for too long
-   - that leaves one live leg exposed to an extra fill
-2. Lighter-side repair is still too willing to overpay after those asymmetric fills.
-   - the run repaired back to `25 / 25`
-   - but only after raising the paired core to `combined_avg_paid=1.044` during the main window
-3. The final market-end economics are still not acceptable.
-   - final `paired_size=25`
-   - final `unmatched_size=5`
-   - final `share_skew=1.200`
-   - final `combined_avg_paid=1.079`
-4. Taper maintenance is still capable of adding late unmatched inventory even when final quiet stays clean.
+1. Startup basis can still become too expensive after asymmetric early fills.
+   - the latest reviewed run first became balanced at about `10 / 10`
+   - but only at about `total_cost=10.80`
+2. `PairBuild` still freezes too aggressively once paired cost is already bad.
+   - the latest run spent almost all paired-cost observations in `repair_only` / `freeze`
+   - that prevented the strategy from averaging down through the middle of the market
+3. The final market-end economics are still not acceptable even on a balanced book.
+   - final `paired_size=20`
+   - final `unmatched_size=0`
+   - final `share_skew=1.000`
+   - final `combined_avg_paid=1.058`
+   - final `worst_case_settlement_floor=-1.15`
+4. The latest current-tree fixes still need live canary confirmation.
+   - duplicate `OpenBoth` live-order resubmits are now blocked in code
+   - taper paired-growth `suppress` now returns before submit
 5. The next validation loop should focus on:
-   - canceling orphaned paired-growth legs much faster
-   - hard-capping lighter-side pay-up after asymmetric fills
-   - cleaning taper/noise telemetry around min-notional skips and late-order counters
+   - keeping startup paired cost below `1.00` after asymmetric early fills
+   - loosening or refactoring paired-cost gating so `PairBuild` can average down instead of freezing
+   - confirming the latest `OpenBoth` and taper suppress fixes in the next live canary
+   - cleaning taper/noise telemetry around skip and suppress counters
 
 After the latest reviewed canary, `0.1.28` should be read as:
 
@@ -332,5 +343,6 @@ After the latest reviewed canary, `0.1.28` should be read as:
 2. config surface implemented
 3. metrics surface implemented
 4. repeated live canaries reviewed
-5. startup and taper behavior acceptable
-6. `PairBuild` still needs substantial asymmetry and economics work before claiming wallet-clone match
+5. startup, taper, and rollover lifecycle acceptable
+6. expiry-tail handling improved materially
+7. `PairBuild` still needs substantial cost-basis and economics work before claiming wallet-clone match

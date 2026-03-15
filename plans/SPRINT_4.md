@@ -651,24 +651,27 @@ Translate the consultation-derived rule set into explicit Sprint 4 code and cana
 
 Tasks:
 - [ ] Make `projected_paired_cost`, `tail_size`, and `worst_case_settlement_floor` first-class `PairBuild` decision inputs
-- [ ] Gate optional adds on below-snapshot price quality
-- [ ] Gate optional adds on non-negative `edge_model_minus_price` when that live signal exists, or document and implement an explicit fallback
-- [ ] Add the recommended paired-cost regime map:
+- [x] Gate optional adds on below-snapshot price quality
+- [x] Gate optional adds on non-negative `edge_model_minus_price` when that live signal exists, or document and implement an explicit fallback
+  - Wallet-clone fallback while no live edge model exists: use the minimum same-side snapshot gap across YES/NO as the optional-buy edge proxy.
+  - If either paired-growth bid is not strictly below its same-side snapshot, skip the optional add.
+  - If the minimum snapshot gap is positive but below `0.05`, cap the optional add to the small clip bucket instead of allowing a larger size-up.
+- [x] Add the recommended paired-cost regime map:
   - `< 0.94`
   - `0.94 - 0.98`
   - `0.98 - 1.00`
   - `1.00 - 1.02`
   - `> 1.02`
-- [ ] Add repair-budget reserve so heavy-side growth cannot strand the likely lighter-side repair
-- [ ] Replace fixed lighter-side repair behavior with exact-gap or smallest-valid-repair sizing
-- [ ] Tighten time-band policy to:
+- [x] Add repair-budget reserve so heavy-side growth cannot strand the likely lighter-side repair
+- [x] Replace fixed lighter-side repair behavior with exact-gap or smallest-valid-repair sizing
+- [x] Tighten time-band policy to:
   - `0-210s` normal growth
   - `210-240s` reduced growth
   - `240-270s` repair-first
   - `270-300s` no optional adds
-- [ ] Make late `PairBuild` decisions evaluate settlement floor and tail ahead of average-cost cosmetics
-- [ ] Clarify and implement when an opposite-side live order may be preserved versus canceled during lighter-side repair
-- [ ] Add canary reporting for:
+- [x] Make late wallet-clone taper decisions evaluate settlement floor and tail ahead of average-cost cosmetics
+- [x] Clarify and implement when an opposite-side live order may be preserved versus canceled during lighter-side repair
+- [x] Add canary reporting for:
   - below-snapshot fill rate
   - tail at expiry
   - worst-case settlement floor

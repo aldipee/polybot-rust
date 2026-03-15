@@ -103,82 +103,81 @@ Execution note:
   - `share_skew_ratio`
   - `worst_case_settlement_floor`
   - `projected_paired_cost`
-- [ ] Add one helper that classifies the projected paired-cost band:
+- [x] Add one helper that classifies the projected paired-cost band:
   - `< 0.94`
   - `0.94 - 0.98`
   - `0.98 - 1.00`
   - `1.00 - 1.02`
   - `> 1.02`
-- [ ] Add one helper that computes the minimum required repair reserve for the likely lighter-side repair
-- [ ] Add unit tests for all new helpers before wiring them into `PairBuild`
+- [x] Add one helper that computes the minimum required repair reserve for the likely lighter-side repair
+- [x] Add unit tests for all new helpers before wiring them into `PairBuild`
 
 ### 4B.2 Optional Add Price / Edge Gates
-- [ ] Add below-snapshot gating for optional buys only
-- [ ] Make the below-snapshot rule explicit in code and logs:
+- [x] Add below-snapshot gating for optional buys only
+- [x] Make the below-snapshot rule explicit in code and logs:
   - optional `PairedGrowth` must be strictly better than same-side snapshot
   - `OpenBoth`, `SeedCompletion`, and required lighter-side repair remain exempt unless separately restricted
 - [ ] Add non-negative `edge_model_minus_price` gating for optional buys when the live signal exists
-- [ ] Add the first size-up band at about `edge_model_minus_price >= 0.05`
-- [ ] If the live model signal does not exist in Sprint 4 runtime, document and implement the exact fallback rule instead of leaving the gate implicit
+- [x] Add the first size-up band at about `edge_model_minus_price >= 0.05`
+- [x] If the live model signal does not exist in Sprint 4 runtime, document and implement the exact fallback rule instead of leaving the gate implicit
 - [ ] Add explicit hold / suppress log reasons for:
   - `optional_buy_not_below_snapshot`
   - `optional_buy_negative_edge`
   - `optional_buy_weak_edge_reduced_size`
 
 ### 4B.3 Paired-Cost Regime Enforcement
-- [ ] Route optional `PairedGrowth` through the projected paired-cost band helper
-- [ ] Enforce these normal-flow rules:
+- [x] Route optional `PairedGrowth` through the projected paired-cost band helper
+- [x] Enforce these normal-flow rules:
   - `< 0.94` strong paired growth
   - `0.94 - 0.98` normal paired growth
   - `0.98 - 1.00` maintenance / reduced growth
   - `1.00 - 1.02` repair-only
   - `> 1.02` default freeze / skip
-- [ ] Stop optional growth above `projected_paired_cost > 1.00`
-- [ ] Default-freeze or skip above `projected_paired_cost > 1.02`, unless an explicit approved repair exception is added later
-- [ ] Keep `OpenBoth` and `SeedCompletion` outside these optional-growth gates
+- [x] Stop optional growth above `projected_paired_cost > 1.00`
+- [x] Default-freeze or skip above `projected_paired_cost > 1.02`, unless an explicit approved repair exception is added later
+- [x] Keep `OpenBoth` and `SeedCompletion` outside these optional-growth gates
 - [ ] Add explicit hold / suppress log reasons for each paired-cost band transition
 
 ### 4B.4 Repair Reserve And Tail Protection
-- [ ] Add repair-budget reserve before heavy-side growth
-- [ ] Block heavy-side optional growth whenever remaining budget cannot fund the likely lighter-side repair plus the configured reserve buffer
+- [x] Add repair-budget reserve before heavy-side growth
+- [x] Block heavy-side optional growth whenever remaining budget cannot fund the likely lighter-side repair plus the configured reserve buffer
 - [ ] Make `PairBuild` score `worst_case_settlement_floor` and `tail_size` ahead of exact equality cosmetics
-- [ ] Add explicit hold reason when growth is blocked by repair reserve instead of by price quality
-- [ ] Add metrics for:
-  - growth blocked by repair reserve
-  - growth blocked by projected floor / tail deterioration
+- [x] Add explicit hold reason when growth is blocked by repair reserve instead of by price quality
+- [x] Add metrics for growth blocked by repair reserve
+- [x] Add metrics for growth blocked by projected floor / tail deterioration
 
 ### 4B.5 Exact-Gap Repair Behavior
-- [ ] Replace fixed lighter-side repair clips with exact-gap or smallest-valid-repair sizing
-- [ ] Round the exact-gap repair up only as much as needed to satisfy exchange minimum notional / precision rules
-- [ ] Prevent repeated invalid tiny repair attempts once the minimum valid repair size is known
-- [ ] Clarify and implement when opposite-side live orders may be preserved during lighter-side repair versus canceled for clean repair ownership:
+- [x] Replace fixed lighter-side repair clips with exact-gap or smallest-valid-repair sizing
+- [x] Round the exact-gap repair up only as much as needed to satisfy exchange minimum notional / precision rules
+- [x] Prevent repeated invalid tiny repair attempts once the minimum valid repair size is known
+- [x] Clarify and implement when opposite-side live orders may be preserved during lighter-side repair versus canceled for clean repair ownership:
   - preserve only if remaining size and price are compatible with the repair target
   - cancel / handoff otherwise
-- [ ] Add explicit logs for:
+- [x] Add explicit logs for:
   - exact-gap repair sizing
   - rounded-up minimum-valid repair sizing
   - preserve-vs-cancel ownership decisions during lighter-side repair
 
 ### 4B.6 Late-Window Floor / Tail Policy
-- [ ] Tighten the time-band policy to:
+- [x] Tighten the time-band policy to:
   - `0-210s` normal growth
   - `210-240s` reduced growth
   - `240-270s` repair-first
   - `270-300s` no optional adds
-- [ ] After `240s`, make floor and tail improvement beat average-cost cosmetics
-- [ ] After `270s`, allow only the smallest repair that improves floor or reduces tail
-- [ ] Add explicit late hold reasons that distinguish:
+- [x] After `240s`, make floor and tail improvement beat average-cost cosmetics
+- [x] After `270s`, allow only the smallest repair that improves floor or reduces tail
+- [x] Add explicit late hold reasons that distinguish:
   - repair-first suppression
   - no-optional-adds suppression
   - floor / tail priority decisions
 
 ### 4B.7 Metrics And Canary Review Surface
-- [ ] Add canary metrics for:
+- [x] Add canary metrics for:
   - below-snapshot optional fill rate
   - paired-cost band occupancy
   - tail at expiry
   - worst-case settlement floor at expiry
-- [ ] Surface the new metrics in the final `[WALLET_CLONE][METRICS]` summary
+- [x] Surface the new metrics in the final `[WALLET_CLONE][METRICS]` summary
 - [ ] Make the second canary review explicitly compare:
   - paired core cost quality
   - final tail size
@@ -241,7 +240,7 @@ Execution note:
 - [ ] Unit test below-snapshot gating for optional buys
 - [ ] Unit test optional-growth block above `projected_paired_cost > 1.00`
 - [ ] Unit test repair-only behavior in the `1.00 - 1.02` band
-- [ ] Unit test repair-budget reserve blocks heavy-side growth when likely repair cannot be funded
+- [x] Unit test repair-budget reserve blocks heavy-side growth when likely repair cannot be funded
 - [ ] Unit test exact-gap / smallest-valid-repair sizing
 - [ ] Unit test late `240s+` floor/tail-first behavior
 - [ ] Unit test non-negative-edge gate or documented fallback behavior

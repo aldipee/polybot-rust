@@ -578,11 +578,14 @@ Friendly explanation: these keys define the wallet-clone rhythm. The path should
 - `WALLET_CLONE_REPAIR_CLIP_SMALL`
   Default: `15`
   What it does: small missing-side repair clip used by `SeedCompletion`.
+- `WALLET_CLONE_REPAIR_RESERVE_BUFFER_USD`
+  Default: `1.0`
+  What it does: extra wallet-clone budget cushion that `PairBuild` preserves on top of the likely lighter-side repair cost before allowing optional paired growth.
 - `WALLET_CLONE_CLIP_LADDER_LARGE`
   Default: `40,80`
   What it does: comma-separated large clip ladder used by `PairBuild` for aggressive replenishment.
 
-Friendly explanation: Sprint 4 does not use a single giant opener. It uses small startup clips and then scales into repeated larger passive adds.
+Friendly explanation: Sprint 4 does not use a single giant opener. It uses small startup clips, exact-gap repair sizing, and a protected repair reserve before scaling into repeated larger passive adds.
 
 ### Phase Budget Slices
 
