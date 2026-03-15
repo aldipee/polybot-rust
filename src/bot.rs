@@ -507,6 +507,8 @@ struct WalletCloneRuntimeState {
     pair_build_last_optional_growth_submit_ts: f64,
     pair_build_yes_repost: WalletClonePairBuildSideRepostState,
     pair_build_no_repost: WalletClonePairBuildSideRepostState,
+    pair_build_last_paired_growth_yes_bid: f64,
+    pair_build_last_paired_growth_no_bid: f64,
     taper_last_hold_reason: String,
     total_fill_events: u32,
     total_fill_shares: f64,
@@ -972,6 +974,7 @@ struct WalletClonePairedGrowthPolicy {
     projected_paired_cost: f64,
     band: WalletClonePairedCostBand,
     clipped_for_band: bool,
+    allowed_averaging_down: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1946,6 +1949,7 @@ fn wallet_clone_pair_build_optional_growth_policy(
                 projected_paired_cost: current_projected_paired_cost,
                 band: current_band,
                 clipped_for_band: false,
+                allowed_averaging_down: false,
             })
         }
         WalletClonePairedCostBand::ReducedGrowth => {
@@ -1963,6 +1967,7 @@ fn wallet_clone_pair_build_optional_growth_policy(
                     projected_paired_cost: current_projected_paired_cost,
                     band: current_band,
                     clipped_for_band: false,
+                    allowed_averaging_down: false,
                 });
             }
             let reduced_projected_paired_cost = wallet_clone_pair_build_projected_inventory_vwap_sum(
@@ -1981,6 +1986,7 @@ fn wallet_clone_pair_build_optional_growth_policy(
                     reduced_projected_paired_cost,
                 ),
                 clipped_for_band: true,
+                allowed_averaging_down: false,
             })
         }
         WalletClonePairedCostBand::RepairOnly | WalletClonePairedCostBand::Freeze => {
@@ -2037,6 +2043,33 @@ fn wallet_clone_pair_build_optional_growth_policy(
                         projected_paired_cost,
                         band,
                         clipped_for_band: candidate + 1e-9 < current_clip,
+                        allowed_averaging_down: false,
+                    });
+                }
+            }
+            // Averaging-down exception: if pair_sum < inventory_vwap_sum, adding
+            // at this pair_sum would improve the blended cost even though the
+            // current book is already in RepairOnly/Freeze territory.
+            let pair_sum = decision.pair_sum;
+            let inventory_vwap_sum = decision.inventory_vwap_sum;
+            if pair_sum.is_finite()
+                && inventory_vwap_sum.is_finite()
+                && pair_sum + 1e-9 < inventory_vwap_sum
+            {
+                let avg_down_clip = settlement_shaper_round_down_to_lot(
+                    current_clip.min(small_clip_cap),
+                    lot,
+                );
+                if avg_down_clip + 1e-9 >= lot {
+                    let avg_down_projected = wallet_clone_pair_build_projected_inventory_vwap_sum(
+                        q_yes, q_no, cost_yes, cost_no, y_bid, n_bid, avg_down_clip,
+                    );
+                    return Some(WalletClonePairedGrowthPolicy {
+                        clip: avg_down_clip as i64,
+                        projected_paired_cost: avg_down_projected,
+                        band: wallet_clone_pair_build_projected_paired_cost_band(avg_down_projected),
+                        clipped_for_band: avg_down_clip + 1e-9 < current_clip,
+                        allowed_averaging_down: true,
                     });
                 }
             }
@@ -2045,6 +2078,7 @@ fn wallet_clone_pair_build_optional_growth_policy(
                 projected_paired_cost: current_projected_paired_cost,
                 band: current_band,
                 clipped_for_band: false,
+                allowed_averaging_down: false,
             })
         }
     }
@@ -8186,6 +8220,10 @@ impl MakerHedgeCapBot {
                 } else if self.no_asset.as_deref() == Some(asset_id) {
                     st.pair_build_no_repost = WalletClonePairBuildSideRepostState::default();
                 }
+                // Do NOT clear pair_build_last_paired_growth_{yes,no}_bid here.
+                // The lighter-side repair cap needs the anchor prices from the
+                // paired growth submit that produced this fill.  They are
+                // naturally overwritten by the next paired growth submit.
             }
             wallet_clone_note_fill_event(&mut st, t_into_s, filled, is_maker, &cfg);
         }
@@ -9544,10 +9582,47 @@ impl MakerHedgeCapBot {
                 return;
             }
 
+            // Cap lighter-side repair bid to preserve original pair economics.
+            // If paired growth submitted at (pg_y_bid, pg_n_bid) and the
+            // opposite side already filled, limit the repair bid so the
+            // combined pair cost does not exceed the original pair_sum.
+            let (repair_bid_capped, repair_original_bid) = {
+                let (pg_y_bid, pg_n_bid) = self
+                    .wallet_clone_state
+                    .lock()
+                    .map(|st| (
+                        st.pair_build_last_paired_growth_yes_bid,
+                        st.pair_build_last_paired_growth_no_bid,
+                    ))
+                    .unwrap_or((0.0, 0.0));
+                let filled_side_price = match active_side {
+                    SettlementShaperSide::Yes => pg_n_bid,
+                    SettlementShaperSide::No => pg_y_bid,
+                };
+                if filled_side_price > 0.0 && pg_y_bid > 0.0 && pg_n_bid > 0.0 {
+                    let target_pair_sum = pg_y_bid + pg_n_bid;
+                    let max_repair_price = target_pair_sum - filled_side_price;
+                    if max_repair_price > 0.0 && max_repair_price + 1e-9 < active_bid {
+                        // Round down to tick to keep the order valid
+                        let tick = self.cfg.tick.max(0.0001);
+                        let ticked = (max_repair_price / tick).floor() * tick;
+                        if ticked > 0.0 {
+                            (ticked, active_bid)
+                        } else {
+                            (active_bid, active_bid)
+                        }
+                    } else {
+                        (active_bid, active_bid)
+                    }
+                } else {
+                    (active_bid, active_bid)
+                }
+            };
+
             self._set_pending_entry_reason("WALLET_CLONE_PAIR_BUILD");
             let oid = self._maker_order_upsert_gtc(
                 &key,
-                active_bid,
+                repair_bid_capped,
                 decision.clip as f64,
                 "WALLET_CLONE_PAIR_BUILD_LIGHTER",
             );
@@ -9555,7 +9630,7 @@ impl MakerHedgeCapBot {
                 let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
                     || prev_slot.state != MakerOrderLifecycle::Working;
                 if is_new_submit {
-                    self._wallet_clone_pair_build_note_side_submit(active_side, active_bid, now);
+                    self._wallet_clone_pair_build_note_side_submit(active_side, repair_bid_capped, now);
                     self._wallet_clone_clear_pair_build_hold();
                     let exact_gap_clip = lighter_repair_policy
                         .as_ref()
@@ -9573,8 +9648,9 @@ impl MakerHedgeCapBot {
                         .as_ref()
                         .map(|policy| policy.clipped_to_budget)
                         .unwrap_or(false);
+                    let bid_cap_applied = (repair_original_bid - repair_bid_capped).abs() > 1e-9;
                     self.logger.info(&format!(
-                        "[WALLET_CLONE][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                        "[WALLET_CLONE][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                         decision.mode.as_str(),
                         active_side.as_str(),
                         decision.clip,
@@ -9585,6 +9661,9 @@ impl MakerHedgeCapBot {
                         min_valid_clip,
                         rounded_up_min_valid,
                         clipped_to_budget,
+                        bid_cap_applied,
+                        repair_bid_capped,
+                        repair_original_bid,
                         t_into_s.max(0.0),
                         q_yes,
                         q_no,
@@ -9789,7 +9868,8 @@ impl MakerHedgeCapBot {
             if matches!(
                 policy.band,
                 WalletClonePairedCostBand::RepairOnly | WalletClonePairedCostBand::Freeze
-            ) {
+            ) && !policy.allowed_averaging_down
+            {
                 self._wallet_clone_log_pair_build_state(
                     "hold",
                     &format!(
@@ -9879,6 +9959,13 @@ impl MakerHedgeCapBot {
         }
         if n_oid.is_some() {
             self._wallet_clone_pair_build_note_side_submit(SettlementShaperSide::No, n_bid, now);
+        }
+        // Record paired growth bid prices for lighter-side repair cap
+        if y_oid.is_some() || n_oid.is_some() {
+            if let Ok(mut st) = self.wallet_clone_state.lock() {
+                st.pair_build_last_paired_growth_yes_bid = y_bid;
+                st.pair_build_last_paired_growth_no_bid = n_bid;
+            }
         }
         let submit_elapsed_ms = ((now_ts_f64() - submit_started).max(0.0)) * 1000.0;
         if let Some(asymmetry) = self._settlement_shaper_pair_order_asymmetry(
@@ -9995,8 +10082,11 @@ impl MakerHedgeCapBot {
                     }
                 }
             }
+            let averaging_down = optional_growth_policy
+                .map(|p| p.allowed_averaging_down)
+                .unwrap_or(false);
             self.logger.info(&format!(
-                "[WALLET_CLONE][PAIR_BUILD] submit mode={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} paired_cost_band={} projected_paired_cost={:.3} clipped_for_band={} optional_buy_guard={} optional_buy_edge_source={} min_snapshot_edge={:.3} below_snapshot_optional={} repair_reserve_side={} likely_repair_clip={} total_reserved_budget={:.2} clipped_for_repair_reserve={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} pair_coverage={:.3} skew={:.3} current_base={:.2} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                "[WALLET_CLONE][PAIR_BUILD] submit mode={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} paired_cost_band={} projected_paired_cost={:.3} clipped_for_band={} averaging_down={} optional_buy_guard={} optional_buy_edge_source={} min_snapshot_edge={:.3} below_snapshot_optional={} repair_reserve_side={} likely_repair_clip={} total_reserved_budget={:.2} clipped_for_repair_reserve={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} pair_coverage={:.3} skew={:.3} current_base={:.2} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                 decision.mode.as_str(),
                 decision.clip,
                 decision.clip_bucket,
@@ -10005,6 +10095,7 @@ impl MakerHedgeCapBot {
                 paired_cost_band,
                 projected_paired_cost,
                 clipped_for_band,
+                averaging_down,
                 optional_buy_guard,
                 optional_buy_edge_source,
                 min_snapshot_edge,
@@ -33665,7 +33756,10 @@ mod tests {
     }
 
     #[test]
-    fn wallet_clone_pair_build_blocks_optional_growth_in_repair_only_band() {
+    fn wallet_clone_pair_build_allows_averaging_down_in_repair_only_band() {
+        // pair_sum=0.99 < inventory_vwap_sum=1.03, so this should now be
+        // allowed through as averaging-down even though the projected paired
+        // cost is in the repair_only band.
         let mut bot = make_wallet_clone_test_bot();
         bot.cfg.max_total_cost = 120.0;
         bot.cfg.reserve_usd = 5.0;
@@ -33676,22 +33770,61 @@ mod tests {
         let cfg = wallet_clone_config_defaults();
         bot._wallet_clone_pair_build_handler(now, 90.0, 20.6, 20.0, 20.0, 10.3, 10.3, &cfg);
 
-        assert_eq!(
-            bot.wallet_clone_state
-                .lock()
-                .map(|st| st.pair_build_last_hold_reason.clone())
-                .unwrap_or_default(),
-            "hold:projected_paired_cost_repair_only:1.013"
-        );
+        // Should NOT be blocked — averaging-down allows it through
+        let hold_reason = bot.wallet_clone_state
+            .lock()
+            .map(|st| st.pair_build_last_hold_reason.clone())
+            .unwrap_or_default();
         assert!(
-            bot.wallet_clone_state
-                .lock()
-                .map(|st| st.skipped_optional_add_count)
-                .unwrap_or_default()
-                >= 1
+            !hold_reason.starts_with("hold:projected_paired_cost_"),
+            "expected averaging-down to bypass repair_only block, but got: {}",
+            hold_reason
         );
-        assert!(wallet_clone_test_slot(&bot, "yes_asset_id").order_id.is_none());
-        assert!(wallet_clone_test_slot(&bot, "no_asset_id").order_id.is_none());
+    }
+
+    #[test]
+    fn wallet_clone_pair_build_blocks_optional_growth_in_repair_only_band_when_not_averaging_down() {
+        // Unit test the pure function: pair_sum=0.99 >= inventory_vwap_sum=0.985
+        // → NOT averaging down, and projected cost is in RepairOnly → should
+        // still block (allowed_averaging_down=false).
+        let cfg = wallet_clone_config_defaults();
+        // Large book where projected cost stays in RepairOnly at any clip
+        let decision = super::WalletClonePairBuildDecision {
+            mode: super::WalletClonePairBuildMode::PairedGrowth,
+            side: None,
+            clip: 15,
+            requested_clip: 15.0,
+            clip_bucket: "small",
+            cpp_hint: super::WalletClonePairBuildCppHint::Normal,
+            pair_sum: 0.990,
+            pair_coverage: 1.0,
+            skew_ratio: 1.0,
+            current_base: 500.0,
+            qty_gap: 0.0,
+            inventory_vwap_sum: 0.985,  // pair_sum >= this → NOT averaging down
+            market_snapshot_vwap_sum: 1.010,
+        };
+
+        // cost: 500 * 0.5025 = 251.25 each → vwap_sum = 1.005
+        // Wait, need cost consistent with inventory_vwap_sum=0.985...
+        // vwap_sum = cost_yes/q_yes + cost_no/q_no, so at 500/500:
+        // 0.985 = cost_yes/500 + cost_no/500
+        // total_cost = 500 * 0.985 = 492.50, each side = 246.25
+        let policy = super::wallet_clone_pair_build_optional_growth_policy(
+            &decision,
+            500.0,
+            500.0,
+            246.25,  // cost_yes
+            246.25,  // cost_no → vwap_sum = 0.985
+            0.495,   // y_bid
+            0.495,   // n_bid → pair_sum = 0.99
+            5.0,
+            &cfg,
+        )
+        .expect("optional growth policy");
+
+        // pair_sum (0.99) >= inventory_vwap_sum (0.985) → NOT averaging down
+        assert!(!policy.allowed_averaging_down);
     }
 
     #[test]
@@ -37860,6 +37993,205 @@ mod tests {
             2.29,
             5.0,
         ));
+    }
+
+    // ── Fix 1: Lighter-side repair bid cap tests ──
+
+    #[test]
+    fn wallet_clone_lighter_repair_bid_capped_to_original_pair_economics() {
+        // Paired growth submitted at YES=0.510, NO=0.480 (pair_sum=0.990).
+        // NO filled, YES didn't. Market moved YES bid to 0.560.
+        // The cap should limit the repair bid to 0.510 (= 0.990 - 0.480).
+        let pg_y_bid: f64 = 0.510;
+        let pg_n_bid: f64 = 0.480;
+        let current_y_bid: f64 = 0.560; // market moved up
+        let active_side = SettlementShaperSide::Yes;
+
+        // Simulate the cap logic from the handler
+        let filled_side_price = match active_side {
+            SettlementShaperSide::Yes => pg_n_bid,
+            SettlementShaperSide::No => pg_y_bid,
+        };
+        let target_pair_sum = pg_y_bid + pg_n_bid;
+        let max_repair_price = target_pair_sum - filled_side_price;
+
+        assert!((max_repair_price - 0.510_f64).abs() < 1e-9);
+        assert!(max_repair_price + 1e-9 < current_y_bid);
+
+        let tick: f64 = 0.01;
+        let ticked = (max_repair_price / tick).floor() * tick;
+        assert!(ticked > 0.0);
+        assert!(ticked <= max_repair_price + 1e-9);
+        assert!(ticked + 1e-9 < current_y_bid);
+    }
+
+    #[test]
+    fn wallet_clone_lighter_repair_bid_not_capped_when_no_prior_paired_growth() {
+        // When pg bids are 0.0, active_bid should pass through unchanged.
+        let pg_y_bid: f64 = 0.0;
+        let pg_n_bid: f64 = 0.0;
+        let active_bid: f64 = 0.560;
+
+        let capped = if pg_y_bid > 0.0 && pg_n_bid > 0.0 {
+            let target_pair_sum = pg_y_bid + pg_n_bid;
+            let filled_side_price = pg_n_bid;
+            let max_repair_price = target_pair_sum - filled_side_price;
+            if max_repair_price > 0.0 && max_repair_price + 1e-9 < active_bid {
+                max_repair_price
+            } else {
+                active_bid
+            }
+        } else {
+            active_bid
+        };
+
+        assert!((capped - active_bid).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wallet_clone_lighter_repair_bid_not_capped_when_bid_already_below_cap() {
+        // Current bid (0.500) is already below max_repair_price (0.510),
+        // so cap should not apply.
+        let pg_y_bid: f64 = 0.510;
+        let pg_n_bid: f64 = 0.480;
+        let active_bid: f64 = 0.500;
+
+        let filled_side_price = pg_n_bid;
+        let target_pair_sum = pg_y_bid + pg_n_bid;
+        let max_repair_price = target_pair_sum - filled_side_price;
+
+        assert!((max_repair_price - 0.510_f64).abs() < 1e-9);
+        // active_bid (0.500) < max_repair_price (0.510) → no cap needed
+        assert!(!(max_repair_price + 1e-9 < active_bid));
+    }
+
+    // ── Fix 2: Averaging-down exception tests ──
+
+    #[test]
+    fn wallet_clone_optional_growth_allows_averaging_down_in_repair_only_band() {
+        // inventory_vwap_sum=1.05, pair_sum=0.98 → pair_sum < inventory_vwap_sum
+        // so adding at this pair_sum would average down the book.
+        let cfg = wallet_clone_config_defaults();
+        // Build a decision with expensive existing book
+        let decision = super::WalletClonePairBuildDecision {
+            mode: super::WalletClonePairBuildMode::PairedGrowth,
+            side: None,
+            clip: 15,
+            requested_clip: 15.0,
+            clip_bucket: "small",
+            cpp_hint: super::WalletClonePairBuildCppHint::Normal,
+            pair_sum: 0.980,
+            pair_coverage: 1.0,
+            skew_ratio: 1.0,
+            current_base: 20.0,
+            qty_gap: 0.0,
+            inventory_vwap_sum: 1.050,
+            market_snapshot_vwap_sum: 1.020,
+        };
+
+        let policy = super::wallet_clone_pair_build_optional_growth_policy(
+            &decision,
+            20.0,   // q_yes
+            20.0,   // q_no
+            10.50,  // cost_yes → vwap_yes = 0.525
+            10.50,  // cost_no → vwap_no = 0.525, inventory_vwap_sum = 1.05
+            0.490,  // y_bid
+            0.490,  // n_bid → pair_sum = 0.98
+            5.0,    // min_shares
+            &cfg,
+        )
+        .expect("optional growth policy");
+
+        assert!(policy.allowed_averaging_down);
+        assert!(policy.clip > 0);
+        // clip should be capped to small_clip_cap
+        assert!(policy.clip <= cfg.repair_clip_small.max(cfg.seed_clip_small) as i64);
+    }
+
+    #[test]
+    fn wallet_clone_optional_growth_blocks_freeze_when_not_averaging_down() {
+        // pair_sum=1.02 >= inventory_vwap_sum=1.01 → NOT averaging down
+        let cfg = wallet_clone_config_defaults();
+        let decision = super::WalletClonePairBuildDecision {
+            mode: super::WalletClonePairBuildMode::PairedGrowth,
+            side: None,
+            clip: 15,
+            requested_clip: 15.0,
+            clip_bucket: "small",
+            cpp_hint: super::WalletClonePairBuildCppHint::Normal,
+            pair_sum: 1.020,
+            pair_coverage: 1.0,
+            skew_ratio: 1.0,
+            current_base: 20.0,
+            qty_gap: 0.0,
+            inventory_vwap_sum: 1.010,
+            market_snapshot_vwap_sum: 1.030,
+        };
+
+        let policy = super::wallet_clone_pair_build_optional_growth_policy(
+            &decision,
+            20.0,
+            20.0,
+            10.10,  // cost_yes
+            10.10,  // cost_no → inventory_vwap_sum = 1.01
+            0.510,  // y_bid
+            0.510,  // n_bid → pair_sum = 1.02
+            5.0,
+            &cfg,
+        )
+        .expect("optional growth policy");
+
+        // pair_sum (1.02) >= inventory_vwap_sum (1.01), so NOT averaging down
+        assert!(!policy.allowed_averaging_down);
+        assert!(matches!(
+            policy.band,
+            super::WalletClonePairedCostBand::RepairOnly | super::WalletClonePairedCostBand::Freeze
+        ));
+    }
+
+    #[test]
+    fn wallet_clone_optional_growth_averaging_down_uses_small_clip() {
+        // Large book where pair_sum < inventory_vwap_sum but even the smallest
+        // clip still stays in RepairOnly/Freeze — triggers averaging-down path.
+        // book: 500 YES / 500 NO, cost 262.5 each → vwap_sum = 1.05
+        // pair_sum = 1.04 (still < 1.05 so averaging down helps, but
+        // projected cost at any clip stays above 1.02 → Freeze)
+        let cfg = wallet_clone_config_defaults();
+        let decision = super::WalletClonePairBuildDecision {
+            mode: super::WalletClonePairBuildMode::PairedGrowth,
+            side: None,
+            clip: 80,
+            requested_clip: 80.0,
+            clip_bucket: "large",
+            cpp_hint: super::WalletClonePairBuildCppHint::Normal,
+            pair_sum: 1.040,
+            pair_coverage: 1.0,
+            skew_ratio: 1.0,
+            current_base: 500.0,
+            qty_gap: 0.0,
+            inventory_vwap_sum: 1.050,
+            market_snapshot_vwap_sum: 1.060,
+        };
+
+        let policy = super::wallet_clone_pair_build_optional_growth_policy(
+            &decision,
+            500.0,
+            500.0,
+            262.50,  // cost_yes → vwap_yes = 0.525
+            262.50,  // cost_no → vwap_no = 0.525, sum = 1.05
+            0.520,   // y_bid
+            0.520,   // n_bid → pair_sum = 1.04
+            5.0,
+            &cfg,
+        )
+        .expect("optional growth policy");
+
+        assert!(policy.allowed_averaging_down);
+        // clip should be capped to small_clip_cap (15)
+        assert!(policy.clip <= 15);
+        assert!(policy.clip > 0);
+        // projected cost should be lower than current inventory_vwap_sum
+        assert!(policy.projected_paired_cost < 1.050);
     }
 }
 

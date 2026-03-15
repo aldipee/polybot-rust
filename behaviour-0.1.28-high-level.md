@@ -2,10 +2,10 @@
 
 ## Version 0.1.28
 
-Audience: non-technical operator, reviewer, or stakeholder  
-Scope: Sprint 4 only  
-Mode: `EXEC_MODE=WALLET_CLONE`  
-Date: 2026-03-15  
+Audience: non-technical operator, reviewer, or stakeholder
+Scope: Sprint 4 only
+Mode: `EXEC_MODE=WALLET_CLONE`
+Date: 2026-03-16
 Reference: based on the latest technical runtime note in `behaviour-0.1.28.md`
 
 This document explains the current wallet-clone behaviour in plain language.
@@ -32,19 +32,20 @@ The important business idea is:
 
 ## Current Status
 
-Current status: `PARTIAL`
+Current status: `FIRST_PROFITABLE_CANARY`
 
 That means:
 
 1. the mode is live
-2. the startup path now works
+2. the startup path works
 3. the bot can seed both sides
 4. the bot can repair one-sided startup fills
-5. the latest reviewed run finished balanced and with no expiry tail
-6. the current tree now blocks duplicate `OpenBoth` resubmits and taper `suppress` fall-through
-7. but the mode can still overpay early, freeze through the middle of the market, and end balanced but unprofitable
+5. the mid-market builder no longer freezes — it accumulates through the whole window
+6. lighter-side repairs are now capped to prevent overpaying after market moves
+7. the latest reviewed canary was profitable on both settlement outcomes
+8. but only one profitable run has been reviewed — consistency is not yet proven
 
-So the mode is real and much stronger than before, but it is still a canary, not a finished wallet clone.
+So the mode is real, materially improved, and has shown its first profit. But it is still a canary, not a confirmed production strategy.
 
 ---
 
@@ -67,6 +68,8 @@ This means:
 1. keep participating across the market
 2. keep posting maker buys on both sides when conditions are usable
 3. lean toward the lighter side when one side grows too large
+4. cap lighter-side repair bids to avoid chasing bad prices
+5. average down the book when the current pair_sum is cheaper than the existing book
 
 ### Goal C: avoid late chaos
 
@@ -76,8 +79,7 @@ This means:
 2. reduce activity after taper starts
 3. become nearly silent in the final quiet window
 
-In the current canary, Goal A and Goal C are working much better than before.
-Goal B is active, but it can still get into an expensive early basis and then freeze instead of averaging down.
+In the latest canary, all three goals are now working. Goal B in particular is substantially improved — the bot no longer freezes mid-market.
 
 ---
 
@@ -107,6 +109,7 @@ Once the market is live, the bot moves through these broad windows:
 2. `PairBuild`
    - the main normal-flow builder
    - includes early build, main build, and late build behavior
+   - now includes lighter-side repair bid cap and averaging-down logic
 3. `Taper`
    - begins around `240s`
    - late activity becomes maintenance-only
@@ -135,10 +138,12 @@ The important owners today are:
 6. `HoldSettleRollover`
    - stop / rollover owner
 
-Compared with older behaviour, the important improvement is:
+Compared with older behaviour, the important improvements are:
 
 1. startup asymmetry now has its own owner
 2. the bot no longer gets stuck because startup repair is treated like ordinary shaping
+3. `PairBuild` no longer freezes when the book is expensive — it can average down
+4. lighter-side repairs no longer chase the market — they are capped to the original pair economics
 
 ---
 
@@ -173,10 +178,10 @@ Current opening rules include:
 
 In the reviewed run, the opening pair was roughly:
 
-1. YES around `0.520`
-2. NO around `0.470`
+1. YES around `0.470`
+2. NO around `0.510`
 3. clip `5`
-4. pair sum about `0.990`
+4. pair sum about `0.980`
 
 So the opener worked and got the strategy into the market.
 
@@ -188,16 +193,17 @@ A bad startup outcome is mainly this:
 2. the other side does not
 3. the bot is left one-sided right after opening
 
-In the latest run, that did happen briefly:
+In the latest run, that did happen:
 
-1. YES filled first
-2. NO did not become inventory immediately
-3. the reviewed run briefly deepened to about `10 YES / 0 NO` before missing-side restoration
+1. NO filled first at `0.510`
+2. YES did not fill immediately
+3. `SeedCompletion` posted YES, first at `0.480`, then `0.520`, finally filling at `0.580`
 
 The important difference from older behaviour is:
 
 1. the bot did not freeze in that state
 2. it handed control to the startup repair owner
+3. the expensive startup fill was recovered through mid-market volume
 
 ## D. SeedCompletion Logic
 
@@ -214,10 +220,10 @@ Its job in plain language is:
 In the reviewed run, this worked:
 
 1. missing side was identified correctly
-2. NO was restored by about `9.7s`
+2. YES was restored by about `22.5s`
 3. both startup targets were met
 
-This is one of the main improvements in `0.1.28`.
+Note: `SeedCompletion` bypasses cost guards by design. In this run it paid `0.580` for YES, which is expensive. The strategy recovered this cost through subsequent mid-market accumulation at cheaper pair_sums.
 
 ## E. PairBuild Logic
 
@@ -228,36 +234,34 @@ Its job is to:
 1. keep posting paired maker buys when conditions are usable
 2. add more inventory through the middle of the market
 3. switch to the lighter side when one side becomes too large
-4. use clip ladders and phase budgets instead of one fixed order size
+4. cap lighter-side repair bids to preserve pair economics
+5. average down the book when pair_sum is cheaper than the current blended cost
+6. use clip ladders and phase budgets instead of one fixed order size
 
-In the latest reviewed canary, `PairBuild` was real and structurally active.
-It is no longer a missing stub.
+In the latest reviewed canary, `PairBuild` is now fully functional.
 
-But it still has three important live problems:
+The two new fixes addressed the previous problems:
 
-1. startup can leave the paired core too expensive very early
-2. once paired cost is already bad, `PairBuild` spends most of the market in freeze instead of averaging down
-3. that means the bot can finish balanced and still be locked at a loss
+1. **Lighter-side repair bid cap**: when paired growth fills one side and the other needs repair, the repair bid is capped at `original_pair_sum - filled_side_price`. This prevents the bot from chasing the current market price after a move. The log shows `bid_cap_applied=true bid=0.420 original_bid=0.590` — a saving of `0.17` per share on that repair.
 
-That is why the mode now looks mechanically alive but still not economically safe enough.
+2. **Averaging-down exception**: when the current book is expensive (RepairOnly or Freeze band) but the current pair_sum is cheaper than the existing inventory_vwap_sum, the bot is now allowed to add a small clip to improve the blended cost. This eliminated the mid-market freeze entirely — the latest run spent `91.6%` of paired-cost observations in `normal_growth` and `0%` in `freeze`.
 
-## F. Why PairBuild Is Still The Main Problem
+## F. Why PairBuild Is No Longer The Main Problem
 
-The latest reviewed run repeatedly showed:
+The latest reviewed run showed:
 
-1. the book first became balanced at about `10 YES / 10 NO / total_cost=10.80`
-2. middle-market fill shares were effectively zero from `60s` to `240s`
-3. paired-cost occupancy was almost entirely `freeze`
-4. the final state was balanced at `20 YES / 20 NO`, but only at `total_cost=21.15`
+1. 30 fill events and 133 total shares (versus 8 fills and 40 shares before)
+2. fill shares in `60-180s` segment: `78.36` (was `0.00` in the previous canary)
+3. paired-cost band occupancy: `normal_growth=91.6%, reduced_growth=8.4%, freeze=0%`
+4. `combined_avg_paid=0.967` (below 1.00)
+5. `worst_case_settlement_floor=+0.86`
 
 Plain-language meaning:
 
-1. the bot can pay too much very early
-2. after that, the strategy becomes too conservative instead of averaging down
-3. the book can stay balanced but still cost more than it can ever settle for
-4. so the bot now loses more from bad basis and freezing than from expiry tails
-
-This is why the run ended operational but economically weak.
+1. the bot now accumulates actively through the middle of the market
+2. the freeze that prevented mid-market building is gone
+3. the cheaper mid-market fills bring the blended cost below settlement value
+4. the bot is now profitable on both settlement outcomes
 
 ## G. Taper Logic
 
@@ -269,19 +273,14 @@ Its job is to:
 2. allow only small maintenance if needed
 3. go mostly quiet in the final quiet window
 
-In the latest reviewed run, this part mostly behaved correctly.
+In the latest reviewed run, this part behaved correctly.
 
 Observed good signs:
 
 1. the bot moved to `Taper` at the expected late point
-2. the final state still had `tail_at_expiry=0`
-3. it placed no activity after final quiet
+2. zero fills after `240s`
+3. zero new orders after `240s`
 4. it rolled over correctly near expiry
-
-Observed caveat:
-
-1. the reviewed run exposed a bug where taper could log `suppress` and still submit anyway
-2. the current tree now blocks that fall-through path
 
 ## H. Rollover Logic
 
@@ -298,133 +297,47 @@ This part is now one of the more reliable pieces of the mode.
 
 ---
 
-## Step-By-Step Of The Latest Live Run
-
-Below is the latest reviewed run in business terms.
-
-### 1. Startup gating worked
-
-The bot:
-
-1. found the correct market
-2. loaded the YES and NO assets
-3. warmed trading metadata
-4. waited for fresh enough data
-5. waited for websocket readiness
-
-So the run did not fail at discovery or readiness.
-
-### 2. OpenBoth got into market, but startup was still expensive
-
-Once live:
-
-1. the bot entered `OpenBoth`
-2. it posted a paired maker opener immediately after open
-3. the opening pair was roughly:
-   - `YES bid 0.520`
-   - `NO bid 0.470`
-   - `pair sum 0.990`
-   - `clip 5`
-4. YES filled first
-5. in the reviewed run, YES effectively filled again before NO was restored, and the book briefly reached about `10 YES / 0 NO`
-
-That means the mode is no longer failing at the first trade, but startup can still get too expensive too quickly.
-
-### 3. SeedCompletion worked
-
-The startup outcome was briefly asymmetric:
-
-1. YES filled first
-2. NO lagged
-3. the bot switched to `SeedCompletion`
-4. the missing NO side was restored
-5. both sides were live by about `9.7s`
-
-This is the clearest improvement versus earlier wallet-clone canaries.
-
-### 4. PairBuild was active, but mostly frozen
-
-The bot then built inventory through the middle of the market.
-
-Observed good signs:
-
-1. it kept trading through the main window
-2. it did restore a balanced `10 YES / 10 NO` paired core
-3. it stayed mechanically stable instead of collapsing into a tail through the middle
-
-Observed bad signs:
-
-1. the book first reached about `10 YES / 10 NO / total_cost=10.80`
-2. from `60s` to `240s`, it recorded no fill shares at all
-3. paired-cost occupancy was almost entirely `freeze`
-4. so the strategy did not average down through the middle of the market
-5. the book stayed balanced, but not cheap
-
-So the builder was live, but it still creates bad economics by freezing on an already-expensive book.
-
-### 5. Late behaviour mostly worked, and no final tail remained
-
-After about `240s`:
-
-1. the bot entered `Taper`
-2. it still submitted some late maintenance fills
-3. it went quiet in the final quiet window
-4. it rolled over correctly near expiry
-5. the final state still ended with no unmatched expiry tail
-6. the reviewed run also exposed a taper bug where `suppress` could still fall through to submit
-7. the current tree now blocks that path
-
-So the late lifecycle is still one of the stronger parts of the mode, and it is cleaner than the previous tail-heavy canary.
-
----
-
 ## Final State Of The Latest Run
 
 The final reviewed state before rollover was approximately:
 
-1. `qYES=20`
-2. `qNO=20`
-3. `total_cost=21.15`
-4. `paired_size=20`
-5. `unmatched_size=0`
-6. `pair_coverage=1.000`
-7. `share_skew=1.000`
-8. `combined_avg_paid=1.058`
-9. `worst_case_settlement_floor=-1.15`
+1. `paired_size=64.99`
+2. `unmatched_size=3.37`
+3. `pair_coverage=0.951`
+4. `share_skew=1.052`
+5. `combined_avg_paid=0.967`
+6. `worst_case_settlement_floor=+0.86`
+7. `tail_at_expiry=3.37`
 
 Plain-language meaning:
 
-1. the bot built a real two-sided book
-2. it finished balanced
-3. it did not finish with an expiry tail
-4. but the final paired inventory was still much too expensive
-
-So this is no longer a tail-heavy canary.
-It is now an active bot that can finish balanced and still lose money because the book is too expensive.
+1. the bot built a large two-sided book (65 paired shares)
+2. it finished nearly balanced with a small tail (3.37 shares)
+3. the final paired inventory cost less than settlement value
+4. the bot is profitable regardless of which side wins
+5. worst case profit is `+$0.86`, best case is approximately `+$4.23`
 
 ---
 
 ## What Is Good News In This Run
-
-Even though the run still fell short of the objective, it tells us useful things.
 
 Good news:
 
 1. the mode started correctly
 2. the mode opened correctly
 3. the mode repaired startup asymmetry correctly
-4. the mode rolled over correctly
-5. the latest reviewed run finished with no expiry tail
-6. the current tree now blocks two canary-discovered flow bugs
+4. the mid-market builder stayed active and accumulated 78 shares from `60-180s`
+5. the paired cost never entered freeze or repair-only territory
+6. the mode rolled over correctly
+7. the bot was profitable on both settlement outcomes for the first time
 
-So the architecture is much stronger than before.
-The remaining problem is more focused now.
+This is a substantial improvement over the previous canary.
 
 ---
 
 ## What Is The Main Problem In One Sentence
 
-The bot can now build and repair inventory, but it still overpays early and then freezes instead of averaging down, so it can finish balanced and still lose money.
+The bot can now build profitable inventory, but this has only been proven in one canary — consistency across different market conditions is not yet confirmed.
 
 ---
 
@@ -432,16 +345,17 @@ The bot can now build and repair inventory, but it still overpays early and then
 
 If you are not reading code, the practical takeaway is:
 
-1. the bot now behaves like a real strategy, not a broken startup stub
+1. the bot now behaves like a real profitable strategy, not a broken or unprofitable stub
 2. it can enter the market
 3. it can recover one-sided startup outcomes
-4. it can finish without an expiry tail
-5. but it still does not build inventory cheaply enough to be profitable
+4. it can accumulate cheaply through the middle of the market without freezing
+5. it finished its first canary profitable on both outcomes
+6. but one profitable run does not mean it always works — more runs are needed
 
-That is why the correct label today is still:
+That is why the correct label today is:
 
-- strong canary
-- not yet finished production behaviour
+- first profitable canary
+- needs more data to confirm stability
 
 ---
 
@@ -449,32 +363,31 @@ That is why the correct label today is still:
 
 The next desired behaviour is simple:
 
-1. confirm in the next canary that the latest `OpenBoth` and taper suppress fixes behave as intended
-2. reduce early overpay after asymmetric startup fills
-3. change `PairBuild` cost gating so the middle of the market can average down instead of freezing
-4. keep startup completion, final quiet, and rollover behaviour exactly as they are unless the next canary disproves them
+1. run 3-5 more canaries across different market conditions
+2. confirm that `worst_case_settlement_floor` stays positive (or near zero) consistently
+3. confirm that `combined_avg_paid` stays below `~0.98` consistently
+4. watch for runs where the bid cap creates persistent unfilled repairs and the bot ends heavily skewed
+5. if the bid cap causes fillability problems consistently, add a spread-floor softening so capped bids stay within a maximum spread of current market
+6. keep startup completion, final quiet, and rollover behaviour exactly as they are unless a canary disproves them
 
-If those things improve, the next canary has a realistic chance of looking much closer to the target wallet.
+If those canaries confirm consistent profitability, the mode can be considered for production readiness.
 
 ---
 
 ## Short Plain-English Conclusion
 
-Today, wallet clone is operational and substantially improved.
+Today, wallet clone is operational and has shown its first profit.
 
 It can:
 
 1. pre-arm
 2. open
 3. repair startup asymmetry
-4. build inventory
-5. taper
-6. roll over
+4. build inventory cheaply through the middle of the market
+5. cap lighter-side repairs to avoid chasing
+6. average down an expensive book
+7. taper
+8. roll over
+9. finish profitable on both outcomes
 
-But it still cannot reliably do the most important economic next step well enough:
-
-1. keep `PairBuild` calm
-2. keep the paired core below settlement value
-3. finish with cheaper, cleaner paired inventory after early asymmetry
-
-That is the current real-world behaviour in one page.
+The next step is confirming this result across more market conditions.

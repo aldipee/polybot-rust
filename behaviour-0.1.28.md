@@ -2,9 +2,9 @@
 
 ## Version 0.1.28
 
-Scope: Sprint 4 only  
-Mode: `EXEC_MODE=WALLET_CLONE`  
-Date: 2026-03-15
+Scope: Sprint 4 only
+Mode: `EXEC_MODE=WALLET_CLONE`
+Date: 2026-03-16
 
 This file is not a design target.
 It is a concrete runtime note for the current Sprint 4 wallet-clone path in the working tree.
@@ -15,7 +15,7 @@ It is a concrete runtime note for the current Sprint 4 wallet-clone path in the 
 
 `0.1.28` records the current runnable Sprint 4 wallet-clone implementation.
 
-The main current-tree changes are:
+The main current-tree changes since the previous reviewed canary are:
 
 1. `WALLET_CLONE` now has its own runtime loop boundary and is no longer forced through the older market / settlement-shaper routing.
 2. The wallet-clone controller now runs explicit `PreArm`, `OpenBoth`, `SeedCompletion`, `PairBuild`, `Taper`, and rollover ownership.
@@ -28,46 +28,66 @@ The main current-tree changes are:
 5. Wallet-clone phase budget fractions now affect live runtime behavior in `OpenBoth`, `PairBuild`, and `Taper`.
 6. Wallet-clone metrics now count actual fill events instead of inferring fills from raw inventory deltas.
 7. A flat market that reaches `PairBuild` with `qYES=0` and `qNO=0` now keeps `OpenBoth` live instead of falling through to an inactive owner branch.
+8. `PairBuild` lighter-side repair bids are now capped to preserve original paired-growth economics.
+   - when a paired growth submit fills one side and the other side needs repair, the repair bid is capped at `original_pair_sum - filled_side_price`
+   - this prevents lighter-side repairs from chasing the current market bid after a price move
+   - `SeedCompletion` repairs are exempt from this cap
+9. `PairBuild` optional paired growth now allows averaging down when the book is in `RepairOnly` or `Freeze` territory.
+   - if the current `pair_sum < inventory_vwap_sum`, adding at that pair_sum improves the blended cost
+   - the averaging-down exception uses a reduced clip (small_clip_cap) to limit risk
+   - this eliminates the mid-market freeze that prevented accumulation in earlier canaries
 
-The latest reviewed canary on `2026-03-15` ended balanced and tail-free, but it still did not prove profitability.
+The latest reviewed canary on `2026-03-16` was the first Sprint 4 run to show profitability on both settlement outcomes.
 
-That canary and the current-tree follow-up fixes confirm:
+That canary and the current-tree fixes confirm:
 
 1. `OpenBoth`, `SeedCompletion`, `PairBuild`, `Taper`, and rollover are all mechanically live.
 2. Both startup targets were met in the reviewed run:
    - `both_by_30s=true`
    - `both_by_60s=true`
 3. The latest reviewed run ended with:
-   - `paired_size=20.00`
-   - `unmatched_size=0.00`
-   - `tail_at_expiry=0.00`
-4. The current tree now blocks duplicate `OpenBoth` resubmits while both startup seed legs are already live.
-5. The current tree now treats taper paired-growth `suppress` as a real no-submit return.
-6. The main remaining problem is no longer expiry-tail handling.
-7. The main remaining problems are now:
-   - expensive startup basis after asymmetric early fills
-   - almost complete mid-market `PairBuild` freeze once paired cost is above `1.00`
-   - balanced but still unprofitable market-end books
+   - `paired_size=64.99`
+   - `unmatched_size=3.37`
+   - `tail_at_expiry=3.37`
+   - `combined_avg_paid=0.967`
+   - `worst_case_settlement_floor=+0.86`
+4. The current tree blocks duplicate `OpenBoth` resubmits while both startup seed legs are already live.
+5. The current tree treats taper paired-growth `suppress` as a real no-submit return.
+6. The mid-market `PairBuild` freeze is now eliminated.
+7. The lighter-side repair bid cap is active and observable in logs (`bid_cap_applied=true`).
+8. The main remaining observations are:
+   - startup basis can still be expensive after asymmetric early fills (SeedCompletion bypasses cost guards by design)
+   - the bid cap can create temporarily unfillable lighter-side orders when the market has moved significantly from the paired growth anchor
+   - profitability has been shown in one canary but not yet confirmed across multiple market conditions
 
 ---
 
 ## Executive Summary
 
-The Sprint 4 runtime is now structurally runnable and has been through multiple real wallet-clone canary reviews.
+The Sprint 4 runtime is now structurally runnable and has produced its first profitable canary.
 
 The current code path can:
 
 1. pre-arm before open
 2. seed both sides
 3. treat one-sided startup fills as normal startup completion
-4. replenish through `PairBuild`
-5. taper late
-6. emit wallet-clone-specific metrics and config logs
+4. replenish through `PairBuild` without freezing mid-market
+5. cap lighter-side repair bids to preserve pair economics
+6. average down the book when pair_sum is better than the current blended cost
+7. taper late
+8. emit wallet-clone-specific metrics and config logs
+
+The current code path has shown in one canary:
+
+1. profitability on both settlement outcomes (`worst_case_settlement_floor=+0.86`)
+2. `combined_avg_paid=0.967` (below 1.00)
+3. zero time in the `freeze` or `repair_only` paired-cost bands
+4. 30 fill events / 133 total shares (versus 8 fills / 40 shares in the previous canary)
 
 The current code path does **not** yet prove:
 
-1. that startup seeding stays economically clean after asymmetric early fills
-2. that `PairBuild` can average down instead of freezing once paired cost is already too high
+1. that this profitability is consistent across multiple market conditions
+2. that the lighter-side bid cap performs well in all price regimes
 3. that the wallet-clone path is production-ready
 
 ---
@@ -79,73 +99,98 @@ Relative to Sprint 4 requirements, the current tree is approximately:
 1. runnable as an isolated wallet-clone mode
 2. mechanically aligned on startup ownership and missing-side repair
 3. materially closer to an aggressive inventory builder than the older settlement-shaper path
-4. now backed by multiple real canaries, with the latest finishing balanced and tail-free but still below the settlement floor
-5. strong enough on startup, taper, and rollover lifecycle, but still not good enough on startup cost discipline or `PairBuild` economics
+4. now backed by a profitable canary with `worst_case_settlement_floor=+0.86`
+5. strong on startup, taper, rollover lifecycle, and now also on mid-market `PairBuild` economics
+6. still needing more canary runs to confirm consistency
 
 ---
 
 ## Latest Live Canary
 
-Reviewed run date: 2026-03-15
+Reviewed run date: 2026-03-16
 
 Observed headline metrics from the reviewed run:
 
 1. `market_participated=true`
-2. `fills_per_market=8`
-3. `total_fill_shares=40.00`
-4. `maker_fill_share=0.625`
-5. `paired_size=20.00`
-6. `unmatched_size=0.00`
-7. `pair_coverage=1.000`
-8. `share_skew=1.000`
-9. `combined_avg_paid=1.058`
-10. `worst_case_settlement_floor=-1.15`
+2. `fills_per_market=30`
+3. `total_fill_shares=133.34`
+4. `maker_fill_share=0.924`
+5. `paired_size=64.99`
+6. `unmatched_size=3.37`
+7. `pair_coverage=0.951`
+8. `share_skew=1.052`
+9. `combined_avg_paid=0.967`
+10. `worst_case_settlement_floor=+0.86`
 11. `fills_after_final_quiet=0`
-12. `fills_after_taper_start=4`
-13. `new_orders_after_taper_start=1`
-14. `fill_events_by_segment=0-30s:3,30-60s:1,60-180s:0,180-240s:0,240-300s:4`
-15. `fill_shares_by_segment=0-30s:15.00,30-60s:5.00,60-180s:0.00,180-240s:0.00,240-300s:20.00`
-16. `paired_cost_band_occupancy_rate=strong_growth:0.000,normal_growth:0.000,reduced_growth:0.000,repair_only:0.003,freeze:0.997`
-17. `tail_at_expiry=0.00`
-18. `startup_completion_blocked=2`
+12. `fills_after_taper_start=0`
+13. `new_orders_after_taper_start=0`
+14. `fill_events_by_segment=0-30s:2,30-60s:3,60-180s:20,180-240s:5,240-300s:0`
+15. `fill_shares_by_segment=0-30s:10.00,30-60s:15.00,60-180s:78.36,180-240s:29.99,240-300s:0.00`
+16. `paired_cost_band_occupancy_rate=strong_growth:0.000,normal_growth:0.916,reduced_growth:0.084,repair_only:0.000,freeze:0.000`
+17. `tail_at_expiry=3.37`
+18. `startup_completion_blocked=5`
+19. `below_snapshot_optional_fill_rate=0.444`
+20. `repair_reserve_blocks=37`
 
 What the canary confirms:
 
-1. Startup is still mechanically improved.
+1. The two new fixes are mechanically working.
 2. `OpenBoth` submitted immediately after open at roughly:
-   - `y_bid=0.520`
-   - `n_bid=0.470`
-   - `pair_sum=0.990`
+   - `y_bid=0.470`
+   - `n_bid=0.510`
+   - `pair_sum=0.980`
    - `clip=5`
-3. `SeedCompletion` still restored the missing side and both startup targets were met:
+3. `SeedCompletion` restored the missing side and both startup targets were met:
    - `both_by_30s=true`
    - `both_by_60s=true`
-4. The latest reviewed run finished balanced and tail-free:
-   - `paired_size=20.00`
-   - `unmatched_size=0.00`
-   - `tail_at_expiry=0.00`
-5. Final quiet and rollover ownership still worked as intended.
-6. The reviewed run exposed two execution bugs that the current tree now blocks:
-   - duplicate `OpenBoth` resubmits while both startup seed legs were already live
-   - taper paired-growth `suppress` falling through to submit anyway
+4. The lighter-side repair bid cap is active:
+   - the log shows `bid_cap_applied=true` with capped bids well below the current market
+   - example: `bid=0.420 original_bid=0.590` — the cap saved `0.17` per share on that repair
+5. The averaging-down exception eliminated mid-market freeze:
+   - `paired_cost_band_occupancy_rate ... repair_only:0.000,freeze:0.000`
+   - `fill_shares_by_segment=60-180s:78.36` — the middle of the market is now the most active segment
+6. The final book is profitable on both outcomes:
+   - `paired_size=64.99`
+   - `combined_avg_paid=0.967`
+   - `worst_case_settlement_floor=+0.86`
+7. Final quiet and rollover ownership worked as intended.
+8. Taper is clean: zero fills and zero new orders after `240s`.
 
 What the canary still shows:
 
-1. Startup can still become too expensive very early.
-   - the reviewed run reached about `10 YES / 0 NO` before missing-side restoration
-   - by the time the book first became balanced at about `10 YES / 10 NO`, `total_cost` was already about `10.80`
-2. Once the paired core moved above `1.00`, `PairBuild` spent almost the entire market in `repair_only` / `freeze`.
-   - `paired_cost_band_occupancy_rate ... freeze=0.997`
-   - `fill_shares_by_segment=60-180s:0.00,180-240s:0.00`
-3. Because of that freeze, the mode can finish perfectly balanced and still be locked negative.
-   - final inventory was `20 YES / 20 NO`
-   - final `total_cost=21.15`
-   - final `worst_case_settlement_floor=-1.15`
-4. Taper before the current-tree fix could still log `suppress` and then submit anyway.
-   - the reviewed run showed late paired-growth submits after `suppress`
-   - the current tree now blocks that path
-5. Operator telemetry is still noisy in some skip/suppress counters.
-   - `skipped_optional_adds=152` is still not a clean direct measure of one distinct behavior
+1. Startup can still become expensive.
+   - `SeedCompletion` paid `YES@0.580` while NO was at `0.510`
+   - this is by design: `SeedCompletion` bypasses cost guards to get both sides live
+   - the strategy recovered through mid-market volume at better pair_sums
+2. The lighter-side bid cap can create temporarily unfillable orders.
+   - when the market moves significantly from the paired growth anchor, the capped bid sits far below market
+   - example: cap bid at `0.420` into a `0.590` market — the order sat unfilled for many seconds
+   - those orders eventually expired and the bot re-entered through paired growth at fresh prices
+   - this did not prevent profitability in this run but could in low-liquidity or fast-moving markets
+3. There is a small residual tail at expiry.
+   - `tail_at_expiry=3.37`
+   - previous canary had `tail_at_expiry=0.00` but was unprofitable
+   - a small tail with a positive settlement floor is a better outcome than zero tail with a negative floor
+4. The bid cap uses global anchor state rather than per-order tracking.
+   - in cancel/fill race conditions between consecutive paired-growth submits, the cap could reference slightly stale anchor prices
+   - the error is bounded by price movement between consecutive submits (typically 1-2 ticks)
+   - this is a known hardening item but does not materially affect the current canary
+
+---
+
+## Comparison: Previous Canary vs Current Canary
+
+| Metric | 2026-03-15 | 2026-03-16 | Change |
+|---|---|---|---|
+| `paired_size` | 20.00 | 64.99 | +3.25x |
+| `combined_avg_paid` | 1.058 | 0.967 | below 1.00 |
+| `worst_case_settlement_floor` | -1.15 | +0.86 | profitable |
+| `freeze` band occupancy | 99.7% | 0.0% | eliminated |
+| `fills_per_market` | 8 | 30 | 3.75x |
+| `total_fill_shares` | 40 | 133.34 | 3.3x |
+| `fills 60-180s` | 0 shares | 78.36 shares | no longer frozen |
+| `maker_fill_share` | 62.5% | 92.4% | more maker |
+| `tail_at_expiry` | 0.00 | 3.37 | small tail |
 
 ---
 
@@ -298,44 +343,45 @@ This reviewed configuration is effectively saying:
 1. run the isolated wallet-clone path, not the older controller stack
 2. arm early, seed both sides in `5`-share clips, and repair the missing side in `5`-share clips
 3. allow `PairBuild` to scale into `7` and `10` share adds through the main window
-4. keep the runtime aggressively refreshed with `1s` cadence and `2`-tick repricing
-5. stop new activity near expiry and stay mostly silent in the final `30s`
-6. spend out of a roughly `70`-dollar usable budget after reserve
+4. cap lighter-side repair bids to original pair economics to prevent chasing
+5. allow `PairBuild` to average down even when the book is already above `1.00` paired cost
+6. keep the runtime aggressively refreshed with `1s` cadence and `2`-tick repricing
+7. stop new activity near expiry and stay mostly silent in the final `30s`
+8. spend out of a roughly `70`-dollar usable budget after reserve
 
 The most important current tradeoff in this profile is:
 
-1. it is aggressive enough to participate and build inventory
-2. but startup basis can still become too expensive before both sides are restored
-3. and once paired cost is already bad, `PairBuild` still freezes too hard instead of averaging down
+1. the strategy is now aggressive enough to participate, build inventory, and stay profitable
+2. the bid cap prevents worst-case chasing but can create temporarily unfillable lighter-side orders
+3. startup basis can still become expensive before both sides are restored, but the strategy can now recover through mid-market volume
 
 ---
 
 ## Known Remaining Gap
 
-The dominant remaining gap is no longer hidden config wiring, missing controller ownership, or startup completion.
+The dominant remaining gaps are no longer `PairBuild` freeze or mid-market economics.
 
-The dominant remaining gaps after the reviewed canary are:
+The dominant remaining observations after the reviewed canary are:
 
-1. Startup basis can still become too expensive after asymmetric early fills.
-   - the latest reviewed run first became balanced at about `10 / 10`
-   - but only at about `total_cost=10.80`
-2. `PairBuild` still freezes too aggressively once paired cost is already bad.
-   - the latest run spent almost all paired-cost observations in `repair_only` / `freeze`
-   - that prevented the strategy from averaging down through the middle of the market
-3. The final market-end economics are still not acceptable even on a balanced book.
-   - final `paired_size=20`
-   - final `unmatched_size=0`
-   - final `share_skew=1.000`
-   - final `combined_avg_paid=1.058`
-   - final `worst_case_settlement_floor=-1.15`
-4. The latest current-tree fixes still need live canary confirmation.
-   - duplicate `OpenBoth` live-order resubmits are now blocked in code
-   - taper paired-growth `suppress` now returns before submit
-5. The next validation loop should focus on:
-   - keeping startup paired cost below `1.00` after asymmetric early fills
-   - loosening or refactoring paired-cost gating so `PairBuild` can average down instead of freezing
-   - confirming the latest `OpenBoth` and taper suppress fixes in the next live canary
-   - cleaning taper/noise telemetry around skip and suppress counters
+1. Only one profitable canary has been reviewed.
+   - consistency across different market conditions has not been proven
+   - more canary runs are needed before claiming stable profitability
+2. The lighter-side bid cap uses global anchor state, not per-order tracking.
+   - in cancel/fill race conditions, the cap can reference stale anchor prices
+   - the error is bounded by 1-2 ticks and is a known hardening item
+3. The bid cap can create unfillable orders when the market moves significantly.
+   - the cap holds the repair bid at the original pair economics level
+   - if the market has moved 10+ ticks from the anchor, the capped bid sits far below market
+   - the orders eventually expire and the bot re-enters through fresh paired growth
+   - a spread-floor softening (e.g., cap at max of pair_economics and current_bid minus max_spread) could address this
+4. Startup cost discipline is still not directly addressed.
+   - `SeedCompletion` bypasses cost guards by design
+   - the latest run paid `YES@0.580` during seed completion
+   - the strategy recovered through volume, but a market with less mid-market fill opportunity might not
+5. The small residual expiry tail (`tail_at_expiry=3.37`) is new.
+   - the previous canary had zero tail but negative economics
+   - a small tail with positive economics is strictly better
+   - whether this tail grows in other market conditions is unknown
 
 After the latest reviewed canary, `0.1.28` should be read as:
 
@@ -344,5 +390,7 @@ After the latest reviewed canary, `0.1.28` should be read as:
 3. metrics surface implemented
 4. repeated live canaries reviewed
 5. startup, taper, and rollover lifecycle acceptable
-6. expiry-tail handling improved materially
-7. `PairBuild` still needs substantial cost-basis and economics work before claiming wallet-clone match
+6. mid-market `PairBuild` economics now functional — freeze eliminated, averaging-down working
+7. lighter-side repair bid cap active
+8. first profitable canary achieved (`worst_case_settlement_floor=+0.86`)
+9. consistency across market conditions not yet proven — more canary runs needed
