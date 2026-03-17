@@ -1,6 +1,5 @@
 #![recursion_limit = "256"]
 
-mod binance_feed;
 mod bot;
 mod config;
 mod db;
@@ -8,14 +7,13 @@ mod env_contract;
 mod env_utils;
 mod gamma;
 mod helpers;
+mod latency_log;
 mod logging;
 mod r2_storage;
 mod rtds;
-mod signal;
-mod sniper_filters;
 
 use anyhow::{anyhow, Context, Result};
-use bot::{MakerHedgeCapBot, SettlementShaperMetricsSummary};
+use bot::MakerHedgeCapBot;
 use chrono::{Duration as ChronoDuration, Utc};
 use chrono_tz::Asia::Jakarta;
 use config::BotConfig;
@@ -32,11 +30,10 @@ use reqwest::blocking::Client;
 use rtds::{get_resolution_snapshot_for_market, RtdsService};
 use serde::Serialize;
 use serde_json::Value;
-use signal::{JsonlFileService, SignalHub, SignalInbox};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -77,122 +74,18 @@ fn analytics_exit_reason(raw_reason: &str) -> String {
     }
 }
 
-fn format_optional_decimal(value: Option<f64>) -> String {
-    value
-        .map(|v| format!("{:.3}", v))
-        .unwrap_or_else(|| "NA".to_string())
-}
-
-fn settlement_shaper_target_gaps_log(summary: &SettlementShaperMetricsSummary) -> String {
-    match (
-        summary.coverage_gap,
-        summary.skew_gap,
-        summary.favorite_cost_gap,
-        summary.underdog_share_gap,
-    ) {
-        (
-            Some(coverage_gap),
-            Some(skew_gap),
-            Some(favorite_cost_gap),
-            Some(underdog_share_gap),
-        ) => format!(
-            "coverage:{:+.2} skew:{:+.2} favorite_cost:{:+.2} underdog_share:{:+.2}",
-            coverage_gap, skew_gap, favorite_cost_gap, underdog_share_gap
-        ),
-        _ => "NA".to_string(),
-    }
-}
-
-fn settlement_shaper_phase_action_mix_log(
-    summary: &SettlementShaperMetricsSummary,
-) -> String {
-    let parts: Vec<String> = summary
-        .phase_action_summaries
-        .iter()
-        .filter(|phase| phase.action_count > 0)
-        .map(|phase| {
-            format!(
-                "{}:a={} sh={:.2} mk={}/{} tk={}/{} clips={}/{}/{}/{}",
-                phase.phase,
-                phase.action_count,
-                phase.total_shares,
-                phase.maker_action_count,
-                format!("{:.2}", phase.maker_shares),
-                phase.taker_action_count,
-                format!("{:.2}", phase.taker_shares),
-                phase.small_action_count,
-                phase.medium_action_count,
-                phase.large_action_count,
-                phase.unbucketed_action_count
-            )
-        })
-        .collect();
-    if parts.is_empty() {
-        "NA".to_string()
+fn require_bot_exec_mode() -> Result<String> {
+    let exec_mode = env::var("EXEC_MODE")
+        .unwrap_or_else(|_| "BOT".to_string())
+        .trim()
+        .to_ascii_uppercase();
+    if exec_mode == "BOT" {
+        Ok(exec_mode)
     } else {
-        parts.join(" | ")
+        Err(anyhow!(
+            "Unsupported EXEC_MODE={exec_mode}. Only BOT is supported."
+        ))
     }
-}
-
-fn settlement_shaper_metrics_consistency_log(
-    summary: &SettlementShaperMetricsSummary,
-) -> String {
-    if summary.metrics_consistent {
-        "ok".to_string()
-    } else if summary.metrics_consistency_issues.is_empty() {
-        "failed".to_string()
-    } else {
-        summary.metrics_consistency_issues.join("|")
-    }
-}
-
-fn settlement_shaper_trade_metadata(
-    summary: &SettlementShaperMetricsSummary,
-) -> Option<(String, String)> {
-    let claim_status = summary.claim_status.trim();
-    if claim_status.is_empty() {
-        return None;
-    }
-
-    let meta = serde_json::json!({
-        "mode": "SETTLEMENT_SHAPER",
-        "final_phase": summary.final_phase.as_str(),
-        "final_handler": summary.final_handler.as_str(),
-        "final_owner": summary.final_owner.as_str(),
-        "final_owner_reason": summary.final_owner_reason.as_str(),
-        "favorite_side": summary.favorite_side.as_deref(),
-        "underdog_side": summary.underdog_side.as_deref(),
-        "pair_coverage": summary.pair_coverage,
-        "share_skew_ratio": summary.share_skew_ratio,
-        "favorite_cost_fraction": summary.favorite_cost_fraction,
-        "underdog_share_fraction": summary.underdog_share_fraction,
-        "inventory_vwap_sum": summary.inventory_vwap_sum,
-        "market_snapshot_vwap_sum": summary.market_snapshot_vwap_sum,
-        "coverage_gap": summary.coverage_gap,
-        "skew_gap": summary.skew_gap,
-        "favorite_cost_gap": summary.favorite_cost_gap,
-        "underdog_share_gap": summary.underdog_share_gap,
-        "claim_status": claim_status,
-        "winner_side": summary.winner_side.as_deref(),
-        "gross_payout": summary.gross_payout,
-        "realized_pnl": summary.realized_pnl,
-        "settled_yes_shares": summary.settled_yes_shares,
-        "settled_no_shares": summary.settled_no_shares,
-        "resolution_source": summary.resolution_source.as_str(),
-        "observed_windows": summary.observed_windows,
-        "windows_skew_gt_130": summary.windows_skew_gt_130,
-        "windows_coverage_lt_080": summary.windows_coverage_lt_080,
-        "maker_action_count": summary.maker_action_count,
-        "maker_shares": summary.maker_shares,
-        "maker_notional": summary.maker_notional,
-        "taker_action_count": summary.taker_action_count,
-        "taker_shares": summary.taker_shares,
-        "taker_notional": summary.taker_notional,
-        "phase_action_summaries": summary.phase_action_summaries,
-        "metrics_consistent": summary.metrics_consistent,
-        "metrics_consistency_issues": summary.metrics_consistency_issues,
-    });
-    Some((claim_status.to_string(), meta.to_string()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1166,112 +1059,16 @@ fn run() -> Result<()> {
         return Err(anyhow!("Missing POLYMARKET_FUNDER"));
     }
 
-    let exec_mode = env::var("EXEC_MODE")
-        .unwrap_or_else(|_| "MAKER".to_string())
-        .trim()
-        .to_ascii_uppercase();
-    let signal_mode = matches!(
-        exec_mode.as_str(),
-        "SIGNAL_SNIPPER" | "SIGNAL_SNIPER" | "SIGNAL_SNIPE" | "SIGNAL"
-    );
+    let exec_mode = require_bot_exec_mode()?;
     if telegram_enabled() {
         let startup_logger = setup_item_logger("startup");
         let startup_msg = build_telegram_startup_message(&bot_id, &exec_mode);
         send_telegram_stats_if_enabled(&startup_msg, &startup_logger);
     }
 
-    let mut signal_hub: Option<Arc<SignalHub>> = None;
-    let signal_stop_event = Arc::new(AtomicBool::new(false));
-    if signal_mode {
-        let provider = env::var("SIGNAL_PROVIDER")
-            .unwrap_or_else(|_| "WEBSOCKET".to_string())
-            .trim()
-            .to_ascii_uppercase();
-        if provider == "WEBSOCKET" {
-            let inbox = Arc::new(SignalInbox::new(Some(signal_stop_event.clone()), 10000));
-            let signal_file_dir =
-                env::var("SIGNAL_FILE_DIR").unwrap_or_else(|_| "./signals".to_string());
-            let signal_file_dir = if signal_file_dir.trim().is_empty() {
-                "./signals".to_string()
-            } else {
-                signal_file_dir
-            };
-            std::fs::create_dir_all(&signal_file_dir).ok();
-            let signal_file_path = env::var("SIGNAL_FILE_PATH")
-                .unwrap_or_else(|_| format!("{signal_file_dir}/signal_ws_global.jsonl"));
-            let file_log_raw = env_bool("SIGNAL_FILE_LOG_RAW", false);
-            let fs = Arc::new(JsonlFileService::new(signal_file_path.clone(), true));
-            let ws_url = env::var("SIGNAL_WS_URL").unwrap_or_default();
-            if ws_url.trim().is_empty() {
-                return Err(anyhow!(
-                    "Missing SIGNAL_WS_URL for SIGNAL_PROVIDER=WEBSOCKET"
-                ));
-            }
-            let hub_logger = setup_item_logger("signal_hub");
-            let hub = Arc::new(SignalHub::new(
-                ws_url.clone(),
-                inbox,
-                signal_stop_event.clone(),
-                Some(fs),
-                Some(hub_logger.clone()),
-                env_float("SIGNAL_WS_RECONNECT_MIN", 1.0),
-                env_float("SIGNAL_WS_RECONNECT_MAX", 30.0),
-                env_float("SIGNAL_WS_PING_INTERVAL", 10.0),
-                env_float("SIGNAL_WS_PING_TIMEOUT", 7.0),
-                env_float("SIGNAL_WS_TLS_MIN", 1.2),
-                env_bool("SIGNAL_WS_INSECURE", false),
-                env_bool("SIGNAL_WS_DEBUG", false),
-                file_log_raw,
-            ));
-            hub.start();
-            hub_logger.info(&format!(
-                "[SIGNAL_HUB] started provider=WEBSOCKET url={} file={}",
-                ws_url, signal_file_path
-            ));
-            signal_hub = Some(hub);
-        }
-    }
-
     let mut slug = env::var("MARKET_SLUG").unwrap_or_default();
     if slug.trim().is_empty() {
-        if signal_mode && env_bool("SIGNAL_FOLLOW_SLUG", false) {
-            if let Some(hub) = &signal_hub {
-                let wait_logger = setup_item_logger("signal_wait");
-                wait_logger.info(
-                    "MARKET_SLUG is empty; waiting for first signal (SIGNAL_FOLLOW_SLUG=true)...",
-                );
-                let first = hub.inbox.peek(None);
-                if let Some(sig) = first {
-                    slug = sig.market_slug;
-                    wait_logger.info(&format!("Using initial market_slug from signal: {slug}"));
-                } else if let Some(auto_slug) =
-                    generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
-                {
-                    wait_logger.warning(&format!(
-                        "No signal yet; auto-generated MARKET_SLUG from current time: {auto_slug}"
-                    ));
-                    slug = auto_slug;
-                } else {
-                    return Err(anyhow!(
-                        "Missing MARKET_SLUG and no signal received from SIGNAL_WS_URL. \
-Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
-                    ));
-                }
-            } else if let Some(auto_slug) =
-                generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
-            {
-                let auto_logger = setup_item_logger("slug_auto");
-                auto_logger.warning(&format!(
-                    "SIGNAL_FOLLOW_SLUG enabled but signal hub unavailable; auto-generated MARKET_SLUG from current time: {auto_slug}"
-                ));
-                slug = auto_slug;
-            } else {
-                return Err(anyhow!(
-                    "Missing MARKET_SLUG. Set MARKET_SLUG or provide MARKET_SYMBOL \
-(or RTDS_SYMBOL) with MARKET_SEGMENT."
-                ));
-            }
-        } else if let Some(auto_slug) =
+        if let Some(auto_slug) =
             generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
         {
             let auto_logger = setup_item_logger("slug_auto");
@@ -1408,7 +1205,6 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
             run_cfg.clone(),
             &current_slug,
             bot_logger.clone(),
-            signal_hub.clone(),
         )
         .with_context(|| format!("failed to initialize bot for {current_slug}"))?;
 
@@ -1502,10 +1298,6 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                     &bg_logger,
                     bg_trade_realized_log_enabled,
                 );
-                let settlement_shaper_mode =
-                    bot.exec_mode.eq_ignore_ascii_case("SETTLEMENT_SHAPER");
-                let settlement_shaper_summary = settlement_shaper_mode
-                    .then(|| bot.settlement_shaper_final_metrics_snapshot());
                 let end_trade_iso = now_iso_jakarta();
                 let raw_exit_reason = if metrics.exit_reason.trim().is_empty()
                     || metrics.exit_reason.eq_ignore_ascii_case("RUNNING")
@@ -1542,8 +1334,6 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                 } else {
                     None
                 };
-                let decision_row = bot.trade_decision_snapshot().unwrap_or_default();
-                let _ = repo.upsert_trade_decision(&trade_id, &decision_row);
                 let _ = repo.update_trade_result(
                     &trade_id,
                     &end_trade_iso,
@@ -1561,145 +1351,15 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
                     entry_price,
                     exit_price,
                 );
-                if let Some(summary) = settlement_shaper_summary.as_ref() {
-                    if let Some((claim_status, meta_data)) =
-                        settlement_shaper_trade_metadata(summary)
-                    {
-                        let _ = repo.update_trade_settlement_fields(
-                            &trade_id,
-                            Some(claim_status.as_str()),
-                            Some(meta_data.as_str()),
-                        );
-                    }
-                }
                 bot.persist_state();
-                if let Some(summary) = settlement_shaper_summary.as_ref() {
-                    bg_logger.info(&format!(
-                        "[SETTLEMENT_SHAPER][METRICS] phase={} handler={} owner={} owner_reason={} favorite={} underdog={} pair_coverage={:.3} skew={:.3} favorite_cost_fraction={} underdog_share_fraction={} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3} target_gaps={} observed_windows={} skew_gt_130={} coverage_lt_080={} maker_mix=count:{} shares:{:.2} notional:{:.2} taker_mix=count:{} shares:{:.2} notional:{:.2} phase_action_mix={} metrics_consistent={} consistency={} claim_status={} winner={} payout={:.2} realized_pnl={:+.2} settled_yes={:.2} settled_no={:.2} resolution_source={}",
-                        summary.final_phase.as_str(),
-                        summary.final_handler.as_str(),
-                        summary.final_owner.as_str(),
-                        summary.final_owner_reason.as_str(),
-                        summary.favorite_side.as_deref().unwrap_or("NA"),
-                        summary.underdog_side.as_deref().unwrap_or("NA"),
-                        summary.pair_coverage,
-                        summary.share_skew_ratio,
-                        format_optional_decimal(summary.favorite_cost_fraction),
-                        format_optional_decimal(summary.underdog_share_fraction),
-                        summary.inventory_vwap_sum,
-                        summary.market_snapshot_vwap_sum,
-                        settlement_shaper_target_gaps_log(summary),
-                        summary.observed_windows,
-                        summary.windows_skew_gt_130,
-                        summary.windows_coverage_lt_080,
-                        summary.maker_action_count,
-                        summary.maker_shares,
-                        summary.maker_notional,
-                        summary.taker_action_count,
-                        summary.taker_shares,
-                        summary.taker_notional,
-                        settlement_shaper_phase_action_mix_log(summary),
-                        summary.metrics_consistent,
-                        settlement_shaper_metrics_consistency_log(summary),
-                        summary.claim_status,
-                        summary.winner_side.as_deref().unwrap_or("NA"),
-                        summary.gross_payout,
-                        summary.realized_pnl,
-                        summary.settled_yes_shares,
-                        summary.settled_no_shares,
-                        summary.resolution_source.as_str()
-                    ));
-                    bg_logger.info(&format!(
-                        "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4} cpp={:.4} qYES={:.2} qNO={:.2} claim_status={} winner={} payout={:.2} realized_pnl={:+.2} phase={} owner={} metrics_consistent={} observed_windows={}",
-                        metrics.lp,
-                        metrics.total_cost,
-                        metrics.cpp,
-                        metrics.q_yes,
-                        metrics.q_no,
-                        summary.claim_status.as_str(),
-                        summary.winner_side.as_deref().unwrap_or("NA"),
-                        summary.gross_payout,
-                        summary.realized_pnl,
-                        summary.final_phase.as_str(),
-                        summary.final_owner.as_str(),
-                        summary.metrics_consistent,
-                        summary.observed_windows
-                    ));
-                    if !summary.metrics_consistent {
-                        bg_logger.warning(&format!(
-                            "[SETTLEMENT_SHAPER][METRICS][WARN] trade_id={} consistency={}",
-                            trade_id,
-                            settlement_shaper_metrics_consistency_log(summary)
-                        ));
-                    }
-                } else {
-                    let pair_metrics = bot.pair_base_metrics_snapshot(metrics.lp);
-                    bg_logger.info(&format!(
-                        "[PAIR_BASE][METRICS] both_side_participation={} pair_entries={} merge_cycles={} merge_success_rate={:.3} maker_recovery_success_rate={:.3} risk_exit_count={} emergency_taker_attempts={} pair_coverage_avg={:.3} pair_coverage_min={:.3} downside_floor_lp={:+.4} downside_floor_fee_net_worst_case={:+.4} upside_ceiling_fee_net_best_case={:+.4} residual_gap_avg={:.4} residual_gap_max={:.4} avg_time_to_flat_s={:.2} max_time_to_flat_s={:.2} avg_time_to_redeploy_s={:.2} max_time_to_redeploy_s={:.2} covered_by_live_order_s={:.2} negative_economics_s={:.2} resolved_before_last_sixty_rate={:.3} resolved_by_maker_rate={:.3} resolved_by_exact_sell_rate={:.3} resolved_by_taker_buy_rate={:.3} fak_no_match_count={} avg_entry_fee_net_edge={:+.4} avg_maker_recovery_cost={:+.4} avg_taker_recovery_cost={:+.4} taker_fee_estimate_total={:.4} settlement_pnl_net_of_fees={:+.4}",
-                        pair_metrics.both_side_participation,
-                        pair_metrics.pair_entry_count,
-                        pair_metrics.merge_cycle_count,
-                        pair_metrics.merge_success_rate,
-                        pair_metrics.maker_recovery_success_rate,
-                        pair_metrics.risk_exit_count,
-                        pair_metrics.emergency_taker_attempt_count,
-                        pair_metrics.pair_coverage_avg,
-                        pair_metrics.pair_coverage_min,
-                        pair_metrics.downside_floor_lp,
-                        pair_metrics.downside_floor_fee_net_worst_case,
-                        pair_metrics.upside_ceiling_fee_net_best_case,
-                        pair_metrics.residual_unmerged_inventory_after_resolution_avg,
-                        pair_metrics.residual_unmerged_inventory_after_resolution_max,
-                        pair_metrics.avg_time_to_flat_after_resolution_seconds,
-                        pair_metrics.max_time_to_flat_after_resolution_seconds,
-                        pair_metrics.avg_time_to_redeploy_capital_seconds,
-                        pair_metrics.max_time_to_redeploy_capital_seconds,
-                        pair_metrics.covered_by_live_order_seconds_total,
-                        pair_metrics.negative_economics_seconds_total,
-                        pair_metrics.resolved_before_last_sixty_rate,
-                        pair_metrics.resolved_by_maker_rate,
-                        pair_metrics.resolved_by_exact_sell_rate,
-                        pair_metrics.resolved_by_taker_buy_rate,
-                        pair_metrics.fak_no_match_count,
-                        pair_metrics.avg_entry_fee_net_edge,
-                        pair_metrics.avg_maker_recovery_cost,
-                        pair_metrics.avg_taker_recovery_cost,
-                        pair_metrics.taker_fee_estimate_total,
-                        pair_metrics.settlement_pnl_net_of_fees
-                    ));
-                    bg_logger.info(&format!(
-                        "[PAIR_BASE][METRICS] maker_fill_yes={:.2} maker_fill_no={:.2} taker_fill_yes={:.2} taker_fill_no={:.2}",
-                        pair_metrics.maker_fill_yes,
-                        pair_metrics.maker_fill_no,
-                        pair_metrics.taker_fill_yes,
-                        pair_metrics.taker_fill_no
-                    ));
-                    bg_logger.info(&format!(
-                        "[PAIR_BASE][SKEW][METRICS] both_side_participation={} skew_ratio_avg={:.3} skew_ratio_max={:.3} cost_split_yes_avg={:.3} cost_split_no_avg={:.3} downside_floor_lp={:+.4} best_case_upside_lp={:+.4} pair_coverage_avg={:.3} normal_flow_taker_count={} fee_net_worst_case_min={:+.4} fee_net_best_case_max={:+.4} fee_net_pair_cost_avg={:.4} skew_fill_yes={:.2} skew_fill_no={:.2}",
-                        pair_metrics.skew_both_side_participation,
-                        pair_metrics.skew_ratio_avg,
-                        pair_metrics.skew_ratio_max,
-                        pair_metrics.skew_cost_split_yes_avg,
-                        pair_metrics.skew_cost_split_no_avg,
-                        pair_metrics.skew_downside_floor_lp,
-                        pair_metrics.skew_best_case_upside_lp,
-                        pair_metrics.skew_pair_coverage_avg,
-                        pair_metrics.skew_normal_flow_taker_count,
-                        pair_metrics.skew_fee_net_worst_case_min,
-                        pair_metrics.skew_fee_net_best_case_max,
-                        pair_metrics.skew_fee_net_pair_cost_avg,
-                        pair_metrics.skew_fill_yes,
-                        pair_metrics.skew_fill_no
-                    ));
-                    bg_logger.info(&format!(
-                        "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4} cpp={:.4} qYES={:.2} qNO={:.2}",
-                        metrics.lp,
-                        metrics.total_cost,
-                        metrics.cpp,
-                        metrics.q_yes,
-                        metrics.q_no
-                    ));
-                }
+                bg_logger.info(&format!(
+                    "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4} cpp={:.4} qYES={:.2} qNO={:.2}",
+                    metrics.lp,
+                    metrics.total_cost,
+                    metrics.cpp,
+                    metrics.q_yes,
+                    metrics.q_no
+                ));
             }
 
             if bg_trade_validation_enabled && bg_trade_validation_after_market_enabled {
@@ -1772,21 +1432,13 @@ Set MARKET_SLUG or provide MARKET_SYMBOL (or RTDS_SYMBOL) with MARKET_SEGMENT."
         current_slug = next_slug;
     }
 
-    signal_stop_event.store(true, Ordering::SeqCst);
-    if let Some(hub) = signal_hub {
-        hub.close();
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        payout_from_resolution_diff, settlement_shaper_target_gaps_log,
-        settlement_shaper_trade_metadata,
-    };
-    use crate::bot::{SettlementShaperMetricsSummary, SettlementShaperPhaseActionSummary};
-    use serde_json::Value;
+    use super::{payout_from_resolution_diff, require_bot_exec_mode};
+    use std::env;
 
     #[test]
     fn tie_resolves_to_yes() {
@@ -1810,101 +1462,31 @@ mod tests {
     }
 
     #[test]
-    fn settlement_shaper_trade_metadata_includes_claim_and_settlement_result() {
-        let summary = SettlementShaperMetricsSummary {
-            final_phase: "SettlementRedeem".to_string(),
-            final_handler: "SettlementRedeem".to_string(),
-            final_owner: "ShapeRepair".to_string(),
-            final_owner_reason: "favorite_cost_drift".to_string(),
-            favorite_side: Some("YES".to_string()),
-            underdog_side: Some("NO".to_string()),
-            pair_coverage: 0.92,
-            share_skew_ratio: 1.18,
-            favorite_cost_fraction: Some(0.63),
-            underdog_share_fraction: Some(0.55),
-            inventory_vwap_sum: 0.95,
-            market_snapshot_vwap_sum: 0.97,
-            coverage_gap: Some(1.0),
-            skew_gap: Some(0.05),
-            favorite_cost_gap: Some(-2.0),
-            underdog_share_gap: Some(4.0),
-            claim_status: "ACCOUNTED".to_string(),
-            winner_side: Some("YES".to_string()),
-            gross_payout: 12.0,
-            realized_pnl: -3.5,
-            settled_yes_shares: 12.0,
-            settled_no_shares: 0.0,
-            resolution_source: "RTDS".to_string(),
-            observed_windows: 9,
-            windows_skew_gt_130: 2,
-            windows_coverage_lt_080: 1,
-            maker_action_count: 4,
-            maker_shares: 95.0,
-            maker_notional: 45.25,
-            taker_action_count: 1,
-            taker_shares: 5.0,
-            taker_notional: 2.60,
-            phase_action_summaries: vec![SettlementShaperPhaseActionSummary {
-                phase: "MainAccumulation".to_string(),
-                action_count: 5,
-                total_shares: 100.0,
-                total_notional: 47.85,
-                maker_action_count: 4,
-                maker_shares: 95.0,
-                maker_notional: 45.25,
-                taker_action_count: 1,
-                taker_shares: 5.0,
-                taker_notional: 2.60,
-                small_action_count: 2,
-                small_shares: 10.0,
-                medium_action_count: 2,
-                medium_shares: 40.0,
-                large_action_count: 1,
-                large_shares: 50.0,
-                unbucketed_action_count: 0,
-                unbucketed_shares: 0.0,
-            }],
-            metrics_consistent: true,
-            metrics_consistency_issues: Vec::new(),
-        };
+    fn require_bot_exec_mode_defaults_and_rejects_legacy_modes() {
+        let original = env::var("EXEC_MODE").ok();
 
-        let (claim_status, meta_data) =
-            settlement_shaper_trade_metadata(&summary).expect("metadata");
-        let meta: Value = serde_json::from_str(&meta_data).expect("json");
-
-        assert_eq!(claim_status, "ACCOUNTED");
-        assert_eq!(meta.get("claim_status").and_then(|v| v.as_str()), Some("ACCOUNTED"));
-        assert_eq!(meta.get("winner_side").and_then(|v| v.as_str()), Some("YES"));
-        assert_eq!(meta.get("resolution_source").and_then(|v| v.as_str()), Some("RTDS"));
-        assert_eq!(meta.get("final_owner").and_then(|v| v.as_str()), Some("ShapeRepair"));
-        assert_eq!(meta.get("settled_no_shares").and_then(|v| v.as_f64()), Some(0.0));
-        assert_eq!(meta.get("observed_windows").and_then(|v| v.as_u64()), Some(9));
-        assert_eq!(meta.get("maker_action_count").and_then(|v| v.as_u64()), Some(4));
-        assert_eq!(meta.get("metrics_consistent").and_then(|v| v.as_bool()), Some(true));
+        env::remove_var("EXEC_MODE");
         assert_eq!(
-            meta.get("phase_action_summaries")
-                .and_then(|v| v.as_array())
-                .map(|v| v.len()),
-            Some(1)
+            require_bot_exec_mode().expect("default mode"),
+            "BOT"
         );
-    }
 
-    #[test]
-    fn settlement_shaper_target_gaps_log_formats_all_four_gaps() {
-        let summary = SettlementShaperMetricsSummary {
-            final_owner: "PairResting".to_string(),
-            final_owner_reason: "shape_healthy".to_string(),
-            coverage_gap: Some(1.0),
-            skew_gap: Some(0.05),
-            favorite_cost_gap: Some(-2.0),
-            underdog_share_gap: Some(4.0),
-            ..SettlementShaperMetricsSummary::default()
-        };
-
+        env::set_var("EXEC_MODE", "BOT");
         assert_eq!(
-            settlement_shaper_target_gaps_log(&summary),
-            "coverage:+1.00 skew:+0.05 favorite_cost:-2.00 underdog_share:+4.00"
+            require_bot_exec_mode().expect("bot mode"),
+            "BOT"
         );
+
+        env::set_var("EXEC_MODE", "SNIPER");
+        let err = require_bot_exec_mode()
+            .expect_err("legacy mode should be rejected")
+            .to_string();
+        assert!(err.contains("Only BOT is supported"));
+
+        match original {
+            Some(value) => env::set_var("EXEC_MODE", value),
+            None => env::remove_var("EXEC_MODE"),
+        }
     }
 }
 

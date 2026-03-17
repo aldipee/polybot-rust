@@ -1,0 +1,746 @@
+use super::*;
+
+pub struct MakerHedgeCapBot {
+    pub cfg: BotConfig,
+    pub logger: Arc<dyn LogLike>,
+    pub market_slug: String,
+    pub state_file: PathBuf,
+    pub state: Arc<Mutex<BotState>>,
+    pub start_trade_iso: String,
+    pub first_entry_fill_iso: Arc<Mutex<Option<String>>>,
+    pub first_entry_reason: Arc<Mutex<Option<String>>>,
+    pub pending_entry_reason: Arc<Mutex<Option<String>>>,
+    pub active_entry_reason: Arc<Mutex<Option<String>>>,
+    pub stop_loss_category: Arc<Mutex<Option<String>>>,
+    pub exit_reason: Arc<Mutex<String>>,
+    pub stop_flag: Arc<AtomicBool>,
+    pub wallet_address: String,
+    pub min_maker_notional: f64,
+    pub min_taker_notional: f64,
+    pub reconcile_sell_credit_mult: f64,
+    pub first_clip_shares: f64,
+    pub first_hedge_full: bool,
+    pub start_ts: i64,
+    pub expiry_ts: i64,
+    pub warmup_seconds: i64,
+    pub max_spread_ticks: i64,
+    pub parity_tolerance: f64,
+    pub unhedged_timeout_seconds: f64,
+    pub hedge_slippage_ticks: i64,
+    pub hedge_taker_order_type: String,
+    pub taker_order_ttl_seconds: i64,
+    pub taker_fill_fallback_from_order_events: bool,
+    pub taker_strict_inflight: bool,
+    pub last_taker_hedge_ts: f64,
+    pub taker_hedge_min_interval: f64,
+    pub exec_mode: String,
+    pub loop_wait_seconds_maker: f64,
+    pub loop_wait_seconds_taker: f64,
+    pub condition_id: Option<String>,
+    pub market_fees_enabled: Option<bool>,
+    pub yes_asset: Option<String>,
+    pub no_asset: Option<String>,
+    pub runtime_flags: HashMap<String, Value>,
+    pub market_last_update_ts: Arc<Mutex<f64>>,
+    pub best_quotes: Arc<Mutex<HashMap<String, (f64, f64, f64)>>>,
+    pub market_connected: Arc<AtomicBool>,
+    pub user_connected: Arc<AtomicBool>,
+    pub book_cache: Arc<Mutex<HashMap<String, (Value, f64)>>>,
+    pub debug_last_ts: Arc<Mutex<HashMap<String, f64>>>,
+    pub fsm_state: Arc<Mutex<String>>,
+    pub order_exec_context: Arc<Mutex<HashMap<String, Value>>>,
+    pub(super) submit_timing_cache: Arc<Mutex<HashMap<String, Value>>>,
+    pub(super) taker_orders: Arc<Mutex<HashMap<String, TakerOrderRecord>>>,
+    pub latency_log: Option<Arc<LatencyLogService>>,
+    pub(super) clob_rt: Option<Arc<TokioRuntime>>,
+    pub(super) clob_client: Option<Arc<RsClobClient>>,
+    pub(super) clob_api_creds: Option<ApiKeyCreds>,
+    pub(super) balance_allowance_cache: Arc<Mutex<HashMap<String, (f64, f64, f64)>>>,
+    pub(super) reconcile_suspect_yes: Arc<Mutex<Option<(f64, f64)>>>,
+    pub(super) reconcile_suspect_no: Arc<Mutex<Option<(f64, f64)>>>,
+    pub(super) reconcile_last_ts: Arc<Mutex<f64>>,
+    pub exchange_orders_cache: Arc<Mutex<Vec<Value>>>,
+    pub(super) maker_ladder_open_orders: Arc<Mutex<HashMap<String, LadderOrderState>>>,
+    pub(super) maker_order_slots: Arc<Mutex<HashMap<MakerOrderKey, MakerOrderSlot>>>,
+    pub(super) maker_order_index: Arc<Mutex<HashMap<String, MakerOrderKey>>>,
+    pub(super) maker_exec_ledger: Arc<Mutex<MakerExecLedger>>,
+    pub(super) bot_runtime_state: Arc<Mutex<BotRuntimeState>>,
+    pub(super) bot_runtime_cfg: BotRuntimeConfigSnapshot,
+}
+
+impl MakerHedgeCapBot {
+    /// Builds a fully wired bot instance from env-backed config, persisted state,
+    /// derived market metadata, and optional latency/CLOB clients.
+    ///
+    /// This constructor is the main assembly point for runtime dependencies and
+    /// also applies the final env overrides that shape the live BOT behavior.
+    pub fn new(
+        cfg: BotConfig,
+        market_slug: &str,
+        bot_logger: Arc<dyn LogLike>,
+    ) -> Result<Self> {
+        let state_file = PathBuf::from(format!("maker_hedgecap_state_{market_slug}.json"));
+        let state = load_state(&state_file)?;
+        let start_trade_iso = crate::db::now_iso_jakarta();
+
+        let mut wallet_address = std::env::var("WALLET_ADDRESS").unwrap_or_default();
+        if wallet_address.trim().is_empty() {
+            wallet_address = std::env::var("POLYMARKET_WALLET_ADDRESS").unwrap_or_default();
+        }
+        if wallet_address.trim().is_empty() {
+            wallet_address = std::env::var("POLYMARKET_FUNDER").unwrap_or_default();
+        }
+        if wallet_address.trim().is_empty() {
+            wallet_address = cfg.funder.clone().unwrap_or_default();
+        }
+        wallet_address = wallet_address.trim().to_ascii_lowercase();
+
+        let mut start_ts = now_ts();
+        let mut expiry_ts = start_ts + cfg.market_duration_seconds;
+        let slug_window_start_ts = market_slug
+            .split('-')
+            .last()
+            .and_then(|s| s.parse::<i64>().ok());
+        if let Some(raw_ts) = slug_window_start_ts {
+            start_ts = raw_ts;
+            expiry_ts = raw_ts + cfg.market_duration_seconds;
+        }
+
+        let seg_d = segment_defaults(&cfg.market_segment);
+        let runtime_flags = HashMap::new();
+        let exec_latency_log_enabled = env_bool("EXEC_LATENCY_LOG_ENABLED", true);
+        let exec_latency_file_log_enabled = env_bool("EXEC_LATENCY_FILE_LOG_ENABLED", true);
+        let exec_latency_jsonl_enabled = env_bool("EXEC_LATENCY_JSONL_ENABLED", true);
+        let exec_latency_csv_enabled = env_bool("EXEC_LATENCY_CSV_ENABLED", true);
+        let exec_latency_log_dir = std::env::var("EXEC_LATENCY_LOG_DIR")
+            .unwrap_or_else(|_| "./logs".to_string())
+            .trim()
+            .to_string();
+        let exec_latency_jsonl_path = {
+            let p = std::env::var("EXEC_LATENCY_JSONL_PATH").unwrap_or_default();
+            if p.trim().is_empty() {
+                format!("{exec_latency_log_dir}/exec_latency.jsonl")
+            } else {
+                p
+            }
+        };
+        let exec_latency_csv_path = {
+            let p = std::env::var("EXEC_LATENCY_CSV_PATH").unwrap_or_default();
+            if p.trim().is_empty() {
+                format!("{exec_latency_log_dir}/exec_latency.csv")
+            } else {
+                p
+            }
+        };
+        let latency_log = if exec_latency_log_enabled && exec_latency_file_log_enabled {
+            Some(Arc::new(LatencyLogService::new(
+                exec_latency_jsonl_path,
+                exec_latency_csv_path,
+                true,
+                exec_latency_jsonl_enabled,
+                exec_latency_csv_enabled,
+                None,
+            )))
+        } else {
+            None
+        };
+        let clob_gamma_host = std::env::var("CLOB_GAMMA_API_URL")
+            .or_else(|_| std::env::var("GAMMA_HOST"))
+            .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
+        let (clob_rt, clob_client, clob_api_creds) =
+            Self::_init_native_clob_client(&cfg, &bot_logger, &clob_gamma_host)?;
+
+        let mut out = Self {
+            cfg,
+            logger: bot_logger,
+            market_slug: market_slug.to_string(),
+            state_file,
+            state: Arc::new(Mutex::new(state)),
+            start_trade_iso,
+            first_entry_fill_iso: Arc::new(Mutex::new(None)),
+            first_entry_reason: Arc::new(Mutex::new(None)),
+            pending_entry_reason: Arc::new(Mutex::new(None)),
+            active_entry_reason: Arc::new(Mutex::new(None)),
+            stop_loss_category: Arc::new(Mutex::new(None)),
+            exit_reason: Arc::new(Mutex::new("RUNNING".to_string())),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            wallet_address,
+            min_maker_notional: env_float("MIN_MAKER_NOTIONAL", 1.0),
+            min_taker_notional: env_float("MIN_TAKER_NOTIONAL", 1.0),
+            reconcile_sell_credit_mult: clamp(
+                env_float("RECONCILE_SELL_CREDIT_MULT", 1.0),
+                0.0,
+                1.0,
+            ),
+            first_clip_shares: env_float("FIRST_CLIP_SHARES", 0.0),
+            first_hedge_full: matches!(
+                std::env::var("FIRST_HEDGE_FULL")
+                    .unwrap_or_else(|_| "false".to_string())
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes" | "y"
+            ),
+            start_ts,
+            expiry_ts,
+            warmup_seconds: env_int("WARMUP_SECONDS", seg_d.warmup) as i64,
+            max_spread_ticks: env_int("MAX_SPREAD_TICKS", 6) as i64,
+            parity_tolerance: env_float("PARITY_TOLERANCE", 0.025),
+            unhedged_timeout_seconds: env_float("UNHEDGED_TIMEOUT_SECONDS", 2.0),
+            hedge_slippage_ticks: env_int("HEDGE_SLIPPAGE_TICKS", 1) as i64,
+            hedge_taker_order_type: std::env::var("HEDGE_TAKER_ORDER_TYPE")
+                .unwrap_or_else(|_| "FAK".to_string())
+                .trim()
+                .to_ascii_uppercase(),
+            taker_order_ttl_seconds: env_int("TAKER_ORDER_TTL_SECONDS", 120) as i64,
+            taker_fill_fallback_from_order_events: env_bool(
+                "TAKER_FILL_FALLBACK_FROM_ORDER_EVENTS",
+                true,
+            ),
+            taker_strict_inflight: env_bool("TAKER_STRICT_INFLIGHT", true),
+            last_taker_hedge_ts: 0.0,
+            taker_hedge_min_interval: env_float("TAKER_HEDGE_MIN_INTERVAL", 1.0),
+            exec_mode: require_bot_exec_mode()?,
+            loop_wait_seconds_maker: env_float("LOOP_WAIT_SECONDS_MAKER", 1.0),
+            loop_wait_seconds_taker: env_float("LOOP_WAIT_SECONDS_TAKER", 0.2),
+            condition_id: None,
+            market_fees_enabled: None,
+            yes_asset: None,
+            no_asset: None,
+            runtime_flags,
+            market_last_update_ts: Arc::new(Mutex::new(0.0)),
+            best_quotes: Arc::new(Mutex::new(HashMap::new())),
+            market_connected: Arc::new(AtomicBool::new(false)),
+            user_connected: Arc::new(AtomicBool::new(false)),
+            book_cache: Arc::new(Mutex::new(HashMap::new())),
+            debug_last_ts: Arc::new(Mutex::new(HashMap::new())),
+            fsm_state: Arc::new(Mutex::new("ACCUMULATE".to_string())),
+            order_exec_context: Arc::new(Mutex::new(HashMap::new())),
+            submit_timing_cache: Arc::new(Mutex::new(HashMap::new())),
+            taker_orders: Arc::new(Mutex::new(HashMap::new())),
+            latency_log,
+            clob_rt,
+            clob_client,
+            clob_api_creds,
+            balance_allowance_cache: Arc::new(Mutex::new(HashMap::new())),
+            reconcile_suspect_yes: Arc::new(Mutex::new(None)),
+            reconcile_suspect_no: Arc::new(Mutex::new(None)),
+            reconcile_last_ts: Arc::new(Mutex::new(0.0)),
+            exchange_orders_cache: Arc::new(Mutex::new(Vec::new())),
+            maker_ladder_open_orders: Arc::new(Mutex::new(HashMap::new())),
+            maker_order_slots: Arc::new(Mutex::new(HashMap::new())),
+            maker_order_index: Arc::new(Mutex::new(HashMap::new())),
+            maker_exec_ledger: Arc::new(Mutex::new(MakerExecLedger::default())),
+            bot_runtime_state: Arc::new(Mutex::new(BotRuntimeState::default())),
+            bot_runtime_cfg: bot_runtime_config_from_env(),
+        };
+
+        out._apply_cfg_overrides_from_env();
+        let min_entry_edge_ticks = env_int("MIN_ENTRY_EDGE_TICKS", out.cfg.entry_edge_ticks).max(0);
+        let effective_entry_edge_ticks = out.cfg.entry_edge_ticks.max(min_entry_edge_ticks);
+        out.logger.info(&format!(
+            "[CFG_EFFECTIVE] dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale={}s stop_buffer={}s",
+            out.cfg.dry_run,
+            out.cfg.max_total_cost,
+            out.cfg.reserve_usd,
+            out.cfg.min_shares,
+            out.cfg.clip_shares,
+            out.cfg.entry_edge_ticks,
+            min_entry_edge_ticks,
+            effective_entry_edge_ticks,
+            out.cfg.log_every,
+            out.cfg.market_data_stale_seconds,
+            out.cfg.stop_buffer_seconds
+        ));
+
+        if let Some(market) = fetch_market_by_slug(&out.market_slug, Some(&out.logger))? {
+            out.market_fees_enabled = market
+                .get("feesEnabled")
+                .or_else(|| market.get("fees_enabled"))
+                .and_then(|v| v.as_bool());
+            if let Ok((yes, no, condition)) = parse_tokens_and_condition(&market) {
+                out.condition_id = Some(condition.clone());
+                out.yes_asset = Some(yes.clone());
+                out.no_asset = Some(no.clone());
+                if slug_window_start_ts.is_none() {
+                    if let Some(st) = market
+                        .get("startDate")
+                        .and_then(|v| v.as_str())
+                        .and_then(iso_to_epoch)
+                    {
+                        out.start_ts = st;
+                    }
+                }
+                if let Some(et) = market
+                    .get("endDate")
+                    .and_then(|v| v.as_str())
+                    .and_then(iso_to_epoch)
+                {
+                    out.expiry_ts = et;
+                }
+                out.logger
+                    .info(&format!("Market Found: {}", out.market_slug));
+                out.logger.info(&format!("Condition ID: {condition}"));
+                out.logger.info(&format!("YES asset: {yes}"));
+                out.logger.info(&format!("NO  asset: {no}"));
+                out.logger.info(&format!(
+                    "Start ts: {} | Expiry ts: {}",
+                    out.start_ts, out.expiry_ts
+                ));
+            }
+        }
+        out._log_bot_runtime_cfg();
+        out._warm_clob_order_meta_cache();
+
+        Ok(out)
+    }
+
+    /// Warms the native CLOB metadata cache for the active YES/NO assets.
+    ///
+    /// This front-loads tick size, neg-risk, and fee lookups so the runtime loop
+    /// does not pay the first-request latency while it is already trading.
+    pub(super) fn _warm_clob_order_meta_cache(&self) {
+        if !env_bool("CLOB_ORDER_META_WARMUP", true) {
+            return;
+        }
+        let (rt, client) = match (&self.clob_rt, &self.clob_client) {
+            (Some(rt), Some(client)) => (rt, client),
+            _ => return,
+        };
+        let mut assets: Vec<String> = Vec::new();
+        if let Some(a) = &self.yes_asset {
+            if !a.trim().is_empty() {
+                assets.push(a.clone());
+            }
+        }
+        if let Some(a) = &self.no_asset {
+            if !a.trim().is_empty() && !assets.iter().any(|v| v == a) {
+                assets.push(a.clone());
+            }
+        }
+        for aid in assets {
+            let t0 = now_ns();
+            let _ = rt.block_on(client.get_tick_size(&aid));
+            let _ = rt.block_on(client.get_neg_risk(&aid));
+            let _ = rt.block_on(client.get_fee_rate_bps(&aid));
+            let ms = ((now_ns() - t0) as f64 / 1_000_000.0).round() as i64;
+            let tail: String = aid
+                .chars()
+                .rev()
+                .take(6)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            self.logger
+                .info(&format!("[CLOB] warm order meta asset={tail} took={ms}ms"));
+        }
+    }
+
+    /// Creates the native Rust CLOB client stack and derives authenticated API
+    /// credentials from the configured private key when trading is enabled.
+    ///
+    /// When no private key is configured, this returns an empty client bundle so
+    /// dry or partially wired runs can still construct the bot safely.
+    pub(super) fn _init_native_clob_client(
+        cfg: &BotConfig,
+        logger: &Arc<dyn LogLike>,
+        gamma_host: &str,
+    ) -> Result<(
+        Option<Arc<TokioRuntime>>,
+        Option<Arc<RsClobClient>>,
+        Option<ApiKeyCreds>,
+    )> {
+        let key = cfg.private_key.trim();
+        if key.is_empty() {
+            return Ok((None, None, None));
+        }
+
+        let rt = Arc::new(
+            TokioRuntimeBuilder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow!("failed to create tokio runtime for CLOB client: {e}"))?,
+        );
+
+        let chain = match cfg.chain_id {
+            137 => Chain::Polygon,
+            80002 => Chain::Amoy,
+            other => {
+                logger.warning(&format!(
+                    "Unsupported CHAIN_ID={other}, defaulting CLOB client to Polygon (137)"
+                ));
+                Chain::Polygon
+            }
+        };
+
+        let signature_type = cfg.signature_type.and_then(|v| {
+            if (0..=u8::MAX as i64).contains(&v) {
+                Some(v as u8)
+            } else {
+                None
+            }
+        });
+        let funder = cfg
+            .funder
+            .clone()
+            .and_then(|v| (!v.trim().is_empty()).then_some(v));
+        let normalized_key = if key.starts_with("0x") || key.starts_with("0X") {
+            key.to_string()
+        } else {
+            format!("0x{key}")
+        };
+        let wallet = normalized_key
+            .parse::<PrivateKeySigner>()
+            .map_err(|e| anyhow!("failed to parse POLYMARKET_PRIVATE_KEY: {e}"))?;
+
+        let unauth_client = RsClobClient::new(
+            cfg.clob_host.clone(),
+            gamma_host.to_string(),
+            chain,
+            Some(wallet.clone()),
+            None,
+            signature_type,
+            funder.clone(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .map_err(|e| anyhow!("failed to initialize CLOB client: {e}"))?;
+
+        let creds = rt
+            .block_on(unauth_client.create_or_derive_api_key(None))
+            .map_err(|e| anyhow!("failed to derive CLOB API credentials: {e}"))?;
+
+        let authed_client = RsClobClient::new(
+            cfg.clob_host.clone(),
+            gamma_host.to_string(),
+            chain,
+            Some(wallet),
+            Some(creds.clone()),
+            signature_type,
+            funder,
+            None,
+            false,
+            None,
+            None,
+        )
+        .map_err(|e| anyhow!("failed to initialize authenticated CLOB client: {e}"))?;
+
+        Ok((Some(rt), Some(Arc::new(authed_client)), Some(creds)))
+    }
+
+    /// Normalizes external order-type strings into the rs-clob enum used by the
+    /// native client.
+    pub(super) fn _clob_order_type(order_type: &str) -> ClobOrderType {
+        match order_type.trim().to_ascii_uppercase().as_str() {
+            "FAK" => ClobOrderType::Fak,
+            "FOK" => ClobOrderType::Fok,
+            "GTD" => ClobOrderType::Gtd,
+            _ => ClobOrderType::Gtc,
+        }
+    }
+
+    /// Maps a textual side label into the rs-clob side enum.
+    pub(super) fn _clob_side(side: &str) -> Option<ClobSide> {
+        match side.trim().to_ascii_uppercase().as_str() {
+            "BUY" => Some(ClobSide::Buy),
+            "SELL" => Some(ClobSide::Sell),
+            _ => None,
+        }
+    }
+
+    /// Converts a floating-point tick value into the nearest supported CLOB tick
+    /// size enum.
+    pub(super) fn _tick_size_from_f64(v: f64) -> TickSize {
+        let vv = (v * 10_000.0).round() / 10_000.0;
+        if (vv - 0.1).abs() < 1e-9 {
+            TickSize::ZeroPointOne
+        } else if (vv - 0.01).abs() < 1e-9 {
+            TickSize::ZeroPointZeroOne
+        } else if (vv - 0.001).abs() < 1e-9 {
+            TickSize::ZeroPointZeroZeroOne
+        } else {
+            TickSize::ZeroPointZeroZeroZeroOne
+        }
+    }
+
+    /// Returns the decimal precision implied by a concrete CLOB tick-size enum.
+    pub(super) fn _tick_size_decimals(tick_size: TickSize) -> u32 {
+        match tick_size {
+            TickSize::ZeroPointOne => 1,
+            TickSize::ZeroPointZeroOne => 2,
+            TickSize::ZeroPointZeroZeroOne => 3,
+            TickSize::ZeroPointZeroZeroZeroOne => 4,
+        }
+    }
+
+    /// Computes the greatest common divisor used to reduce price/size fractions
+    /// into a valid exchange quantum.
+    pub(super) fn _gcd_u64(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        a.max(1)
+    }
+
+    /// Derives the minimum valid buy-size quantum for a limit order at the given
+    /// price and tick size.
+    ///
+    /// Polymarket limit BUY orders can require finer size quantization than the
+    /// generic two-decimal share display used by the strategy.
+    pub(super) fn _maker_limit_buy_size_quantum(price: f64, tick_size: TickSize) -> f64 {
+        if !price.is_finite() || price <= 0.0 {
+            return 0.01;
+        }
+        let price_dp = Self::_tick_size_decimals(tick_size);
+        let denom = 10_u64.pow(price_dp);
+        let price_units = (q_down(price.max(0.0), price_dp) * denom as f64).round() as u64;
+        if price_units == 0 {
+            return 0.01;
+        }
+        let gcd = Self::_gcd_u64(price_units, denom);
+        ((denom / gcd) as f64 / 100.0).max(0.01)
+    }
+
+    /// Rounds an intended maker order size down to an exchange-acceptable size
+    /// for the requested side and tick size.
+    pub(super) fn _maker_limit_exchange_quantized_size(
+        side: ClobSide,
+        price: f64,
+        size: f64,
+        tick_size: TickSize,
+    ) -> f64 {
+        let size = q_down(size.max(0.0), 2).max(0.0);
+        if size <= 0.0 {
+            return 0.0;
+        }
+        let quantum = match side {
+            ClobSide::Buy => Self::_maker_limit_buy_size_quantum(price, tick_size),
+            ClobSide::Sell => 0.01,
+        };
+        if !quantum.is_finite() || quantum <= 0.010_000_001 {
+            return size;
+        }
+        q_down(round_down(size, quantum).max(0.0), 2).max(0.0)
+    }
+
+    /// Extracts a floating-point number from a JSON value that may be stored as
+    /// either a JSON number or a numeric string.
+    pub(super) fn _value_f64(v: Option<&Value>) -> Option<f64> {
+        v.and_then(|x| match x {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => s.parse::<f64>().ok(),
+            _ => None,
+        })
+    }
+
+    /// Walks an arbitrary JSON tree and returns the largest numeric value found.
+    ///
+    /// This is used as a permissive extractor when the upstream payload shape is
+    /// inconsistent but still contains one meaningful numeric field somewhere.
+    pub(super) fn _max_numeric_in_value(v: Option<&Value>) -> Option<f64> {
+        // Recursively visits nested arrays and objects so loosely shaped payloads
+        // can still yield a best-effort numeric maximum.
+        fn walk(node: &Value, best: &mut Option<f64>) {
+            match node {
+                Value::Number(n) => {
+                    if let Some(x) = n.as_f64() {
+                        *best = Some(best.map_or(x, |b| b.max(x)));
+                    }
+                }
+                Value::String(s) => {
+                    if let Ok(x) = s.parse::<f64>() {
+                        *best = Some(best.map_or(x, |b| b.max(x)));
+                    }
+                }
+                Value::Array(a) => {
+                    for it in a {
+                        walk(it, best);
+                    }
+                }
+                Value::Object(m) => {
+                    for it in m.values() {
+                        walk(it, best);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut best = None;
+        if let Some(root) = v {
+            walk(root, &mut best);
+        }
+        best
+    }
+
+    /// Pulls a posted order id out of the different response shapes used by the
+    /// exchange and local compatibility wrappers.
+    pub(super) fn _extract_posted_order_id(resp: &Value) -> Option<String> {
+        resp.get("orderID")
+            .or_else(|| resp.get("order_id"))
+            .or_else(|| resp.get("id"))
+            .or_else(|| resp.get("order").and_then(|v| v.get("id")))
+            .or_else(|| resp.get("order").and_then(|v| v.get("order_id")))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// Builds authenticated level-2 headers for direct CLOB REST requests using
+    /// the currently derived API credentials and private key.
+    pub(super) fn _build_l2_headers(
+        &self,
+        method: &str,
+        request_path: &str,
+        body: Option<&str>,
+    ) -> Option<HashMap<String, String>> {
+        let creds = self.clob_api_creds.as_ref()?;
+        let rt = self.clob_rt.as_ref()?;
+        let raw_key = self.cfg.private_key.trim();
+        if raw_key.is_empty() {
+            return None;
+        }
+        let normalized_key = if raw_key.starts_with("0x") || raw_key.starts_with("0X") {
+            raw_key.to_string()
+        } else {
+            format!("0x{raw_key}")
+        };
+        let wallet = normalized_key.parse::<PrivateKeySigner>().ok()?;
+        let headers = rt
+            .block_on(create_l2_headers(
+                &wallet,
+                creds,
+                method,
+                request_path,
+                body,
+                None,
+            ))
+            .ok()?;
+        Some(headers.to_headers())
+    }
+
+    /// Normalizes multiple open-order payload shapes into one local structure the
+    /// bot can reconcile against consistently.
+    pub(super) fn _normalize_open_orders_payload(payload: &Value) -> Vec<Value> {
+        let items = if let Some(a) = payload.as_array() {
+            a.clone()
+        } else if let Some(a) = payload.get("data").and_then(|v| v.as_array()) {
+            a.clone()
+        } else if let Some(a) = payload.get("orders").and_then(|v| v.as_array()) {
+            a.clone()
+        } else if let Some(a) = payload.get("results").and_then(|v| v.as_array()) {
+            a.clone()
+        } else {
+            Vec::new()
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let oid = item
+                .get("id")
+                .or_else(|| item.get("order_id"))
+                .or_else(|| item.get("orderID"))
+                .or_else(|| item.get("orderId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if oid.trim().is_empty() {
+                continue;
+            }
+            let asset_id = item
+                .get("asset_id")
+                .or_else(|| item.get("token_id"))
+                .or_else(|| item.get("assetId"))
+                .or_else(|| item.get("tokenId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let price = Self::_value_f64(item.get("price")).unwrap_or(0.0);
+            let original_size = Self::_value_f64(
+                item.get("original_size")
+                    .or_else(|| item.get("originalSize"))
+                    .or_else(|| item.get("size")),
+            )
+            .unwrap_or(0.0);
+            let size_matched = Self::_value_f64(
+                item.get("size_matched")
+                    .or_else(|| item.get("sizeMatched"))
+                    .or_else(|| item.get("filled")),
+            )
+            .unwrap_or(0.0);
+            let remaining_size = Self::_value_f64(
+                item.get("remaining_size")
+                    .or_else(|| item.get("remainingSize"))
+                    .or_else(|| item.get("size")),
+            )
+            .unwrap_or_else(|| (original_size - size_matched).max(0.0));
+            out.push(json!({
+                "id": oid.clone(),
+                "order_id": oid,
+                "asset_id": asset_id.clone(),
+                "token_id": asset_id,
+                "side": item
+                    .get("side")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_uppercase(),
+                "price": price,
+                "size": remaining_size,
+                "remaining_size": remaining_size,
+                "original_size": original_size,
+                "size_matched": size_matched,
+                "status": item.get("status").cloned().unwrap_or(Value::Null),
+                "market": item.get("market").cloned().unwrap_or(Value::Null),
+                "order_type": item.get("order_type").cloned().unwrap_or(Value::Null),
+                "created_at": item.get("created_at").cloned().unwrap_or(Value::Null),
+            }));
+        }
+        out
+    }
+
+    /// Fetches open orders from the exchange's REST endpoint and returns them in
+    /// the normalized local payload format.
+    pub(super) fn _list_open_orders_exchange_raw(&self) -> Option<Vec<Value>> {
+        let endpoint_path = "/data/orders";
+        let headers = self._build_l2_headers("GET", endpoint_path, None)?;
+        let mut req = Client::new().get(format!(
+            "{}{}",
+            self.cfg.clob_host.trim_end_matches('/'),
+            endpoint_path
+        ));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        if let Some(market) = self
+            .condition_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            req = req.query(&[("market", market)]);
+        }
+        let payload = req.send().ok()?.json::<Value>().ok()?;
+        Some(Self::_normalize_open_orders_payload(&payload))
+    }
+
+    /// Reads a timestamp-like runtime scratch value from the shared debug/runtime
+    /// map, returning `0.0` when no value has been recorded.
+    pub(super) fn _runtime_ts_get(&self, key: &str) -> f64 {
+        self.debug_last_ts
+            .lock()
+            .ok()
+            .and_then(|m| m.get(key).copied())
+            .unwrap_or(0.0)
+    }
+
+    /// Stores a timestamp-like runtime scratch value in the shared debug/runtime
+    /// map for later cooldown or inflight checks.
+    pub(super) fn _runtime_ts_set(&self, key: &str, value: f64) {
+        if let Ok(mut m) = self.debug_last_ts.lock() {
+            m.insert(key.to_string(), value);
+        }
+    }
+
+}

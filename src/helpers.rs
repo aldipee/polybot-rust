@@ -402,20 +402,6 @@ pub struct OpenOrderState {
     pub ts: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SniperEntryBreakoutAnchorState {
-    pub side: String,
-    pub trigger_dir: String,
-    pub entry_hk: f64,
-    pub entry_lk: f64,
-    pub entry_buffer_up: f64,
-    pub entry_buffer_dn: f64,
-    pub triggered_at_ms: i64,
-    pub decided_at_ms: i64,
-    pub decision_spot_price: f64,
-    pub order_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotState {
     pub q_yes: f64,
@@ -423,22 +409,7 @@ pub struct BotState {
     pub c_yes: f64,
     pub c_no: f64,
     pub seen_trade_keys: Vec<String>,
-    pub seen_signal_keys: Vec<String>,
     pub open_orders: HashMap<String, OpenOrderState>,
-    pub sniper_trade_count: i64,
-    pub sniper_last_entry_ts: f64,
-    pub sniper_last_exit_ts: f64,
-    pub sniper_last_side: String,
-    #[serde(default)]
-    pub maker_skew_window_start_ts: i64,
-    #[serde(default)]
-    pub maker_skew_last_decision_ts: f64,
-    #[serde(default)]
-    pub maker_skew_unhedged_since: f64,
-    #[serde(default)]
-    pub sniper_pending_breakout_anchor: Option<SniperEntryBreakoutAnchorState>,
-    #[serde(default)]
-    pub sniper_active_breakout_anchor: Option<SniperEntryBreakoutAnchorState>,
 }
 
 impl Default for BotState {
@@ -449,17 +420,7 @@ impl Default for BotState {
             c_yes: 0.0,
             c_no: 0.0,
             seen_trade_keys: Vec::new(),
-            seen_signal_keys: Vec::new(),
             open_orders: HashMap::new(),
-            sniper_trade_count: 0,
-            sniper_last_entry_ts: 0.0,
-            sniper_last_exit_ts: 0.0,
-            sniper_last_side: String::new(),
-            maker_skew_window_start_ts: 0,
-            maker_skew_last_decision_ts: 0.0,
-            maker_skew_unhedged_since: 0.0,
-            sniper_pending_breakout_anchor: None,
-            sniper_active_breakout_anchor: None,
         }
     }
 }
@@ -488,10 +449,6 @@ pub fn save_state(state_file: &Path, state: &mut BotState) -> Result<()> {
     if state.seen_trade_keys.len() > 5000 {
         let start = state.seen_trade_keys.len().saturating_sub(2000);
         state.seen_trade_keys = state.seen_trade_keys[start..].to_vec();
-    }
-    if state.seen_signal_keys.len() > 5000 {
-        let start = state.seen_signal_keys.len().saturating_sub(2000);
-        state.seen_signal_keys = state.seen_signal_keys[start..].to_vec();
     }
     let raw = serde_json::to_string_pretty(state)?;
     fs::write(state_file, raw)

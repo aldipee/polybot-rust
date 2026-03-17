@@ -475,7 +475,7 @@ impl CollectorConfig {
             ],
             true,
         );
-        let ws_url = env_first(&["COPY_COLLECT_WS_URL", "SIGNAL_WS_URL", "RTDS_WS_URL"])
+        let ws_url = env_first(&["COPY_COLLECT_WS_URL", "RTDS_WS_URL"])
             .unwrap_or_else(|| "wss://ws-live-data.polymarket.com".to_string());
         let out_path = PathBuf::from(
             env_first(&["COPY_COLLECT_OUT_PATH"])
@@ -494,7 +494,7 @@ impl CollectorConfig {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>();
         if price_symbols.is_empty() {
-            if let Some(slug) = env_first(&["MARKET_SLUG", "SIGNAL_COPY_MARKET_SLUG"]) {
+            if let Some(slug) = env_first(&["MARKET_SLUG"]) {
                 if let Some(sym) = infer_symbol_from_slug(&slug) {
                     price_symbols.push(sym);
                 }
@@ -520,21 +520,9 @@ impl CollectorConfig {
         Self {
             ws_url,
             out_path,
-            reconnect_min: env_f64(
-                &["COPY_COLLECT_RECONNECT_MIN", "SIGNAL_WS_RECONNECT_MIN"],
-                0.5,
-            )
-            .max(0.1),
-            reconnect_max: env_f64(
-                &["COPY_COLLECT_RECONNECT_MAX", "SIGNAL_WS_RECONNECT_MAX"],
-                8.0,
-            )
-            .max(0.5),
-            ping_interval: env_f64(
-                &["COPY_COLLECT_PING_INTERVAL", "SIGNAL_WS_PING_INTERVAL"],
-                5.0,
-            )
-            .max(0.0),
+            reconnect_min: env_f64(&["COPY_COLLECT_RECONNECT_MIN"], 0.5).max(0.1),
+            reconnect_max: env_f64(&["COPY_COLLECT_RECONNECT_MAX"], 8.0).max(0.5),
+            ping_interval: env_f64(&["COPY_COLLECT_PING_INTERVAL"], 5.0).max(0.0),
             read_timeout: env_f64(
                 &[
                     "COPY_COLLECT_READ_TIMEOUT_SECONDS",
@@ -543,24 +531,18 @@ impl CollectorConfig {
                 0.25,
             )
             .max(0.05),
-            ws_debug: env_bool(&["COPY_COLLECT_WS_DEBUG", "SIGNAL_WS_DEBUG"], false),
+            ws_debug: env_bool(&["COPY_COLLECT_WS_DEBUG"], false),
             log_raw: env_bool(&["COPY_COLLECT_LOG_RAW"], false),
             include_rtds_data,
             include_price_ticks: env_bool(&["COPY_COLLECT_LOG_PRICE_TICKS"], true),
             include_rfq: env_bool(&["COPY_COLLECT_INCLUDE_RFQ"], true),
             max_trades: env_i64(&["COPY_COLLECT_MAX_TRADES"], 0),
             run_seconds: env_f64(&["COPY_COLLECT_RUN_SECONDS"], 0.0).max(0.0),
-            wallet_filters: parse_csv_set(&["SIGNAL_COPY_WALLETS", "COPYTRADE_WALLETS"]),
-            market_slug_filters: parse_csv_set(&[
-                "SIGNAL_COPY_MARKET_SLUGS",
-                "COPYTRADE_MARKET_SLUGS",
-            ]),
-            event_slug_filters: parse_csv_set(&[
-                "SIGNAL_COPY_EVENT_SLUGS",
-                "COPYTRADE_EVENT_SLUGS",
-            ]),
-            buy_only: env_bool(&["SIGNAL_COPY_BUY_ONLY", "COPYTRADE_BUY_ONLY"], false),
-            min_trade_size: env_f64(&["SIGNAL_COPY_MIN_SIZE", "COPYTRADE_MIN_SIZE"], 0.0).max(0.0),
+            wallet_filters: parse_csv_set(&["COPYTRADE_WALLETS"]),
+            market_slug_filters: parse_csv_set(&["COPYTRADE_MARKET_SLUGS"]),
+            event_slug_filters: parse_csv_set(&["COPYTRADE_EVENT_SLUGS"]),
+            buy_only: env_bool(&["COPYTRADE_BUY_ONLY"], false),
+            min_trade_size: env_f64(&["COPYTRADE_MIN_SIZE"], 0.0).max(0.0),
             price_topics,
             price_symbols,
             rfq_types,
