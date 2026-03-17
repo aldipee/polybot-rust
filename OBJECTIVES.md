@@ -1,4 +1,4 @@
-# TARGET GOAL: Pair-First, Merge-First, Maker-First Roadmap
+# OBJECTIVES: Pair-First, Merge-First, Maker-First Roadmap
 
 Date: 2026-03-06
 Status: Active target roadmap

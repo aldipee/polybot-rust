@@ -235,7 +235,7 @@ In short:
 
 ## Overall Status Against Target
 
-Relative to `TARGET_GOAL_STATUS.md`, current behaviour is approximately:
+Relative to `OBJECTIVES_STATUS.md`, current behaviour is approximately:
 
 1. `Milestone 0`: complete
 2. `Step 1`: partial but runnable

@@ -1,8 +1,8 @@
-# TARGET GOAL STATUS
+# OBJECTIVES STATUS
 
-Date: 2026-03-08
-Scope: Status mapping of current code against `TARGET_GOAL.md`
-Reference roadmap: `TARGET_GOAL.md`
+Date: 2026-03-16
+Scope: Status mapping of current code against `OBJECTIVES.md`
+Reference roadmap: `OBJECTIVES.md`
 
 ---
 
@@ -39,6 +39,11 @@ That means:
 2. the real `Step 1` now exists as a runnable path under the existing top-level mode
 3. current `v0.1.24` quote-only path remains infrastructure only, not the target wallet behavior
 4. the latest live runs indicate the stale recovery-order reopen bug is closed enough that it should no longer block progression
+5. Sprint 4 wallet-clone mode has now completed live canaries
+6. the dominant Sprint 4 blocker is no longer startup/taper mechanics; it is `PairBuild` economic strictness
+7. the remaining root Sprint 4 loss classes are:
+   - expensive paired core
+   - oversized expiry tail
 
 ---
 
@@ -411,17 +416,52 @@ This is the next implementation order against the approved roadmap.
 1. complete
 2. emitted in final `[PAIR_BASE][METRICS]` logs during market finalization
 
+### Checkpoint D: Tighten Sprint 4 `PairBuild` economics
+
+1. implemented in the current tree
+2. current code now includes:
+   - a hard projected post-add paired-cost gate across optional growth
+   - truthful `repair_only` / `freeze` behavior for optional paired growth
+   - time-banded relative tail caps with lighter-side repair priority
+   - exact-gap lighter-repair overshoot suppression
+   - early bad-regime shutdown for expensive markets
+3. current validation metrics now include:
+   - paired-size delta by state
+   - optional-add quality above / below snapshot
+   - bad-regime shutdown state in final metrics
+4. remaining work is live canary validation, not missing code guards
+
 ---
 
 ## Sprint 4 Status
+
+Status: `PARTIAL`
 
 Sprint 4 wallet-clone status is now:
 
 1. `EXEC_MODE=WALLET_CLONE` is a separate runnable top-level path
 2. `PreArm`, `OpenBoth`, `SeedCompletion`, `PairBuild`, `Taper`, and clone metrics are implemented behind that mode
 3. the Sprint 4 operator config surface is documented in `ENVIRONMENT.md` and enforced in `src/env_contract.rs`
-4. Sprint 4 is runnable, but it is not yet empirically validated because the first live canary has not been run
-5. the next gating task for Sprint 4 is canary validation and an observed behavior note, not more hidden config work
+4. live canaries have now been run and profitable books are possible in some markets
+5. startup, maker-first participation, taper, and rollover are mechanically live enough for canary iteration
+6. the current tree now implements the planned `PairBuild` hardening guard set:
+   - hard paired-cost gating
+   - truthful `repair_only` / `freeze`
+   - exact-gap lighter repair without overshoot
+   - time-banded relative tail caps
+   - bad-regime shutdown
+   - richer canary metrics
+7. Sprint 4 remains `PARTIAL` because these guard changes still need fresh live canary validation
+8. the next gating task is rerunning canaries and comparing whether the expensive-core and oversized-tail loss modes are actually closed
+
+### Sprint 4 Validation Focus
+
+The next live review needs to answer:
+
+1. whether the hard paired-cost gate actually stops expensive-core canaries from being accumulated
+2. whether exact-gap lighter repair plus relative tail caps keeps expiry tails inside the intended bands
+3. whether bad-regime shutdown suppresses optional growth in persistent overround markets instead of merely relabeling them
+4. whether maker share remains high after removing the old normal-flow taker fallback
 
 ---
 
@@ -432,6 +472,7 @@ Current status is:
 1. `Milestone 0` is complete
 2. the true `Step 1` now exists and is runnable
 3. the stale recovery-order reopen blocker is closed enough to stop holding progression
-4. Sprint 4 wallet-clone mode is now also runnable behind its own mode boundary
-5. the main remaining gaps are empirical validation, metrics cleanup, and overall recovery quality
-6. the next work can begin on the next stage, with Step 1 kept as the canary baseline and Sprint 4 awaiting its first canary
+4. Sprint 4 wallet-clone mode is now also runnable behind its own mode boundary and has completed live canaries
+5. Sprint 4 has proven profitability is possible, and the planned `PairBuild` hardening guard set is now implemented in code
+6. Sprint 4 is still `PARTIAL` until fresh canaries confirm those guards close the expensive-core and oversized-tail loss modes
+7. the next work should focus on live revalidation, with Step 1 kept as the canary baseline

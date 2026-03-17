@@ -11,8 +11,8 @@ It translates the strategy and sprint documents into concrete runtime decision r
 
 Primary references:
 1. `plans/SPRINT_3.md`
-2. `TARGET_GOAL.md`
-3. `TARGET_GOAL_STATUS.md`
+2. `OBJECTIVES.md`
+3. `OBJECTIVES_STATUS.md`
 
 This file is intentionally narrower than `SPRINT_3.md`.
 `SPRINT_3.md` describes the strategy and rollout.

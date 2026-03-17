@@ -930,7 +930,7 @@ Completed in this pass:
 ### Config And Docs
 - [x] Add new env keys to `src/env_contract.rs`
 - [x] Document all Sprint 3 env keys in `ENVIRONMENT.md`
-- [ ] Update `TARGET_GOAL_STATUS.md` when Sprint 3 has a real runnable canary
+- [ ] Update `OBJECTIVES_STATUS.md` when Sprint 3 has a real runnable canary
 - [x] Add a `behaviour-<version>.md` note once the first `SETTLEMENT_SHAPER` canary is run
 
 ### Canary Readiness Criteria

@@ -217,7 +217,7 @@ Execution note:
 - [x] Add Sprint 4 env keys to `src/env_contract.rs`
 - [x] Document Sprint 4 env keys in `ENVIRONMENT.md`
 - [x] Document Sprint 4 behavior note once first canary is run
-- [x] Update `TARGET_GOAL_STATUS.md` only after Sprint 4 is truly runnable
+- [x] Update `OBJECTIVES_STATUS.md` only after Sprint 4 is truly runnable
 - [x] Create Sprint 4 high-level behavior note after first canary review
 
 ## Tests
@@ -237,7 +237,7 @@ Execution note:
 - [x] Unit test lighter-side-first ownership dominance while skew remains materially stretched
 - [x] Unit test broken paired-growth asymmetry cancels on the short wallet-clone horizon
 - [x] Unit test projected repaired-book cap blocks extreme lighter-side pay-up
-- [ ] Unit test below-snapshot gating for optional buys
+- [x] Unit test below-snapshot gating for optional buys
 - [ ] Unit test optional-growth block above `projected_paired_cost > 1.00`
 - [ ] Unit test repair-only behavior in the `1.00 - 1.02` band
 - [x] Unit test repair-budget reserve blocks heavy-side growth when likely repair cannot be funded
@@ -289,7 +289,7 @@ Execution note:
 - [ ] CPP logic does not collapse aggressive high-frequency participation
 - [ ] wallet-clone `PairBuild` no longer churns viable resting maker orders on a generic stale horizon
 - [ ] wallet-clone normal flow no longer leaks sub-minimum maker orders to the exchange
-- [ ] optional growth respects the cheap-pair rule, below-snapshot rule, and non-negative-edge rule or explicit fallback
+- [x] optional growth respects the cheap-pair rule, below-snapshot rule, and non-negative-edge rule or explicit fallback
 - [ ] repair reserve prevents heavy-side growth from stranding the likely repair tail
 - [ ] exact-gap lighter-side repair no longer leaves avoidable residual tails
 - [ ] final paired inventory quality is at or near break-even and the remaining tail does not wipe out the paired edge on reviewed canaries

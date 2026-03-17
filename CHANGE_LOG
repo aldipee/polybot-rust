@@ -3,7 +3,7 @@ Date: 2026-03-11
 ### Changes
 
 #### Sprint 4: Wallet-clone runtime is now runnable behind its own mode boundary
-- **Files:** `src/bot.rs`, `src/env_contract.rs`, `ENVIRONMENT.md`, `plans/SPRINT_4.md`, `plans/SPRINT_4_CHECKLIST.md`, `TARGET_GOAL_STATUS.md`
+- **Files:** `src/bot.rs`, `src/env_contract.rs`, `ENVIRONMENT.md`, `plans/SPRINT_4.md`, `plans/SPRINT_4_CHECKLIST.md`, `OBJECTIVES_STATUS.md`
 - **Changes:**
   - added a dedicated `EXEC_MODE=WALLET_CLONE` runtime path instead of routing Sprint 4 through the older market / settlement-shaper loops
   - implemented the Sprint 4 wallet-clone control flow with `PreArm`, `OpenBoth`, `SeedCompletion`, `PairBuild`, `Taper`, and rollover ownership

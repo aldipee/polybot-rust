@@ -32,7 +32,7 @@ The important business idea is:
 
 ## Current Status
 
-Current status: `FIRST_PROFITABLE_CANARY`
+Current status: `MIXED_CANARY_RESULTS`
 
 That means:
 
@@ -40,12 +40,15 @@ That means:
 2. the startup path works
 3. the bot can seed both sides
 4. the bot can repair one-sided startup fills
-5. the mid-market builder no longer freezes — it accumulates through the whole window
+5. the mid-market builder no longer freezes - it accumulates through the whole window
 6. lighter-side repairs are now capped to prevent overpaying after market moves
-7. the latest reviewed canary was profitable on both settlement outcomes
-8. but only one profitable run has been reviewed — consistency is not yet proven
+7. profitable books have now been seen in canaries 1 and 2
+8. later completed canaries still lost for two different reasons:
+   - directional tail
+   - expensive paired core
+9. the mode is still a canary, not a confirmed production strategy
 
-So the mode is real, materially improved, and has shown its first profit. But it is still a canary, not a confirmed production strategy.
+So the mode is real and materially improved, but it is not yet consistently profitable.
 
 ---
 
@@ -79,7 +82,7 @@ This means:
 2. reduce activity after taper starts
 3. become nearly silent in the final quiet window
 
-In the latest canary, all three goals are now working. Goal B in particular is substantially improved — the bot no longer freezes mid-market.
+Across the reviewed canary set, Goal A and Goal C are mechanically working. Goal B is substantially improved because the bot no longer freezes mid-market, but it still fails economically in some market regimes.
 
 ---
 
@@ -238,30 +241,36 @@ Its job is to:
 5. average down the book when pair_sum is cheaper than the current blended cost
 6. use clip ladders and phase budgets instead of one fixed order size
 
-In the latest reviewed canary, `PairBuild` is now fully functional.
+In the reviewed canary set, `PairBuild` is mechanically live but not yet economically safe.
 
 The two new fixes addressed the previous problems:
 
 1. **Lighter-side repair bid cap**: when paired growth fills one side and the other needs repair, the repair bid is capped at `original_pair_sum - filled_side_price`. This prevents the bot from chasing the current market price after a move. The log shows `bid_cap_applied=true bid=0.420 original_bid=0.590` — a saving of `0.17` per share on that repair.
 
-2. **Averaging-down exception**: when the current book is expensive (RepairOnly or Freeze band) but the current pair_sum is cheaper than the existing inventory_vwap_sum, the bot is now allowed to add a small clip to improve the blended cost. This eliminated the mid-market freeze entirely — the latest run spent `91.6%` of paired-cost observations in `normal_growth` and `0%` in `freeze`.
+2. **Averaging-down exception**: when the current book is expensive (RepairOnly or Freeze band) but the current pair_sum is cheaper than the existing inventory_vwap_sum, the bot is now allowed to add a small clip to improve the blended cost. This eliminated the mid-market freeze entirely in the profitable canaries.
 
-## F. Why PairBuild Is No Longer The Main Problem
+But the later completed canaries exposed two new problems:
 
-The latest reviewed run showed:
+1. **Directional tail**: in canary 5, a late lighter-side YES repair filled `20` shares even though the exact live gap was only about `10`. That turned a nearly balanced book into a `10.55` share YES tail.
+2. **Expensive core**: in canary 6, the bot finished almost perfectly balanced but still lost because the combined paired cost finished at `1.026`.
 
-1. 30 fill events and 133 total shares (versus 8 fills and 40 shares before)
-2. fill shares in `60-180s` segment: `78.36` (was `0.00` in the previous canary)
-3. paired-cost band occupancy: `normal_growth=91.6%, reduced_growth=8.4%, freeze=0%`
-4. `combined_avg_paid=0.967` (below 1.00)
-5. `worst_case_settlement_floor=+0.86`
+## F. Why PairBuild Is Better But Still Risky
+
+The reviewed canary set showed:
+
+1. the bot now accumulates actively through the middle of the market
+2. the earlier freeze problem is gone
+3. profitable books are possible
+4. but the bot can still lose in two ways:
+   - end skewed with a tail
+   - end balanced but too expensive
 
 Plain-language meaning:
 
 1. the bot now accumulates actively through the middle of the market
 2. the freeze that prevented mid-market building is gone
-3. the cheaper mid-market fills bring the blended cost below settlement value
-4. the bot is now profitable on both settlement outcomes
+3. the builder is no longer broken
+4. the remaining problem is economic judgement, not lack of activity
 
 ## G. Taper Logic
 
@@ -273,14 +282,18 @@ Its job is to:
 2. allow only small maintenance if needed
 3. go mostly quiet in the final quiet window
 
-In the latest reviewed run, this part behaved correctly.
+In the reviewed completed runs, this part behaved mechanically correctly.
 
 Observed good signs:
 
 1. the bot moved to `Taper` at the expected late point
-2. zero fills after `240s`
-3. zero new orders after `240s`
-4. it rolled over correctly near expiry
+2. quiet late behaviour still exists in profitable runs
+3. the bot rolled over correctly near expiry
+
+But taper is not yet solving late risk by itself:
+
+1. in canary 5, taper started with `budget_too_small`
+2. the lifecycle handoff worked, but there was no budget left to clean up the tail
 
 ## H. Rollover Logic
 
@@ -297,47 +310,53 @@ This part is now one of the more reliable pieces of the mode.
 
 ---
 
-## Final State Of The Latest Run
+## Final State Of The Latest Completed Runs
 
-The final reviewed state before rollover was approximately:
+The most important completed runs to read together are:
 
-1. `paired_size=64.99`
-2. `unmatched_size=3.37`
-3. `pair_coverage=0.951`
-4. `share_skew=1.052`
-5. `combined_avg_paid=0.967`
-6. `worst_case_settlement_floor=+0.86`
-7. `tail_at_expiry=3.37`
+1. profitable reference run (`btc-updown-5m-1773596100`)
+   - `paired_size=64.98`
+   - `tail_at_expiry=0.01`
+   - `combined_avg_paid=0.982`
+   - `worst_case_settlement_floor=+1.19`
+2. directional-tail loss (`btc-updown-5m-1773598200`)
+   - `paired_size=65.00`
+   - `tail_at_expiry=10.55`
+   - `combined_avg_paid=0.960`
+   - `worst_case_settlement_floor=-0.92`
+3. expensive-core loss (`btc-updown-5m-1773598500`)
+   - `paired_size=59.99`
+   - `tail_at_expiry=0.01`
+   - `combined_avg_paid=1.026`
+   - `worst_case_settlement_floor=-1.55`
 
 Plain-language meaning:
 
-1. the bot built a large two-sided book (65 paired shares)
-2. it finished nearly balanced with a small tail (3.37 shares)
-3. the final paired inventory cost less than settlement value
-4. the bot is profitable regardless of which side wins
-5. worst case profit is `+$0.86`, best case is approximately `+$4.23`
+1. the bot can build a large profitable two-sided book
+2. the bot can also lose even when the paired core is cheap if it ends with the wrong tail
+3. the bot can also lose even when it finishes balanced if the whole paired book was bought too expensively
 
 ---
 
-## What Is Good News In This Run
+## What Is Good News In The Reviewed Set
 
 Good news:
 
 1. the mode started correctly
 2. the mode opened correctly
 3. the mode repaired startup asymmetry correctly
-4. the mid-market builder stayed active and accumulated 78 shares from `60-180s`
-5. the paired cost never entered freeze or repair-only territory
+4. the mid-market builder stayed active instead of freezing
+5. the lockout failure from earlier canaries is materially improved
 6. the mode rolled over correctly
-7. the bot was profitable on both settlement outcomes for the first time
+7. profitable runs now exist, so the edge is not purely hypothetical
 
-This is a substantial improvement over the previous canary.
+This is still a substantial improvement over the earlier lockout state.
 
 ---
 
 ## What Is The Main Problem In One Sentence
 
-The bot can now build profitable inventory, but this has only been proven in one canary — consistency across different market conditions is not yet confirmed.
+The bot is now active and mechanically correct, but it can still lose either by ending skewed or by building a balanced book above `1.00` total cost.
 
 ---
 
@@ -345,17 +364,18 @@ The bot can now build profitable inventory, but this has only been proven in one
 
 If you are not reading code, the practical takeaway is:
 
-1. the bot now behaves like a real profitable strategy, not a broken or unprofitable stub
+1. the bot now behaves like a real strategy, not a broken stub
 2. it can enter the market
 3. it can recover one-sided startup outcomes
-4. it can accumulate cheaply through the middle of the market without freezing
-5. it finished its first canary profitable on both outcomes
-6. but one profitable run does not mean it always works — more runs are needed
+4. it can accumulate through the middle of the market without freezing
+5. it has shown real profits in some runs
+6. it still loses in other runs for understandable reasons
+7. more fixes and more canary data are still needed
 
 That is why the correct label today is:
 
-- first profitable canary
-- needs more data to confirm stability
+- mixed canary results
+- mechanically live, economically not yet stable
 
 ---
 
@@ -364,10 +384,10 @@ That is why the correct label today is:
 The next desired behaviour is simple:
 
 1. run 3-5 more canaries across different market conditions
-2. confirm that `worst_case_settlement_floor` stays positive (or near zero) consistently
-3. confirm that `combined_avg_paid` stays below `~0.98` consistently
-4. watch for runs where the bid cap creates persistent unfilled repairs and the bot ends heavily skewed
-5. if the bid cap causes fillability problems consistently, add a spread-floor softening so capped bids stay within a maximum spread of current market
+2. clamp lighter-side repairs so they do not overshoot the exact live gap into a new tail
+3. add a stronger stop for paired growth when projected paired cost stays above `1.00`
+4. confirm that `worst_case_settlement_floor` stays near zero or positive more consistently
+5. watch for runs where the bid cap creates persistent unfilled repairs and the bot ends heavily skewed
 6. keep startup completion, final quiet, and rollover behaviour exactly as they are unless a canary disproves them
 
 If those canaries confirm consistent profitability, the mode can be considered for production readiness.
@@ -376,18 +396,18 @@ If those canaries confirm consistent profitability, the mode can be considered f
 
 ## Short Plain-English Conclusion
 
-Today, wallet clone is operational and has shown its first profit.
+Today, wallet clone is operational, active, and capable of profit, but it is not yet consistently safe.
 
 It can:
 
 1. pre-arm
 2. open
 3. repair startup asymmetry
-4. build inventory cheaply through the middle of the market
+4. build inventory through the middle of the market
 5. cap lighter-side repairs to avoid chasing
 6. average down an expensive book
 7. taper
 8. roll over
-9. finish profitable on both outcomes
+9. sometimes finish profitably, but sometimes lose through tail or expensive-core behaviour
 
-The next step is confirming this result across more market conditions.
+The next step is tightening those two failure modes and then confirming the result across more market conditions.

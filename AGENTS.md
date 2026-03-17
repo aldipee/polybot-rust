@@ -17,8 +17,8 @@
 - Step 1 baseline is pair-base + recovery. Step 2 skew is a guarded overlay on top of that baseline.
 - `main.py` is a legacy reference. Do not treat it as the source of truth for current behavior unless explicitly comparing ports.
 - Roadmap docs:
-  - `TARGET_GOAL.md`
-  - `TARGET_GOAL_STATUS.md`
+  - `OBJECTIVES.md`
+  - `OBJECTIVES_STATUS.md`
   - `plans/SPRINT_*.md`
 
 ## 2. Setup / run commands
@@ -92,7 +92,7 @@
   - Do not copy raw secrets into docs.
 - `behaviour-<version>.md`
   - Version-specific runtime behavior summaries.
-- `TARGET_GOAL.md` / `TARGET_GOAL_STATUS.md`
+- `OBJECTIVES.md` / `OBJECTIVES_STATUS.md`
   - Strategy roadmap and gating status.
   - Update status when a blocker is actually cleared.
 - `CHANGE_LOG`, `Cargo.toml`, `Cargo.lock`
@@ -110,8 +110,8 @@
 - Do not revert unrelated user changes.
 - Recommended workflow for future sessions:
   1. `git status --short`
-  2. read `TARGET_GOAL.md`
-  3. read `TARGET_GOAL_STATUS.md`
+  2. read `OBJECTIVES.md`
+  3. read `OBJECTIVES_STATUS.md`
   4. read the current version behavior doc, e.g. `behaviour-0.1.26.md`
   5. read `ENVIRONMENT.md` if env behavior matters
   6. scan the runtime starting points in `src/bot.rs`
@@ -137,7 +137,7 @@
   - usually `cargo test -q`
 - After behavior or config changes, update the relevant docs:
   - `ENVIRONMENT.md`
-  - `TARGET_GOAL_STATUS.md`
+  - `OBJECTIVES_STATUS.md`
   - `behaviour-<version>.md`
   - relevant `plans/SPRINT_*.md`
 - Keep Step 1 baseline intact while testing overlays like Step 2.

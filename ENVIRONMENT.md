@@ -618,7 +618,33 @@ Friendly explanation: these ten keys split the usable market budget across start
   Default: `true`
   What it does: keeps normal wallet-clone flow on the observed `BUY`-only path instead of adding live sell-style shaping or exits.
 
-Friendly explanation: this is not a conservative profitability gate. It is just a guardrail that keeps Sprint 4 on the observed wallet behavior instead of drifting back into controller-style cleanup logic. Setting it to `false` is currently unsupported and the wallet-clone loop will fail closed instead of pretending a non-buy path exists.
+Friendly explanation: this is not a conservative profitability gate. It is just a guardrail that keeps Sprint 4 on the observed wallet behavior instead of drifting back into controller-style cleanup logic. Setting it to `false` is currently unsupported and the wallet-clone loop will fail closed instead of pretending a non-buy path exists. Normal wallet-clone flow is now fully maker-only; there is no normal-flow taker fallback for lighter-side repair.
+
+### PairBuild Economic Guardrails
+
+- `WALLET_CLONE_TAIL_CAP_MID_START_SECONDS`
+  Default: `210`
+  What it does: starts the tighter mid-market relative tail cap.
+- `WALLET_CLONE_TAIL_CAP_LATE_START_SECONDS`
+  Default: `240`
+  What it does: starts the strict late-market relative tail cap.
+- `WALLET_CLONE_TAIL_CAP_EARLY_FRACTION`
+  Default: `0.10`
+  What it does: maximum early unmatched tail as a fraction of paired size.
+- `WALLET_CLONE_TAIL_CAP_MID_FRACTION`
+  Default: `0.05`
+  What it does: maximum mid-market unmatched tail as a fraction of paired size.
+- `WALLET_CLONE_TAIL_CAP_LATE_FRACTION`
+  Default: `0.02`
+  What it does: maximum late-market unmatched tail as a fraction of paired size.
+- `WALLET_CLONE_BAD_REGIME_WINDOW_SECONDS`
+  Default: `120`
+  What it does: early-market observation window used to decide whether optional growth should be shut down for an expensive market.
+- `WALLET_CLONE_BAD_REGIME_EXPENSIVE_FRACTION`
+  Default: `0.60`
+  What it does: required share of early projected paired-cost observations in `repair_only` / `freeze` before bad-regime shutdown activates.
+
+Friendly explanation: these keys are the current wallet-clone economic circuit breakers. They stop optional paired growth from pretending a bad book is safe, switch priority to exact-gap lighter-side repair when the tail gets too large relative to paired size, and shut optional growth off entirely when the market spends too much of the early window structurally expensive.
 
 ### Shared Maker Cadence
 
