@@ -1,4 +1,5 @@
 use crate::config::BotConfig;
+use crate::helpers::canonical_pair_id_from_slug;
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, Duration, Utc};
 use chrono_tz::Asia::Jakarta;
@@ -103,6 +104,10 @@ pub struct TradeRow {
     pub trade_id: String,
     pub bot_id: String,
     pub slug: String,
+    pub pair_id: String,
+    pub condition_id: Option<String>,
+    pub yes_asset_id: Option<String>,
+    pub no_asset_id: Option<String>,
     pub configuration_id: String,
     pub date: String,
     pub start_trade: String,
@@ -147,7 +152,21 @@ pub struct UnvalidatedTradeRow {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct TradePairMetadata {
+    pub pair_id: String,
+    pub market_slug: String,
+    pub condition_id: Option<String>,
+    pub yes_asset_id: Option<String>,
+    pub no_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TradeDecisionUpsert {
+    pub pair_id: Option<String>,
+    pub market_slug: Option<String>,
+    pub condition_id: Option<String>,
+    pub yes_asset_id: Option<String>,
+    pub no_asset_id: Option<String>,
     pub t_left_seconds: Option<f64>,
     pub tick_age_ms: Option<i64>,
     pub momentum_checks_passed: Option<i64>,
@@ -255,6 +274,33 @@ pub fn new_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn normalized_trade_pair_metadata(pair: &TradePairMetadata) -> TradePairMetadata {
+    let market_slug = pair.market_slug.trim().to_string();
+    let pair_id = canonical_pair_id_from_slug(if pair.pair_id.trim().is_empty() {
+        market_slug.as_str()
+    } else {
+        pair.pair_id.as_str()
+    });
+    TradePairMetadata {
+        pair_id,
+        market_slug,
+        condition_id: normalize_optional_text(pair.condition_id.as_deref()),
+        yes_asset_id: normalize_optional_text(pair.yes_asset_id.as_deref()),
+        no_asset_id: normalize_optional_text(pair.no_asset_id.as_deref()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BotRepository {
     engine: Engine,
@@ -311,6 +357,10 @@ CREATE TABLE IF NOT EXISTS trade (
   exit_reason TEXT NOT NULL,
   bot_id TEXT NOT NULL,
   slug TEXT NOT NULL,
+  pair_id TEXT NOT NULL,
+  condition_id TEXT NULL,
+  yes_asset_id TEXT NULL,
+  no_asset_id TEXT NULL,
   configuration_id TEXT NOT NULL,
   date TEXT NOT NULL,
   start_trade TEXT NOT NULL,
@@ -339,6 +389,11 @@ CREATE TABLE IF NOT EXISTS trade (
 
 CREATE TABLE IF NOT EXISTS trade_decisions (
   trade_id TEXT PRIMARY KEY,
+  pair_id TEXT NULL,
+  market_slug TEXT NULL,
+  condition_id TEXT NULL,
+  yes_asset_id TEXT NULL,
+  no_asset_id TEXT NULL,
   t_left_seconds DOUBLE PRECISION NULL,
   tick_age_ms BIGINT NULL,
   momentum_checks_passed BIGINT NULL,
@@ -391,6 +446,9 @@ CREATE TABLE IF NOT EXISTS trade_decisions (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
+  ON trade (bot_id, pair_id);
 "#,
         )
         .context("failed creating schema")?;
@@ -422,6 +480,10 @@ ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAU
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_checked_at TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_validated_at TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_source TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS pair_id TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS condition_id TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS yes_asset_id TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS no_asset_id TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS entry_time TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS holding_duration_seconds DOUBLE PRECISION NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS entry_reason TEXT NULL;
@@ -434,6 +496,9 @@ ALTER TABLE trade ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION NULL;
 UPDATE trade
 SET validation_status = 'PENDING'
 WHERE validation_status IS NULL OR trim(validation_status) = '';
+UPDATE trade
+SET pair_id = lower(trim(slug))
+WHERE pair_id IS NULL OR trim(pair_id) = '';
 UPDATE trade
 SET entry_time = start_trade
 WHERE COALESCE(trim(entry_time), '') = ''
@@ -460,7 +525,13 @@ WHERE (stop_loss_category IS NULL OR trim(stop_loss_category) = '')
     upper(COALESCE(exit_reason, '')) LIKE '%STOP_LOSS%'
     OR upper(COALESCE(exit_reason, '')) LIKE '%CAP_LOCKED_LOSS%'
   );
+ALTER TABLE trade ALTER COLUMN pair_id SET NOT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS t_left_seconds DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pair_id TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS market_slug TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS condition_id TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS yes_asset_id TEXT NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS no_asset_id TEXT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS tick_age_ms BIGINT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_checks_passed BIGINT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS momentum_checks_required BIGINT NULL;
@@ -515,6 +586,8 @@ UPDATE trade_decisions SET created_at = COALESCE(NULLIF(trim(created_at), ''), '
 WHERE COALESCE(trim(created_at), '') = '';
 UPDATE trade_decisions SET updated_at = COALESCE(NULLIF(trim(updated_at), ''), '1970-01-01T00:00:00+00:00')
 WHERE COALESCE(trim(updated_at), '') = '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
+  ON trade (bot_id, pair_id);
 "#,
         )
         .context("failed migrating configuration schema for PostgreSQL compatibility")?;
@@ -936,14 +1009,18 @@ WHERE COALESCE(trim(updated_at), '') = '';
     pub fn create_pending_trade(
         &self,
         bot_id: &str,
-        slug: &str,
+        pair: &TradePairMetadata,
         configuration_id: &str,
         start_trade_iso: &str,
     ) -> Result<(String, String)> {
+        let pair = normalized_trade_pair_metadata(pair);
+        if pair.pair_id.trim().is_empty() || pair.market_slug.trim().is_empty() {
+            return Err(anyhow!("missing pair metadata for pending trade creation"));
+        }
         let mut conn = open_conn(&self.engine)?;
         if let Some(row) = conn.query_opt(
-            "SELECT trade_id, status FROM trade WHERE bot_id = $1 AND slug = $2 LIMIT 1",
-            &[&bot_id, &slug],
+            "SELECT trade_id, status FROM trade WHERE bot_id = $1 AND pair_id = $2 LIMIT 1",
+            &[&bot_id, &pair.pair_id],
         )? {
             let trade_id: String = row.get(0);
             let status: Option<String> = row.get(1);
@@ -962,23 +1039,29 @@ WHERE COALESCE(trim(updated_at), '') = '';
 
         conn.execute(
             "INSERT INTO trade (
-                trade_id, exit_reason, bot_id, slug, configuration_id,
+                trade_id, exit_reason, bot_id, slug, pair_id, condition_id, yes_asset_id, no_asset_id,
+                configuration_id,
                 date, start_trade, end_trade,
                 entry_time, holding_duration_seconds, entry_reason, exit_time, exit_reason_category,
                 stop_loss_category, entry_price, exit_price,
                 lp, total_cost, q_yes, q_no, cpp, status, claim_status, meta_data
             ) VALUES (
-                $1, $2, $3, $4, $5,
-                $6, $7, $8,
-                $9, $10, $11, $12, $13,
-                $14, $15, $16,
-                $17, $18, $19, $20, $21, $22, $23, $24
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9,
+                $10, $11, $12,
+                $13, $14, $15, $16, $17,
+                $18, $19, $20,
+                $21, $22, $23, $24, $25, $26, $27, $28
             )",
             &[
                 &tid,
                 &running,
                 &bot_id,
-                &slug,
+                &pair.market_slug,
+                &pair.pair_id,
+                &pair.condition_id,
+                &pair.yes_asset_id,
+                &pair.no_asset_id,
                 &configuration_id,
                 &date_jakarta(),
                 &start_trade_iso,
@@ -1189,16 +1272,22 @@ WHERE COALESCE(trim(updated_at), '') = '';
         Ok(())
     }
 
-    pub fn upsert_trade_decision(
-        &self,
-        trade_id: &str,
-        row: &TradeDecisionUpsert,
-    ) -> Result<()> {
+    pub fn upsert_trade_decision(&self, trade_id: &str, row: &TradeDecisionUpsert) -> Result<()> {
         let mut conn = open_conn(&self.engine)?;
         let now = now_iso_jakarta();
+        let pair_id = row
+            .pair_id
+            .as_deref()
+            .map(canonical_pair_id_from_slug)
+            .or_else(|| row.market_slug.as_deref().map(canonical_pair_id_from_slug));
+        let market_slug = normalize_optional_text(row.market_slug.as_deref());
+        let condition_id = normalize_optional_text(row.condition_id.as_deref());
+        let yes_asset_id = normalize_optional_text(row.yes_asset_id.as_deref());
+        let no_asset_id = normalize_optional_text(row.no_asset_id.as_deref());
         conn.execute(
             "INSERT INTO trade_decisions (
                 trade_id,
+                pair_id, market_slug, condition_id, yes_asset_id, no_asset_id,
                 t_left_seconds, tick_age_ms,
                 momentum_checks_passed, momentum_checks_required, momentum_trend_ok, momentum_slope_ok, momentum_candles_ok,
                 momentum_ema_fast_last, momentum_ema_slow_last, momentum_ema_fast_prev, momentum_body_count,
@@ -1215,22 +1304,28 @@ WHERE COALESCE(trim(updated_at), '') = '';
                 created_at, updated_at
             ) VALUES (
                 $1,
-                $2, $3,
-                $4, $5, $6, $7, $8,
-                $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19,
-                $20, $21, $22,
-                $23, $24, $25,
-                $26, $27, $28, $29, $30,
-                $31, $32,
-                $33, $34, $35, $36, $37,
-                $38, $39,
-                $40, $41, $42,
-                $43, $44, $45, $46, $47,
-                $48, $49, $50,
-                $51, $52
+                $2, $3, $4, $5, $6,
+                $7, $8,
+                $9, $10, $11, $12, $13,
+                $14, $15, $16, $17,
+                $18, $19, $20, $21, $22, $23, $24,
+                $25, $26, $27,
+                $28, $29, $30,
+                $31, $32, $33, $34, $35,
+                $36, $37,
+                $38, $39, $40, $41, $42,
+                $43, $44,
+                $45, $46, $47,
+                $48, $49, $50, $51, $52,
+                $53, $54, $55,
+                $56, $57
             )
             ON CONFLICT (trade_id) DO UPDATE SET
+                pair_id = EXCLUDED.pair_id,
+                market_slug = EXCLUDED.market_slug,
+                condition_id = EXCLUDED.condition_id,
+                yes_asset_id = EXCLUDED.yes_asset_id,
+                no_asset_id = EXCLUDED.no_asset_id,
                 t_left_seconds = EXCLUDED.t_left_seconds,
                 tick_age_ms = EXCLUDED.tick_age_ms,
                 momentum_checks_passed = EXCLUDED.momentum_checks_passed,
@@ -1283,6 +1378,11 @@ WHERE COALESCE(trim(updated_at), '') = '';
                 updated_at = EXCLUDED.updated_at",
             &[
                 &trade_id,
+                &pair_id,
+                &market_slug,
+                &condition_id,
+                &yes_asset_id,
+                &no_asset_id,
                 &row.t_left_seconds,
                 &row.tick_age_ms,
                 &row.momentum_checks_passed,
@@ -1341,8 +1441,47 @@ WHERE COALESCE(trim(updated_at), '') = '';
 
     pub fn delete_trade(&self, trade_id: &str) -> Result<()> {
         let mut conn = open_conn(&self.engine)?;
-        conn.execute("DELETE FROM trade_decisions WHERE trade_id = $1", &[&trade_id])?;
+        conn.execute(
+            "DELETE FROM trade_decisions WHERE trade_id = $1",
+            &[&trade_id],
+        )?;
         conn.execute("DELETE FROM trade WHERE trade_id = $1", &[&trade_id])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_trade_pair_metadata_canonicalizes_slug_variants_to_one_pair_id() {
+        let upper = normalized_trade_pair_metadata(&TradePairMetadata {
+            market_slug: "  BTC-Up-15M  ".to_string(),
+            ..TradePairMetadata::default()
+        });
+        let lower = normalized_trade_pair_metadata(&TradePairMetadata {
+            market_slug: "btc-up-15m".to_string(),
+            ..TradePairMetadata::default()
+        });
+        assert_eq!(upper.pair_id, "btc-up-15m");
+        assert_eq!(upper.pair_id, lower.pair_id);
+        assert_eq!(upper.market_slug, "BTC-Up-15M");
+    }
+
+    #[test]
+    fn normalized_trade_pair_metadata_preserves_pair_metadata_fields() {
+        let pair = normalized_trade_pair_metadata(&TradePairMetadata {
+            pair_id: "  custom-pair  ".to_string(),
+            market_slug: " Custom-Pair ".to_string(),
+            condition_id: Some(" cond ".to_string()),
+            yes_asset_id: Some(" yes ".to_string()),
+            no_asset_id: Some(" no ".to_string()),
+        });
+        assert_eq!(pair.pair_id, "custom-pair");
+        assert_eq!(pair.market_slug, "Custom-Pair");
+        assert_eq!(pair.condition_id.as_deref(), Some("cond"));
+        assert_eq!(pair.yes_asset_id.as_deref(), Some("yes"));
+        assert_eq!(pair.no_asset_id.as_deref(), Some("no"));
     }
 }

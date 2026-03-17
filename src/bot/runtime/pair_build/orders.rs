@@ -1,7 +1,6 @@
 use super::super::*;
 use super::decision::{
-    bot_runtime_pair_build_asymmetry_timeout_seconds,
-    bot_runtime_pair_build_broken_asymmetry,
+    bot_runtime_pair_build_asymmetry_timeout_seconds, bot_runtime_pair_build_broken_asymmetry,
     bot_runtime_pair_build_buy_order_is_economically_invalid,
     bot_runtime_pair_build_pair_orders_are_economically_invalid,
     bot_runtime_pair_build_paired_live_order_timeout_seconds,
@@ -321,12 +320,20 @@ impl MakerHedgeCapBot {
                 &context.yes_key,
                 "bot_runtime_pair_build_invalid_both_live",
             );
-            self._bot_runtime_pair_build_note_side_cancel(OutcomeSide::Yes, context.yes_slot.price, now);
+            self._bot_runtime_pair_build_note_side_cancel(
+                OutcomeSide::Yes,
+                context.yes_slot.price,
+                now,
+            );
             let _ = self._maker_order_request_cancel(
                 &context.no_key,
                 "bot_runtime_pair_build_invalid_both_live",
             );
-            self._bot_runtime_pair_build_note_side_cancel(OutcomeSide::No, context.no_slot.price, now);
+            self._bot_runtime_pair_build_note_side_cancel(
+                OutcomeSide::No,
+                context.no_slot.price,
+                now,
+            );
             self._bot_runtime_log_pair_build_state(
                 "rest",
                 &format!("paired_growth_live_orders_invalid_cancel:{yes_age_s:.1}:{no_age_s:.1}"),

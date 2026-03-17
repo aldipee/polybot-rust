@@ -573,4 +573,3 @@ impl MakerHedgeCapBot {
         Some((bal, allow))
     }
 }
-

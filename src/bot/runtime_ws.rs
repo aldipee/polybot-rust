@@ -791,6 +791,7 @@ impl MakerHedgeCapBot {
     pub fn _reconcile_state_from_positions(&self, reason: &str) -> bool {
         // Primary source is Data API positions. Legacy balance-based mode can be
         // explicitly enabled, but mixed per-leg fallback is intentionally disabled.
+        let pair_id = self.pair_identity().pair_id;
         let use_data_api = env_bool("RECONCILE_USE_DATA_API", true);
         let use_legacy_balance = env_bool("MISMATCH_RECONCILE_FROM_BALANCE", false);
         if !use_data_api && !use_legacy_balance {
@@ -898,7 +899,8 @@ impl MakerHedgeCapBot {
                             // First time seeing this discrepancy ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â record and wait
                             *suspect = Some((now, yes_bal));
                             self.logger.warning(&format!(
-                                "[RECONCILE] YES suspect: internal={new_q_yes:.2} api={yes_bal:.2} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â waiting {confirm_delay:.1}s to confirm ({reason})"
+                                "[RECONCILE] pair_id={} YES suspect: internal={new_q_yes:.2} api={yes_bal:.2} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â waiting {confirm_delay:.1}s to confirm ({reason})",
+                                pair_id
                             ));
                         }
                     }
@@ -910,7 +912,8 @@ impl MakerHedgeCapBot {
                     new_q_yes = yes_bal;
                     changed = true;
                     self.logger.warning(&format!(
-                        "[RECONCILE] YES confirmed zero after delay: internalÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢{yes_bal:.2} ({reason})"
+                        "[RECONCILE] pair_id={} YES confirmed zero after delay: internalÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢{yes_bal:.2} ({reason})",
+                        pair_id
                     ));
                 }
             } else {
@@ -967,7 +970,8 @@ impl MakerHedgeCapBot {
                         _ => {
                             *suspect = Some((now, no_bal));
                             self.logger.warning(&format!(
-                                "[RECONCILE] NO suspect: internal={new_q_no:.2} api={no_bal:.2} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â waiting {confirm_delay:.1}s to confirm ({reason})"
+                                "[RECONCILE] pair_id={} NO suspect: internal={new_q_no:.2} api={no_bal:.2} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â waiting {confirm_delay:.1}s to confirm ({reason})",
+                                pair_id
                             ));
                         }
                     }
@@ -977,7 +981,8 @@ impl MakerHedgeCapBot {
                     new_q_no = no_bal;
                     changed = true;
                     self.logger.warning(&format!(
-                        "[RECONCILE] NO confirmed zero after delay: internalÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢{no_bal:.2} ({reason})"
+                        "[RECONCILE] pair_id={} NO confirmed zero after delay: internalÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢{no_bal:.2} ({reason})",
+                        pair_id
                     ));
                 }
             } else {
@@ -1025,7 +1030,8 @@ impl MakerHedgeCapBot {
             format!(" ({reason})")
         };
         self.logger.warning(&format!(
-            "Reconciled state from positions{} qYES={new_q_yes:.6} qNO={new_q_no:.6} total_cost={:.4}",
+            "Reconciled state from positions pair_id={}{} qYES={new_q_yes:.6} qNO={new_q_no:.6} total_cost={:.4}",
+            pair_id,
             tag,
             new_c_yes + new_c_no
         ));
@@ -1295,7 +1301,4 @@ impl MakerHedgeCapBot {
         }
         clip.max(self.cfg.min_shares.max(1.0))
     }
-
-
 }
-

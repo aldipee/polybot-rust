@@ -56,6 +56,13 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
         cfg,
         logger: Arc::new(BotRuntimeNoopLogger),
         market_slug: "bot-test".to_string(),
+        pair_identity: PairIdentity {
+            pair_id: canonical_pair_id_from_slug("bot-test"),
+            market_slug: "bot-test".to_string(),
+            condition_id: None,
+            yes_asset_id: Some("yes_asset_id".to_string()),
+            no_asset_id: Some("no_asset_id".to_string()),
+        },
         state_file: PathBuf::from("__bot_runtime_test_state_nonexistent.json"),
         state: Arc::new(Mutex::new(BotState::default())),
         start_trade_iso: "2024-01-01T00:00:00Z".to_string(),
@@ -127,10 +134,7 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
 #[test]
 fn exec_mode_defaults_to_bot_runtime() {
     with_exec_mode(None, || {
-        assert_eq!(
-            require_bot_exec_mode().expect("default exec mode"),
-            "BOT"
-        );
+        assert_eq!(require_bot_exec_mode().expect("default exec mode"), "BOT");
     });
 }
 /// Exercises the exec mode rejects unsupported modes scenario and checks the expected BOT
@@ -141,9 +145,7 @@ fn exec_mode_defaults_to_bot_runtime() {
 fn exec_mode_rejects_unsupported_modes() {
     with_exec_mode(Some("SETTLEMENT_SHAPER"), || {
         let err = require_bot_exec_mode().expect_err("unsupported mode should fail");
-        assert!(err
-            .to_string()
-            .contains("Only BOT is supported"));
+        assert!(err.to_string().contains("Only BOT is supported"));
     });
 }
 /// Exercises the BOT runtime phase routing covers runtime segments scenario and checks the
@@ -251,13 +253,76 @@ fn trade_metrics_snapshot_reports_bot_runtime_fields() {
         *exit_reason = "DONE".to_string();
     }
     let snapshot = bot.trade_metrics_snapshot();
+    assert_eq!(snapshot.pair_id, "bot-test");
+    assert_eq!(snapshot.market_slug, "bot-test");
+    assert_eq!(snapshot.yes_asset_id.as_deref(), Some("yes_asset_id"));
+    assert_eq!(snapshot.no_asset_id.as_deref(), Some("no_asset_id"));
     assert_eq!(snapshot.total_cost, 4.0);
     assert_eq!(snapshot.q_yes, 4.0);
     assert_eq!(snapshot.q_no, 6.0);
     assert_eq!(snapshot.fill_count, 2);
-    assert_eq!(snapshot.entry_time_iso.as_deref(), Some("2024-01-01T00:00:10Z"));
+    assert_eq!(
+        snapshot.entry_time_iso.as_deref(),
+        Some("2024-01-01T00:00:10Z")
+    );
     assert_eq!(snapshot.entry_reason.as_deref(), Some("BOT_ENTRY"));
     assert_eq!(snapshot.stop_loss_category.as_deref(), Some("none"));
     assert_eq!(snapshot.exit_reason, "DONE");
 }
 
+/// Exercises the pair identity normalization scenario and checks the expected BOT behavior.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+#[test]
+fn pair_identity_is_present_and_carries_market_metadata() {
+    let bot = make_bot_runtime_test_bot();
+    let pair = bot.pair_identity();
+    assert_eq!(pair.pair_id, "bot-test");
+    assert_eq!(pair.market_slug, "bot-test");
+    assert_eq!(pair.yes_asset_id.as_deref(), Some("yes_asset_id"));
+    assert_eq!(pair.no_asset_id.as_deref(), Some("no_asset_id"));
+}
+
+/// Exercises the pair snapshot math scenario and checks the expected BOT behavior.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+#[test]
+fn pair_snapshot_reports_position_cost_and_quote_state() {
+    let bot = make_bot_runtime_test_bot();
+    if let Ok(mut quotes) = bot.best_quotes.lock() {
+        quotes.insert("yes_asset_id".to_string(), (0.40, 0.42, 10.0));
+        quotes.insert("no_asset_id".to_string(), (0.55, 0.57, 11.0));
+    }
+    let snapshot =
+        bot._pair_snapshot_from_inputs(BotRuntimePhase::PairBuild, 42.0, 4.0, 6.0, 1.2, 2.8);
+    assert_eq!(snapshot.identity.pair_id, "bot-test");
+    assert_eq!(snapshot.phase, "PairBuild");
+    assert_eq!(snapshot.t_into_s, 42.0);
+    assert_eq!(snapshot.total_cost, 4.0);
+    assert_eq!(snapshot.paired_size, 4.0);
+    assert_eq!(snapshot.unmatched_size, 2.0);
+    assert_eq!(snapshot.yes_quote.map(|quote| quote.bid), Some(0.40));
+    assert_eq!(snapshot.no_quote.map(|quote| quote.ask), Some(0.57));
+}
+
+/// Exercises the pair-owned fill accounting scenario and checks the expected BOT behavior.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+#[test]
+fn apply_fill_updates_pair_owned_position_without_side_orphans() {
+    let bot = make_bot_runtime_test_bot();
+    assert!(bot._apply_fill("yes_asset_id", 0.40, 5.0, "fill-yes", "BUY"));
+    let one_sided = bot._pair_snapshot_from_state(BotRuntimePhase::OpenBoth, 12.0);
+    assert_eq!(one_sided.position.q_yes, 5.0);
+    assert_eq!(one_sided.position.q_no, 0.0);
+    assert_eq!(one_sided.paired_size, 0.0);
+    assert_eq!(one_sided.unmatched_size, 5.0);
+
+    assert!(bot._apply_fill("no_asset_id", 0.45, 5.0, "fill-no", "BUY"));
+    let paired = bot._pair_snapshot_from_state(BotRuntimePhase::PairBuild, 18.0);
+    assert_eq!(paired.position.q_yes, 5.0);
+    assert_eq!(paired.position.q_no, 5.0);
+    assert!((paired.total_cost - 4.25).abs() < 1e-9);
+    assert_eq!(paired.paired_size, 5.0);
+    assert_eq!(paired.unmatched_size, 0.0);
+}

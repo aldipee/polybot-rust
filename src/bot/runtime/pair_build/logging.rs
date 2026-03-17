@@ -43,8 +43,10 @@ impl MakerHedgeCapBot {
         let inventory_vwap_sum = decision
             .map(|value| value.inventory_vwap_sum)
             .unwrap_or(f64::INFINITY);
+        let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][PAIR_BUILD] {} reason={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3}",
+            "[BOT][PAIR_BUILD] pair_id={} {} reason={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3}",
+            pair_id,
             state_kind,
             reason,
             mode,

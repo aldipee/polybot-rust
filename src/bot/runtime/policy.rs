@@ -234,4 +234,3 @@ pub(in crate::bot) fn bot_runtime_budget_snapshot(
         under_min_target: cost + 1e-9 < cumulative_min_cost,
     }
 }
-

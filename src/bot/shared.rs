@@ -42,6 +42,86 @@ impl OutcomeSide {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct PairIdentity {
+    pub(crate) pair_id: String,
+    pub(crate) market_slug: String,
+    pub(crate) condition_id: Option<String>,
+    pub(crate) yes_asset_id: Option<String>,
+    pub(crate) no_asset_id: Option<String>,
+}
+
+impl PairIdentity {
+    pub(crate) fn from_slug(slug: &str) -> Self {
+        Self {
+            pair_id: canonical_pair_id_from_slug(slug),
+            market_slug: slug.trim().to_string(),
+            condition_id: None,
+            yes_asset_id: None,
+            no_asset_id: None,
+        }
+    }
+
+    pub(crate) fn update_market_metadata(
+        &mut self,
+        condition_id: Option<String>,
+        yes_asset_id: Option<String>,
+        no_asset_id: Option<String>,
+    ) {
+        if let Some(condition_id) = condition_id.filter(|value| !value.trim().is_empty()) {
+            self.condition_id = Some(condition_id);
+        }
+        if let Some(yes_asset_id) = yes_asset_id.filter(|value| !value.trim().is_empty()) {
+            self.yes_asset_id = Some(yes_asset_id);
+        }
+        if let Some(no_asset_id) = no_asset_id.filter(|value| !value.trim().is_empty()) {
+            self.no_asset_id = Some(no_asset_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct PairPosition {
+    pub(crate) q_yes: f64,
+    pub(crate) q_no: f64,
+    pub(crate) c_yes: f64,
+    pub(crate) c_no: f64,
+}
+
+impl PairPosition {
+    pub(crate) fn total_cost(self) -> f64 {
+        self.c_yes.max(0.0) + self.c_no.max(0.0)
+    }
+
+    pub(crate) fn paired_size(self) -> f64 {
+        self.q_yes.max(0.0).min(self.q_no.max(0.0))
+    }
+
+    pub(crate) fn unmatched_size(self) -> f64 {
+        (self.q_yes.max(0.0) - self.q_no.max(0.0)).abs()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct PairQuote {
+    pub(crate) bid: f64,
+    pub(crate) ask: f64,
+    pub(crate) ts: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct PairSnapshot {
+    pub(crate) identity: PairIdentity,
+    pub(crate) position: PairPosition,
+    pub(crate) phase: String,
+    pub(crate) t_into_s: f64,
+    pub(crate) total_cost: f64,
+    pub(crate) paired_size: f64,
+    pub(crate) unmatched_size: f64,
+    pub(crate) yes_quote: Option<PairQuote>,
+    pub(crate) no_quote: Option<PairQuote>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SnapshotPricingSource {
     Midpoint,
@@ -174,10 +254,19 @@ pub(super) struct MakerExecLedger {
 
 #[derive(Debug, Clone)]
 pub(super) enum MakerExecApplyResult {
-    Applied { canonical_id: String },
-    Duplicate { canonical_id: String },
-    Conflict { canonical_id: String, reason: String },
-    DroppedWeakId { reason: String },
+    Applied {
+        canonical_id: String,
+    },
+    Duplicate {
+        canonical_id: String,
+    },
+    Conflict {
+        canonical_id: String,
+        reason: String,
+    },
+    DroppedWeakId {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -234,7 +323,11 @@ pub(super) fn round_up_to_lot(value: f64, lot: f64) -> f64 {
 pub(super) fn pair_coverage(q_yes: f64, q_no: f64) -> f64 {
     let mn = q_yes.max(0.0).min(q_no.max(0.0));
     let mx = q_yes.max(0.0).max(q_no.max(0.0));
-    if mx > 1e-9 { mn / mx } else { 1.0 }
+    if mx > 1e-9 {
+        mn / mx
+    } else {
+        1.0
+    }
 }
 
 /// Computes share skew ratio for the BOT runtime.
@@ -377,11 +470,15 @@ pub(super) fn maker_slot_family_live(slot: &MakerOrderSlot, origin_prefix: &str)
 /// Implements pair submit leg is new for the maker-side BOT workflow.
 /// This is a helper used by the BOT runtime for normalization, state labels, or calculations.
 
-pub(super) fn maker_pair_submit_leg_is_new(live_oid: Option<&str>, prev_slot: &MakerOrderSlot) -> bool {
+pub(super) fn maker_pair_submit_leg_is_new(
+    live_oid: Option<&str>,
+    prev_slot: &MakerOrderSlot,
+) -> bool {
     let Some(live_oid) = live_oid.filter(|oid| !oid.trim().is_empty()) else {
         return false;
     };
-    prev_slot.order_id.as_deref() != Some(live_oid) || prev_slot.state != MakerOrderLifecycle::Working
+    prev_slot.order_id.as_deref() != Some(live_oid)
+        || prev_slot.state != MakerOrderLifecycle::Working
 }
 
 /// Implements order lifecycle label for the maker-side BOT workflow.

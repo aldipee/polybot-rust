@@ -109,7 +109,11 @@ where
 /// Implements env clip ladder large for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_env_clip_ladder_large<F>(get: &mut F, key: &str, default: [f64; 2]) -> [f64; 2]
+pub(in crate::bot) fn bot_runtime_env_clip_ladder_large<F>(
+    get: &mut F,
+    key: &str,
+    default: [f64; 2],
+) -> [f64; 2]
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -136,28 +140,19 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     let mut cfg = bot_runtime_config_defaults();
-    cfg.prearm_lead_seconds = bot_runtime_env_float(
-        &mut get,
-        "BOT_PREARM_LEAD_SECONDS",
-        cfg.prearm_lead_seconds,
-    );
+    cfg.prearm_lead_seconds =
+        bot_runtime_env_float(&mut get, "BOT_PREARM_LEAD_SECONDS", cfg.prearm_lead_seconds);
     cfg.seed_clip_small =
         bot_runtime_env_float(&mut get, "BOT_SEED_CLIP_SMALL", cfg.seed_clip_small);
-    cfg.repair_clip_small = bot_runtime_env_float(
-        &mut get,
-        "BOT_REPAIR_CLIP_SMALL",
-        cfg.repair_clip_small,
-    );
+    cfg.repair_clip_small =
+        bot_runtime_env_float(&mut get, "BOT_REPAIR_CLIP_SMALL", cfg.repair_clip_small);
     cfg.repair_reserve_buffer_usd = bot_runtime_env_float(
         &mut get,
         "BOT_REPAIR_RESERVE_BUFFER_USD",
         cfg.repair_reserve_buffer_usd,
     );
-    cfg.large_clip_ladder = bot_runtime_env_clip_ladder_large(
-        &mut get,
-        "BOT_CLIP_LADDER_LARGE",
-        cfg.large_clip_ladder,
-    );
+    cfg.large_clip_ladder =
+        bot_runtime_env_clip_ladder_large(&mut get, "BOT_CLIP_LADDER_LARGE", cfg.large_clip_ladder);
     cfg.seed_budget_min_fraction = bot_runtime_env_float(
         &mut get,
         "BOT_BUDGET_SEED_MIN_FRACTION",
@@ -218,16 +213,10 @@ where
         "BOT_TARGET_BOTH_SIDES_BY_60S",
         cfg.target_both_sides_by_60s,
     );
-    cfg.taper_start_seconds = bot_runtime_env_float(
-        &mut get,
-        "BOT_TAPER_START_SECONDS",
-        cfg.taper_start_seconds,
-    );
-    cfg.final_quiet_seconds = bot_runtime_env_float(
-        &mut get,
-        "BOT_FINAL_QUIET_SECONDS",
-        cfg.final_quiet_seconds,
-    );
+    cfg.taper_start_seconds =
+        bot_runtime_env_float(&mut get, "BOT_TAPER_START_SECONDS", cfg.taper_start_seconds);
+    cfg.final_quiet_seconds =
+        bot_runtime_env_float(&mut get, "BOT_FINAL_QUIET_SECONDS", cfg.final_quiet_seconds);
     cfg.buy_only_normal_flow = bot_runtime_env_bool(
         &mut get,
         "BOT_BUY_ONLY_NORMAL_FLOW",
@@ -279,7 +268,9 @@ pub(in crate::bot) fn bot_runtime_config_from_env() -> BotRuntimeConfigSnapshot 
 /// Implements validate config for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_validate_config(cfg: &BotRuntimeConfigSnapshot) -> Result<(), &'static str> {
+pub(in crate::bot) fn bot_runtime_validate_config(
+    cfg: &BotRuntimeConfigSnapshot,
+) -> Result<(), &'static str> {
     if !cfg.buy_only_normal_flow {
         return Err("buy_only_normal_flow_false_unsupported");
     }
@@ -322,7 +313,9 @@ pub(in crate::bot) fn bot_runtime_validate_config(cfg: &BotRuntimeConfigSnapshot
 /// Implements prearm window active for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_prearm_window_active(t_into_s: f64, cfg: &BotRuntimeConfigSnapshot) -> bool {
+pub(in crate::bot) fn bot_runtime_prearm_window_active(
+    t_into_s: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> bool {
     t_into_s >= -cfg.prearm_lead_seconds.max(0.0) && t_into_s < 0.0
 }
-

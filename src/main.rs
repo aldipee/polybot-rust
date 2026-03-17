@@ -19,7 +19,7 @@ use chrono_tz::Asia::Jakarta;
 use config::BotConfig;
 use db::{
     date_jakarta, make_engine, make_session_factory, month_start_date_jakarta, now_iso_jakarta,
-    week_start_date_jakarta, BotRepository, BotTradeStats, ConfigurationRow,
+    week_start_date_jakarta, BotRepository, BotTradeStats, ConfigurationRow, TradePairMetadata,
 };
 use env_utils::{env_bool, env_float, env_int};
 use gamma::fetch_market_by_slug;
@@ -32,8 +32,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1201,21 +1201,26 @@ fn run() -> Result<()> {
             }
         };
 
-        let bot = MakerHedgeCapBot::new(
-            run_cfg.clone(),
-            &current_slug,
-            bot_logger.clone(),
-        )
-        .with_context(|| format!("failed to initialize bot for {current_slug}"))?;
+        let bot = MakerHedgeCapBot::new(run_cfg.clone(), &current_slug, bot_logger.clone())
+            .with_context(|| format!("failed to initialize bot for {current_slug}"))?;
+        let pair = bot.pair_identity();
+        let trade_pair = TradePairMetadata {
+            pair_id: pair.pair_id.clone(),
+            market_slug: pair.market_slug.clone(),
+            condition_id: pair.condition_id.clone(),
+            yes_asset_id: pair.yes_asset_id.clone(),
+            no_asset_id: pair.no_asset_id.clone(),
+        };
 
         let (trade_id, status) = repo.create_pending_trade(
             &bot_id,
-            &current_slug,
+            &trade_pair,
             &configuration_id,
             &bot.start_trade_iso,
         )?;
         bot_logger.info(&format!(
-            "Created pending trade record: {trade_id} status={status}"
+            "Created pending trade record: {trade_id} status={status} pair_id={}",
+            trade_pair.pair_id
         ));
         if status != "INITIALIZED" {
             bot_logger.info(&format!(
@@ -1311,8 +1316,7 @@ fn run() -> Result<()> {
                     .entry_time_iso
                     .as_deref()
                     .unwrap_or(bot.start_trade_iso.as_str());
-                let holding_secs =
-                    holding_duration_seconds(effective_entry_iso, &end_trade_iso);
+                let holding_secs = holding_duration_seconds(effective_entry_iso, &end_trade_iso);
                 let total_qty = metrics.q_yes + metrics.q_no;
                 let entry_price = if total_qty > 1e-9 {
                     Some(metrics.total_cost / total_qty)
@@ -1365,10 +1369,7 @@ fn run() -> Result<()> {
             if bg_trade_validation_enabled && bg_trade_validation_after_market_enabled {
                 let repo = bg_session_factory.repository();
                 if let Err(e) = reconcile_unvalidated_trades_with_polymarket(
-                    &repo,
-                    &bg_bot_id,
-                    &bg_cfg,
-                    &bg_logger,
+                    &repo, &bg_bot_id, &bg_cfg, &bg_logger,
                 ) {
                     bg_logger.warning(&format!(
                         "[TRADE_VALIDATE] post-market poll error trade_id={} err={e:#}",
@@ -1466,16 +1467,10 @@ mod tests {
         let original = env::var("EXEC_MODE").ok();
 
         env::remove_var("EXEC_MODE");
-        assert_eq!(
-            require_bot_exec_mode().expect("default mode"),
-            "BOT"
-        );
+        assert_eq!(require_bot_exec_mode().expect("default mode"), "BOT");
 
         env::set_var("EXEC_MODE", "BOT");
-        assert_eq!(
-            require_bot_exec_mode().expect("bot mode"),
-            "BOT"
-        );
+        assert_eq!(require_bot_exec_mode().expect("bot mode"), "BOT");
 
         env::set_var("EXEC_MODE", "SNIPER");
         let err = require_bot_exec_mode()

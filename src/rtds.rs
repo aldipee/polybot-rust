@@ -2,8 +2,8 @@ use crate::config::BotConfig;
 use crate::env_utils::{env_bool, env_float, env_int};
 use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
 use crate::helpers::iso_to_epoch;
-use crate::logging::LogLike;
 use crate::latency_log::JsonlFileService;
+use crate::logging::LogLike;
 use anyhow::{anyhow, Result};
 use chainlink_data_streams_report::feed_id::ID as ChainlinkFeedId;
 use chainlink_data_streams_report::report::{

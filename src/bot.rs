@@ -2,8 +2,8 @@ use crate::config::BotConfig;
 use crate::env_utils::{env_bool, env_float, env_int};
 use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
 use crate::helpers::{
-    clamp, cost_per_pair, iso_to_epoch, load_state, locked_profit, q_down, round_down, round_up,
-    save_state, segment_defaults, BotState, OpenOrderState,
+    canonical_pair_id_from_slug, clamp, cost_per_pair, iso_to_epoch, load_state, locked_profit,
+    q_down, round_down, round_up, save_state, segment_defaults, BotState, OpenOrderState,
 };
 use crate::latency_log::LatencyLogService;
 use crate::logging::LogLike;
@@ -70,6 +70,11 @@ pub fn require_bot_exec_mode() -> Result<String> {
 
 #[derive(Debug, Clone)]
 pub struct TradeMetrics {
+    pub pair_id: String,
+    pub market_slug: String,
+    pub condition_id: Option<String>,
+    pub yes_asset_id: Option<String>,
+    pub no_asset_id: Option<String>,
     pub lp: f64,
     pub total_cost: f64,
     pub q_yes: f64,
@@ -91,8 +96,8 @@ use self::runtime::*;
 mod core;
 pub use self::core::MakerHedgeCapBot;
 
-mod runtime_ws;
+mod execution;
 mod maker_exec;
 mod maker_orders;
-mod execution;
 mod public_tail;
+mod runtime_ws;

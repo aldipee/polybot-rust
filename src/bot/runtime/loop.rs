@@ -6,6 +6,7 @@ impl MakerHedgeCapBot {
 
     pub(in crate::bot) fn _bot_runtime_log_final_metrics(&self, exit_reason: &str) {
         let cfg = *self._bot_runtime_cfg();
+        let pair_id = self.pair_identity().pair_id;
         let (q_yes, q_no, cost_yes, cost_no, total_cost) = self
             .state
             .lock()
@@ -16,7 +17,8 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|st| st.clone())
             .unwrap_or_default();
-        let metrics = bot_runtime_metrics_snapshot(&state, q_yes, q_no, cost_yes, cost_no, total_cost);
+        let metrics =
+            bot_runtime_metrics_snapshot(&state, q_yes, q_no, cost_yes, cost_no, total_cost);
         let combined_avg_paid = if metrics.inventory_vwap_sum.is_finite() {
             format!("{:.3}", metrics.inventory_vwap_sum)
         } else {
@@ -39,7 +41,8 @@ impl MakerHedgeCapBot {
         let canary_success = bot_runtime_canary_success(&metrics);
         let canary_failure_summary = bot_runtime_canary_failure_summary(&metrics);
         self.logger.info(&format!(
-            "[BOT][METRICS] exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} fills_after_taper_start={} fills_after_final_quiet={} new_orders_after_taper_start={} new_orders_after_final_quiet={} both_by_30s={} both_by_60s={} target_both_by_30s={:.2} target_both_by_60s={:.2} target_both_by_30s_met={} target_both_by_60s_met={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
+            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} fills_after_taper_start={} fills_after_final_quiet={} new_orders_after_taper_start={} new_orders_after_final_quiet={} both_by_30s={} both_by_60s={} target_both_by_30s={:.2} target_both_by_60s={:.2} target_both_by_30s_met={} target_both_by_60s_met={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
+            pair_id,
             exit_reason,
             metrics.market_participated,
             if metrics.market_participated { 1.0 } else { 0.0 },
@@ -90,9 +93,11 @@ impl MakerHedgeCapBot {
     pub(in crate::bot) fn _run_bot_runtime_loop(&self) -> String {
         let mut last_log = 0.0;
         let mut stale_logged = false;
-        self.logger.info(
-            "[BOT] Phase 2 open-both active; runtime path is isolated from settlement-shaper target-gap planning and opening now posts neutral paired BUY seeds",
-        );
+        let pair_id = self.pair_identity().pair_id;
+        self.logger.info(&format!(
+            "[BOT] pair_id={} Phase 2 open-both active; runtime path is isolated from settlement-shaper target-gap planning and opening now posts neutral paired BUY seeds",
+            pair_id
+        ));
         while !self.stop_flag.load(Ordering::SeqCst) {
             let wait_s = self.loop_wait_seconds_maker.max(0.01);
             thread::sleep(Duration::from_secs_f64(wait_s.min(0.5)));
@@ -117,6 +122,9 @@ impl MakerHedgeCapBot {
             if bot_runtime_should_stop_for_rollover(seconds_left, self.cfg.stop_buffer_seconds) {
                 phase = BotRuntimePhase::HoldSettleRollover;
             }
+            let pair_snapshot =
+                self._pair_snapshot_from_inputs(phase, t_into_s, qy, qn, cost_yes, cost_no);
+            let pair_id = pair_snapshot.identity.pair_id.clone();
             let (owner, owner_reason) = bot_runtime_owner_for_snapshot(phase, qy, qn);
             let prearm_status = matches!(phase, BotRuntimePhase::PreArm)
                 .then(|| self._bot_runtime_prearm_status(t_into_s));
@@ -129,7 +137,8 @@ impl MakerHedgeCapBot {
                     st.owner_enter_ts = now;
                     st.owner_reason = owner_reason;
                     self.logger.info(&format!(
-                        "[BOT] armed phase={} owner={} reason={} t_into={:.1}s t_left={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+                        "[BOT] pair_id={} armed phase={} owner={} reason={} t_into={:.1}s t_left={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+                        pair_id,
                         phase.as_str(),
                         owner.as_str(),
                         owner_reason,
@@ -157,7 +166,8 @@ impl MakerHedgeCapBot {
                             String::new()
                         };
                         self.logger.info(&format!(
-                            "[BOT] phase {} -> {} t_into={:.1}s t_left={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}{}",
+                            "[BOT] pair_id={} phase {} -> {} t_into={:.1}s t_left={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}{}",
+                            pair_id,
                             st.phase.as_str(),
                             phase.as_str(),
                             t_into_s.max(0.0),
@@ -172,7 +182,8 @@ impl MakerHedgeCapBot {
                     }
                     if st.owner != owner || st.owner_reason != owner_reason {
                         self.logger.info(&format!(
-                            "[BOT] owner {} -> {} reason={} phase={} t_into={:.1}s t_left={:.1}s",
+                            "[BOT] pair_id={} owner {} -> {} reason={} phase={} t_into={:.1}s t_left={:.1}s",
+                            pair_id,
                             st.owner.as_str(),
                             owner.as_str(),
                             owner_reason,
@@ -192,7 +203,8 @@ impl MakerHedgeCapBot {
                             st.prearm_ready_once = true;
                             st.prearm_ready_ts = now;
                             self.logger.info(&format!(
-                                "[BOT][PREARM] ready t_to_open={:.1}s market_slug={} start_ts={} discovery_preloaded={} asset_ids_ready={} market_ws_ready={} user_ws_ready={} quote_inputs={} paired_quotes={} prearm_lead={:.0}s",
+                                "[BOT][PREARM] pair_id={} ready t_to_open={:.1}s market_slug={} start_ts={} discovery_preloaded={} asset_ids_ready={} market_ws_ready={} user_ws_ready={} quote_inputs={} paired_quotes={} prearm_lead={:.0}s",
+                                pair_id,
                                 (-t_into_s).max(0.0),
                                 self.market_slug,
                                 self.start_ts,
@@ -208,7 +220,8 @@ impl MakerHedgeCapBot {
                     } else if st.prearm_hold_reason != prearm.hold_reason {
                         st.prearm_hold_reason = prearm.hold_reason.clone();
                         self.logger.info(&format!(
-                            "[BOT][PREARM] hold reason={} t_to_open={:.1}s market_slug={} market_selected={} asset_ids_ready={} market_ws_ready={} user_ws_ready={} quotes_ready={} paired_quotes_ready={} quote_inputs={} paired_quotes={}",
+                            "[BOT][PREARM] pair_id={} hold reason={} t_to_open={:.1}s market_slug={} market_selected={} asset_ids_ready={} market_ws_ready={} user_ws_ready={} quotes_ready={} paired_quotes_ready={} quote_inputs={} paired_quotes={}",
+                            pair_id,
                             prearm.hold_reason,
                             (-t_into_s).max(0.0),
                             self.market_slug,
@@ -247,21 +260,24 @@ impl MakerHedgeCapBot {
                     None,
                     "bot_runtime_pair_build_owner_inactive",
                 );
-                let _ = self._bot_runtime_cancel_taper_orders(
-                    None,
-                    "bot_runtime_taper_owner_inactive",
-                );
+                let _ =
+                    self._bot_runtime_cancel_taper_orders(None, "bot_runtime_taper_owner_inactive");
             }
             if matches!(phase, BotRuntimePhase::PreArm) {
                 stale_logged = false;
             } else if !self._market_data_fresh() {
                 if !stale_logged {
-                    self.logger.info("[BOT] hold reason=market_data_stale");
+                    self.logger.info(&format!(
+                        "[BOT] pair_id={} hold reason=market_data_stale",
+                        pair_id
+                    ));
                     stale_logged = true;
                 }
             } else if stale_logged {
-                self.logger
-                    .info("[BOT] market data fresh -> bot phase controller active");
+                self.logger.info(&format!(
+                    "[BOT] pair_id={} market data fresh -> bot phase controller active",
+                    pair_id
+                ));
                 stale_logged = false;
             }
             if now - last_log >= (self.cfg.log_every as f64).max(0.5) {
@@ -328,7 +344,8 @@ impl MakerHedgeCapBot {
                         0,
                     ));
                 self.logger.info(&format!(
-                    "[BOT] hold phase={} owner={} owner_reason={} armed={} prearm_ready={} prearm_hold_reason={} open_attempts={} first_seed_submit_t_into={} first_fill_t_into={} second_side_t_into={} second_side_latency={} both_by_30s={} both_by_60s={} seed_completion_failed={} taper_fill_events_240={} taper_fill_events_270={} taper_new_orders_240={} taper_new_orders_270={} t_left={:.1}s prearm_lead={:.0}s qYES={:.2} qNO={:.2} total_cost={:.2} market_data_fresh={} market_connected={} user_connected={}",
+                    "[BOT] pair_id={} hold phase={} owner={} owner_reason={} armed={} prearm_ready={} prearm_hold_reason={} open_attempts={} first_seed_submit_t_into={} first_fill_t_into={} second_side_t_into={} second_side_latency={} both_by_30s={} both_by_60s={} seed_completion_failed={} taper_fill_events_240={} taper_fill_events_270={} taper_new_orders_240={} taper_new_orders_270={} t_left={:.1}s prearm_lead={:.0}s qYES={:.2} qNO={:.2} total_cost={:.2} market_data_fresh={} market_connected={} user_connected={}",
+                    pair_id,
                     phase.as_str(),
                     owner.as_str(),
                     owner_reason,
@@ -401,4 +418,3 @@ impl MakerHedgeCapBot {
         exit_reason
     }
 }
-

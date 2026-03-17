@@ -90,6 +90,7 @@ impl MakerHedgeCapBot {
     /// BOT runtime.
 
     pub fn _handle_user_trade_event(&self, msg: &Value) {
+        let pair_id = self.pair_identity().pair_id;
         let event_type = msg
             .get("event_type")
             .or_else(|| msg.get("type"))
@@ -217,7 +218,8 @@ impl MakerHedgeCapBot {
                 )
                 .unwrap_or(0.0);
                 self.logger.info(&format!(
-                    "[FILL][DBG_MAP] taker_oid={}.. msg_asset={} rec_asset={} msg_side={} rec_side={} msg_px={mpx:.4} msg_sz={msz:.6}",
+                    "[FILL][DBG_MAP] pair_id={} taker_oid={}.. msg_asset={} rec_asset={} msg_side={} rec_side={} msg_px={mpx:.4} msg_sz={msz:.6}",
+                    pair_id,
                     taker_oid.chars().take(10).collect::<String>(),
                     msg_tail,
                     rec_tail,
@@ -324,7 +326,8 @@ impl MakerHedgeCapBot {
                         MakerExecApplyResult::Applied { canonical_id } => {
                             let alias_kind = Self::_maker_exec_alias_kind(&canonical_id);
                             self.logger.info(&format!(
-                                "[FILL][MAKER_APPLY] oid={}.. canonical={} alias_kind={} qty={qty:.6} px={px:.4}",
+                                "[FILL][MAKER_APPLY] pair_id={} oid={}.. canonical={} alias_kind={} qty={qty:.6} px={px:.4}",
+                                pair_id,
                                 maker_oid.chars().take(10).collect::<String>(),
                                 canonical_id,
                                 alias_kind
@@ -334,7 +337,8 @@ impl MakerHedgeCapBot {
                         MakerExecApplyResult::Duplicate { canonical_id } => {
                             let alias_kind = Self::_maker_exec_alias_kind(&canonical_id);
                             self.logger.info(&format!(
-                                "[FILL][MAKER_DEDUPE] drop oid={}.. canonical={} alias_kind={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                "[FILL][MAKER_DEDUPE] pair_id={} drop oid={}.. canonical={} alias_kind={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                pair_id,
                                 maker_oid.chars().take(10).collect::<String>(),
                                 canonical_id,
                                 alias_kind,
@@ -350,7 +354,8 @@ impl MakerHedgeCapBot {
                         } => {
                             let alias_kind = Self::_maker_exec_alias_kind(&canonical_id);
                             self.logger.warning(&format!(
-                                "[FILL][MAKER_CONFLICT] oid={}.. canonical={} alias_kind={} reason={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                "[FILL][MAKER_CONFLICT] pair_id={} oid={}.. canonical={} alias_kind={} reason={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                pair_id,
                                 maker_oid.chars().take(10).collect::<String>(),
                                 canonical_id,
                                 alias_kind,
@@ -363,7 +368,8 @@ impl MakerHedgeCapBot {
                         }
                         MakerExecApplyResult::DroppedWeakId { reason } => {
                             self.logger.warning(&format!(
-                                "[FILL][MAKER_DROP_WEAK] oid={}.. reason={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                "[FILL][MAKER_DROP_WEAK] pair_id={} oid={}.. reason={} qty={qty:.6} px={px:.4} trade_id={} tx={} taker_oid={} match_time={}",
+                                pair_id,
                                 maker_oid.chars().take(10).collect::<String>(),
                                 reason,
                                 trade_id,
@@ -386,7 +392,8 @@ impl MakerHedgeCapBot {
                 .map(|a| !a.is_empty())
                 .unwrap_or(false);
             self.logger.info(&format!(
-                "[FILL][DBG_DROP] drop ambiguous trade event id={} taker_oid={} has_maker_orders={}",
+                "[FILL][DBG_DROP] pair_id={} drop ambiguous trade event id={} taker_oid={} has_maker_orders={}",
+                pair_id,
                 trade_id,
                 taker_oid,
                 has_maker
@@ -546,4 +553,3 @@ impl MakerHedgeCapBot {
         }
     }
 }
-

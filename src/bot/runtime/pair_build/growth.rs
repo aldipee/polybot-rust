@@ -29,7 +29,13 @@ pub(in crate::bot) fn bot_runtime_pair_build_optional_growth_policy(
         return None;
     }
     let current_projected_paired_cost = bot_runtime_pair_build_projected_inventory_vwap_sum(
-        q_yes, q_no, cost_yes, cost_no, y_bid, n_bid, current_clip,
+        q_yes,
+        q_no,
+        cost_yes,
+        cost_no,
+        y_bid,
+        n_bid,
+        current_clip,
     );
     let current_band =
         bot_runtime_pair_build_projected_paired_cost_band(current_projected_paired_cost);
@@ -45,7 +51,9 @@ pub(in crate::bot) fn bot_runtime_pair_build_optional_growth_policy(
         }
         BotRuntimePairedCostBand::ReducedGrowth => {
             let maintenance_clip_cap = round_down_to_lot(
-                cfg.repair_clip_small.max(cfg.seed_clip_small).max(min_shares.max(1.0)),
+                cfg.repair_clip_small
+                    .max(cfg.seed_clip_small)
+                    .max(min_shares.max(1.0)),
                 min_shares.max(1.0),
             );
             let reduced_clip =
@@ -71,7 +79,9 @@ pub(in crate::bot) fn bot_runtime_pair_build_optional_growth_policy(
             Some(BotRuntimePairedGrowthPolicy {
                 clip: reduced_clip as i64,
                 projected_paired_cost: reduced_projected_paired_cost,
-                band: bot_runtime_pair_build_projected_paired_cost_band(reduced_projected_paired_cost),
+                band: bot_runtime_pair_build_projected_paired_cost_band(
+                    reduced_projected_paired_cost,
+                ),
                 clipped_for_band: true,
                 allowed_averaging_down: false,
             })
@@ -108,8 +118,10 @@ pub(in crate::bot) fn bot_runtime_pair_build_optional_buy_policy(
     if current_clip <= 0.0 {
         return None;
     }
-    let (yes_snapshot_price, yes_snapshot_source) = market_snapshot_price(y_bid, y_ask, n_bid, n_ask)?;
-    let (no_snapshot_price, no_snapshot_source) = market_snapshot_price(n_bid, n_ask, y_bid, y_ask)?;
+    let (yes_snapshot_price, yes_snapshot_source) =
+        market_snapshot_price(y_bid, y_ask, n_bid, n_ask)?;
+    let (no_snapshot_price, no_snapshot_source) =
+        market_snapshot_price(n_bid, n_ask, y_bid, y_ask)?;
     let yes_snapshot_edge = yes_snapshot_price - y_bid.max(0.0);
     let no_snapshot_edge = no_snapshot_price - n_bid.max(0.0);
     let min_snapshot_edge = yes_snapshot_edge.min(no_snapshot_edge);
@@ -145,7 +157,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_optional_buy_policy(
         None
     };
     let lot = min_shares.max(1.0);
-    let small_clip_cap = round_down_to_lot(cfg.repair_clip_small.max(cfg.seed_clip_small).max(lot), lot);
+    let small_clip_cap =
+        round_down_to_lot(cfg.repair_clip_small.max(cfg.seed_clip_small).max(lot), lot);
     let reduced_clip = round_down_to_lot(current_clip.min(small_clip_cap), lot);
     let weak_edge_reduced = hold_reason.is_none()
         && (!snapshot_reliable || min_snapshot_edge + 1e-9 < 0.05)
@@ -278,9 +291,7 @@ impl MakerHedgeCapBot {
                     "hold",
                     &format!(
                         "tail_cap_repair_priority:{:.2}:{:.2}:{:.3}",
-                        tail_cap.tail_size,
-                        tail_cap.cap_shares,
-                        tail_cap.cap_fraction
+                        tail_cap.tail_size, tail_cap.cap_shares, tail_cap.cap_fraction
                     ),
                     Some(decision),
                     t_into_s,
@@ -291,9 +302,10 @@ impl MakerHedgeCapBot {
                 return;
             }
         }
-        if let Some(pace_seconds) =
-            bot_runtime_pair_build_cpp_pace_seconds(&decision, plan.budget_snapshot.under_min_target)
-        {
+        if let Some(pace_seconds) = bot_runtime_pair_build_cpp_pace_seconds(
+            &decision,
+            plan.budget_snapshot.under_min_target,
+        ) {
             let last_submit_ts = self._bot_runtime_last_optional_growth_submit_ts();
             if last_submit_ts > 0.0 && (now - last_submit_ts).max(0.0) < pace_seconds {
                 self._bot_runtime_log_pair_build_state(
@@ -308,7 +320,10 @@ impl MakerHedgeCapBot {
                 return;
             }
         }
-        for (side, target_price) in [(OutcomeSide::Yes, context.y_bid), (OutcomeSide::No, context.n_bid)] {
+        for (side, target_price) in [
+            (OutcomeSide::Yes, context.y_bid),
+            (OutcomeSide::No, context.n_bid),
+        ] {
             if let Some(reason) = self._bot_runtime_pair_build_repost_block_reason(
                 side,
                 target_price,
@@ -379,8 +394,14 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        let yes_live_oid = self._maker_order_slot_get(&context.yes_key).order_id.or(y_oid);
-        let no_live_oid = self._maker_order_slot_get(&context.no_key).order_id.or(n_oid);
+        let yes_live_oid = self
+            ._maker_order_slot_get(&context.yes_key)
+            .order_id
+            .or(y_oid);
+        let no_live_oid = self
+            ._maker_order_slot_get(&context.no_key)
+            .order_id
+            .or(n_oid);
         if yes_live_oid.is_none() && no_live_oid.is_none() {
             self._bot_runtime_log_pair_build_state(
                 "hold",
@@ -464,7 +485,10 @@ impl MakerHedgeCapBot {
                 .unwrap_or(false);
             self._bot_runtime_clear_pair_build_hold();
             if below_snapshot_optional {
-                for (is_new, live_oid) in [(yes_new, yes_live_oid.as_deref()), (no_new, no_live_oid.as_deref())] {
+                for (is_new, live_oid) in [
+                    (yes_new, yes_live_oid.as_deref()),
+                    (no_new, no_live_oid.as_deref()),
+                ] {
                     if !is_new {
                         continue;
                     }

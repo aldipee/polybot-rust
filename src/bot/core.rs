@@ -4,6 +4,7 @@ pub struct MakerHedgeCapBot {
     pub cfg: BotConfig,
     pub logger: Arc<dyn LogLike>,
     pub market_slug: String,
+    pub(super) pair_identity: PairIdentity,
     pub state_file: PathBuf,
     pub state: Arc<Mutex<BotState>>,
     pub start_trade_iso: String,
@@ -74,11 +75,7 @@ impl MakerHedgeCapBot {
     ///
     /// This constructor is the main assembly point for runtime dependencies and
     /// also applies the final env overrides that shape the live BOT behavior.
-    pub fn new(
-        cfg: BotConfig,
-        market_slug: &str,
-        bot_logger: Arc<dyn LogLike>,
-    ) -> Result<Self> {
+    pub fn new(cfg: BotConfig, market_slug: &str, bot_logger: Arc<dyn LogLike>) -> Result<Self> {
         let state_file = PathBuf::from(format!("maker_hedgecap_state_{market_slug}.json"));
         let state = load_state(&state_file)?;
         let start_trade_iso = crate::db::now_iso_jakarta();
@@ -154,6 +151,7 @@ impl MakerHedgeCapBot {
             cfg,
             logger: bot_logger,
             market_slug: market_slug.to_string(),
+            pair_identity: PairIdentity::from_slug(market_slug),
             state_file,
             state: Arc::new(Mutex::new(state)),
             start_trade_iso,
@@ -261,6 +259,11 @@ impl MakerHedgeCapBot {
                 out.condition_id = Some(condition.clone());
                 out.yes_asset = Some(yes.clone());
                 out.no_asset = Some(no.clone());
+                out.pair_identity.update_market_metadata(
+                    Some(condition.clone()),
+                    Some(yes.clone()),
+                    Some(no.clone()),
+                );
                 if slug_window_start_ts.is_none() {
                     if let Some(st) = market
                         .get("startDate")
@@ -742,5 +745,4 @@ impl MakerHedgeCapBot {
             m.insert(key.to_string(), value);
         }
     }
-
 }

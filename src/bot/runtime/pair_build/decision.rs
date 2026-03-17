@@ -69,7 +69,9 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
             .max(min_lot)
     };
 
-    let medium_clip_cap = cfg.large_clip_ladder[0].max(cfg.seed_clip_small).max(min_lot);
+    let medium_clip_cap = cfg.large_clip_ladder[0]
+        .max(cfg.seed_clip_small)
+        .max(min_lot);
     let small_clip_cap = cfg.repair_clip_small.max(cfg.seed_clip_small).max(min_lot);
     let cpp_hint = if !inventory_vwap_sum.is_finite() || !market_snapshot_vwap_sum.is_finite() {
         BotRuntimePairBuildCppHint::Small
@@ -347,7 +349,8 @@ pub(in crate::bot) fn bot_runtime_lighter_repair_opposite_order_policy(
     inactive_target_price: f64,
     tick_size: f64,
 ) -> Option<BotRuntimeLighterOppositeOrderPolicy> {
-    if decision.mode != BotRuntimePairBuildMode::LighterSideFirst || inactive_slot.order_id.is_none()
+    if decision.mode != BotRuntimePairBuildMode::LighterSideFirst
+        || inactive_slot.order_id.is_none()
     {
         return None;
     }
@@ -366,9 +369,8 @@ pub(in crate::bot) fn bot_runtime_lighter_repair_opposite_order_policy(
         inactive_target_price,
         tick_size,
     );
-    let size_compatible = compatible_remaining > 1e-9
-        && remaining > 1e-9
-        && remaining <= compatible_remaining + 1e-9;
+    let size_compatible =
+        compatible_remaining > 1e-9 && remaining > 1e-9 && remaining <= compatible_remaining + 1e-9;
     let (preserve, reason) = if inactive_slot.state == MakerOrderLifecycle::CancelPending {
         (false, "cancel_pending")
     } else if !price_compatible {
@@ -485,7 +487,9 @@ pub(in crate::bot) fn bot_runtime_pair_build_reject_cooldown_seconds(
         return None;
     }
     if origin.starts_with("BOT_PAIR_BUILD_LIGHTER")
-        || slot.last_reject_origin.starts_with("BOT_PAIR_BUILD_LIGHTER")
+        || slot
+            .last_reject_origin
+            .starts_with("BOT_PAIR_BUILD_LIGHTER")
     {
         Some(0.5)
     } else {

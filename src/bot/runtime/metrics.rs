@@ -85,7 +85,13 @@ pub(in crate::bot) fn bot_runtime_paired_cost_band_label(index: usize) -> &'stat
 
 pub(in crate::bot) fn bot_runtime_paired_cost_band_summary_u32(values: &[u32; 5]) -> String {
     (0..values.len())
-        .map(|idx| format!("{}:{}", bot_runtime_paired_cost_band_label(idx), values[idx]))
+        .map(|idx| {
+            format!(
+                "{}:{}",
+                bot_runtime_paired_cost_band_label(idx),
+                values[idx]
+            )
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -110,7 +116,13 @@ pub(in crate::bot) fn bot_runtime_paired_cost_band_summary_fraction(values: &[u3
 
 pub(in crate::bot) fn bot_runtime_paired_cost_band_summary_f64(values: &[f64; 5]) -> String {
     (0..values.len())
-        .map(|idx| format!("{}:{:.2}", bot_runtime_paired_cost_band_label(idx), values[idx]))
+        .map(|idx| {
+            format!(
+                "{}:{:.2}",
+                bot_runtime_paired_cost_band_label(idx),
+                values[idx]
+            )
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -138,12 +150,10 @@ pub(in crate::bot) fn bot_runtime_note_fill_event(
         state.fill_events_by_segment[segment_idx].saturating_add(1);
     state.fill_shares_by_segment[segment_idx] += filled.max(0.0);
     if t_into_s >= cfg.taper_start_seconds {
-        state.taper_fill_events_after_240 =
-            state.taper_fill_events_after_240.saturating_add(1);
+        state.taper_fill_events_after_240 = state.taper_fill_events_after_240.saturating_add(1);
     }
     if t_into_s >= (300.0 - cfg.final_quiet_seconds.max(0.0)) {
-        state.taper_fill_events_after_270 =
-            state.taper_fill_events_after_270.saturating_add(1);
+        state.taper_fill_events_after_270 = state.taper_fill_events_after_270.saturating_add(1);
     }
 }
 /// Implements metrics snapshot for the BOT runtime.
@@ -166,7 +176,7 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
     let below_snapshot_optional_fill_rate = if state.below_snapshot_optional_submit_shares > 1e-9 {
         (state.below_snapshot_optional_fill_shares.max(0.0)
             / state.below_snapshot_optional_submit_shares.max(0.0))
-            .clamp(0.0, 1.0)
+        .clamp(0.0, 1.0)
     } else {
         0.0
     };
@@ -221,7 +231,8 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
 pub(in crate::bot) fn bot_runtime_canary_success(metrics: &BotRuntimeMetricsSnapshot) -> bool {
-    let core_ok = metrics.inventory_vwap_sum.is_finite() && metrics.inventory_vwap_sum <= 0.995 + 1e-9;
+    let core_ok =
+        metrics.inventory_vwap_sum.is_finite() && metrics.inventory_vwap_sum <= 0.995 + 1e-9;
     let maker_ok = metrics.maker_fill_share + 1e-9 >= 0.80;
     let tail_ok = if metrics.paired_size > 1e-9 {
         (metrics.tail_at_expiry / metrics.paired_size.max(1e-9)) <= 0.10 + 1e-9
@@ -233,13 +244,12 @@ pub(in crate::bot) fn bot_runtime_canary_success(metrics: &BotRuntimeMetricsSnap
 /// Implements canary failure summary for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_canary_failure_summary(metrics: &BotRuntimeMetricsSnapshot) -> String {
+pub(in crate::bot) fn bot_runtime_canary_failure_summary(
+    metrics: &BotRuntimeMetricsSnapshot,
+) -> String {
     let mut failures = Vec::new();
     if metrics.worst_case_settlement_floor <= 0.0 {
-        failures.push(format!(
-            "floor={:+.2}",
-            metrics.worst_case_settlement_floor
-        ));
+        failures.push(format!("floor={:+.2}", metrics.worst_case_settlement_floor));
     }
     if !metrics.inventory_vwap_sum.is_finite() || metrics.inventory_vwap_sum > 0.995 + 1e-9 {
         failures.push(format!("core_cost={:.3}", metrics.inventory_vwap_sum));
@@ -264,7 +274,11 @@ pub(in crate::bot) fn bot_runtime_canary_failure_summary(metrics: &BotRuntimeMet
 /// Implements worst case settlement floor for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_worst_case_settlement_floor(q_yes: f64, q_no: f64, total_cost: f64) -> f64 {
+pub(in crate::bot) fn bot_runtime_worst_case_settlement_floor(
+    q_yes: f64,
+    q_no: f64,
+    total_cost: f64,
+) -> f64 {
     q_yes.max(0.0).min(q_no.max(0.0)) - total_cost.max(0.0)
 }
 /// Implements projected tail and floor after decision for the BOT runtime.
@@ -334,10 +348,7 @@ pub(in crate::bot) fn bot_runtime_taper_late_action_policy(
         {
             Some(format!(
                 "late_repair_first_suppress:{:.2}:{:.2}:{:+.2}:{:+.2}",
-                current_tail_size,
-                projected_tail_size,
-                current_floor,
-                projected_floor
+                current_tail_size, projected_tail_size, current_floor, projected_floor
             ))
         }
         BotRuntimeTaperMode::NoOptionalAdds
@@ -345,17 +356,12 @@ pub(in crate::bot) fn bot_runtime_taper_late_action_policy(
         {
             Some(format!(
                 "late_no_optional_adds_suppress:{:.2}:{:+.2}:{:+.2}",
-                current_tail_size,
-                current_floor,
-                projected_floor
+                current_tail_size, current_floor, projected_floor
             ))
         }
         _ if !improves_tail && !improves_floor => Some(format!(
             "late_floor_tail_priority:{:.2}:{:.2}:{:+.2}:{:+.2}",
-            current_tail_size,
-            projected_tail_size,
-            current_floor,
-            projected_floor
+            current_tail_size, projected_tail_size, current_floor, projected_floor
         )),
         _ => None,
     };
@@ -369,4 +375,3 @@ pub(in crate::bot) fn bot_runtime_taper_late_action_policy(
         hold_reason,
     })
 }
-

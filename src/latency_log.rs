@@ -44,7 +44,11 @@ impl JsonlFileService {
         let line = serde_json::to_string(obj)
             .unwrap_or_else(|_| serde_json::json!({"_non_json": format!("{obj:?}")}).to_string());
         let _guard = self.lock.lock().ok();
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.path) {
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             let _ = writeln!(file, "{line}");
         }
     }
@@ -116,7 +120,9 @@ impl CsvFileService {
                 .and_then(|s| s.to_str())
                 .unwrap_or("csv")
                 .to_string();
-            let backup = self.path.with_file_name(format!("{stem}.old_{:.0}.{ext}", now_ts()));
+            let backup = self
+                .path
+                .with_file_name(format!("{stem}.old_{:.0}.{ext}", now_ts()));
             let _ = fs::rename(&self.path, &backup);
             if let Ok(mut header_written) = self.header_written.lock() {
                 *header_written = false;

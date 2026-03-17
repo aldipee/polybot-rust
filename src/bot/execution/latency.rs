@@ -94,6 +94,7 @@ impl MakerHedgeCapBot {
         if !rec2.is_object() {
             rec2 = json!({});
         }
+        self._merge_pair_metadata_into_value(&mut rec2);
         if let Ok(mut timings) = self.submit_timing_cache.lock() {
             if let Some(t) = timings.remove(order_id) {
                 if let (Some(dst), Some(src)) = (rec2.as_object_mut(), t.as_object()) {
@@ -114,6 +115,11 @@ impl MakerHedgeCapBot {
                         "fee_rate_bps",
                         "tick_size",
                         "neg_risk",
+                        "pair_id",
+                        "market_slug",
+                        "condition_id",
+                        "yes_asset_id",
+                        "no_asset_id",
                     ] {
                         if let Some(v) = src.get(k) {
                             dst.insert(k.to_string(), v.clone());
@@ -245,6 +251,11 @@ impl MakerHedgeCapBot {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let pair_id = rec2
+            .get("pair_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let px_limit = Self::_value_f64(rec2.get("px_limit"));
         let size = Self::_value_f64(rec2.get("size"));
         if let Some(obj) = rec2.as_object_mut() {
@@ -328,7 +339,8 @@ impl MakerHedgeCapBot {
                     .map(|v| format!("{v}"))
                     .unwrap_or_else(|| "None".to_string());
                 self.logger.info(&format!(
-                    "[LATENCY][SUBMIT] decide->send={d2s_us}us send->ack={s2a_us}us decide->ack={d2a_us}us prep={pm_us}us sign={sm_us}us sign_total={stm_us}us oid={}.. asset={aid_tail} side={side} origin={origin}",
+                    "[LATENCY][SUBMIT] pair_id={} decide->send={d2s_us}us send->ack={s2a_us}us decide->ack={d2a_us}us prep={pm_us}us sign={sm_us}us sign_total={stm_us}us oid={}.. asset={aid_tail} side={side} origin={origin}",
+                    pair_id,
                     order_id.chars().take(10).collect::<String>(),
                 ));
             }
@@ -338,7 +350,14 @@ impl MakerHedgeCapBot {
                 "event": "SUBMIT",
                 "ts": submit_ts,
                 "ts_utc": self._utc_iso(submit_ts),
-                "market_slug": self.market_slug,
+                "pair_id": rec2.get("pair_id").cloned().unwrap_or(Value::Null),
+                "market_slug": rec2
+                    .get("market_slug")
+                    .cloned()
+                    .unwrap_or_else(|| json!(self.market_slug)),
+                "condition_id": rec2.get("condition_id").cloned().unwrap_or(Value::Null),
+                "yes_asset_id": rec2.get("yes_asset_id").cloned().unwrap_or(Value::Null),
+                "no_asset_id": rec2.get("no_asset_id").cloned().unwrap_or(Value::Null),
                 "exec_mode": self.exec_mode,
                 "order_id": order_id,
                 "asset_id": asset_id,
@@ -401,6 +420,7 @@ impl MakerHedgeCapBot {
                 dst.entry("ts".to_string())
                     .or_insert_with(|| Value::from(now));
             }
+            self._merge_pair_metadata_into_value(&mut merged);
             map.insert(trimmed.to_string(), merged);
         }
         self._prune_order_exec_context_locked(now);
@@ -431,6 +451,7 @@ impl MakerHedgeCapBot {
                 "fill_ts": fill_ts,
                 "meta_json": ctx,
             });
+            self._merge_pair_metadata_into_value(&mut rec);
             let submit_ts = rec
                 .get("meta_json")
                 .and_then(|m| m.get("order_submit_ts"))
@@ -445,14 +466,20 @@ impl MakerHedgeCapBot {
                     rec["submit_to_fill_ms"] = json!(ms);
                 }
             }
+            let pair_id = rec
+                .get("pair_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
             if let Some(ms) = rec.get("submit_to_fill_ms").and_then(|x| x.as_i64()) {
                 self.logger.info(&format!(
-                    "[LATENCY][FILL] submit->fill={ms}ms oid={}..",
+                    "[LATENCY][FILL] pair_id={} submit->fill={ms}ms oid={}..",
+                    pair_id,
                     order_id.chars().take(10).collect::<String>()
                 ));
             } else {
                 self.logger.info(&format!(
-                    "[LATENCY][FILL] no_timing_ctx oid={}..",
+                    "[LATENCY][FILL] pair_id={} no_timing_ctx oid={}..",
+                    pair_id,
                     order_id.chars().take(10).collect::<String>()
                 ));
             }
@@ -460,4 +487,3 @@ impl MakerHedgeCapBot {
         }
     }
 }
-

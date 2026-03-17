@@ -26,7 +26,10 @@ impl BotRuntimePhase {
 /// Implements should stop for rollover for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_should_stop_for_rollover(seconds_left: f64, stop_buffer_seconds: i64) -> bool {
+pub(in crate::bot) fn bot_runtime_should_stop_for_rollover(
+    seconds_left: f64,
+    stop_buffer_seconds: i64,
+) -> bool {
     let rollover_seconds_left = seconds_left - 10.0;
     rollover_seconds_left < stop_buffer_seconds.max(0) as f64
 }
@@ -61,9 +64,10 @@ pub(in crate::bot) fn bot_runtime_owner_for_snapshot(
     let has_no = q_no > 1e-9;
     match phase {
         BotRuntimePhase::PreArm => (BotRuntimeControlOwner::PreArm, "prearm_window"),
-        BotRuntimePhase::HoldSettleRollover => {
-            (BotRuntimeControlOwner::HoldSettleRollover, "near_expiry_rollover")
-        }
+        BotRuntimePhase::HoldSettleRollover => (
+            BotRuntimeControlOwner::HoldSettleRollover,
+            "near_expiry_rollover",
+        ),
         BotRuntimePhase::OpenBoth => {
             if has_yes ^ has_no {
                 (BotRuntimeControlOwner::SeedCompletion, "startup_asymmetry")
@@ -94,7 +98,9 @@ pub(in crate::bot) fn bot_runtime_owner_for_snapshot(
 /// Implements should run open both handler for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_should_run_open_both_handler(owner: BotRuntimeControlOwner) -> bool {
+pub(in crate::bot) fn bot_runtime_should_run_open_both_handler(
+    owner: BotRuntimeControlOwner,
+) -> bool {
     matches!(owner, BotRuntimeControlOwner::OpenBoth)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -399,4 +405,3 @@ pub(in crate::bot) struct BotRuntimeBudgetSnapshot {
     pub(in crate::bot) remaining_to_max_cost: f64,
     pub(in crate::bot) under_min_target: bool,
 }
-

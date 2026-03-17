@@ -57,8 +57,12 @@ impl MakerHedgeCapBot {
         let stale_s = self.cfg.market_data_stale_seconds.max(1) as f64;
         let now = now_ts_f64();
         for (label, asset_id) in [("YES", yes_asset.as_str()), ("NO", no_asset.as_str())] {
-            let (ready, reason) =
-                bot_runtime_quote_snapshot_status(label, self._best_bid_ask_with_ts(asset_id), now, stale_s);
+            let (ready, reason) = bot_runtime_quote_snapshot_status(
+                label,
+                self._best_bid_ask_with_ts(asset_id),
+                now,
+                stale_s,
+            );
             if !ready {
                 return (false, reason);
             }
@@ -85,16 +89,19 @@ impl MakerHedgeCapBot {
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
 
-    pub(in crate::bot) fn _bot_runtime_prearm_status(&self, t_into_s: f64) -> BotRuntimePreArmStatus {
+    pub(in crate::bot) fn _bot_runtime_prearm_status(
+        &self,
+        t_into_s: f64,
+    ) -> BotRuntimePreArmStatus {
         let cfg = *self._bot_runtime_cfg();
-        let market_selected =
-            !self.market_slug.trim().is_empty() && self.start_ts > 0 && self.expiry_ts > self.start_ts;
+        let market_selected = !self.market_slug.trim().is_empty()
+            && self.start_ts > 0
+            && self.expiry_ts > self.start_ts;
         let asset_ids_ready =
             self.condition_id.is_some() && self.yes_asset.is_some() && self.no_asset.is_some();
         let market_ws_ready = self.market_connected.load(Ordering::SeqCst);
         let user_ws_required = env_bool("REQUIRE_USER_WS_CONNECTED", true);
-        let user_ws_ready =
-            !user_ws_required || self.user_connected.load(Ordering::SeqCst);
+        let user_ws_ready = !user_ws_required || self.user_connected.load(Ordering::SeqCst);
         let (quotes_ready, quote_input_reason) = if asset_ids_ready {
             self._bot_runtime_quote_input_status()
         } else {
@@ -178,8 +185,20 @@ impl MakerHedgeCapBot {
         cost_yes: f64,
         cost_no: f64,
     ) {
-        let has_fill = has_side_participation(q_yes, cost_yes)
-            || has_side_participation(q_no, cost_no);
+        let phase = bot_runtime_phase_from_t_into_s(
+            (now - self.start_ts as f64).max(0.0),
+            self._bot_runtime_cfg(),
+        );
+        let pair_snapshot = self._pair_snapshot_from_inputs(
+            phase,
+            (now - self.start_ts as f64).max(0.0),
+            q_yes,
+            q_no,
+            cost_yes,
+            cost_no,
+        );
+        let has_fill =
+            has_side_participation(q_yes, cost_yes) || has_side_participation(q_no, cost_no);
         if !has_fill {
             return;
         }
@@ -199,7 +218,8 @@ impl MakerHedgeCapBot {
             return;
         };
         self.logger.info(&format!(
-            "[BOT][OPEN_BOTH] first_fill t_into={:.1}s submit_to_fill_ms={:.0} qYES={:.2} qNO={:.2} costYES={:.2} costNO={:.2}",
+            "[BOT][OPEN_BOTH] pair_id={} first_fill t_into={:.1}s submit_to_fill_ms={:.0} qYES={:.2} qNO={:.2} costYES={:.2} costNO={:.2}",
+            pair_snapshot.identity.pair_id,
             (now - self.start_ts as f64).max(0.0),
             if first_submit_ts > 0.0 {
                 ((now - first_submit_ts).max(0.0)) * 1000.0
@@ -227,8 +247,10 @@ impl MakerHedgeCapBot {
         if !self._bot_runtime_open_both_hold_changed(reason) {
             return;
         }
+        let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][OPEN_BOTH] hold reason={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            "[BOT][OPEN_BOTH] pair_id={} hold reason={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            pair_id,
             reason,
             t_into_s.max(0.0),
             q_yes,
@@ -259,11 +281,17 @@ impl MakerHedgeCapBot {
         &self,
         now: f64,
         t_into_s: f64,
-        total_cost: f64,
-        q_yes: f64,
-        q_no: f64,
+        _total_cost: f64,
+        _q_yes: f64,
+        _q_no: f64,
         cfg: &BotRuntimeConfigSnapshot,
     ) {
+        let pair_snapshot = self
+            ._pair_snapshot_from_state(bot_runtime_phase_from_t_into_s(t_into_s, cfg), t_into_s);
+        let pair_id = pair_snapshot.identity.pair_id.clone();
+        let total_cost = pair_snapshot.total_cost;
+        let q_yes = pair_snapshot.position.q_yes;
+        let q_no = pair_snapshot.position.q_no;
         let (yes_asset, no_asset) = match (&self.yes_asset, &self.no_asset) {
             (Some(yes_asset), Some(no_asset)) => (yes_asset.as_str(), no_asset.as_str()),
             _ => {
@@ -397,10 +425,8 @@ impl MakerHedgeCapBot {
         let no_key = MakerOrderKey::buy(no_asset);
         let prev_yes_slot = self._maker_order_slot_get(&yes_key);
         let prev_no_slot = self._maker_order_slot_get(&no_key);
-        let yes_live =
-            maker_slot_family_live(&prev_yes_slot, "BOT_OPEN_BOTH");
-        let no_live =
-            maker_slot_family_live(&prev_no_slot, "BOT_OPEN_BOTH");
+        let yes_live = maker_slot_family_live(&prev_yes_slot, "BOT_OPEN_BOTH");
+        let no_live = maker_slot_family_live(&prev_no_slot, "BOT_OPEN_BOTH");
         if yes_live && no_live {
             self._bot_runtime_log_open_both_hold(
                 &format!(
@@ -416,12 +442,9 @@ impl MakerHedgeCapBot {
             return;
         }
         let asymmetry_timeout_s = self.cfg.stale_seconds.max(1) as f64;
-        if let Some(asymmetry) = maker_pair_order_asymmetry(
-            &prev_yes_slot,
-            &prev_no_slot,
-            "BOT_OPEN_BOTH",
-            now,
-        ) {
+        if let Some(asymmetry) =
+            maker_pair_order_asymmetry(&prev_yes_slot, &prev_no_slot, "BOT_OPEN_BOTH", now)
+        {
             let live_asset = match asymmetry.live_side {
                 OutcomeSide::Yes => yes_asset,
                 OutcomeSide::No => no_asset,
@@ -475,17 +498,22 @@ impl MakerHedgeCapBot {
             "BOT_OPEN_BOTH",
         );
         let submit_elapsed_ms = ((now_ts_f64() - submit_started).max(0.0)) * 1000.0;
-        let yes_live = self._maker_order_slot_get(&yes_key).order_id.or(y_oid.clone());
-        let no_live = self._maker_order_slot_get(&no_key).order_id.or(n_oid.clone());
-        let yes_new =
-            maker_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
-        let no_new =
-            maker_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
+        let yes_live = self
+            ._maker_order_slot_get(&yes_key)
+            .order_id
+            .or(y_oid.clone());
+        let no_live = self
+            ._maker_order_slot_get(&no_key)
+            .order_id
+            .or(n_oid.clone());
+        let yes_new = maker_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
+        let no_new = maker_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
         if yes_new || no_new {
             let (attempt_count, first_submit) =
                 self._bot_runtime_note_open_both_submit(now_ts_f64());
             self.logger.info(&format!(
-                "[BOT][OPEN_BOTH] submit attempt={} t_into={:.1}s y_bid={:.3} n_bid={:.3} pair_sum={:.3} clip={} post_only=true neutral=true favorite_gating=false elapsed_ms={:.0} first_submit={}",
+                "[BOT][OPEN_BOTH] pair_id={} submit attempt={} t_into={:.1}s y_bid={:.3} n_bid={:.3} pair_sum={:.3} clip={} post_only=true neutral=true favorite_gating=false elapsed_ms={:.0} first_submit={}",
+                pair_id,
                 attempt_count,
                 t_into_s.max(0.0),
                 y_bid,
@@ -496,12 +524,9 @@ impl MakerHedgeCapBot {
                 first_submit
             ));
         }
-        if let Some(asymmetry) = self._maker_pair_order_asymmetry(
-            now_ts_f64(),
-            yes_asset,
-            no_asset,
-            "BOT_OPEN_BOTH",
-        ) {
+        if let Some(asymmetry) =
+            self._maker_pair_order_asymmetry(now_ts_f64(), yes_asset, no_asset, "BOT_OPEN_BOTH")
+        {
             self._bot_runtime_log_open_both_hold(
                 &format!(
                     "asymmetric_submit:{}:{:.0}ms",
@@ -608,8 +633,8 @@ impl MakerHedgeCapBot {
         if !matches!(side_u.as_str(), "BUY" | "SELL") {
             return;
         }
-        let is_wallet_asset =
-            self.yes_asset.as_deref() == Some(asset_id) || self.no_asset.as_deref() == Some(asset_id);
+        let is_wallet_asset = self.yes_asset.as_deref() == Some(asset_id)
+            || self.no_asset.as_deref() == Some(asset_id);
         if !is_wallet_asset || self.start_ts <= 0 {
             return;
         }
@@ -662,8 +687,10 @@ impl MakerHedgeCapBot {
             return;
         }
         self._bot_runtime_note_startup_completion_blocked();
+        let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][SEED_COMPLETION] hold reason={} missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            "[BOT][SEED_COMPLETION] pair_id={} hold reason={} missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            pair_id,
             reason,
             missing_side.as_str(),
             t_into_s.max(0.0),
@@ -686,6 +713,10 @@ impl MakerHedgeCapBot {
         cost_yes: f64,
         cost_no: f64,
     ) {
+        let phase = bot_runtime_phase_from_t_into_s(t_into_s, self._bot_runtime_cfg());
+        let pair_snapshot =
+            self._pair_snapshot_from_inputs(phase, t_into_s, q_yes, q_no, cost_yes, cost_no);
+        let pair_id = pair_snapshot.identity.pair_id;
         let first_fill_ts = self
             .bot_runtime_state
             .lock()
@@ -720,7 +751,8 @@ impl MakerHedgeCapBot {
                 let both_by_30s = (now - self.start_ts as f64) <= 30.0 + 1e-9;
                 let both_by_60s = (now - self.start_ts as f64) <= 60.0 + 1e-9;
                 self.logger.info(&format!(
-                    "[BOT][SEED_COMPLETION] success reason=missing_side_restored t_into={:.1}s since_first_side={:.1}s both_by_30s={} both_by_60s={} qYES={:.2} qNO={:.2}",
+                    "[BOT][SEED_COMPLETION] pair_id={} success reason=missing_side_restored t_into={:.1}s since_first_side={:.1}s both_by_30s={} both_by_60s={} qYES={:.2} qNO={:.2}",
+                    pair_id,
                     t_into_s.max(0.0),
                     second_side_latency_s,
                     both_by_30s,
@@ -749,7 +781,8 @@ impl MakerHedgeCapBot {
             .unwrap_or(false);
         if should_log_start {
             self.logger.info(&format!(
-                "[BOT][SEED_COMPLETION] start reason=startup_asymmetry missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2}",
+                "[BOT][SEED_COMPLETION] pair_id={} start reason=startup_asymmetry missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2}",
+                pair_id,
                 missing_side.as_str(),
                 t_into_s.max(0.0),
                 time_since_first_side_s,
@@ -772,7 +805,8 @@ impl MakerHedgeCapBot {
                 .unwrap_or(false);
             if should_log_failure {
                 self.logger.info(&format!(
-                    "[BOT][SEED_COMPLETION] failure reason=still_one_sided_by_60s missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2}",
+                    "[BOT][SEED_COMPLETION] pair_id={} failure reason=still_one_sided_by_60s missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2}",
+                    pair_id,
                     missing_side.as_str(),
                     t_into_s.max(0.0),
                     time_since_first_side_s,
@@ -790,18 +824,32 @@ impl MakerHedgeCapBot {
         &self,
         now: f64,
         t_into_s: f64,
-        total_cost: f64,
-        q_yes: f64,
-        q_no: f64,
-        cost_yes: f64,
-        cost_no: f64,
+        _total_cost: f64,
+        _q_yes: f64,
+        _q_no: f64,
+        _cost_yes: f64,
+        _cost_no: f64,
         cfg: &BotRuntimeConfigSnapshot,
     ) {
-        let (total_cost, q_yes, q_no, cost_yes, cost_no) = self
+        let (_total_cost, q_yes, q_no, cost_yes, cost_no) = self
             .state
             .lock()
             .map(|s| (s.c_yes + s.c_no, s.q_yes, s.q_no, s.c_yes, s.c_no))
-            .unwrap_or((total_cost, q_yes, q_no, cost_yes, cost_no));
+            .unwrap_or((_total_cost, _q_yes, _q_no, _cost_yes, _cost_no));
+        let pair_snapshot = self._pair_snapshot_from_inputs(
+            bot_runtime_phase_from_t_into_s(t_into_s, cfg),
+            t_into_s,
+            q_yes,
+            q_no,
+            cost_yes,
+            cost_no,
+        );
+        let pair_id = pair_snapshot.identity.pair_id.clone();
+        let total_cost = pair_snapshot.total_cost;
+        let q_yes = pair_snapshot.position.q_yes;
+        let q_no = pair_snapshot.position.q_no;
+        let cost_yes = pair_snapshot.position.c_yes;
+        let cost_no = pair_snapshot.position.c_no;
         let Some(missing_side) =
             bot_runtime_seed_completion_missing_side(q_yes, cost_yes, q_no, cost_no)
         else {
@@ -934,9 +982,10 @@ impl MakerHedgeCapBot {
         );
         if maker_slot_family_live(&prev_slot, "BOT_SEED_COMPLETION") {
             let age_s = (now - prev_slot.last_submit_ts).max(0.0);
-            if age_s >= live_order_timeout_s && prev_slot.state != MakerOrderLifecycle::CancelPending {
-                let _ =
-                    self._maker_order_request_cancel(&key, "bot_runtime_seed_completion_stale");
+            if age_s >= live_order_timeout_s
+                && prev_slot.state != MakerOrderLifecycle::CancelPending
+            {
+                let _ = self._maker_order_request_cancel(&key, "bot_runtime_seed_completion_stale");
                 self._bot_runtime_log_seed_completion_hold(
                     "missing_side_live_order_stale_cancel",
                     missing_side,
@@ -989,19 +1038,16 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        let oid = self._maker_order_upsert_gtc(
-            &key,
-            missing_bid,
-            size_int as f64,
-            "BOT_SEED_COMPLETION",
-        );
+        let oid =
+            self._maker_order_upsert_gtc(&key, missing_bid, size_int as f64, "BOT_SEED_COMPLETION");
         if let Some(order_id) = oid.as_deref() {
             let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
                 || prev_slot.state != MakerOrderLifecycle::Working;
             if is_new_submit {
                 self._bot_runtime_clear_seed_completion_hold();
                 self.logger.info(&format!(
-                    "[BOT][SEED_COMPLETION] submit missing_side={} bid={:.3} clip={} t_into={:.1}s since_first_side={:.1}s budget_scope=whole_window gates_bypassed=hard_skew,shape_target,cpp",
+                    "[BOT][SEED_COMPLETION] pair_id={} submit missing_side={} bid={:.3} clip={} t_into={:.1}s since_first_side={:.1}s budget_scope=whole_window gates_bypassed=hard_skew,shape_target,cpp",
+                    pair_id,
                     missing_side.as_str(),
                     missing_bid,
                     size_int,
@@ -1024,4 +1070,3 @@ impl MakerHedgeCapBot {
         }
     }
 }
-

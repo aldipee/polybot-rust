@@ -43,8 +43,7 @@ impl MakerHedgeCapBot {
 
     pub(in crate::bot) fn _bot_runtime_note_repair_reserve_blocked(&self) {
         if let Ok(mut st) = self.bot_runtime_state.lock() {
-            st.repair_reserve_blocked_count =
-                st.repair_reserve_blocked_count.saturating_add(1);
+            st.repair_reserve_blocked_count = st.repair_reserve_blocked_count.saturating_add(1);
         }
     }
 
@@ -111,9 +110,7 @@ impl MakerHedgeCapBot {
     /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
     /// BOT runtime.
 
-    pub(in crate::bot) fn _bot_runtime_bad_regime_shutdown_status(
-        &self,
-    ) -> (bool, f64, u32, u32) {
+    pub(in crate::bot) fn _bot_runtime_bad_regime_shutdown_status(&self) -> (bool, f64, u32, u32) {
         self.bot_runtime_state
             .lock()
             .map(|st| {

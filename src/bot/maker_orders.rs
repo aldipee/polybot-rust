@@ -198,8 +198,9 @@ impl MakerHedgeCapBot {
                 .entry(trimmed_oid.to_string())
                 .or_default();
             let existing = entry.trim();
-            let can_upgrade_reconcile =
-                existing == "RECONCILE" && !trimmed_origin.is_empty() && trimmed_origin != "RECONCILE";
+            let can_upgrade_reconcile = existing == "RECONCILE"
+                && !trimmed_origin.is_empty()
+                && trimmed_origin != "RECONCILE";
             if (existing.is_empty() || can_upgrade_reconcile) && !trimmed_origin.is_empty() {
                 *entry = trimmed_origin.to_string();
             }
@@ -248,7 +249,12 @@ impl MakerHedgeCapBot {
     /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
     /// runtime.
 
-    pub(super) fn _maker_order_on_submit_reject(&self, key: &MakerOrderKey, origin: &str, reason: &str) {
+    pub(super) fn _maker_order_on_submit_reject(
+        &self,
+        key: &MakerOrderKey,
+        origin: &str,
+        reason: &str,
+    ) {
         if !self._maker_single_inflight_enabled() {
             return;
         }
@@ -320,7 +326,11 @@ impl MakerHedgeCapBot {
     /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
     /// runtime.
 
-    pub(super) fn _maker_order_cancel_all_except_asset(&self, keep_asset_id: Option<&str>, reason: &str) {
+    pub(super) fn _maker_order_cancel_all_except_asset(
+        &self,
+        keep_asset_id: Option<&str>,
+        reason: &str,
+    ) {
         if !self._maker_single_inflight_enabled() {
             return;
         }
@@ -705,7 +715,13 @@ impl MakerHedgeCapBot {
             return None;
         }
         if !self._maker_single_inflight_enabled() {
-            return self._place_limit_bid_gtc_with_origin(&key.asset_id, price, size, Some(true), origin);
+            return self._place_limit_bid_gtc_with_origin(
+                &key.asset_id,
+                price,
+                size,
+                Some(true),
+                origin,
+            );
         }
 
         let now = now_ts_f64();
@@ -760,8 +776,8 @@ impl MakerHedgeCapBot {
             && reject_cooldown > 0.0
             && slot.last_reject_ts > 0.0
         {
-            let max_reject_cooldown = env_float("MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS", 60.0)
-                .max(reject_cooldown);
+            let max_reject_cooldown =
+                env_float("MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS", 60.0).max(reject_cooldown);
             let effective_cooldown = maker_order_effective_reject_cooldown_seconds(
                 origin,
                 &slot,
@@ -1135,7 +1151,11 @@ impl MakerHedgeCapBot {
     /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
     /// runtime.
 
-    pub(super) fn _maker_ladder_cancel_except_role_asset(&self, keep_role: &str, keep_asset_id: &str) {
+    pub(super) fn _maker_ladder_cancel_except_role_asset(
+        &self,
+        keep_role: &str,
+        keep_asset_id: &str,
+    ) {
         let stale_keys: Vec<String> = self
             .maker_ladder_open_orders
             .lock()
@@ -1244,10 +1264,8 @@ impl MakerHedgeCapBot {
         let (y_oid, n_oid) = if resolved == "GTC" && self._maker_single_inflight_enabled() {
             let y_key = MakerOrderKey::buy(yes);
             let n_key = MakerOrderKey::buy(no);
-            let y_oid =
-                self._maker_order_upsert_gtc(&y_key, y_px, y_qty, &format!("{origin}_YES"));
-            let n_oid =
-                self._maker_order_upsert_gtc(&n_key, n_px, n_qty, &format!("{origin}_NO"));
+            let y_oid = self._maker_order_upsert_gtc(&y_key, y_px, y_qty, &format!("{origin}_YES"));
+            let n_oid = self._maker_order_upsert_gtc(&n_key, n_px, n_qty, &format!("{origin}_NO"));
             (y_oid, n_oid)
         } else {
             let signed_y = json!({
@@ -1315,4 +1333,3 @@ impl MakerHedgeCapBot {
         (y_oid, n_oid)
     }
 }
-

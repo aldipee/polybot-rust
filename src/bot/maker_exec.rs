@@ -211,7 +211,10 @@ impl MakerHedgeCapBot {
     /// This is a helper used by the BOT runtime for normalization, state labels, or
     /// calculations.
 
-    pub(super) fn _maker_exec_record_matches(record: &MakerExecRecord, candidate: &MakerExecCandidate) -> bool {
+    pub(super) fn _maker_exec_record_matches(
+        record: &MakerExecRecord,
+        candidate: &MakerExecCandidate,
+    ) -> bool {
         const EPS: f64 = 1e-9;
         record.order_id == candidate.order_id
             && record.asset_id == candidate.asset_id
@@ -285,7 +288,10 @@ impl MakerHedgeCapBot {
     /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
     /// runtime.
 
-    pub(super) fn _maker_commit_exec_fill(&self, candidate: MakerExecCandidate) -> MakerExecApplyResult {
+    pub(super) fn _maker_commit_exec_fill(
+        &self,
+        candidate: MakerExecCandidate,
+    ) -> MakerExecApplyResult {
         const EPS: f64 = 1e-9;
         let aliases = Self::_maker_trade_exec_aliases(&candidate);
         if aliases.is_empty() {
@@ -341,7 +347,10 @@ impl MakerHedgeCapBot {
             };
         }
 
-        if state.seen_trade_keys.iter().any(|seen| seen == &canonical_id)
+        if state
+            .seen_trade_keys
+            .iter()
+            .any(|seen| seen == &canonical_id)
             || aliases
                 .iter()
                 .any(|alias| state.seen_trade_keys.iter().any(|seen| seen == alias))
@@ -426,7 +435,8 @@ impl MakerHedgeCapBot {
         }
         drop(ledger);
 
-        self._apply_fill_finalize(meta);        let fill_origin = self._maker_order_origin_by_order_id(&candidate.order_id);
+        self._apply_fill_finalize(meta);
+        let fill_origin = self._maker_order_origin_by_order_id(&candidate.order_id);
         self._bot_runtime_note_observed_fill(
             &candidate.asset_id,
             candidate.qty,
@@ -438,4 +448,3 @@ impl MakerHedgeCapBot {
         MakerExecApplyResult::Applied { canonical_id }
     }
 }
-

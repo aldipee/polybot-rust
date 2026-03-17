@@ -1,8 +1,7 @@
 use super::*;
-mod guards;
-mod fills;
-mod latency;
-mod user_events;
 mod exchange_orders;
+mod fills;
+mod guards;
+mod latency;
 mod submit;
-
+mod user_events;

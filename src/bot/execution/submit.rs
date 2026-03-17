@@ -152,7 +152,9 @@ impl MakerHedgeCapBot {
             Err(e) => {
                 let err_s = e.to_string();
                 let no_match = matches!(clob_order_type, ClobOrderType::Fak)
-                    && err_s.to_ascii_lowercase().contains("no orders found to match");
+                    && err_s
+                        .to_ascii_lowercase()
+                        .contains("no orders found to match");
                 if no_match {
                     self._runtime_ts_set("__last_fak_no_match_ts", now_ts_f64());
                 }
@@ -177,7 +179,9 @@ impl MakerHedgeCapBot {
             Err(e) => {
                 let err_s = e.to_string();
                 let no_match = matches!(clob_order_type, ClobOrderType::Fak)
-                    && err_s.to_ascii_lowercase().contains("no orders found to match");
+                    && err_s
+                        .to_ascii_lowercase()
+                        .contains("no orders found to match");
                 if no_match {
                     self._runtime_ts_set("__last_fak_no_match_ts", now_ts_f64());
                 }
@@ -206,27 +210,26 @@ impl MakerHedgeCapBot {
             ex.push(row);
         }
         if let Ok(mut m) = self.submit_timing_cache.lock() {
-            m.insert(
-                oid.clone(),
-                json!({
-                    "sign_start_ns": sign_start_ns,
-                    "sign_end_ns": sign_end_ns,
-                    "sign_start_ts": sign_start_ts,
-                    "sign_end_ts": sign_end_ts,
-                    "prep_start_ns": prep_start_ns,
-                    "prep_end_ns": prep_end_ns,
-                    "prep_start_ts": prep_start_ts,
-                    "prep_end_ts": prep_end_ts,
-                    "post_start_ns": post_start_ns,
-                    "post_end_ns": post_end_ns,
-                    "post_start_ts": post_start_ts,
-                    "post_end_ts": post_end_ts,
-                    "order_submit_ts": post_end_ts,
-                    "fee_rate_bps": fee_rate_bps,
-                    "tick_size": tick_size.as_f64(),
-                    "neg_risk": neg_risk,
-                }),
-            );
+            let mut submit_timing = json!({
+                "sign_start_ns": sign_start_ns,
+                "sign_end_ns": sign_end_ns,
+                "sign_start_ts": sign_start_ts,
+                "sign_end_ts": sign_end_ts,
+                "prep_start_ns": prep_start_ns,
+                "prep_end_ns": prep_end_ns,
+                "prep_start_ts": prep_start_ts,
+                "prep_end_ts": prep_end_ts,
+                "post_start_ns": post_start_ns,
+                "post_end_ns": post_end_ns,
+                "post_start_ts": post_start_ts,
+                "post_end_ts": post_end_ts,
+                "order_submit_ts": post_end_ts,
+                "fee_rate_bps": fee_rate_bps,
+                "tick_size": tick_size.as_f64(),
+                "neg_risk": neg_risk,
+            });
+            self._merge_pair_metadata_into_value(&mut submit_timing);
+            m.insert(oid.clone(), submit_timing);
         }
         Some(oid)
     }
@@ -470,8 +473,7 @@ impl MakerHedgeCapBot {
         px = round_down(px, tick);
         px = clamp(px, tick, 0.99);
         let tick_size = Self::_tick_size_from_f64(tick);
-        let size =
-            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, px, size, tick_size);
+        let size = Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, px, size, tick_size);
         if size < 0.01 {
             return None;
         }
@@ -882,4 +884,3 @@ impl MakerHedgeCapBot {
         Some(oid)
     }
 }
-

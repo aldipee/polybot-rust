@@ -91,9 +91,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_repair_policy(
             clipped_to_budget: false,
             hold_reason: Some(format!(
                 "lighter_side_min_valid_would_overshoot:{}:{}:{:.2}",
-                sizing.exact_gap_clip,
-                sizing.min_valid_clip,
-                side_price
+                sizing.exact_gap_clip, sizing.min_valid_clip, side_price
             )),
         });
     }
@@ -107,9 +105,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_repair_policy(
             clipped_to_budget: true,
             hold_reason: Some(format!(
                 "lighter_side_min_valid_repair_unaffordable:{}:{}:{:.2}",
-                max_affordable_clip,
-                sizing.min_valid_clip,
-                side_price
+                max_affordable_clip, sizing.min_valid_clip, side_price
             )),
         });
     }
@@ -249,7 +245,13 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_clip_after_projected_cost(
         return requested_clip;
     }
     let projected_inventory_vwap_sum = bot_runtime_pair_build_projected_repair_inventory_vwap_sum(
-        q_yes, q_no, cost_yes, cost_no, side, price, requested_clip,
+        q_yes,
+        q_no,
+        cost_yes,
+        cost_no,
+        side,
+        price,
+        requested_clip,
     );
     if !projected_inventory_vwap_sum.is_finite() || projected_inventory_vwap_sum <= 1.01 + 1e-9 {
         return requested_clip;
@@ -262,8 +264,10 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_clip_after_projected_cost(
     {
         return requested_clip;
     }
-    let reduced_clip =
-        round_down_to_lot(requested_clip.min(cfg.repair_clip_small.max(min_lot)), min_lot);
+    let reduced_clip = round_down_to_lot(
+        requested_clip.min(cfg.repair_clip_small.max(min_lot)),
+        min_lot,
+    );
     if reduced_clip + 1e-9 < requested_clip {
         reduced_clip
     } else {
@@ -400,9 +404,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_extreme_projected_cost_bloc
         "medium" => (1.025, 2.0),
         _ => (1.03, 3.0),
     };
-    if projected_inventory_vwap_sum > projected_cap + 1e-9
-        && payup_ticks > max_payup_ticks + 1e-9
-    {
+    if projected_inventory_vwap_sum > projected_cap + 1e-9 && payup_ticks > max_payup_ticks + 1e-9 {
         Some(projected_inventory_vwap_sum)
     } else {
         None
@@ -763,8 +765,8 @@ impl MakerHedgeCapBot {
             "BOT_PAIR_BUILD_LIGHTER",
         );
         if let Some(order_id) = oid.as_deref() {
-            let is_new_submit =
-                prev_slot.order_id.as_deref() != Some(order_id) || prev_slot.state != MakerOrderLifecycle::Working;
+            let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
+                || prev_slot.state != MakerOrderLifecycle::Working;
             if is_new_submit {
                 self._bot_runtime_pair_build_note_side_submit(active_side, repair_bid_capped, now);
                 self._bot_runtime_clear_pair_build_hold();

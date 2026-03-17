@@ -73,6 +73,10 @@ pub fn segment(name: &str) -> String {
     }
 }
 
+pub fn canonical_pair_id_from_slug(slug: &str) -> String {
+    slug.trim().to_ascii_lowercase()
+}
+
 fn normalize_market_slug_style(raw: &str) -> String {
     match raw.trim().to_ascii_uppercase().as_str() {
         "HUMAN" | "HUMAN_ET" | "ET" | "HUMAN-ET" | "HUMANET" => "HUMAN_ET".to_string(),
@@ -145,7 +149,11 @@ pub fn generate_market_slug_from_now(
     generate_market_slug_from_now_with_style(&asset, segment_name, step_seconds, "TIMESTAMP")
 }
 
-fn startup_timestamp_slot_ts(now_ts: i64, step_seconds: i64, rollover_buffer_seconds: i64) -> Option<i64> {
+fn startup_timestamp_slot_ts(
+    now_ts: i64,
+    step_seconds: i64,
+    rollover_buffer_seconds: i64,
+) -> Option<i64> {
     if step_seconds <= 0 {
         return None;
     }
@@ -544,22 +552,37 @@ mod tests {
 
     #[test]
     fn startup_timestamp_slot_keeps_current_slot_when_outside_rollover_buffer() {
-        assert_eq!(startup_timestamp_slot_ts(1_770_000_200, 300, 60), Some(1_770_000_000));
+        assert_eq!(
+            startup_timestamp_slot_ts(1_770_000_200, 300, 60),
+            Some(1_770_000_000)
+        );
     }
 
     #[test]
     fn startup_timestamp_slot_uses_next_slot_inside_rollover_buffer() {
-        assert_eq!(startup_timestamp_slot_ts(1_770_000_299, 300, 60), Some(1_770_000_300));
-        assert_eq!(startup_timestamp_slot_ts(1_770_000_240, 300, 60), Some(1_770_000_300));
+        assert_eq!(
+            startup_timestamp_slot_ts(1_770_000_299, 300, 60),
+            Some(1_770_000_300)
+        );
+        assert_eq!(
+            startup_timestamp_slot_ts(1_770_000_240, 300, 60),
+            Some(1_770_000_300)
+        );
     }
 
     #[test]
     fn startup_timestamp_slot_keeps_exact_boundary_on_current_slot() {
-        assert_eq!(startup_timestamp_slot_ts(1_770_000_300, 300, 60), Some(1_770_000_300));
+        assert_eq!(
+            startup_timestamp_slot_ts(1_770_000_300, 300, 60),
+            Some(1_770_000_300)
+        );
     }
 
     #[test]
     fn startup_timestamp_slot_clamps_large_rollover_buffer() {
-        assert_eq!(startup_timestamp_slot_ts(1_770_000_001, 300, 999), Some(1_770_000_300));
+        assert_eq!(
+            startup_timestamp_slot_ts(1_770_000_001, 300, 999),
+            Some(1_770_000_300)
+        );
     }
 }

@@ -28,8 +28,12 @@ pub(in crate::bot) fn bot_runtime_taper_paired_growth_submin_notional_reason(
     );
     match (yes_ok, no_ok) {
         (true, true) => None,
-        (false, true) => Some(format!("paired_growth_submin_notional:YES:{y_bid:.3}:{clip:.0}")),
-        (true, false) => Some(format!("paired_growth_submin_notional:NO:{n_bid:.3}:{clip:.0}")),
+        (false, true) => Some(format!(
+            "paired_growth_submin_notional:YES:{y_bid:.3}:{clip:.0}"
+        )),
+        (true, false) => Some(format!(
+            "paired_growth_submin_notional:NO:{n_bid:.3}:{clip:.0}"
+        )),
         (false, false) => Some(format!(
             "paired_growth_submin_notional:BOTH:{y_bid:.3}:{n_bid:.3}:{clip:.0}"
         )),
@@ -77,7 +81,10 @@ pub(in crate::bot) fn bot_runtime_tail_size(q_yes: f64, q_no: f64) -> f64 {
 /// Implements tail cap fraction for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_tail_cap_fraction(t_into_s: f64, cfg: &BotRuntimeConfigSnapshot) -> f64 {
+pub(in crate::bot) fn bot_runtime_tail_cap_fraction(
+    t_into_s: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> f64 {
     if t_into_s >= cfg.tail_cap_late_start_seconds {
         cfg.tail_cap_late_fraction.max(0.0)
     } else if t_into_s >= cfg.tail_cap_mid_start_seconds {
@@ -187,4 +194,3 @@ pub(in crate::bot) fn bot_runtime_pair_build_apply_tail_repair_priority(
         ..decision
     }
 }
-

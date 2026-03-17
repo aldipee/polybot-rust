@@ -9,13 +9,133 @@ impl MakerHedgeCapBot {
         self.stop_flag.store(true, Ordering::SeqCst);
     }
 
+    /// Returns pair identity for the active BOT execution path.
+    /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
+    /// runtime.
+
+    pub(crate) fn pair_identity(&self) -> PairIdentity {
+        let mut identity = self.pair_identity.clone();
+        identity.update_market_metadata(
+            self.condition_id.clone(),
+            self.yes_asset.clone(),
+            self.no_asset.clone(),
+        );
+        identity
+    }
+
+    /// Returns or derives pair metadata as a JSON object for the active BOT execution path.
+    /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
+    /// runtime.
+
+    pub(in crate::bot) fn _pair_metadata_json(&self) -> Value {
+        let identity = self.pair_identity();
+        json!({
+            "pair_id": identity.pair_id,
+            "market_slug": identity.market_slug,
+            "condition_id": identity.condition_id,
+            "yes_asset_id": identity.yes_asset_id,
+            "no_asset_id": identity.no_asset_id,
+        })
+    }
+
+    /// Merges pair metadata into an execution or runtime record for the active BOT execution
+    /// path.
+    /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
+    /// runtime.
+
+    pub(in crate::bot) fn _merge_pair_metadata_into_value(&self, rec: &mut Value) {
+        if !rec.is_object() {
+            *rec = json!({});
+        }
+        let identity = self.pair_identity();
+        if let Some(obj) = rec.as_object_mut() {
+            obj.entry("pair_id".to_string())
+                .or_insert_with(|| json!(identity.pair_id));
+            obj.entry("market_slug".to_string())
+                .or_insert_with(|| json!(identity.market_slug));
+            obj.entry("condition_id".to_string())
+                .or_insert_with(|| json!(identity.condition_id));
+            obj.entry("yes_asset_id".to_string())
+                .or_insert_with(|| json!(identity.yes_asset_id));
+            obj.entry("no_asset_id".to_string())
+                .or_insert_with(|| json!(identity.no_asset_id));
+        }
+    }
+
+    /// Returns or derives pair snapshot from explicit inputs for the active BOT execution path.
+    /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
+    /// runtime.
+
+    pub(in crate::bot) fn _pair_snapshot_from_inputs(
+        &self,
+        phase: BotRuntimePhase,
+        t_into_s: f64,
+        q_yes: f64,
+        q_no: f64,
+        c_yes: f64,
+        c_no: f64,
+    ) -> PairSnapshot {
+        let identity = self.pair_identity();
+        let position = PairPosition {
+            q_yes,
+            q_no,
+            c_yes,
+            c_no,
+        };
+        let yes_quote = identity
+            .yes_asset_id
+            .as_deref()
+            .and_then(|asset_id| self._best_bid_ask_with_ts(asset_id))
+            .map(|(bid, ask, ts)| PairQuote { bid, ask, ts });
+        let no_quote = identity
+            .no_asset_id
+            .as_deref()
+            .and_then(|asset_id| self._best_bid_ask_with_ts(asset_id))
+            .map(|(bid, ask, ts)| PairQuote { bid, ask, ts });
+        PairSnapshot {
+            identity,
+            position,
+            phase: phase.as_str().to_string(),
+            t_into_s,
+            total_cost: position.total_cost(),
+            paired_size: position.paired_size(),
+            unmatched_size: position.unmatched_size(),
+            yes_quote,
+            no_quote,
+        }
+    }
+
+    /// Returns or derives pair snapshot from current bot state for the active BOT execution
+    /// path.
+    /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
+    /// runtime.
+
+    pub(in crate::bot) fn _pair_snapshot_from_state(
+        &self,
+        phase: BotRuntimePhase,
+        t_into_s: f64,
+    ) -> PairSnapshot {
+        let (q_yes, q_no, c_yes, c_no) = self
+            .state
+            .lock()
+            .map(|state| (state.q_yes, state.q_no, state.c_yes, state.c_no))
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        self._pair_snapshot_from_inputs(phase, t_into_s, q_yes, q_no, c_yes, c_no)
+    }
+
     /// Returns or derives trade metrics snapshot for the active BOT execution path.
     /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
     /// runtime.
 
     pub fn trade_metrics_snapshot(&self) -> TradeMetrics {
         let state = self.state.lock().map(|s| s.clone()).unwrap_or_default();
+        let identity = self.pair_identity();
         TradeMetrics {
+            pair_id: identity.pair_id,
+            market_slug: identity.market_slug,
+            condition_id: identity.condition_id,
+            yes_asset_id: identity.yes_asset_id,
+            no_asset_id: identity.no_asset_id,
             lp: locked_profit(&state),
             total_cost: state.c_yes + state.c_no,
             q_yes: state.q_yes,
@@ -65,4 +185,3 @@ impl MakerHedgeCapBot {
         }
     }
 }
-

@@ -63,7 +63,8 @@ impl MakerHedgeCapBot {
             if let Some(policy) = policy.as_ref() {
                 if policy.hold_reason.is_none() && policy.clip > 0 && policy.clip != decision.clip {
                     decision.clip = policy.clip;
-                    decision.clip_bucket = bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
+                    decision.clip_bucket =
+                        bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
                 }
             }
             policy
@@ -79,15 +80,7 @@ impl MakerHedgeCapBot {
             };
             let min_lot = self.cfg.min_shares.max(1.0);
             let adjusted_clip = bot_runtime_pair_build_lighter_clip_after_projected_cost(
-                &decision,
-                q_yes,
-                q_no,
-                cost_yes,
-                cost_no,
-                side,
-                side_bid,
-                min_lot,
-                cfg,
+                &decision, q_yes, q_no, cost_yes, cost_no, side, side_bid, min_lot, cfg,
             );
             if adjusted_clip + 1e-9 < decision.clip as f64 {
                 decision.clip = adjusted_clip as i64;
@@ -110,7 +103,8 @@ impl MakerHedgeCapBot {
             if let Some(policy) = policy.as_ref() {
                 if policy.clip > 0 && policy.clip < decision.clip {
                     decision.clip = policy.clip;
-                    decision.clip_bucket = bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
+                    decision.clip_bucket =
+                        bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
                 }
             }
             policy
@@ -133,7 +127,8 @@ impl MakerHedgeCapBot {
             if let Some(policy) = policy {
                 if policy.clip > 0 && policy.clip < decision.clip {
                     decision.clip = policy.clip;
-                    decision.clip_bucket = bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
+                    decision.clip_bucket =
+                        bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
                 }
             }
             policy
@@ -159,7 +154,8 @@ impl MakerHedgeCapBot {
             if let Some(policy) = policy.as_ref() {
                 if policy.clip > 0 && policy.clip < decision.clip {
                     decision.clip = policy.clip;
-                    decision.clip_bucket = bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
+                    decision.clip_bucket =
+                        bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
                 }
             }
             policy
@@ -200,13 +196,26 @@ impl MakerHedgeCapBot {
         &self,
         now: f64,
         t_into_s: f64,
-        total_cost: f64,
+        _total_cost: f64,
         q_yes: f64,
         q_no: f64,
         cost_yes: f64,
         cost_no: f64,
         cfg: &BotRuntimeConfigSnapshot,
     ) {
+        let pair_snapshot = self._pair_snapshot_from_inputs(
+            bot_runtime_phase_from_t_into_s(t_into_s, cfg),
+            t_into_s,
+            q_yes,
+            q_no,
+            cost_yes,
+            cost_no,
+        );
+        let total_cost = pair_snapshot.total_cost;
+        let q_yes = pair_snapshot.position.q_yes;
+        let q_no = pair_snapshot.position.q_no;
+        let cost_yes = pair_snapshot.position.c_yes;
+        let cost_no = pair_snapshot.position.c_no;
         let (yes_asset, no_asset) = match (&self.yes_asset, &self.no_asset) {
             (Some(yes_asset), Some(no_asset)) => (yes_asset.as_str(), no_asset.as_str()),
             _ => {
@@ -227,13 +236,7 @@ impl MakerHedgeCapBot {
         let yes_slot = self._maker_order_slot_get(&yes_key);
         let no_slot = self._maker_order_slot_get(&no_key);
         if self._bot_runtime_pair_build_seed_completion_handoff(
-            now,
-            t_into_s,
-            total_cost,
-            q_yes,
-            q_no,
-            &yes_slot,
-            &no_slot,
+            now, t_into_s, total_cost, q_yes, q_no, &yes_slot, &no_slot,
         ) {
             return;
         }
@@ -249,7 +252,9 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        if env_bool("REQUIRE_USER_WS_CONNECTED", true) && !self.user_connected.load(Ordering::SeqCst) {
+        if env_bool("REQUIRE_USER_WS_CONNECTED", true)
+            && !self.user_connected.load(Ordering::SeqCst)
+        {
             self._bot_runtime_log_pair_build_state(
                 "hold",
                 "user_ws_disconnected",
@@ -342,13 +347,7 @@ impl MakerHedgeCapBot {
             Ok(plan) => plan,
             Err(reason) => {
                 self._bot_runtime_log_pair_build_state(
-                    "hold",
-                    &reason,
-                    None,
-                    t_into_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
+                    "hold", &reason, None, t_into_s, total_cost, q_yes, q_no,
                 );
                 return;
             }
@@ -366,15 +365,7 @@ impl MakerHedgeCapBot {
         }
         if plan.decision.mode == BotRuntimePairBuildMode::LighterSideFirst {
             self._bot_runtime_pair_build_handle_lighter_side_repair(
-                now,
-                t_into_s,
-                total_cost,
-                q_yes,
-                q_no,
-                cost_yes,
-                cost_no,
-                &context,
-                &plan,
+                now, t_into_s, total_cost, q_yes, q_no, cost_yes, cost_no, &context, &plan,
             );
             return;
         }
@@ -401,14 +392,7 @@ impl MakerHedgeCapBot {
             return;
         }
         self._bot_runtime_pair_build_handle_paired_growth(
-            now,
-            t_into_s,
-            total_cost,
-            q_yes,
-            q_no,
-            &context,
-            &plan,
-            cfg,
+            now, t_into_s, total_cost, q_yes, q_no, &context, &plan, cfg,
         );
     }
 }

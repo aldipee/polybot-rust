@@ -38,6 +38,13 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
         cfg,
         logger: Arc::new(BotRuntimeNoopLogger),
         market_slug: "pair-build-test".to_string(),
+        pair_identity: PairIdentity {
+            pair_id: canonical_pair_id_from_slug("pair-build-test"),
+            market_slug: "pair-build-test".to_string(),
+            condition_id: None,
+            yes_asset_id: Some("yes_asset_id".to_string()),
+            no_asset_id: Some("no_asset_id".to_string()),
+        },
         state_file: PathBuf::from("__pair_build_test_state_nonexistent.json"),
         state: Arc::new(Mutex::new(BotState::default())),
         start_trade_iso: "2024-01-01T00:00:00Z".to_string(),
@@ -261,8 +268,12 @@ fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
 
 #[test]
 fn bot_runtime_pair_build_repost_and_reject_cooldowns() {
-    assert!(!bot_runtime_pair_build_price_moved_meaningfully(0.40, 0.40, 0.01));
-    assert!(bot_runtime_pair_build_price_moved_meaningfully(0.40, 0.41, 0.01));
+    assert!(!bot_runtime_pair_build_price_moved_meaningfully(
+        0.40, 0.40, 0.01
+    ));
+    assert!(bot_runtime_pair_build_price_moved_meaningfully(
+        0.40, 0.41, 0.01
+    ));
 
     let slot = MakerOrderSlot {
         last_reject_ts: 10.0,
@@ -270,12 +281,8 @@ fn bot_runtime_pair_build_repost_and_reject_cooldowns() {
         last_reject_origin: "BOT_PAIR_BUILD".to_string(),
         ..MakerOrderSlot::default()
     };
-    let cooldown = maker_order_effective_reject_cooldown_seconds(
-        "BOT_PAIR_BUILD",
-        &slot,
-        1.0,
-        60.0,
-    );
+    let cooldown =
+        maker_order_effective_reject_cooldown_seconds("BOT_PAIR_BUILD", &slot, 1.0, 60.0);
     assert_eq!(cooldown, 4.0);
 }
 
@@ -310,13 +317,24 @@ fn bot_runtime_pair_build_handler_submits_paired_growth_orders() {
     let origins: Vec<String> = contexts
         .values()
         .filter_map(|value| {
-            value.get("origin")
+            value
+                .get("origin")
                 .and_then(|origin| origin.as_str())
                 .map(ToString::to_string)
         })
         .collect();
     assert!(origins.iter().any(|origin| origin == "BOT_PAIR_BUILD_YES"));
     assert!(origins.iter().any(|origin| origin == "BOT_PAIR_BUILD_NO"));
+    for value in contexts.values() {
+        assert_eq!(
+            value.get("pair_id").and_then(|field| field.as_str()),
+            Some("pair-build-test")
+        );
+        assert_eq!(
+            value.get("market_slug").and_then(|field| field.as_str()),
+            Some("pair-build-test")
+        );
+    }
 }
 
 /// Exercises the BOT runtime pair build handler submits lighter side repair order scenario and
@@ -377,15 +395,7 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
         bad_regime_shutdown: (false, 0.0, 0, 0),
     };
     bot._bot_runtime_pair_build_handle_lighter_side_repair(
-        40.0,
-        40.0,
-        7.5,
-        5.0,
-        20.0,
-        1.5,
-        6.0,
-        &context,
-        &plan,
+        40.0, 40.0, 7.5, 5.0, 20.0, 1.5, 6.0, &context, &plan,
     );
 
     let state = bot.state.lock().expect("bot state");

@@ -95,8 +95,10 @@ impl MakerHedgeCapBot {
         let cpp_hint = decision
             .map(|value| value.cpp_hint.as_str().to_string())
             .unwrap_or_else(|| "NA".to_string());
+        let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][TAPER] {} reason={} taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            "[BOT][TAPER] pair_id={} {} reason={} taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            pair_id,
             state_kind,
             reason,
             taper_mode.as_str(),
