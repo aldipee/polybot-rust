@@ -391,8 +391,13 @@ impl MakerHedgeCapBot {
         };
 
         state.seen_trade_keys.push(canonical_id.clone());
+        state.record_pair_liquidity_fill(candidate.qty, true);
         let _ = save_state(&self.state_file, &mut state);
         drop(state);
+        let fill_ts = candidate.match_time.as_deref().and_then(|value| {
+            self._fill_event_ts_from_value(Some(&Value::String(value.to_string())))
+        });
+        self._record_daily_liquidity_fill_global(candidate.qty, true, fill_ts);
 
         let record = MakerExecRecord {
             canonical_id: canonical_id.clone(),

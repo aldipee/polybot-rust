@@ -9,6 +9,91 @@ pub(super) struct TakerOrderRecord {
     pub(super) px_limit: f64,
     pub(super) side: String,
     pub(super) ts: f64,
+    pub(super) liquidity_intent: LiquidityIntent,
+    pub(super) taker_exception_reason: Option<TakerExceptionReason>,
+    pub(super) taker_cap_policy: TakerCapPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum LiquidityIntent {
+    #[default]
+    Maker,
+    TakerException,
+}
+
+impl LiquidityIntent {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Maker => "maker",
+            Self::TakerException => "taker_exception",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TakerExceptionReason {
+    AwaitSecondFillRescue,
+    RebalanceRepair,
+    RecoveryBypass,
+}
+
+impl TakerExceptionReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitSecondFillRescue => "await_second_fill_rescue",
+            Self::RebalanceRepair => "rebalance_repair",
+            Self::RecoveryBypass => "recovery_bypass",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum TakerCapPolicy {
+    #[default]
+    EnforceCap,
+    RecoveryBypass,
+}
+
+impl TakerCapPolicy {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::EnforceCap => "enforce_cap",
+            Self::RecoveryBypass => "recovery_bypass",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(super) struct TakerShareSnapshot {
+    pub(super) pair_taker_share: f64,
+    pub(super) projected_pair_taker_share: f64,
+    pub(super) daily_taker_share: f64,
+    pub(super) projected_daily_taker_share: f64,
+}
+
+pub(super) fn taker_submit_reason_allowed(
+    side: &str,
+    reason: Option<TakerExceptionReason>,
+    cap_policy: TakerCapPolicy,
+) -> Result<TakerExceptionReason, &'static str> {
+    let side_u = side.trim().to_ascii_uppercase();
+    let Some(reason) = reason else {
+        return Err("taker_exception_reason_missing");
+    };
+    match cap_policy {
+        TakerCapPolicy::RecoveryBypass => {
+            if reason == TakerExceptionReason::RecoveryBypass {
+                Ok(reason)
+            } else {
+                Err("taker_exception_reason_disallowed")
+            }
+        }
+        TakerCapPolicy::EnforceCap => match (side_u.as_str(), reason) {
+            ("BUY", TakerExceptionReason::AwaitSecondFillRescue)
+            | ("BUY", TakerExceptionReason::RebalanceRepair) => Ok(reason),
+            _ => Err("taker_exception_reason_disallowed"),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

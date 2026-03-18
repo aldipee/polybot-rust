@@ -251,6 +251,16 @@ impl MakerHedgeCapBot {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let liquidity_intent = rec2
+            .get("liquidity_intent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let taker_exception_reason = rec2
+            .get("taker_exception_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let pair_id = rec2
             .get("pair_id")
             .and_then(|v| v.as_str())
@@ -339,9 +349,19 @@ impl MakerHedgeCapBot {
                     .map(|v| format!("{v}"))
                     .unwrap_or_else(|| "None".to_string());
                 self.logger.info(&format!(
-                    "[LATENCY][SUBMIT] pair_id={} decide->send={d2s_us}us send->ack={s2a_us}us decide->ack={d2a_us}us prep={pm_us}us sign={sm_us}us sign_total={stm_us}us oid={}.. asset={aid_tail} side={side} origin={origin}",
+                    "[LATENCY][SUBMIT] pair_id={} decide->send={d2s_us}us send->ack={s2a_us}us decide->ack={d2a_us}us prep={pm_us}us sign={sm_us}us sign_total={stm_us}us oid={}.. asset={aid_tail} side={side} origin={origin} liquidity_intent={} taker_exception_reason={}",
                     pair_id,
                     order_id.chars().take(10).collect::<String>(),
+                    if liquidity_intent.is_empty() {
+                        "NA"
+                    } else {
+                        liquidity_intent.as_str()
+                    },
+                    if taker_exception_reason.is_empty() {
+                        "NA"
+                    } else {
+                        taker_exception_reason.as_str()
+                    },
                 ));
             }
         }
@@ -363,6 +383,14 @@ impl MakerHedgeCapBot {
                 "asset_id": asset_id,
                 "side": side,
                 "origin": origin,
+                "liquidity_intent": rec2
+                    .get("liquidity_intent")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "taker_exception_reason": rec2
+                    .get("taker_exception_reason")
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 "source": "ORDER_SUBMIT",
                 "price": px_limit,
                 "qty": size,

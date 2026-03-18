@@ -1,7 +1,6 @@
 use super::super::*;
 use super::*;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 struct BotRuntimeNoopLogger;
@@ -34,6 +33,14 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
     cfg.stale_seconds = 3;
     cfg.max_total_cost = 20.0;
     cfg.reserve_usd = 2.0;
+    let state_file = std::env::temp_dir().join(format!(
+        "pair_build_test_state_{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let daily_liquidity_state_file = std::env::temp_dir().join(format!(
+        "pair_build_test_daily_liquidity_state_{}.json",
+        uuid::Uuid::new_v4()
+    ));
     MakerHedgeCapBot {
         cfg,
         logger: Arc::new(BotRuntimeNoopLogger),
@@ -45,8 +52,10 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
             yes_asset_id: Some("yes_asset_id".to_string()),
             no_asset_id: Some("no_asset_id".to_string()),
         },
-        state_file: PathBuf::from("__pair_build_test_state_nonexistent.json"),
+        state_file,
         state: Arc::new(Mutex::new(BotState::default())),
+        daily_liquidity_state_file,
+        daily_liquidity_state: Arc::new(Mutex::new(DailyLiquidityState::default())),
         start_trade_iso: "2024-01-01T00:00:00Z".to_string(),
         first_entry_fill_iso: Arc::new(Mutex::new(None)),
         first_entry_reason: Arc::new(Mutex::new(None)),
@@ -55,7 +64,7 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
         stop_loss_category: Arc::new(Mutex::new(None)),
         exit_reason: Arc::new(Mutex::new("RUNNING".to_string())),
         stop_flag: Arc::new(AtomicBool::new(false)),
-        wallet_address: "0xtest".to_string(),
+        wallet_address: format!("0xtest{}", uuid::Uuid::new_v4().simple()),
         min_maker_notional: 1.0,
         min_taker_notional: 1.0,
         reconcile_sell_credit_mult: 1.0,

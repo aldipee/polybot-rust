@@ -51,6 +51,9 @@ export DB_URL="${POLYBOT_DB_URL:-${DB_URL:-postgresql://postgres:postgres@localh
 export LOG_DIR="$instance_dir/output"
 export EXEC_LATENCY_LOG_DIR="$instance_dir/logs"
 export SIGNAL_FILE_DIR="$instance_dir/signals"
+export POLYBOT_SHARED_STATE_DIR="${POLYBOT_SHARED_STATE_DIR:-$root_dir/shared-state}"
+
+mkdir -p "$POLYBOT_SHARED_STATE_DIR"
 
 db_url_log="$DB_URL"
 if [[ "$db_url_log" != sqlite://* ]]; then

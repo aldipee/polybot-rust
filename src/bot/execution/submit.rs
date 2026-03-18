@@ -346,6 +346,9 @@ impl MakerHedgeCapBot {
                 "post_start_ts": decide_ts,
                 "post_end_ts": now_ts_f64(),
                 "origin": "MAKER_POSTONLY_GTC",
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+                "taker_exception_reason": null,
+                "taker_cap_policy": null,
             }),
         );
         Some(oid)
@@ -465,6 +468,9 @@ impl MakerHedgeCapBot {
                 "post_start_ts": decide_ts,
                 "post_end_ts": now_ts_f64(),
                 "origin": origin,
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+                "taker_exception_reason": null,
+                "taker_cap_policy": null,
             }),
         );
         Some(oid)
@@ -556,9 +562,150 @@ impl MakerHedgeCapBot {
                 "post_start_ts": decide_ts,
                 "post_end_ts": now_ts_f64(),
                 "origin": origin,
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+                "taker_exception_reason": null,
+                "taker_cap_policy": null,
             }),
         );
         Some(oid)
+    }
+
+    /// Synchronizes daily persisted liquidity counters into runtime state for the active BOT
+    /// execution path.
+
+    pub(in crate::bot) fn _bot_runtime_refresh_daily_liquidity_counters(&self) -> (f64, f64) {
+        let snapshot = self._reload_daily_liquidity_state_from_disk();
+        let day_key = snapshot.day_key_utc.clone();
+        let maker_qty = snapshot.maker_fill_shares.max(0.0);
+        let taker_qty = snapshot.taker_fill_shares.max(0.0);
+        if let Ok(mut runtime_state) = self.bot_runtime_state.lock() {
+            runtime_state.daily_taker_day_key_utc = day_key;
+            runtime_state.daily_maker_fill_shares = maker_qty;
+            runtime_state.daily_taker_fill_shares = taker_qty;
+        }
+        (maker_qty, taker_qty)
+    }
+
+    /// Evaluates taker share snapshot for the active BOT execution path.
+
+    pub(in crate::bot) fn _taker_share_snapshot(
+        &self,
+        requested_taker_qty: f64,
+    ) -> TakerShareSnapshot {
+        let (daily_maker_qty, daily_taker_qty) =
+            self._bot_runtime_refresh_daily_liquidity_counters();
+        let (market_maker_qty, market_taker_qty) = self
+            .bot_runtime_state
+            .lock()
+            .map(|state| {
+                (
+                    state.maker_fill_shares.max(0.0),
+                    state.taker_fill_shares.max(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let pending_pair_taker_qty = self._pending_taker_qty_for_current_pair(None);
+        let pending_daily_taker_qty = self._pending_taker_qty(None, None);
+        TakerShareSnapshot {
+            pair_taker_share: bot_runtime_taker_share(market_maker_qty, market_taker_qty),
+            projected_pair_taker_share: bot_runtime_projected_taker_share(
+                market_maker_qty,
+                market_taker_qty,
+                pending_pair_taker_qty,
+                requested_taker_qty,
+            ),
+            daily_taker_share: bot_runtime_taker_share(daily_maker_qty, daily_taker_qty),
+            projected_daily_taker_share: bot_runtime_projected_taker_share(
+                daily_maker_qty,
+                daily_taker_qty,
+                pending_daily_taker_qty,
+                requested_taker_qty,
+            ),
+        }
+    }
+
+    /// Evaluates taker submit policy for the active BOT execution path.
+
+    pub(in crate::bot) fn _evaluate_taker_submit_gate(
+        &self,
+        side: &str,
+        asset_id: &str,
+        requested_taker_qty: f64,
+        taker_exception_reason: Option<TakerExceptionReason>,
+        taker_cap_policy: TakerCapPolicy,
+    ) -> Result<TakerShareSnapshot, String> {
+        let reason = taker_submit_reason_allowed(side, taker_exception_reason, taker_cap_policy)
+            .map_err(|reason| reason.to_string())?;
+        let snapshot = self._taker_share_snapshot(requested_taker_qty);
+        let pair_cap_hit = snapshot.pair_taker_share + 1e-9 >= bot_runtime_taker_share_cap()
+            || snapshot.projected_pair_taker_share + 1e-9 >= bot_runtime_taker_share_cap();
+        let daily_cap_hit = snapshot.daily_taker_share + 1e-9 >= bot_runtime_taker_share_cap()
+            || snapshot.projected_daily_taker_share + 1e-9 >= bot_runtime_taker_share_cap();
+        let warn_target_hit = snapshot.pair_taker_share + 1e-9 >= bot_runtime_taker_share_target()
+            || snapshot.projected_pair_taker_share + 1e-9 >= bot_runtime_taker_share_target()
+            || snapshot.daily_taker_share + 1e-9 >= bot_runtime_taker_share_target()
+            || snapshot.projected_daily_taker_share + 1e-9 >= bot_runtime_taker_share_target();
+        let pair_id = self.pair_identity().pair_id;
+        if matches!(taker_cap_policy, TakerCapPolicy::EnforceCap) && pair_cap_hit {
+            self.logger.warning(&format!(
+                "[TAKER_CAP] pair_id={} hold_reason=taker_cap_market asset={} side={} reason={} requested_qty={:.2} pair_taker_share={:.3} projected_pair_taker_share={:.3} daily_taker_share={:.3} projected_daily_taker_share={:.3}",
+                pair_id,
+                asset_id,
+                side.trim().to_ascii_uppercase(),
+                reason.as_str(),
+                requested_taker_qty.max(0.0),
+                snapshot.pair_taker_share,
+                snapshot.projected_pair_taker_share,
+                snapshot.daily_taker_share,
+                snapshot.projected_daily_taker_share,
+            ));
+            return Err("taker_cap_market".to_string());
+        }
+        if matches!(taker_cap_policy, TakerCapPolicy::EnforceCap) && daily_cap_hit {
+            self.logger.warning(&format!(
+                "[TAKER_CAP] pair_id={} hold_reason=taker_cap_daily asset={} side={} reason={} requested_qty={:.2} pair_taker_share={:.3} projected_pair_taker_share={:.3} daily_taker_share={:.3} projected_daily_taker_share={:.3}",
+                pair_id,
+                asset_id,
+                side.trim().to_ascii_uppercase(),
+                reason.as_str(),
+                requested_taker_qty.max(0.0),
+                snapshot.pair_taker_share,
+                snapshot.projected_pair_taker_share,
+                snapshot.daily_taker_share,
+                snapshot.projected_daily_taker_share,
+            ));
+            return Err("taker_cap_daily".to_string());
+        }
+        if matches!(taker_cap_policy, TakerCapPolicy::RecoveryBypass)
+            && (pair_cap_hit || daily_cap_hit)
+        {
+            self.logger.warning(&format!(
+                "[TAKER_CAP][BYPASS] pair_id={} asset={} side={} reason={} requested_qty={:.2} pair_taker_share={:.3} projected_pair_taker_share={:.3} daily_taker_share={:.3} projected_daily_taker_share={:.3}",
+                pair_id,
+                asset_id,
+                side.trim().to_ascii_uppercase(),
+                reason.as_str(),
+                requested_taker_qty.max(0.0),
+                snapshot.pair_taker_share,
+                snapshot.projected_pair_taker_share,
+                snapshot.daily_taker_share,
+                snapshot.projected_daily_taker_share,
+            ));
+        } else if warn_target_hit {
+            self.logger.warning(&format!(
+                "[TAKER_CAP][WARN] pair_id={} asset={} side={} reason={} requested_qty={:.2} pair_taker_share={:.3} projected_pair_taker_share={:.3} daily_taker_share={:.3} projected_daily_taker_share={:.3}",
+                pair_id,
+                asset_id,
+                side.trim().to_ascii_uppercase(),
+                reason.as_str(),
+                requested_taker_qty.max(0.0),
+                snapshot.pair_taker_share,
+                snapshot.projected_pair_taker_share,
+                snapshot.daily_taker_share,
+                snapshot.projected_daily_taker_share,
+            ));
+        }
+        Ok(snapshot)
     }
     /// Resolves order type for the active BOT flow.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -588,12 +735,14 @@ impl MakerHedgeCapBot {
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
 
-    pub fn _place_taker_bid_fak(
+    pub(in crate::bot) fn _place_taker_bid_fak(
         &self,
         asset_id: &str,
         price: f64,
         size: f64,
         order_type_name: Option<&str>,
+        taker_exception_reason: Option<TakerExceptionReason>,
+        taker_cap_policy: TakerCapPolicy,
     ) -> Option<String> {
         let decide_ts = now_ts_f64();
         let decide_ns = now_ns();
@@ -610,8 +759,28 @@ impl MakerHedgeCapBot {
             return None;
         }
         let size = size_int as f64;
+        let gate_snapshot = match self._evaluate_taker_submit_gate(
+            "BUY",
+            asset_id,
+            size,
+            taker_exception_reason,
+            taker_cap_policy,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                self.logger.warning(&format!(
+                    "[TAKER BLOCK] pair_id={} asset={} side=BUY hold_reason={}",
+                    self.pair_identity().pair_id,
+                    asset_id,
+                    reason
+                ));
+                return None;
+            }
+        };
         let ot_name = order_type_name.unwrap_or(&self.hedge_taker_order_type);
         let ot = self._resolve_order_type(ot_name);
+        let taker_reason =
+            taker_submit_reason_allowed("BUY", taker_exception_reason, taker_cap_policy).ok()?;
         if self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER HEDGE BUY asset={} price={px:.2} size={size_int} type={ot}",
@@ -634,7 +803,16 @@ impl MakerHedgeCapBot {
             "origin": format!("TAKER_{}_BUY", ot),
         });
         let oid = self._post_order_compat(&signed, &ot, None)?;
-        self._remember_taker_order(&oid, asset_id, size, px, "BUY");
+        self._remember_taker_order(
+            &oid,
+            asset_id,
+            size,
+            px,
+            "BUY",
+            LiquidityIntent::TakerException,
+            Some(taker_reason),
+            taker_cap_policy,
+        );
         self._track_order_execution_context(
             &oid,
             &json!({
@@ -648,6 +826,13 @@ impl MakerHedgeCapBot {
                 "post_start_ts": decide_ts,
                 "post_end_ts": now_ts_f64(),
                 "origin": format!("TAKER_{}_BUY", ot),
+                "liquidity_intent": LiquidityIntent::TakerException.as_str(),
+                "taker_exception_reason": taker_reason.as_str(),
+                "taker_cap_policy": taker_cap_policy.as_str(),
+                "pair_taker_share": gate_snapshot.pair_taker_share,
+                "projected_pair_taker_share": gate_snapshot.projected_pair_taker_share,
+                "daily_taker_share": gate_snapshot.daily_taker_share,
+                "projected_daily_taker_share": gate_snapshot.projected_daily_taker_share,
             }),
         );
         self.logger.info(&format!(
@@ -660,12 +845,14 @@ impl MakerHedgeCapBot {
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
 
-    pub fn _place_taker_bid_fak_exact(
+    pub(in crate::bot) fn _place_taker_bid_fak_exact(
         &self,
         asset_id: &str,
         price: f64,
         size: f64,
         order_type_name: Option<&str>,
+        taker_exception_reason: Option<TakerExceptionReason>,
+        taker_cap_policy: TakerCapPolicy,
     ) -> Option<String> {
         let decide_ts = now_ts_f64();
         let decide_ns = now_ns();
@@ -680,8 +867,28 @@ impl MakerHedgeCapBot {
         if size < 0.01 {
             return None;
         }
+        let gate_snapshot = match self._evaluate_taker_submit_gate(
+            "BUY",
+            asset_id,
+            size,
+            taker_exception_reason,
+            taker_cap_policy,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                self.logger.warning(&format!(
+                    "[TAKER BLOCK] pair_id={} asset={} side=BUY hold_reason={}",
+                    self.pair_identity().pair_id,
+                    asset_id,
+                    reason
+                ));
+                return None;
+            }
+        };
         let ot_name = order_type_name.unwrap_or(&self.hedge_taker_order_type);
         let ot = self._resolve_order_type(ot_name);
+        let taker_reason =
+            taker_submit_reason_allowed("BUY", taker_exception_reason, taker_cap_policy).ok()?;
         if self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER HEDGE BUY EXACT asset={} price={px:.2} size={size:.2} type={ot}",
@@ -704,7 +911,16 @@ impl MakerHedgeCapBot {
             "origin": format!("TAKER_{}_BUY_EXACT", ot),
         });
         let oid = self._post_order_compat(&signed, &ot, None)?;
-        self._remember_taker_order(&oid, asset_id, size, px, "BUY");
+        self._remember_taker_order(
+            &oid,
+            asset_id,
+            size,
+            px,
+            "BUY",
+            LiquidityIntent::TakerException,
+            Some(taker_reason),
+            taker_cap_policy,
+        );
         self._track_order_execution_context(
             &oid,
             &json!({
@@ -718,6 +934,13 @@ impl MakerHedgeCapBot {
                 "post_start_ts": decide_ts,
                 "post_end_ts": now_ts_f64(),
                 "origin": format!("TAKER_{}_BUY_EXACT", ot),
+                "liquidity_intent": LiquidityIntent::TakerException.as_str(),
+                "taker_exception_reason": taker_reason.as_str(),
+                "taker_cap_policy": taker_cap_policy.as_str(),
+                "pair_taker_share": gate_snapshot.pair_taker_share,
+                "projected_pair_taker_share": gate_snapshot.projected_pair_taker_share,
+                "daily_taker_share": gate_snapshot.daily_taker_share,
+                "projected_daily_taker_share": gate_snapshot.projected_daily_taker_share,
             }),
         );
         self.logger.info(&format!(
@@ -730,12 +953,14 @@ impl MakerHedgeCapBot {
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
 
-    pub fn _place_taker_ask_fak(
+    pub(in crate::bot) fn _place_taker_ask_fak(
         &self,
         asset_id: &str,
         price: f64,
         size: f64,
         order_type_name: Option<&str>,
+        taker_exception_reason: Option<TakerExceptionReason>,
+        taker_cap_policy: TakerCapPolicy,
     ) -> Option<String> {
         let decide_ts = now_ts_f64();
         let decide_ns = now_ns();
@@ -771,8 +996,28 @@ impl MakerHedgeCapBot {
         } else {
             format!("{:.4}", size)
         };
+        let gate_snapshot = match self._evaluate_taker_submit_gate(
+            "SELL",
+            asset_id,
+            size,
+            taker_exception_reason,
+            taker_cap_policy,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                self.logger.warning(&format!(
+                    "[TAKER BLOCK] pair_id={} asset={} side=SELL hold_reason={}",
+                    self.pair_identity().pair_id,
+                    asset_id,
+                    reason
+                ));
+                return None;
+            }
+        };
         let ot_name = order_type_name.unwrap_or(&self.hedge_taker_order_type);
         let ot = self._resolve_order_type(ot_name);
+        let taker_reason =
+            taker_submit_reason_allowed("SELL", taker_exception_reason, taker_cap_policy).ok()?;
         if self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER SELL asset={} price={px:.2} size={sz_disp} type={ot}",
@@ -804,7 +1049,16 @@ impl MakerHedgeCapBot {
                 return None;
             }
         };
-        self._remember_taker_order(&oid, asset_id, size, px, "SELL");
+        self._remember_taker_order(
+            &oid,
+            asset_id,
+            size,
+            px,
+            "SELL",
+            LiquidityIntent::TakerException,
+            Some(taker_reason),
+            taker_cap_policy,
+        );
         self._track_order_execution_context(
             &oid,
             &json!({
@@ -818,6 +1072,13 @@ impl MakerHedgeCapBot {
                 "post_start_ts": decide_ts,
                 "post_end_ts": now_ts_f64(),
                 "origin": format!("TAKER_{}_SELL", ot),
+                "liquidity_intent": LiquidityIntent::TakerException.as_str(),
+                "taker_exception_reason": taker_reason.as_str(),
+                "taker_cap_policy": taker_cap_policy.as_str(),
+                "pair_taker_share": gate_snapshot.pair_taker_share,
+                "projected_pair_taker_share": gate_snapshot.projected_pair_taker_share,
+                "daily_taker_share": gate_snapshot.daily_taker_share,
+                "projected_daily_taker_share": gate_snapshot.projected_daily_taker_share,
             }),
         );
         self.logger.info(&format!(
@@ -830,12 +1091,14 @@ impl MakerHedgeCapBot {
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
 
-    pub fn _place_taker_ask_fak_exact(
+    pub(in crate::bot) fn _place_taker_ask_fak_exact(
         &self,
         asset_id: &str,
         price: f64,
         size: f64,
         order_type_name: Option<&str>,
+        taker_exception_reason: Option<TakerExceptionReason>,
+        taker_cap_policy: TakerCapPolicy,
     ) -> Option<String> {
         let decide_ts = now_ts_f64();
         let decide_ns = now_ns();
@@ -850,8 +1113,28 @@ impl MakerHedgeCapBot {
         if size < 0.0001 {
             return None;
         }
+        let gate_snapshot = match self._evaluate_taker_submit_gate(
+            "SELL",
+            asset_id,
+            size,
+            taker_exception_reason,
+            taker_cap_policy,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                self.logger.warning(&format!(
+                    "[TAKER BLOCK] pair_id={} asset={} side=SELL hold_reason={}",
+                    self.pair_identity().pair_id,
+                    asset_id,
+                    reason
+                ));
+                return None;
+            }
+        };
         let ot_name = order_type_name.unwrap_or(&self.hedge_taker_order_type);
         let ot = self._resolve_order_type(ot_name);
+        let taker_reason =
+            taker_submit_reason_allowed("SELL", taker_exception_reason, taker_cap_policy).ok()?;
         if self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER SELL EXACT asset={} price={px:.4} size={size:.4} type={ot}",
@@ -883,7 +1166,16 @@ impl MakerHedgeCapBot {
                 return None;
             }
         };
-        self._remember_taker_order(&oid, asset_id, size, px, "SELL");
+        self._remember_taker_order(
+            &oid,
+            asset_id,
+            size,
+            px,
+            "SELL",
+            LiquidityIntent::TakerException,
+            Some(taker_reason),
+            taker_cap_policy,
+        );
         self._track_order_execution_context(
             &oid,
             &json!({
@@ -897,6 +1189,13 @@ impl MakerHedgeCapBot {
                 "post_start_ts": decide_ts,
                 "post_end_ts": now_ts_f64(),
                 "origin": format!("TAKER_{}_SELL_EXACT", ot),
+                "liquidity_intent": LiquidityIntent::TakerException.as_str(),
+                "taker_exception_reason": taker_reason.as_str(),
+                "taker_cap_policy": taker_cap_policy.as_str(),
+                "pair_taker_share": gate_snapshot.pair_taker_share,
+                "projected_pair_taker_share": gate_snapshot.projected_pair_taker_share,
+                "daily_taker_share": gate_snapshot.daily_taker_share,
+                "projected_daily_taker_share": gate_snapshot.projected_daily_taker_share,
             }),
         );
         self.logger.info(&format!(

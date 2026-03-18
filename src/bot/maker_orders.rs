@@ -1290,7 +1290,16 @@ impl MakerHedgeCapBot {
         };
         if let Some(oid) = &y_oid {
             if track_taker_fallback {
-                self._remember_taker_order(oid, yes, y_qty, y_px, "BUY");
+                self._remember_taker_order(
+                    oid,
+                    yes,
+                    y_qty,
+                    y_px,
+                    "BUY",
+                    LiquidityIntent::TakerException,
+                    None,
+                    TakerCapPolicy::EnforceCap,
+                );
             } else {
                 self._forget_taker_order(oid);
             }
@@ -1307,12 +1316,32 @@ impl MakerHedgeCapBot {
                     "post_start_ts": decide_ts,
                     "post_end_ts": now_ts_f64(),
                     "origin": format!("{origin}_YES"),
+                    "liquidity_intent": if track_taker_fallback {
+                        LiquidityIntent::TakerException.as_str()
+                    } else {
+                        LiquidityIntent::Maker.as_str()
+                    },
+                    "taker_exception_reason": Option::<&str>::None,
+                    "taker_cap_policy": if track_taker_fallback {
+                        Some(TakerCapPolicy::EnforceCap.as_str())
+                    } else {
+                        None
+                    },
                 }),
             );
         }
         if let Some(oid) = &n_oid {
             if track_taker_fallback {
-                self._remember_taker_order(oid, no, n_qty, n_px, "BUY");
+                self._remember_taker_order(
+                    oid,
+                    no,
+                    n_qty,
+                    n_px,
+                    "BUY",
+                    LiquidityIntent::TakerException,
+                    None,
+                    TakerCapPolicy::EnforceCap,
+                );
             } else {
                 self._forget_taker_order(oid);
             }
@@ -1329,6 +1358,17 @@ impl MakerHedgeCapBot {
                     "post_start_ts": decide_ts,
                     "post_end_ts": now_ts_f64(),
                     "origin": format!("{origin}_NO"),
+                    "liquidity_intent": if track_taker_fallback {
+                        LiquidityIntent::TakerException.as_str()
+                    } else {
+                        LiquidityIntent::Maker.as_str()
+                    },
+                    "taker_exception_reason": Option::<&str>::None,
+                    "taker_cap_policy": if track_taker_fallback {
+                        Some(TakerCapPolicy::EnforceCap.as_str())
+                    } else {
+                        None
+                    },
                 }),
             );
         }

@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 struct BotRuntimeNoopLogger;
 impl LogLike for BotRuntimeNoopLogger {
@@ -53,6 +54,14 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
     cfg.stale_seconds = 3;
     cfg.max_total_cost = 20.0;
     cfg.reserve_usd = 2.0;
+    let state_file = std::env::temp_dir().join(format!(
+        "bot_runtime_test_state_{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let daily_liquidity_state_file = std::env::temp_dir().join(format!(
+        "bot_runtime_test_daily_liquidity_state_{}.json",
+        uuid::Uuid::new_v4()
+    ));
     MakerHedgeCapBot {
         cfg,
         logger: Arc::new(BotRuntimeNoopLogger),
@@ -64,8 +73,10 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
             yes_asset_id: Some("yes_asset_id".to_string()),
             no_asset_id: Some("no_asset_id".to_string()),
         },
-        state_file: PathBuf::from("__bot_runtime_test_state_nonexistent.json"),
+        state_file,
         state: Arc::new(Mutex::new(BotState::default())),
+        daily_liquidity_state_file,
+        daily_liquidity_state: Arc::new(Mutex::new(DailyLiquidityState::default())),
         start_trade_iso: "2024-01-01T00:00:00Z".to_string(),
         first_entry_fill_iso: Arc::new(Mutex::new(None)),
         first_entry_reason: Arc::new(Mutex::new(None)),
@@ -74,7 +85,7 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
         stop_loss_category: Arc::new(Mutex::new(None)),
         exit_reason: Arc::new(Mutex::new("RUNNING".to_string())),
         stop_flag: Arc::new(AtomicBool::new(false)),
-        wallet_address: "0xtest".to_string(),
+        wallet_address: format!("0xtest{}", uuid::Uuid::new_v4().simple()),
         min_maker_notional: 1.0,
         min_taker_notional: 1.0,
         reconcile_sell_credit_mult: 1.0,
@@ -142,6 +153,20 @@ fn set_pair_quotes(
         quotes.insert("no_asset_id".to_string(), (no_bid, no_ask, ts));
     }
 }
+
+fn set_daily_liquidity_state(
+    bot: &MakerHedgeCapBot,
+    maker_fill_shares: f64,
+    taker_fill_shares: f64,
+) {
+    if let Ok(mut state) = bot.daily_liquidity_state.lock() {
+        state.day_key_utc = crate::helpers::current_utc_day_key();
+        state.maker_fill_shares = maker_fill_shares;
+        state.taker_fill_shares = taker_fill_shares;
+        let _ =
+            crate::helpers::save_daily_liquidity_state(&bot.daily_liquidity_state_file, &mut state);
+    }
+}
 /// Exercises the exec mode defaults to BOT runtime scenario and checks the expected BOT
 /// behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -162,6 +187,25 @@ fn exec_mode_rejects_unsupported_modes() {
         let err = require_bot_exec_mode().expect_err("unsupported mode should fail");
         assert!(err.to_string().contains("Only BOT is supported"));
     });
+}
+
+#[test]
+fn wallet_daily_liquidity_file_uses_shared_state_dir_override() {
+    let _guard = env_lock().lock().expect("env lock");
+    let prior = std::env::var("POLYBOT_SHARED_STATE_DIR").ok();
+    std::env::set_var("POLYBOT_SHARED_STATE_DIR", "__shared_state_test");
+
+    let path = MakerHedgeCapBot::daily_liquidity_state_file_for_wallet("0xAbC");
+
+    match prior {
+        Some(value) => std::env::set_var("POLYBOT_SHARED_STATE_DIR", value),
+        None => std::env::remove_var("POLYBOT_SHARED_STATE_DIR"),
+    }
+
+    assert_eq!(
+        path,
+        PathBuf::from("__shared_state_test").join("maker_hedgecap_daily_liquidity_0xabc.json")
+    );
 }
 /// Exercises the BOT runtime phase routing covers runtime segments scenario and checks the
 /// expected BOT behavior.
@@ -592,6 +636,179 @@ fn apply_fill_updates_pair_owned_position_without_side_orphans() {
     assert!((paired.total_cost - 4.25).abs() < 1e-9);
     assert_eq!(paired.paired_size, 5.0);
     assert_eq!(paired.unmatched_size, 0.0);
+}
+
+#[test]
+fn hydrate_runtime_liquidity_counters_restores_pair_and_daily_taker_history() {
+    let bot = make_bot_runtime_test_bot();
+    if let Ok(mut state) = bot.state.lock() {
+        state.pair_total_fill_events = 3;
+        state.pair_total_fill_shares = 30.0;
+        state.pair_maker_fill_events = 2;
+        state.pair_maker_fill_shares = 27.0;
+        state.pair_taker_fill_events = 1;
+        state.pair_taker_fill_shares = 3.0;
+    }
+    set_daily_liquidity_state(&bot, 90.0, 9.0);
+
+    bot._hydrate_runtime_liquidity_counters_from_state();
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.total_fill_events, 3);
+    assert!((runtime_state.maker_fill_shares - 27.0).abs() < 1e-9);
+    assert!((runtime_state.taker_fill_shares - 3.0).abs() < 1e-9);
+    assert!((runtime_state.daily_maker_fill_shares - 90.0).abs() < 1e-9);
+    assert!((runtime_state.daily_taker_fill_shares - 9.0).abs() < 1e-9);
+
+    let snapshot = bot._taker_share_snapshot(1.0);
+    assert!((snapshot.pair_taker_share - 0.1).abs() < 1e-9);
+    assert!((snapshot.daily_taker_share - (9.0 / 99.0)).abs() < 1e-9);
+}
+
+#[test]
+fn shared_daily_liquidity_state_reloads_before_cap_checks_and_writes() {
+    let mut bot_a = make_bot_runtime_test_bot();
+    let mut bot_b = make_bot_runtime_test_bot();
+    let shared_file = std::env::temp_dir().join(format!(
+        "polybot_daily_liquidity_reload_{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_file(&shared_file);
+    bot_a.daily_liquidity_state_file = shared_file.clone();
+    bot_b.daily_liquidity_state_file = shared_file.clone();
+
+    let mut persisted = DailyLiquidityState {
+        day_key_utc: crate::helpers::current_utc_day_key(),
+        maker_fill_shares: 90.0,
+        taker_fill_shares: 9.0,
+    };
+    crate::helpers::save_daily_liquidity_state(&shared_file, &mut persisted)
+        .expect("seed shared daily state");
+
+    if let Ok(mut state) = bot_b.daily_liquidity_state.lock() {
+        *state = DailyLiquidityState::default();
+    }
+    let (maker_qty, taker_qty) = bot_b._bot_runtime_refresh_daily_liquidity_counters();
+    assert!((maker_qty - 90.0).abs() < 1e-9);
+    assert!((taker_qty - 9.0).abs() < 1e-9);
+
+    if let Ok(mut state) = bot_b.daily_liquidity_state.lock() {
+        state.day_key_utc = crate::helpers::current_utc_day_key();
+        state.maker_fill_shares = 0.0;
+        state.taker_fill_shares = 0.0;
+    }
+    bot_b._record_daily_liquidity_fill_global(1.0, false, Some(now_ts_f64()));
+
+    let reloaded = crate::helpers::load_daily_liquidity_state(&shared_file)
+        .expect("reload merged shared daily state");
+    assert!((reloaded.maker_fill_shares - 90.0).abs() < 1e-9);
+    assert!((reloaded.taker_fill_shares - 10.0).abs() < 1e-9);
+
+    let _ = std::fs::remove_file(&shared_file);
+}
+
+#[test]
+fn taker_share_snapshot_counts_sibling_pending_orders_only_for_daily_share_when_other_pair() {
+    let _guard = env_lock().lock().expect("env lock");
+    let shared_dir =
+        std::env::temp_dir().join(format!("polybot_shared_pending_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&shared_dir).expect("create shared pending dir");
+    let prior_shared_dir = std::env::var("POLYBOT_SHARED_STATE_DIR").ok();
+    std::env::set_var("POLYBOT_SHARED_STATE_DIR", &shared_dir);
+
+    let mut bot_a = make_bot_runtime_test_bot();
+    let mut bot_b = make_bot_runtime_test_bot();
+    let shared_wallet = format!("0xshared{}", uuid::Uuid::new_v4().simple());
+    bot_a.wallet_address = shared_wallet.clone();
+    bot_b.wallet_address = shared_wallet.clone();
+    bot_b.market_slug = "other-pair".to_string();
+    bot_b.pair_identity = PairIdentity {
+        pair_id: canonical_pair_id_from_slug("other-pair"),
+        market_slug: "other-pair".to_string(),
+        condition_id: None,
+        yes_asset_id: Some("other_yes_asset_id".to_string()),
+        no_asset_id: Some("other_no_asset_id".to_string()),
+    };
+    bot_b.yes_asset = Some("other_yes_asset_id".to_string());
+    bot_b.no_asset = Some("other_no_asset_id".to_string());
+    let daily_file = MakerHedgeCapBot::daily_liquidity_state_file_for_wallet(&shared_wallet);
+    bot_a.daily_liquidity_state_file = daily_file.clone();
+    bot_b.daily_liquidity_state_file = daily_file.clone();
+    set_daily_liquidity_state(&bot_a, 90.0, 0.0);
+    if let Ok(mut runtime_state) = bot_a.bot_runtime_state.lock() {
+        runtime_state.maker_fill_shares = 90.0;
+        runtime_state.taker_fill_shares = 0.0;
+    }
+
+    bot_b._remember_taker_order(
+        "shared-pending-oid",
+        "other_yes_asset_id",
+        9.0,
+        0.40,
+        "BUY",
+        LiquidityIntent::TakerException,
+        Some(TakerExceptionReason::AwaitSecondFillRescue),
+        TakerCapPolicy::EnforceCap,
+    );
+
+    let snapshot = bot_a._taker_share_snapshot(2.0);
+    assert!((snapshot.daily_taker_share - 0.0).abs() < 1e-9);
+    assert!((snapshot.projected_pair_taker_share - (2.0 / 92.0)).abs() < 1e-9);
+    assert!((snapshot.projected_daily_taker_share - (11.0 / 101.0)).abs() < 1e-9);
+
+    bot_b._forget_taker_order("shared-pending-oid");
+    let _ = std::fs::remove_file(MakerHedgeCapBot::pending_taker_state_file_for_wallet(
+        &shared_wallet,
+    ));
+    let _ = std::fs::remove_file(&daily_file);
+    let _ = std::fs::remove_dir_all(&shared_dir);
+    match prior_shared_dir {
+        Some(value) => std::env::set_var("POLYBOT_SHARED_STATE_DIR", value),
+        None => std::env::remove_var("POLYBOT_SHARED_STATE_DIR"),
+    }
+}
+
+#[test]
+fn apply_fill_with_fill_ts_attributes_daily_liquidity_to_fill_day() {
+    let bot = make_bot_runtime_test_bot();
+    let fill_ts = now_ts_f64() + 86_400.0;
+    let expected_day_key = crate::helpers::utc_day_key_from_ts(fill_ts);
+    if let Ok(mut daily_state) = bot.daily_liquidity_state.lock() {
+        daily_state.day_key_utc = crate::helpers::current_utc_day_key();
+        daily_state.maker_fill_shares = 0.0;
+        daily_state.taker_fill_shares = 0.0;
+        let _ = crate::helpers::save_daily_liquidity_state(
+            &bot.daily_liquidity_state_file,
+            &mut daily_state,
+        );
+    }
+
+    assert!(bot._apply_fill_with_fill_ts(
+        "yes_asset_id",
+        0.40,
+        5.0,
+        "fill-with-ts",
+        "BUY",
+        Some(fill_ts),
+    ));
+
+    let state = bot.state.lock().expect("state lock");
+    assert_eq!(state.pair_taker_fill_events, 1);
+    assert!((state.pair_taker_fill_shares - 5.0).abs() < 1e-9);
+    drop(state);
+
+    let daily_state = bot
+        .daily_liquidity_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(daily_state.day_key_utc, expected_day_key);
+    assert_eq!(daily_state.maker_fill_shares, 0.0);
+    assert!((daily_state.taker_fill_shares - 5.0).abs() < 1e-9);
 }
 
 #[test]
@@ -1096,7 +1313,10 @@ fn await_second_fill_deadline_rescue_can_use_ask_only_missing_side_quote() {
         st.open_both_first_fill_ts = now - 31.0;
         st.await_second_fill_started_ts = now - 31.0;
         st.await_second_fill_missing_side = Some(OutcomeSide::No);
+        st.maker_fill_shares = 100.0;
+        st.daily_maker_fill_shares = 100.0;
     }
+    set_daily_liquidity_state(&bot, 100.0, 0.0);
 
     let cfg = *bot._bot_runtime_cfg();
     bot._bot_runtime_await_second_fill_handler(now, 31.0, 2.0, 5.0, 0.0, 2.0, 0.0, &cfg);
@@ -1116,4 +1336,175 @@ fn await_second_fill_deadline_rescue_can_use_ask_only_missing_side_quote() {
             .and_then(|field| field.as_bool())
             .unwrap_or(false)
     }));
+}
+
+#[test]
+fn taker_share_helpers_compute_current_and_projected_share() {
+    assert_eq!(bot_runtime_taker_share(0.0, 0.0), 0.0);
+    assert!((bot_runtime_taker_share(95.0, 5.0) - 0.05).abs() < 1e-9);
+    assert!((bot_runtime_projected_taker_share(90.0, 5.0, 3.0, 2.0) - 0.10).abs() < 1e-9);
+}
+
+#[test]
+fn taker_submit_requires_exception_reason() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+
+    let oid = bot._place_taker_bid_fak(
+        "yes_asset_id",
+        0.42,
+        5.0,
+        Some("FAK"),
+        None,
+        TakerCapPolicy::EnforceCap,
+    );
+
+    assert!(oid.is_none());
+}
+
+#[test]
+fn taker_submit_blocks_projected_market_cap() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.maker_fill_shares = 90.0;
+        runtime_state.taker_fill_shares = 9.0;
+    }
+
+    let oid = bot._place_taker_bid_fak(
+        "no_asset_id",
+        0.40,
+        2.0,
+        Some("FAK"),
+        Some(TakerExceptionReason::AwaitSecondFillRescue),
+        TakerCapPolicy::EnforceCap,
+    );
+
+    assert!(oid.is_none());
+}
+
+#[test]
+fn taker_submit_blocks_daily_cap() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    set_daily_liquidity_state(&bot, 90.0, 9.0);
+    bot._bot_runtime_refresh_daily_liquidity_counters();
+
+    let oid = bot._place_taker_bid_fak(
+        "no_asset_id",
+        0.40,
+        2.0,
+        Some("FAK"),
+        Some(TakerExceptionReason::AwaitSecondFillRescue),
+        TakerCapPolicy::EnforceCap,
+    );
+
+    assert!(oid.is_none());
+}
+
+#[test]
+fn recovery_bypass_taker_submit_is_allowed_above_cap_and_records_metadata() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.maker_fill_shares = 10.0;
+        runtime_state.taker_fill_shares = 5.0;
+    }
+    set_daily_liquidity_state(&bot, 10.0, 5.0);
+    bot._bot_runtime_refresh_daily_liquidity_counters();
+
+    let oid = bot._place_taker_ask_fak(
+        "yes_asset_id",
+        0.40,
+        5.0,
+        Some("FAK"),
+        Some(TakerExceptionReason::RecoveryBypass),
+        TakerCapPolicy::RecoveryBypass,
+    );
+
+    let oid = oid.expect("recovery bypass taker order");
+    let ctx = bot
+        .order_exec_context
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&oid).cloned())
+        .expect("taker exec context");
+    assert_eq!(
+        ctx.get("liquidity_intent")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+        LiquidityIntent::TakerException.as_str()
+    );
+    assert_eq!(
+        ctx.get("taker_exception_reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+        TakerExceptionReason::RecoveryBypass.as_str()
+    );
+}
+
+#[test]
+fn runtime_metrics_snapshot_exposes_pair_and_daily_taker_share() {
+    let mut state = BotRuntimeState::default();
+    state.total_fill_events = 3;
+    state.total_fill_shares = 100.0;
+    state.maker_fill_shares = 95.0;
+    state.taker_fill_events = 1;
+    state.taker_fill_shares = 5.0;
+    state.daily_maker_fill_shares = 190.0;
+    state.daily_taker_fill_shares = 10.0;
+
+    let metrics = bot_runtime_metrics_snapshot(&state, 10.0, 10.0, 4.0, 4.0, 8.0);
+
+    assert!((metrics.pair_taker_share - 0.05).abs() < 1e-9);
+    assert!((metrics.daily_taker_share - 0.05).abs() < 1e-9);
+    assert_eq!(metrics.taker_fill_events, 1);
+    assert!((metrics.taker_fill_shares - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn await_second_fill_rescue_hard_pauses_when_taker_cap_is_breached() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    let now = now_ts_f64();
+    bot.start_ts = now.floor() as i64 - 60;
+    bot.expiry_ts = bot.start_ts + 300;
+    if let Ok(mut state) = bot.state.lock() {
+        state.q_yes = 5.0;
+        state.c_yes = 2.0;
+        state.q_no = 0.0;
+        state.c_no = 0.0;
+    }
+    set_daily_liquidity_state(&bot, 5.0, 0.0);
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.open_both_first_fill_ts = now - 31.0;
+        runtime_state.await_second_fill_started_ts = now - 31.0;
+        runtime_state.await_second_fill_missing_side = Some(OutcomeSide::No);
+        runtime_state.maker_fill_shares = 5.0;
+        runtime_state.daily_maker_fill_shares = 5.0;
+    }
+    set_pair_quotes(&bot, 0.40, 0.42, 0.0, 0.39, now);
+    if let Ok(mut books) = bot.book_cache.lock() {
+        books.insert(
+            "no_asset_id".to_string(),
+            (
+                json!({
+                    "asks": [{ "price": 0.39, "size": 8.0 }],
+                    "bids": []
+                }),
+                now,
+            ),
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_await_second_fill_handler(now, 31.0, 2.0, 5.0, 0.0, 2.0, 0.0, &cfg);
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert!(!runtime_state.await_second_fill_rescue_used);
+    assert!(runtime_state.await_second_fill_hard_paused);
 }

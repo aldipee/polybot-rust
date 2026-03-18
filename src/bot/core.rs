@@ -7,6 +7,8 @@ pub struct MakerHedgeCapBot {
     pub(super) pair_identity: PairIdentity,
     pub state_file: PathBuf,
     pub state: Arc<Mutex<BotState>>,
+    pub daily_liquidity_state_file: PathBuf,
+    pub daily_liquidity_state: Arc<Mutex<DailyLiquidityState>>,
     pub start_trade_iso: String,
     pub first_entry_fill_iso: Arc<Mutex<Option<String>>>,
     pub first_entry_reason: Arc<Mutex<Option<String>>>,
@@ -70,6 +72,116 @@ pub struct MakerHedgeCapBot {
 }
 
 impl MakerHedgeCapBot {
+    fn shared_state_dir() -> PathBuf {
+        if let Ok(raw) = std::env::var("POLYBOT_SHARED_STATE_DIR") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+        if let Ok(raw) = std::env::var("BOT_SHARED_STATE_DIR") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.file_name().and_then(|name| name.to_str()) == Some("state") {
+                if let Some(instance_dir) = cwd.parent() {
+                    if let Some(instances_dir) = instance_dir.parent() {
+                        if instances_dir.file_name().and_then(|name| name.to_str())
+                            == Some("instances")
+                        {
+                            if let Some(root_dir) = instances_dir.parent() {
+                                return root_dir.join("shared-state");
+                            }
+                        }
+                    }
+                }
+            }
+            return cwd;
+        }
+        PathBuf::from(".")
+    }
+
+    pub(in crate::bot) fn daily_liquidity_state_file_for_wallet(wallet_address: &str) -> PathBuf {
+        let slug = wallet_address
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>();
+        let suffix = if slug.trim_matches('_').is_empty() {
+            "default".to_string()
+        } else {
+            slug.trim_matches('_').to_string()
+        };
+        Self::shared_state_dir().join(format!("maker_hedgecap_daily_liquidity_{suffix}.json"))
+    }
+
+    pub(in crate::bot) fn pending_taker_state_file_for_wallet(wallet_address: &str) -> PathBuf {
+        let slug = wallet_address
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>();
+        let suffix = if slug.trim_matches('_').is_empty() {
+            "default".to_string()
+        } else {
+            slug.trim_matches('_').to_string()
+        };
+        Self::shared_state_dir().join(format!("maker_hedgecap_pending_takers_{suffix}.json"))
+    }
+
+    pub(in crate::bot) fn shared_state_lock_timeout() -> Duration {
+        Duration::from_secs(5)
+    }
+
+    pub(in crate::bot) fn _hydrate_runtime_liquidity_counters_from_state(&self) {
+        if let (Ok(state), Ok(mut runtime_state)) =
+            (self.state.lock(), self.bot_runtime_state.lock())
+        {
+            runtime_state.total_fill_events = state.pair_total_fill_events;
+            runtime_state.total_fill_shares = state.pair_total_fill_shares.max(0.0);
+            runtime_state.maker_fill_events = state.pair_maker_fill_events;
+            runtime_state.maker_fill_shares = state.pair_maker_fill_shares.max(0.0);
+            runtime_state.taker_fill_events = state.pair_taker_fill_events;
+            runtime_state.taker_fill_shares = state.pair_taker_fill_shares.max(0.0);
+        }
+        if let (Ok(daily_state), Ok(mut runtime_state)) = (
+            self.daily_liquidity_state.lock(),
+            self.bot_runtime_state.lock(),
+        ) {
+            runtime_state.daily_taker_day_key_utc = daily_state.day_key_utc.clone();
+            runtime_state.daily_maker_fill_shares = daily_state.maker_fill_shares.max(0.0);
+            runtime_state.daily_taker_fill_shares = daily_state.taker_fill_shares.max(0.0);
+        }
+    }
+
+    pub(in crate::bot) fn _reload_daily_liquidity_state_from_disk(&self) -> DailyLiquidityState {
+        let _lock = crate::helpers::acquire_companion_file_lock(
+            &self.daily_liquidity_state_file,
+            Self::shared_state_lock_timeout(),
+        )
+        .ok();
+        let snapshot =
+            load_daily_liquidity_state(&self.daily_liquidity_state_file).unwrap_or_else(|_| {
+                self.daily_liquidity_state
+                    .lock()
+                    .map(|state| state.clone())
+                    .unwrap_or_default()
+            });
+        if let Ok(mut state) = self.daily_liquidity_state.lock() {
+            *state = snapshot.clone();
+        }
+        snapshot
+    }
+
+    pub(in crate::bot) fn _pending_taker_state_file(&self) -> PathBuf {
+        Self::pending_taker_state_file_for_wallet(self.wallet_address.as_str())
+    }
+
     /// Builds a fully wired bot instance from env-backed config, persisted state,
     /// derived market metadata, and optional latency/CLOB clients.
     ///
@@ -91,6 +203,14 @@ impl MakerHedgeCapBot {
             wallet_address = cfg.funder.clone().unwrap_or_default();
         }
         wallet_address = wallet_address.trim().to_ascii_lowercase();
+        let daily_liquidity_state_file =
+            Self::daily_liquidity_state_file_for_wallet(wallet_address.as_str());
+        if let Some(parent) = daily_liquidity_state_file.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let daily_liquidity_state = load_daily_liquidity_state(&daily_liquidity_state_file)?;
 
         let mut start_ts = now_ts();
         let mut expiry_ts = start_ts + cfg.market_duration_seconds;
@@ -154,6 +274,8 @@ impl MakerHedgeCapBot {
             pair_identity: PairIdentity::from_slug(market_slug),
             state_file,
             state: Arc::new(Mutex::new(state)),
+            daily_liquidity_state_file,
+            daily_liquidity_state: Arc::new(Mutex::new(daily_liquidity_state)),
             start_trade_iso,
             first_entry_fill_iso: Arc::new(Mutex::new(None)),
             first_entry_reason: Arc::new(Mutex::new(None)),
@@ -231,6 +353,8 @@ impl MakerHedgeCapBot {
             bot_runtime_state: Arc::new(Mutex::new(BotRuntimeState::default())),
             bot_runtime_cfg: bot_runtime_config_from_env(),
         };
+
+        out._hydrate_runtime_liquidity_counters_from_state();
 
         out._apply_cfg_overrides_from_env();
         let min_entry_edge_ticks = env_int("MIN_ENTRY_EDGE_TICKS", out.cfg.entry_edge_ticks).max(0);

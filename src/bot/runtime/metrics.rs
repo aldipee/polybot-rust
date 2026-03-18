@@ -56,6 +56,37 @@ pub(in crate::bot) fn bot_runtime_fill_distribution_summary_f64(values: &[f64; 5
         .collect::<Vec<_>>()
         .join(",")
 }
+
+pub(in crate::bot) fn bot_runtime_taker_share(maker_qty: f64, taker_qty: f64) -> f64 {
+    let maker = maker_qty.max(0.0);
+    let taker = taker_qty.max(0.0);
+    let total = maker + taker;
+    if total > 1e-9 {
+        (taker / total).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+pub(in crate::bot) fn bot_runtime_projected_taker_share(
+    maker_qty: f64,
+    taker_qty: f64,
+    pending_taker_qty: f64,
+    requested_taker_qty: f64,
+) -> f64 {
+    bot_runtime_taker_share(
+        maker_qty,
+        taker_qty.max(0.0) + pending_taker_qty.max(0.0) + requested_taker_qty.max(0.0),
+    )
+}
+
+pub(in crate::bot) fn bot_runtime_taker_share_target() -> f64 {
+    0.05
+}
+
+pub(in crate::bot) fn bot_runtime_taker_share_cap() -> f64 {
+    0.10
+}
 /// Implements paired cost band index for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
@@ -145,6 +176,9 @@ pub(in crate::bot) fn bot_runtime_note_fill_event(
     if is_maker {
         state.maker_fill_events = state.maker_fill_events.saturating_add(1);
         state.maker_fill_shares += filled.max(0.0);
+    } else {
+        state.taker_fill_events = state.taker_fill_events.saturating_add(1);
+        state.taker_fill_shares += filled.max(0.0);
     }
     state.fill_events_by_segment[segment_idx] =
         state.fill_events_by_segment[segment_idx].saturating_add(1);
@@ -173,6 +207,12 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
     } else {
         0.0
     };
+    let taker_fill_shares = state.taker_fill_shares.max(0.0);
+    let pair_taker_share = bot_runtime_taker_share(state.maker_fill_shares, taker_fill_shares);
+    let daily_maker_fill_shares = state.daily_maker_fill_shares.max(0.0);
+    let daily_taker_fill_shares = state.daily_taker_fill_shares.max(0.0);
+    let daily_taker_share =
+        bot_runtime_taker_share(daily_maker_fill_shares, daily_taker_fill_shares);
     let below_snapshot_optional_fill_rate = if state.below_snapshot_optional_submit_shares > 1e-9 {
         (state.below_snapshot_optional_fill_shares.max(0.0)
             / state.below_snapshot_optional_submit_shares.max(0.0))
@@ -197,6 +237,12 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
         fills_per_market: state.total_fill_events,
         total_fill_shares,
         maker_fill_share,
+        taker_fill_events: state.taker_fill_events,
+        taker_fill_shares,
+        pair_taker_share,
+        daily_maker_fill_shares,
+        daily_taker_fill_shares,
+        daily_taker_share,
         fill_events_by_segment: state.fill_events_by_segment,
         fill_shares_by_segment: state.fill_shares_by_segment,
         paired_size: q_yes.max(0.0).min(q_no.max(0.0)),

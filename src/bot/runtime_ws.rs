@@ -1157,6 +1157,8 @@ impl MakerHedgeCapBot {
                 px,
                 sell_int as f64,
                 Some(&ot_name.to_ascii_uppercase()),
+                Some(TakerExceptionReason::RecoveryBypass),
+                TakerCapPolicy::RecoveryBypass,
             );
             thread::sleep(Duration::from_secs_f64(wait_s));
         }

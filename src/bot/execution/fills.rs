@@ -1,5 +1,168 @@
 use super::*;
 impl MakerHedgeCapBot {
+    /// Parses an exchange/event fill timestamp into epoch seconds for the active BOT execution
+    /// path.
+    /// This reads execution state, exchange payloads, or cached order context for the active
+    /// BOT runtime.
+
+    pub(in crate::bot) fn _fill_event_ts_from_value(&self, value: Option<&Value>) -> Option<f64> {
+        let raw = match value? {
+            Value::Number(number) => number.as_f64()?,
+            Value::String(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if let Ok(parsed) = trimmed.parse::<f64>() {
+                    parsed
+                } else if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+                    parsed.timestamp_millis() as f64 / 1000.0
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if !raw.is_finite() || raw <= 0.0 {
+            return None;
+        }
+        let ts = if raw >= 10_000_000_000.0 {
+            raw / 1000.0
+        } else {
+            raw
+        };
+        if ts.is_finite() && ts > 0.0 {
+            Some(ts)
+        } else {
+            None
+        }
+    }
+
+    /// Records the wallet-global daily liquidity counters for the active BOT execution path.
+    /// This reads execution state, exchange payloads, or cached order context for the active
+    /// BOT runtime.
+
+    pub(in crate::bot) fn _record_daily_liquidity_fill_global(
+        &self,
+        filled: f64,
+        is_maker: bool,
+        fill_ts: Option<f64>,
+    ) {
+        let qty = filled.max(0.0);
+        if qty <= 1e-9 {
+            return;
+        }
+        let resolved_fill_ts = fill_ts
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or_else(now_ts_f64);
+        let day_key = crate::helpers::utc_day_key_from_ts(resolved_fill_ts);
+        let state = if let Ok(_lock) = crate::helpers::acquire_companion_file_lock(
+            &self.daily_liquidity_state_file,
+            MakerHedgeCapBot::shared_state_lock_timeout(),
+        ) {
+            let mut state = load_daily_liquidity_state(&self.daily_liquidity_state_file)
+                .unwrap_or_else(|_| {
+                    self.daily_liquidity_state
+                        .lock()
+                        .map(|state| state.clone())
+                        .unwrap_or_default()
+                });
+            state.record_fill(qty, is_maker, day_key.as_str());
+            let _ = save_daily_liquidity_state(&self.daily_liquidity_state_file, &mut state);
+            state
+        } else {
+            let mut state = self
+                .daily_liquidity_state
+                .lock()
+                .map(|state| state.clone())
+                .unwrap_or_default();
+            state.record_fill(qty, is_maker, day_key.as_str());
+            state
+        };
+        let state_day_key = state.day_key_utc.clone();
+        let maker_qty = state.maker_fill_shares.max(0.0);
+        let taker_qty = state.taker_fill_shares.max(0.0);
+        if let Ok(mut shared_state) = self.daily_liquidity_state.lock() {
+            *shared_state = state;
+        }
+        if let Ok(mut runtime_state) = self.bot_runtime_state.lock() {
+            runtime_state.daily_taker_day_key_utc = state_day_key;
+            runtime_state.daily_maker_fill_shares = maker_qty;
+            runtime_state.daily_taker_fill_shares = taker_qty;
+        }
+    }
+
+    pub(in crate::bot) fn _remember_shared_pending_taker_order(
+        &self,
+        order_id: &str,
+        asset_id: &str,
+        size: f64,
+        applied: f64,
+        side: &str,
+        ts: f64,
+    ) {
+        let state_file = self._pending_taker_state_file();
+        let Ok(_lock) = crate::helpers::acquire_companion_file_lock(
+            &state_file,
+            MakerHedgeCapBot::shared_state_lock_timeout(),
+        ) else {
+            return;
+        };
+        let mut state = crate::helpers::load_shared_pending_taker_state(
+            &state_file,
+            self.taker_order_ttl_seconds as f64,
+        )
+        .unwrap_or_default();
+        let pair_id = self.pair_identity().pair_id;
+        state.remember_order(
+            order_id,
+            pair_id.as_str(),
+            asset_id,
+            side,
+            size,
+            applied,
+            ts,
+        );
+        let _ = crate::helpers::save_shared_pending_taker_state(&state_file, &mut state);
+    }
+
+    pub(in crate::bot) fn _update_shared_pending_taker_order_applied(
+        &self,
+        order_id: &str,
+        applied: f64,
+    ) {
+        let state_file = self._pending_taker_state_file();
+        let Ok(_lock) = crate::helpers::acquire_companion_file_lock(
+            &state_file,
+            MakerHedgeCapBot::shared_state_lock_timeout(),
+        ) else {
+            return;
+        };
+        let mut state = crate::helpers::load_shared_pending_taker_state(
+            &state_file,
+            self.taker_order_ttl_seconds as f64,
+        )
+        .unwrap_or_default();
+        state.update_applied(order_id, applied, now_ts_f64());
+        let _ = crate::helpers::save_shared_pending_taker_state(&state_file, &mut state);
+    }
+
+    pub(in crate::bot) fn _forget_shared_pending_taker_order(&self, order_id: &str) {
+        let state_file = self._pending_taker_state_file();
+        let Ok(_lock) = crate::helpers::acquire_companion_file_lock(
+            &state_file,
+            MakerHedgeCapBot::shared_state_lock_timeout(),
+        ) else {
+            return;
+        };
+        let mut state = crate::helpers::load_shared_pending_taker_state(
+            &state_file,
+            self.taker_order_ttl_seconds as f64,
+        )
+        .unwrap_or_default();
+        state.forget_order(order_id);
+        let _ = crate::helpers::save_shared_pending_taker_state(&state_file, &mut state);
+    }
     /// Returns or derives OCO after maker fill for the active BOT execution path.
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
@@ -22,6 +185,18 @@ impl MakerHedgeCapBot {
         filled: f64,
         trade_key: &str,
         side: &str,
+    ) -> bool {
+        self._apply_fill_with_fill_ts(asset_id, price, filled, trade_key, side, None)
+    }
+
+    pub(in crate::bot) fn _apply_fill_with_fill_ts(
+        &self,
+        asset_id: &str,
+        price: f64,
+        filled: f64,
+        trade_key: &str,
+        side: &str,
+        fill_ts: Option<f64>,
     ) -> bool {
         let side_u = side.trim().to_ascii_uppercase();
         if !matches!(side_u.as_str(), "BUY" | "SELL") {
@@ -55,8 +230,10 @@ impl MakerHedgeCapBot {
         let opened_position = side_u == "BUY" && qty_before <= 1e-12 && qty_after > 1e-12;
         let closed_position = qty_after <= 1e-12;
         let mark_first_entry_fill = side_u == "BUY" && qty_after > qty_before + 1e-12;
+        guard.record_pair_liquidity_fill(filled, false);
         let _ = save_state(&self.state_file, &mut guard);
         drop(guard);
+        self._record_daily_liquidity_fill_global(filled, false, fill_ts);
         // Clear seed in-flight cooldown on any fill ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â allows immediate re-seeding
         // of the other side instead of waiting for the hardcoded timeout.
         self._runtime_ts_set("__maker_skew_seed_inflight_until", 0.0);
@@ -182,13 +359,16 @@ impl MakerHedgeCapBot {
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
 
-    pub fn _remember_taker_order(
+    pub(in crate::bot) fn _remember_taker_order(
         &self,
         order_id: &str,
         asset_id: &str,
         size: f64,
         px_limit: f64,
         side: &str,
+        liquidity_intent: LiquidityIntent,
+        taker_exception_reason: Option<TakerExceptionReason>,
+        taker_cap_policy: TakerCapPolicy,
     ) {
         if order_id.trim().is_empty() {
             return;
@@ -201,10 +381,21 @@ impl MakerHedgeCapBot {
             px_limit,
             side: side.to_ascii_uppercase(),
             ts: now_ts_f64(),
+            liquidity_intent,
+            taker_exception_reason,
+            taker_cap_policy,
         };
         if let Ok(mut m) = self.taker_orders.lock() {
             m.insert(order_id.to_string(), rec);
         }
+        self._remember_shared_pending_taker_order(
+            order_id,
+            asset_id,
+            size,
+            0.0,
+            side,
+            now_ts_f64(),
+        );
     }
     /// Removes taker order from the BOT''s runtime bookkeeping.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -217,6 +408,7 @@ impl MakerHedgeCapBot {
         if let Ok(mut m) = self.taker_orders.lock() {
             m.remove(order_id);
         }
+        self._forget_shared_pending_taker_order(order_id);
     }
     /// Returns whether recent taker order is true for the current BOT context.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -275,6 +467,54 @@ impl MakerHedgeCapBot {
                     .sum()
             })
             .unwrap_or(0.0)
+    }
+
+    /// Returns or derives pending taker quantity for the active BOT execution path.
+    /// This reads execution state, exchange payloads, or cached order context for the active
+    /// BOT runtime.
+
+    pub fn _pending_taker_qty(&self, side: Option<&str>, asset_id: Option<&str>) -> f64 {
+        let state_file = self._pending_taker_state_file();
+        let Ok(_lock) = crate::helpers::acquire_companion_file_lock(
+            &state_file,
+            MakerHedgeCapBot::shared_state_lock_timeout(),
+        ) else {
+            return 0.0;
+        };
+        crate::helpers::load_shared_pending_taker_state(
+            &state_file,
+            self.taker_order_ttl_seconds as f64,
+        )
+        .map(|state| state.pending_qty(side, asset_id, self.taker_order_ttl_seconds as f64))
+        .unwrap_or(0.0)
+    }
+
+    /// Returns or derives pending taker quantity for the current pair only.
+    /// This reads the shared pending taker registry for the active BOT execution path.
+
+    pub(in crate::bot) fn _pending_taker_qty_for_current_pair(&self, side: Option<&str>) -> f64 {
+        let pair = self.pair_identity();
+        let state_file = self._pending_taker_state_file();
+        let Ok(_lock) = crate::helpers::acquire_companion_file_lock(
+            &state_file,
+            MakerHedgeCapBot::shared_state_lock_timeout(),
+        ) else {
+            return 0.0;
+        };
+        crate::helpers::load_shared_pending_taker_state(
+            &state_file,
+            self.taker_order_ttl_seconds as f64,
+        )
+        .map(|state| {
+            state.pending_qty_for_pair(
+                pair.pair_id.as_str(),
+                pair.yes_asset_id.as_deref(),
+                pair.no_asset_id.as_deref(),
+                side,
+                self.taker_order_ttl_seconds as f64,
+            )
+        })
+        .unwrap_or(0.0)
     }
     /// Returns whether the BOT currently has pending taker order recent.
     /// This reads execution state, exchange payloads, or cached order context for the active

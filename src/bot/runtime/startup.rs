@@ -1692,12 +1692,42 @@ impl MakerHedgeCapBot {
                 );
                 return;
             }
+            if let Err(reason) = self._evaluate_taker_submit_gate(
+                "BUY",
+                missing_asset,
+                rescue_size as f64,
+                Some(TakerExceptionReason::AwaitSecondFillRescue),
+                TakerCapPolicy::EnforceCap,
+            ) {
+                self._bot_runtime_mark_await_second_fill_hard_paused(
+                    now,
+                    reason.as_str(),
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                self._bot_runtime_log_await_second_fill_hold(
+                    reason.as_str(),
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
             self._set_pending_entry_reason("BOT_AWAIT_SECOND_FILL_RESCUE");
             let oid = self._place_taker_bid_fak(
                 missing_asset,
                 missing_ask,
                 rescue_size as f64,
                 Some("FAK"),
+                Some(TakerExceptionReason::AwaitSecondFillRescue),
+                TakerCapPolicy::EnforceCap,
             );
             if let Some(order_id) = oid.as_deref() {
                 if let Ok(mut st) = self.bot_runtime_state.lock() {
@@ -1706,7 +1736,7 @@ impl MakerHedgeCapBot {
                     st.second_side_by_30s = false;
                     st.await_second_fill_last_hold_reason.clear();
                 }
-                self._track_order_execution_context(
+                self._merge_order_execution_context_fields(
                     order_id,
                     &json!({
                         "origin": "BOT_AWAIT_SECOND_FILL_RESCUE",

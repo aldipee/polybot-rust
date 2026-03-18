@@ -48,7 +48,13 @@ impl MakerHedgeCapBot {
                 .filter(|s| matches!(s.trim().to_ascii_uppercase().as_str(), "BUY" | "SELL"))
                 .unwrap_or(rec0.side.as_str());
             let key = format!("order_evt:{order_id}:{matched_total:.8}");
-            let applied = self._apply_fill(asset, price, inc, &key, side);
+            let fill_ts = self._fill_event_ts_from_value(
+                msg.get("match_time")
+                    .or_else(|| msg.get("matchTime"))
+                    .or_else(|| msg.get("timestamp"))
+                    .or_else(|| msg.get("ts")),
+            );
+            let applied = self._apply_fill_with_fill_ts(asset, price, inc, &key, side, fill_ts);
             if applied {
                 self._log_execution_latency_on_fill(order_id, now_ts_f64());
             }
@@ -76,6 +82,7 @@ impl MakerHedgeCapBot {
             if let Some(rec) = m.get_mut(order_id) {
                 rec.applied = rec.applied.max(matched_total);
                 rec.ts = now_ts_f64();
+                self._update_shared_pending_taker_order_applied(order_id, rec.applied);
                 if done_hint || (rec.size > 0.0 && rec.applied >= rec.size - 1e-9) {
                     remove_oid = true;
                 }
@@ -83,6 +90,9 @@ impl MakerHedgeCapBot {
             if remove_oid {
                 m.remove(order_id);
             }
+        }
+        if remove_oid {
+            self._forget_shared_pending_taker_order(order_id);
         }
     }
     /// Handles user trade event for the active BOT flow.
@@ -270,7 +280,13 @@ impl MakerHedgeCapBot {
             } else {
                 format!("trade_fallback:taker:{taker_oid}:{asset}:{side}:{size:.8}:{price:.8}")
             };
-            let applied = self._apply_fill(&asset, price, size, &key, &side);
+            let fill_ts = self._fill_event_ts_from_value(
+                msg.get("match_time")
+                    .or_else(|| msg.get("matchTime"))
+                    .or_else(|| msg.get("timestamp"))
+                    .or_else(|| msg.get("ts")),
+            );
+            let applied = self._apply_fill_with_fill_ts(&asset, price, size, &key, &side, fill_ts);
             if applied {
                 self._log_execution_latency_on_fill(&taker_oid, now_ts_f64());
                 let mut remove_oid = false;
@@ -278,6 +294,7 @@ impl MakerHedgeCapBot {
                     if let Some(r) = m.get_mut(&taker_oid) {
                         r.applied += size.max(0.0);
                         r.ts = now_ts_f64();
+                        self._update_shared_pending_taker_order_applied(&taker_oid, r.applied);
                         if r.size > 0.0 && r.applied >= r.size - 1e-9 {
                             remove_oid = true;
                         }
@@ -285,6 +302,9 @@ impl MakerHedgeCapBot {
                     if remove_oid {
                         m.remove(&taker_oid);
                     }
+                }
+                if remove_oid {
+                    self._forget_shared_pending_taker_order(&taker_oid);
                 }
             }
             return;
