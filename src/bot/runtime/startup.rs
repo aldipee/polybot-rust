@@ -14,7 +14,7 @@ impl MakerHedgeCapBot {
     pub(in crate::bot) fn _log_bot_runtime_cfg(&self) {
         let cfg = self._bot_runtime_cfg();
         self.logger.info(&format!(
-            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% clip_ladder={:.0}/{:.0}/{:.0}/{:.0} await_second_fill_target={:.0}s await_second_fill_deadline={:.0}s await_second_fill_rescue_once=true taper_start={:.0}s final_quiet={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
+            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% clip_ladder={:.0}/{:.0}/{:.0}/{:.0} await_second_fill_target={:.0}s await_second_fill_deadline={:.0}s await_second_fill_rescue_once=true late_reduce_start={:.0}s late_balance_only_start={:.0}s late_stop_new_orders_start={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
             self.exec_mode,
             cfg.phase_controller,
             cfg.prearm_lead_seconds,
@@ -37,8 +37,9 @@ impl MakerHedgeCapBot {
             cfg.clip_ladder[3],
             bot_runtime_await_second_fill_target_seconds(),
             bot_runtime_await_second_fill_deadline_seconds(),
-            cfg.taper_start_seconds,
-            cfg.final_quiet_seconds,
+            cfg.late_reduce_start_seconds,
+            cfg.late_balance_only_start_seconds,
+            cfg.late_stop_new_orders_start_seconds,
             cfg.buy_only_normal_flow,
             cfg.tail_cap_mid_start_seconds,
             cfg.tail_cap_early_fraction * 100.0,

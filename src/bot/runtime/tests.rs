@@ -231,15 +231,27 @@ fn bot_runtime_phase_routing_covers_runtime_segments() {
         BotRuntimePhase::PairBuild
     );
     assert_eq!(
-        bot_runtime_phase_from_t_into_s(239.9, &cfg),
+        bot_runtime_phase_from_t_into_s(179.9, &cfg),
         BotRuntimePhase::PairBuild
     );
     assert_eq!(
-        bot_runtime_phase_from_t_into_s(240.0, &cfg),
+        bot_runtime_phase_from_t_into_s(180.0, &cfg),
         BotRuntimePhase::Taper
     );
     assert_eq!(
-        bot_runtime_phase_from_t_into_s(300.0, &cfg),
+        bot_runtime_phase_from_t_into_s(224.9, &cfg),
+        BotRuntimePhase::Taper
+    );
+    assert_eq!(
+        bot_runtime_phase_from_t_into_s(225.0, &cfg),
+        BotRuntimePhase::Taper
+    );
+    assert_eq!(
+        bot_runtime_phase_from_t_into_s(239.9, &cfg),
+        BotRuntimePhase::Taper
+    );
+    assert_eq!(
+        bot_runtime_phase_from_t_into_s(240.0, &cfg),
         BotRuntimePhase::AwaitSettlement
     );
 }
@@ -254,6 +266,9 @@ fn bot_runtime_config_defaults_include_exact_open_time_targets() {
     assert_eq!(cfg.imbalance_warning_fraction, 0.12);
     assert_eq!(cfg.imbalance_disable_fraction, 0.20);
     assert_eq!(cfg.clip_ladder, [12.0, 20.0, 40.0, 80.0]);
+    assert_eq!(cfg.late_reduce_start_seconds, 180.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 225.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 240.0);
 }
 
 #[test]
@@ -277,6 +292,27 @@ fn bot_runtime_validate_config_rejects_invalid_open_time_targets() {
     assert_eq!(
         bot_runtime_validate_config(&cfg),
         Err("open_both_submit_delta_exceeds_deadline")
+    );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.late_reduce_start_seconds = 30.0;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_late_reduce_start_seconds")
+    );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.late_balance_only_start_seconds = cfg.late_reduce_start_seconds;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_late_balance_only_start_seconds")
+    );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.late_stop_new_orders_start_seconds = cfg.late_balance_only_start_seconds;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_late_stop_new_orders_start_seconds")
     );
 
     let mut cfg = bot_runtime_config_defaults();
@@ -336,6 +372,195 @@ fn bot_runtime_config_reader_uses_bot_clip_ladder_and_ignores_legacy_split_clip_
 }
 
 #[test]
+fn bot_runtime_config_reader_uses_late_window_env_overrides() {
+    let env = HashMap::from([
+        (
+            "BOT_LATE_REDUCE_START_SECONDS".to_string(),
+            "185".to_string(),
+        ),
+        (
+            "BOT_LATE_BALANCE_ONLY_START_SECONDS".to_string(),
+            "230".to_string(),
+        ),
+        (
+            "BOT_LATE_STOP_NEW_ORDERS_START_SECONDS".to_string(),
+            "245".to_string(),
+        ),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    assert_eq!(cfg.late_reduce_start_seconds, 185.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 230.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 245.0);
+}
+
+#[test]
+fn bot_runtime_config_reader_honors_legacy_late_window_env_names_when_new_ones_absent() {
+    let env = HashMap::from([
+        ("BOT_TAPER_START_SECONDS".to_string(), "210".to_string()),
+        ("BOT_FINAL_QUIET_SECONDS".to_string(), "20".to_string()),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    assert_eq!(cfg.late_reduce_start_seconds, 210.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 280.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 300.0);
+    assert!(cfg.legacy_late_window_budget_mode);
+}
+
+#[test]
+fn legacy_late_window_envs_allow_taper_start_below_30_seconds() {
+    let env = HashMap::from([
+        ("BOT_TAPER_START_SECONDS".to_string(), "20".to_string()),
+        ("BOT_FINAL_QUIET_SECONDS".to_string(), "30".to_string()),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    assert_eq!(cfg.late_reduce_start_seconds, 20.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 270.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 300.0);
+    assert!(cfg.legacy_late_window_budget_mode);
+    assert_eq!(bot_runtime_validate_config(&cfg), Ok(()));
+}
+
+#[test]
+fn legacy_late_window_envs_clamp_pre_taper_final_quiet_to_taper_start() {
+    let env = HashMap::from([
+        ("BOT_TAPER_START_SECONDS".to_string(), "240".to_string()),
+        ("BOT_FINAL_QUIET_SECONDS".to_string(), "90".to_string()),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    assert_eq!(cfg.late_reduce_start_seconds, 240.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 240.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 300.0);
+    assert!(cfg.legacy_late_window_budget_mode);
+    assert_eq!(bot_runtime_validate_config(&cfg), Ok(()));
+    assert_eq!(
+        bot_runtime_taper_mode(240.0, &cfg),
+        BotRuntimeTaperMode::BalanceOnly
+    );
+}
+
+#[test]
+fn legacy_late_window_envs_allow_balance_only_to_start_at_taper_start() {
+    let env = HashMap::from([
+        ("BOT_TAPER_START_SECONDS".to_string(), "240".to_string()),
+        ("BOT_FINAL_QUIET_SECONDS".to_string(), "60".to_string()),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    assert_eq!(cfg.late_reduce_start_seconds, 240.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 240.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 300.0);
+    assert!(cfg.legacy_late_window_budget_mode);
+    assert_eq!(bot_runtime_validate_config(&cfg), Ok(()));
+    assert_eq!(
+        bot_runtime_taper_mode(240.0, &cfg),
+        BotRuntimeTaperMode::BalanceOnly
+    );
+}
+
+#[test]
+fn legacy_late_window_envs_allow_zero_length_final_quiet_window() {
+    let env = HashMap::from([
+        ("BOT_TAPER_START_SECONDS".to_string(), "240".to_string()),
+        ("BOT_FINAL_QUIET_SECONDS".to_string(), "0".to_string()),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    assert_eq!(cfg.late_reduce_start_seconds, 240.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 300.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 300.0);
+    assert!(cfg.legacy_late_window_budget_mode);
+    assert_eq!(bot_runtime_validate_config(&cfg), Ok(()));
+}
+
+#[test]
+fn partial_late_window_migration_preserves_legacy_base_thresholds() {
+    let env = HashMap::from([
+        ("BOT_TAPER_START_SECONDS".to_string(), "210".to_string()),
+        ("BOT_FINAL_QUIET_SECONDS".to_string(), "20".to_string()),
+        (
+            "BOT_LATE_STOP_NEW_ORDERS_START_SECONDS".to_string(),
+            "250".to_string(),
+        ),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    assert_eq!(cfg.late_reduce_start_seconds, 210.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 280.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 250.0);
+    assert!(cfg.legacy_late_window_budget_mode);
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_late_stop_new_orders_start_seconds")
+    );
+}
+
+#[test]
+fn legacy_late_window_envs_preserve_old_budget_bands() {
+    let env = HashMap::from([
+        ("BOT_TAPER_START_SECONDS".to_string(), "240".to_string()),
+        ("BOT_FINAL_QUIET_SECONDS".to_string(), "30".to_string()),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    let seed_early_main =
+        cfg.seed_budget_min_fraction + cfg.early_budget_min_fraction + cfg.main_budget_min_fraction;
+    let with_late = seed_early_main + cfg.late_budget_min_fraction;
+    let with_taper = with_late + cfg.taper_budget_min_fraction;
+
+    assert_eq!(cfg.late_reduce_start_seconds, 240.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 270.0);
+    assert_eq!(cfg.late_stop_new_orders_start_seconds, 300.0);
+    assert!(cfg.legacy_late_window_budget_mode);
+
+    let (min_before_late, _) = bot_runtime_cumulative_budget_fractions(179.9, &cfg);
+    let (min_at_late, _) = bot_runtime_cumulative_budget_fractions(180.0, &cfg);
+    let (min_before_taper, _) = bot_runtime_cumulative_budget_fractions(239.9, &cfg);
+    let (min_at_taper, _) = bot_runtime_cumulative_budget_fractions(240.0, &cfg);
+
+    assert!((min_before_late - seed_early_main).abs() < 1e-9);
+    assert!((min_at_late - with_late).abs() < 1e-9);
+    assert!((min_before_taper - with_late).abs() < 1e-9);
+    assert!((min_at_taper - with_taper).abs() < 1e-9);
+}
+
+#[test]
+fn late_metric_labels_follow_configured_thresholds() {
+    assert_eq!(
+        bot_runtime_late_metric_label("fills", 180.0),
+        "fills_after_180"
+    );
+    assert_eq!(
+        bot_runtime_late_metric_label("new_orders", 225.0),
+        "new_orders_after_225"
+    );
+    assert_eq!(
+        bot_runtime_late_metric_label("fills", 230.5),
+        "fills_after_230_5"
+    );
+    assert_eq!(
+        bot_runtime_late_metric_label("late_new_orders", 300.0),
+        "late_new_orders_after_300"
+    );
+}
+
+#[test]
+fn bot_runtime_taper_mode_uses_exact_late_window_boundaries() {
+    let cfg = bot_runtime_config_defaults();
+    assert_eq!(
+        bot_runtime_taper_mode(180.0, &cfg),
+        BotRuntimeTaperMode::ReduceClips
+    );
+    assert_eq!(
+        bot_runtime_taper_mode(224.9, &cfg),
+        BotRuntimeTaperMode::ReduceClips
+    );
+    assert_eq!(
+        bot_runtime_taper_mode(225.0, &cfg),
+        BotRuntimeTaperMode::BalanceOnly
+    );
+    assert_eq!(
+        bot_runtime_taper_mode(239.9, &cfg),
+        BotRuntimeTaperMode::BalanceOnly
+    );
+}
+
+#[test]
 fn taper_maintenance_decision_downshifts_paired_growth_to_min_lot() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
@@ -346,12 +571,41 @@ fn taper_maintenance_decision_downshifts_paired_growth_to_min_lot() {
     assert_eq!(decision.clip, 80);
 
     let tapered =
-        bot_runtime_taper_maintenance_decision(decision, 5.0, 40.0, 40.0, 100.0, 250.0, &cfg);
+        bot_runtime_taper_maintenance_decision(decision, 5.0, 40.0, 40.0, 100.0, 200.0, &cfg);
     assert_eq!(tapered.mode, BotRuntimePairBuildMode::PairedGrowth);
     assert_eq!(tapered.clip, 5);
     assert_eq!(tapered.selected_rung, BotRuntimeClipRung::Seed);
     assert_eq!(tapered.clip_bucket, "small");
     assert!(!tapered.green_time_ok);
+}
+
+#[test]
+fn late_window_fill_and_submit_counters_follow_180_225_240_thresholds() {
+    let cfg = bot_runtime_config_defaults();
+    let mut state = BotRuntimeState::default();
+    bot_runtime_note_fill_event(&mut state, 179.9, 1.0, true, &cfg);
+    assert_eq!(state.late_fill_events_after_180, 0);
+    assert_eq!(state.late_fill_events_after_225, 0);
+
+    bot_runtime_note_fill_event(&mut state, 180.0, 1.0, true, &cfg);
+    assert_eq!(state.late_fill_events_after_180, 1);
+    assert_eq!(state.late_fill_events_after_225, 0);
+
+    bot_runtime_note_fill_event(&mut state, 225.0, 1.0, true, &cfg);
+    assert_eq!(state.late_fill_events_after_180, 2);
+    assert_eq!(state.late_fill_events_after_225, 1);
+
+    let bot = make_bot_runtime_test_bot();
+    bot._bot_runtime_note_taper_submit(224.9, &cfg);
+    bot._bot_runtime_note_taper_submit(225.0, &cfg);
+    bot._bot_runtime_note_taper_submit(240.0, &cfg);
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert_eq!(state.late_new_orders_after_225, 2);
+    assert_eq!(state.late_new_orders_after_240, 1);
 }
 
 #[test]
@@ -957,7 +1211,7 @@ fn imbalance_repair_unavailable_cancels_live_taper_orders() {
     }
 
     let cfg = *bot._bot_runtime_cfg();
-    bot._bot_runtime_taper_handler(260.0, 260.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+    bot._bot_runtime_taper_handler(200.0, 200.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
 
     let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
     let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
@@ -973,7 +1227,7 @@ fn taper_handler_blocks_balanced_add_at_stop_add_zone_after_runtime_gating() {
     set_pair_quotes(&bot, 0.50, 0.52, 0.50, 0.52, now);
 
     let cfg = *bot._bot_runtime_cfg();
-    bot._bot_runtime_taper_handler(260.0, 260.0, 12.0, 20.0, 20.0, 6.0, 6.0, &cfg);
+    bot._bot_runtime_taper_handler(200.0, 200.0, 12.0, 20.0, 20.0, 6.0, 6.0, &cfg);
 
     let state = bot.state.lock().expect("bot state");
     assert!(!state.open_orders.contains_key("yes_asset_id"));
@@ -1012,7 +1266,7 @@ fn rebalance_price_zone_hold_cancels_live_taper_lighter_order() {
     }
 
     let cfg = *bot._bot_runtime_cfg();
-    bot._bot_runtime_taper_handler(260.0, 260.0, 52.8, 40.0, 48.0, 12.0, 40.8, &cfg);
+    bot._bot_runtime_taper_handler(200.0, 200.0, 52.8, 40.0, 48.0, 12.0, 40.8, &cfg);
 
     let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
     assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
@@ -1022,6 +1276,83 @@ fn rebalance_price_zone_hold_cancels_live_taper_lighter_order() {
         runtime_state
             .taper_last_hold_reason
             .contains("price_zone_danger:rebalance_add:1.050"),
+        "actual_reason={}",
+        runtime_state.taper_last_hold_reason
+    );
+}
+
+#[test]
+fn balance_only_window_cancels_live_taper_growth_orders_before_new_repair_work() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.30, 0.32, 0.30, 0.32, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-yes".to_string()),
+                origin: "BOT_TAPER_YES".to_string(),
+                last_submit_ts: 220.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-no".to_string()),
+                origin: "BOT_TAPER_NO".to_string(),
+                last_submit_ts: 220.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(230.0, 230.0, 12.0, 20.0, 20.0, 6.0, 6.0, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert_eq!(
+        runtime_state.taper_last_hold_reason,
+        "rest:late_balance_only_growth_handoff"
+    );
+}
+
+#[test]
+fn late_action_hold_cancels_stale_taper_lighter_orders_after_inventory_rebalances() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.30, 0.32, 0.30, 0.32, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-lighter-yes".to_string()),
+                origin: "BOT_TAPER_LIGHTER".to_string(),
+                last_submit_ts: 220.0,
+                price: 0.30,
+                remaining: 5.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(230.0, 230.0, 12.0, 20.0, 20.0, 6.0, 6.0, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert_eq!(
+        runtime_state.taper_last_hold_reason, "rest:stale_lighter_repair_balanced",
         "actual_reason={}",
         runtime_state.taper_last_hold_reason
     );
@@ -1058,7 +1389,7 @@ fn imbalance_hold_keeps_live_taper_lighter_repair_orders() {
     }
 
     let cfg = *bot._bot_runtime_cfg();
-    bot._bot_runtime_taper_handler(260.0, 260.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+    bot._bot_runtime_taper_handler(200.0, 200.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
 
     let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
     let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
@@ -1097,7 +1428,7 @@ fn imbalance_hold_cancels_oversized_live_taper_lighter_repair() {
     }
 
     let cfg = *bot._bot_runtime_cfg();
-    bot._bot_runtime_taper_handler(260.0, 260.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+    bot._bot_runtime_taper_handler(200.0, 200.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
 
     let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
     let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
@@ -1136,7 +1467,7 @@ fn imbalance_hold_cancels_wrong_side_live_taper_lighter_repair_after_side_flip()
     }
 
     let cfg = *bot._bot_runtime_cfg();
-    bot._bot_runtime_taper_handler(260.0, 260.0, 0.60, 3.5, 2.5, 0.35, 0.25, &cfg);
+    bot._bot_runtime_taper_handler(200.0, 200.0, 0.60, 3.5, 2.5, 0.35, 0.25, &cfg);
 
     let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
     let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));

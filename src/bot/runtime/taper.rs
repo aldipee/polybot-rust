@@ -46,10 +46,10 @@ pub(in crate::bot) fn bot_runtime_taper_mode(
     t_into_s: f64,
     cfg: &BotRuntimeConfigSnapshot,
 ) -> BotRuntimeTaperMode {
-    if t_into_s >= (300.0 - cfg.final_quiet_seconds) {
-        BotRuntimeTaperMode::NoOptionalAdds
+    if t_into_s >= cfg.late_balance_only_start_seconds {
+        BotRuntimeTaperMode::BalanceOnly
     } else {
-        BotRuntimeTaperMode::RepairFirst
+        BotRuntimeTaperMode::ReduceClips
     }
 }
 /// Implements taper maintenance clip for the BOT runtime.

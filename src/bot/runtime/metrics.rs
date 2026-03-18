@@ -57,6 +57,20 @@ pub(in crate::bot) fn bot_runtime_fill_distribution_summary_f64(values: &[f64; 5
         .join(",")
 }
 
+pub(in crate::bot) fn bot_runtime_late_metric_label(prefix: &str, threshold_s: f64) -> String {
+    let clean_threshold = if threshold_s.is_finite() {
+        threshold_s.max(0.0)
+    } else {
+        0.0
+    };
+    let suffix = if clean_threshold.fract().abs() <= 1e-9 {
+        format!("{:.0}", clean_threshold)
+    } else {
+        format!("{:.1}", clean_threshold).replace('.', "_")
+    };
+    format!("{prefix}_after_{suffix}")
+}
+
 pub(in crate::bot) fn bot_runtime_taker_share(maker_qty: f64, taker_qty: f64) -> f64 {
     let maker = maker_qty.max(0.0);
     let taker = taker_qty.max(0.0);
@@ -300,11 +314,11 @@ pub(in crate::bot) fn bot_runtime_note_fill_event(
     state.fill_events_by_segment[segment_idx] =
         state.fill_events_by_segment[segment_idx].saturating_add(1);
     state.fill_shares_by_segment[segment_idx] += filled.max(0.0);
-    if t_into_s >= cfg.taper_start_seconds {
-        state.taper_fill_events_after_240 = state.taper_fill_events_after_240.saturating_add(1);
+    if t_into_s >= cfg.late_reduce_start_seconds {
+        state.late_fill_events_after_180 = state.late_fill_events_after_180.saturating_add(1);
     }
-    if t_into_s >= (300.0 - cfg.final_quiet_seconds.max(0.0)) {
-        state.taper_fill_events_after_270 = state.taper_fill_events_after_270.saturating_add(1);
+    if t_into_s >= cfg.late_balance_only_start_seconds {
+        state.late_fill_events_after_225 = state.late_fill_events_after_225.saturating_add(1);
     }
 }
 /// Implements metrics snapshot for the BOT runtime.
@@ -370,10 +384,10 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
         pair_coverage: pair_coverage(q_yes, q_no),
         share_skew_ratio: share_skew_ratio(q_yes, q_no),
         inventory_vwap_sum: inventory_vwap_sum(q_yes, q_no, cost_yes, cost_no),
-        taper_fill_events_after_240: state.taper_fill_events_after_240,
-        taper_fill_events_after_270: state.taper_fill_events_after_270,
-        taper_new_orders_after_240: state.taper_new_orders_after_240,
-        taper_new_orders_after_270: state.taper_new_orders_after_270,
+        late_fill_events_after_180: state.late_fill_events_after_180,
+        late_fill_events_after_225: state.late_fill_events_after_225,
+        late_new_orders_after_225: state.late_new_orders_after_225,
+        late_new_orders_after_240: state.late_new_orders_after_240,
         prearm_ready_before_open: state.prearm_ready_before_open,
         open_both_seed_by_deadline_met: state.open_both_seed_by_deadline_met,
         open_both_late_seed_used: state.open_both_late_seed_unlock_used,
@@ -518,20 +532,20 @@ pub(in crate::bot) fn bot_runtime_taper_late_action_policy(
     let improves_tail = projected_tail_size + 1e-9 < current_tail_size;
     let improves_floor = projected_floor > current_floor + 1e-9;
     let hold_reason = match taper_mode {
-        BotRuntimeTaperMode::RepairFirst
+        BotRuntimeTaperMode::ReduceClips
             if decision.mode == BotRuntimePairBuildMode::PairedGrowth
                 && current_tail_size > 1e-9 =>
         {
             Some(format!(
-                "late_repair_first_suppress:{:.2}:{:.2}:{:+.2}:{:+.2}",
+                "late_reduce_clips_repair_first_suppress:{:.2}:{:.2}:{:+.2}:{:+.2}",
                 current_tail_size, projected_tail_size, current_floor, projected_floor
             ))
         }
-        BotRuntimeTaperMode::NoOptionalAdds
+        BotRuntimeTaperMode::BalanceOnly
             if decision.mode == BotRuntimePairBuildMode::PairedGrowth =>
         {
             Some(format!(
-                "late_no_optional_adds_suppress:{:.2}:{:+.2}:{:+.2}",
+                "late_balance_only_suppress:{:.2}:{:+.2}:{:+.2}",
                 current_tail_size, current_floor, projected_floor
             ))
         }

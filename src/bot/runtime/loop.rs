@@ -51,6 +51,7 @@ impl MakerHedgeCapBot {
 
     pub(in crate::bot) fn _bot_runtime_log_final_metrics(&self, exit_reason: &str) {
         let pair_id = self.pair_identity().pair_id;
+        let cfg = *self._bot_runtime_cfg();
         self._bot_runtime_refresh_daily_liquidity_counters();
         let (q_yes, q_no, cost_yes, cost_no, total_cost) = self
             .state
@@ -108,8 +109,16 @@ impl MakerHedgeCapBot {
         } else {
             "NA".to_string()
         };
+        let fills_after_late_reduce_label =
+            bot_runtime_late_metric_label("fills", cfg.late_reduce_start_seconds);
+        let fills_after_balance_only_label =
+            bot_runtime_late_metric_label("fills", cfg.late_balance_only_start_seconds);
+        let new_orders_after_balance_only_label =
+            bot_runtime_late_metric_label("new_orders", cfg.late_balance_only_start_seconds);
+        let new_orders_after_stop_label =
+            bot_runtime_late_metric_label("new_orders", cfg.late_stop_new_orders_start_seconds);
         self.logger.info(&format!(
-            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} taker_fill_events={} taker_fill_shares={:.2} pair_taker_share={:.3} daily_maker_fill_shares={:.2} daily_taker_fill_shares={:.2} daily_taker_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} fills_after_taper_start={} fills_after_final_quiet={} new_orders_after_taper_start={} new_orders_after_final_quiet={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
+            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} taker_fill_events={} taker_fill_shares={:.2} pair_taker_share={:.3} daily_maker_fill_shares={:.2} daily_taker_fill_shares={:.2} daily_taker_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} {}={} {}={} {}={} {}={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
             pair_id,
             exit_reason,
             metrics.market_participated,
@@ -147,10 +156,14 @@ impl MakerHedgeCapBot {
             metrics.bad_regime_shutdown,
             canary_success,
             canary_failure_summary,
-            metrics.taper_fill_events_after_240,
-            metrics.taper_fill_events_after_270,
-            metrics.taper_new_orders_after_240,
-            metrics.taper_new_orders_after_270,
+            fills_after_late_reduce_label,
+            metrics.late_fill_events_after_180,
+            fills_after_balance_only_label,
+            metrics.late_fill_events_after_225,
+            new_orders_after_balance_only_label,
+            metrics.late_new_orders_after_225,
+            new_orders_after_stop_label,
+            metrics.late_new_orders_after_240,
             metrics.prearm_ready_before_open,
             seed_anchor_t_into,
             first_yes_seed_submit_t_into,
@@ -521,6 +534,22 @@ impl MakerHedgeCapBot {
                 stale_logged = false;
             }
             if now - last_log >= (self.cfg.log_every as f64).max(0.5) {
+                let late_fill_events_after_reduce_label = bot_runtime_late_metric_label(
+                    "late_fill_events",
+                    cfg.late_reduce_start_seconds,
+                );
+                let late_fill_events_after_balance_label = bot_runtime_late_metric_label(
+                    "late_fill_events",
+                    cfg.late_balance_only_start_seconds,
+                );
+                let late_new_orders_after_balance_label = bot_runtime_late_metric_label(
+                    "late_new_orders",
+                    cfg.late_balance_only_start_seconds,
+                );
+                let late_new_orders_after_stop_label = bot_runtime_late_metric_label(
+                    "late_new_orders",
+                    cfg.late_stop_new_orders_start_seconds,
+                );
                 let (
                     phase,
                     owner,
@@ -547,10 +576,10 @@ impl MakerHedgeCapBot {
                     await_second_fill_rescue_used,
                     await_second_fill_hard_paused,
                     imbalance_state,
-                    taper_fill_events_after_240,
-                    taper_fill_events_after_270,
-                    taper_new_orders_after_240,
-                    taper_new_orders_after_270,
+                    late_fill_events_after_180,
+                    late_fill_events_after_225,
+                    late_new_orders_after_225,
+                    late_new_orders_after_240,
                 ) = self
                     .bot_runtime_state
                     .lock()
@@ -585,10 +614,10 @@ impl MakerHedgeCapBot {
                             st.await_second_fill_rescue_used,
                             st.await_second_fill_hard_paused,
                             st.imbalance_state,
-                            st.taper_fill_events_after_240,
-                            st.taper_fill_events_after_270,
-                            st.taper_new_orders_after_240,
-                            st.taper_new_orders_after_270,
+                            st.late_fill_events_after_180,
+                            st.late_fill_events_after_225,
+                            st.late_new_orders_after_225,
+                            st.late_new_orders_after_240,
                         )
                     })
                     .unwrap_or((
@@ -623,7 +652,7 @@ impl MakerHedgeCapBot {
                         0,
                     ));
                 self.logger.info(&format!(
-                    "[BOT] pair_id={} hold phase={} owner={} owner_reason={} armed={} prearm_ready={} prearm_ready_before_open={} prearm_hold_reason={} open_attempts={} seed_anchor_t_into={} first_seed_submit_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} first_fill_t_into={} second_side_t_into={} first_fill_to_second_fill_ms={} second_side_by_15s={} second_side_by_30s={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} imbalance_state={} unmatched_fraction={:.3} match_ratio={:.3} pair_taker_share={:.3} daily_taker_share={:.3} taper_fill_events_240={} taper_fill_events_270={} taper_new_orders_240={} taper_new_orders_270={} t_left={:.1}s prearm_lead={:.0}s qYES={:.2} qNO={:.2} total_cost={:.2} market_data_fresh={} market_connected={} user_connected={}",
+                    "[BOT] pair_id={} hold phase={} owner={} owner_reason={} armed={} prearm_ready={} prearm_ready_before_open={} prearm_hold_reason={} open_attempts={} seed_anchor_t_into={} first_seed_submit_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} first_fill_t_into={} second_side_t_into={} first_fill_to_second_fill_ms={} second_side_by_15s={} second_side_by_30s={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} imbalance_state={} unmatched_fraction={:.3} match_ratio={:.3} pair_taker_share={:.3} daily_taker_share={:.3} {}={} {}={} {}={} {}={} t_left={:.1}s prearm_lead={:.0}s qYES={:.2} qNO={:.2} total_cost={:.2} market_data_fresh={} market_connected={} user_connected={}",
                     pair_id,
                     phase.as_str(),
                     owner.as_str(),
@@ -744,10 +773,14 @@ impl MakerHedgeCapBot {
                             .map(|st| st.daily_taker_fill_shares)
                             .unwrap_or(0.0)
                     ),
-                    taper_fill_events_after_240,
-                    taper_fill_events_after_270,
-                    taper_new_orders_after_240,
-                    taper_new_orders_after_270,
+                    late_fill_events_after_reduce_label,
+                    late_fill_events_after_180,
+                    late_fill_events_after_balance_label,
+                    late_fill_events_after_225,
+                    late_new_orders_after_balance_label,
+                    late_new_orders_after_225,
+                    late_new_orders_after_stop_label,
+                    late_new_orders_after_240,
                     seconds_left.max(0.0),
                     cfg.prearm_lead_seconds,
                     qy,

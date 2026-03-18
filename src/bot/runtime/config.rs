@@ -18,8 +18,10 @@ pub(in crate::bot) struct BotRuntimeConfigSnapshot {
     pub(in crate::bot) taper_budget_max_fraction: f64,
     pub(in crate::bot) target_both_sides_by_30s: f64,
     pub(in crate::bot) target_both_sides_by_60s: f64,
-    pub(in crate::bot) taper_start_seconds: f64,
-    pub(in crate::bot) final_quiet_seconds: f64,
+    pub(in crate::bot) late_reduce_start_seconds: f64,
+    pub(in crate::bot) late_balance_only_start_seconds: f64,
+    pub(in crate::bot) late_stop_new_orders_start_seconds: f64,
+    pub(in crate::bot) legacy_late_window_budget_mode: bool,
     pub(in crate::bot) imbalance_target_fraction: f64,
     pub(in crate::bot) imbalance_warning_fraction: f64,
     pub(in crate::bot) imbalance_disable_fraction: f64,
@@ -56,8 +58,10 @@ pub(in crate::bot) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot 
         taper_budget_max_fraction: 0.10,
         target_both_sides_by_30s: 0.80,
         target_both_sides_by_60s: 0.95,
-        taper_start_seconds: 240.0,
-        final_quiet_seconds: 30.0,
+        late_reduce_start_seconds: 180.0,
+        late_balance_only_start_seconds: 225.0,
+        late_stop_new_orders_start_seconds: 240.0,
+        legacy_late_window_budget_mode: false,
         imbalance_target_fraction: 0.07,
         imbalance_warning_fraction: 0.12,
         imbalance_disable_fraction: 0.20,
@@ -91,6 +95,22 @@ where
         })
         .filter(|value| value.is_finite())
         .unwrap_or(default)
+}
+
+pub(in crate::bot) fn bot_runtime_env_float_optional<F>(get: &mut F, key: &str) -> Option<f64>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    get(key)
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<f64>().ok()
+            }
+        })
+        .filter(|value| value.is_finite())
 }
 /// Implements env bool for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -148,6 +168,16 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     let mut cfg = bot_runtime_config_defaults();
+    let late_reduce_override =
+        bot_runtime_env_float_optional(&mut get, "BOT_LATE_REDUCE_START_SECONDS");
+    let late_balance_only_override =
+        bot_runtime_env_float_optional(&mut get, "BOT_LATE_BALANCE_ONLY_START_SECONDS");
+    let late_stop_new_orders_override =
+        bot_runtime_env_float_optional(&mut get, "BOT_LATE_STOP_NEW_ORDERS_START_SECONDS");
+    let legacy_taper_start_override =
+        bot_runtime_env_float_optional(&mut get, "BOT_TAPER_START_SECONDS");
+    let legacy_final_quiet_override =
+        bot_runtime_env_float_optional(&mut get, "BOT_FINAL_QUIET_SECONDS");
     cfg.prearm_lead_seconds =
         bot_runtime_env_float(&mut get, "BOT_PREARM_LEAD_SECONDS", cfg.prearm_lead_seconds);
     cfg.open_both_seed_deadline_seconds = bot_runtime_env_float(
@@ -231,10 +261,27 @@ where
         "BOT_TARGET_BOTH_SIDES_BY_60S",
         cfg.target_both_sides_by_60s,
     );
-    cfg.taper_start_seconds =
-        bot_runtime_env_float(&mut get, "BOT_TAPER_START_SECONDS", cfg.taper_start_seconds);
-    cfg.final_quiet_seconds =
-        bot_runtime_env_float(&mut get, "BOT_FINAL_QUIET_SECONDS", cfg.final_quiet_seconds);
+    let has_legacy_late_window_overrides =
+        legacy_taper_start_override.is_some() || legacy_final_quiet_override.is_some();
+    if has_legacy_late_window_overrides {
+        let legacy_taper_start = legacy_taper_start_override.unwrap_or(240.0);
+        let legacy_final_quiet = legacy_final_quiet_override.unwrap_or(30.0);
+        cfg.late_reduce_start_seconds = legacy_taper_start;
+        cfg.late_balance_only_start_seconds = (300.0 - legacy_final_quiet).max(legacy_taper_start);
+        cfg.late_stop_new_orders_start_seconds = 300.0;
+    }
+    if let Some(value) = late_reduce_override {
+        cfg.late_reduce_start_seconds = value;
+    }
+    if let Some(value) = late_balance_only_override {
+        cfg.late_balance_only_start_seconds = value;
+    }
+    if let Some(value) = late_stop_new_orders_override {
+        cfg.late_stop_new_orders_start_seconds = value;
+    }
+    cfg.legacy_late_window_budget_mode = has_legacy_late_window_overrides
+        && late_reduce_override.is_none()
+        && late_balance_only_override.is_none();
     cfg.imbalance_target_fraction = bot_runtime_env_float(
         &mut get,
         "BOT_IMBALANCE_TARGET_FRACTION",
@@ -323,11 +370,35 @@ pub(in crate::bot) fn bot_runtime_validate_config(
     if cfg.open_both_submit_delta_max_seconds > cfg.open_both_seed_deadline_seconds + 1e-9 {
         return Err("open_both_submit_delta_exceeds_deadline");
     }
-    if !cfg.taper_start_seconds.is_finite() || cfg.taper_start_seconds <= 0.0 {
-        return Err("invalid_taper_start_seconds");
+    let invalid_late_reduce_start = if cfg.legacy_late_window_budget_mode {
+        !cfg.late_reduce_start_seconds.is_finite() || cfg.late_reduce_start_seconds <= 0.0
+    } else {
+        !cfg.late_reduce_start_seconds.is_finite() || cfg.late_reduce_start_seconds <= 30.0
+    };
+    if invalid_late_reduce_start {
+        return Err("invalid_late_reduce_start_seconds");
     }
-    if !cfg.final_quiet_seconds.is_finite() || cfg.final_quiet_seconds < 0.0 {
-        return Err("invalid_final_quiet_seconds");
+    let invalid_late_balance_only = if cfg.legacy_late_window_budget_mode {
+        !cfg.late_balance_only_start_seconds.is_finite()
+            || cfg.late_balance_only_start_seconds < cfg.late_reduce_start_seconds
+    } else {
+        !cfg.late_balance_only_start_seconds.is_finite()
+            || cfg.late_balance_only_start_seconds <= cfg.late_reduce_start_seconds
+    };
+    if invalid_late_balance_only {
+        return Err("invalid_late_balance_only_start_seconds");
+    }
+    let invalid_late_stop_new_orders = if cfg.legacy_late_window_budget_mode {
+        !cfg.late_stop_new_orders_start_seconds.is_finite()
+            || cfg.late_stop_new_orders_start_seconds < cfg.late_balance_only_start_seconds
+            || cfg.late_stop_new_orders_start_seconds > 300.0
+    } else {
+        !cfg.late_stop_new_orders_start_seconds.is_finite()
+            || cfg.late_stop_new_orders_start_seconds <= cfg.late_balance_only_start_seconds
+            || cfg.late_stop_new_orders_start_seconds > 300.0
+    };
+    if invalid_late_stop_new_orders {
+        return Err("invalid_late_stop_new_orders_start_seconds");
     }
     if !cfg.imbalance_target_fraction.is_finite() || cfg.imbalance_target_fraction <= 0.0 {
         return Err("invalid_imbalance_target_fraction");

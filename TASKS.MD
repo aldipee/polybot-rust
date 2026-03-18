@@ -44,16 +44,16 @@ Work status legend:
 
 ### Overall Estimate
 
-- Estimated requirement coverage in current scope: `66%`
-- Estimated remaining gap in current scope: `34%`
+- Estimated requirement coverage in current scope: `70%`
+- Estimated remaining gap in current scope: `30%`
 
 ### Work Status Snapshot
 
 - Requirement analysis: `Done`
 - Requirement-only backlog definition: `Done`
 - `REQ-001` scope override recorded: `Done`
-- Active implementation tasks completed: `9 / 24`
-- Tasks ready to start now: `5 / 24`
+- Active implementation tasks completed: `10 / 24`
+- Tasks ready to start now: `4 / 24`
 - Tasks queued behind earlier work: `4 / 24`
 - Tasks blocked by prerequisites: `6 / 24`
 - Tasks marked not applicable: `1`
@@ -63,7 +63,7 @@ Work status legend:
 | Requirement area | REQ scope | Coverage | Gap | Current reading |
 |---|---|---:|---:|---|
 | Market scope and paired lifecycle | `REQ-002` to `REQ-008` with `REQ-001` excluded | 82% | 18% | Pair identity, pair snapshots, pair-level runtime decisions, `AwaitSettlement`, buy-only hold-to-settlement flow, exact open-time seeding, and `AwaitSecondFill` with one-shot missing-side rescue are now in place. The remaining gap in this area is mostly the still-partial settlement-owned lifecycle polish under `REQ-003`. |
-| Inventory, pricing, and residual discipline | `REQ-009` to `REQ-013`, `REQ-018` to `REQ-021` | 82% | 18% | Exact unmatched-fraction controls, exact marginal pair-cost zones, and explicit residual-direction blocks are now in place, including `7% / 12% / 20%` imbalance thresholds, `0.94 / 0.97 / 1.00 / 1.03` price bands, projected hard-disable blocks, repair-only routing, live order cancellation when imbalance or rebalance pricing shuts off further adds, and hard blocks on speculative one-sided adds or underdog-residual increases. The remaining gap in this area is mostly strict late-window behavior and the optional model-edge overlay. |
+| Inventory, pricing, and residual discipline | `REQ-009` to `REQ-013`, `REQ-018` to `REQ-021` | 91% | 9% | Exact unmatched-fraction controls, exact marginal pair-cost zones, explicit residual-direction blocks, and strict late-window controls are now in place, including `7% / 12% / 20%` imbalance thresholds, `0.94 / 0.97 / 1.00 / 1.03` price bands, projected hard-disable blocks, repair-only routing, hard cutoff into `AwaitSettlement` at the late stop-new-orders window, and dynamic late-window observability keyed to configured thresholds. The remaining gap in this area is mostly the optional model-edge overlay. |
 | Execution controls and clip policy | `REQ-014` to `REQ-017`, `REQ-034` | 80% | 20% | Maker-first execution, explicit taker exception reasons, wallet-aware market and daily taker-share caps, shared pending-taker accounting, crash-tolerant shared-state enforcement, and the exact env-configurable `12 / 20 / 40 / 80` clip ladder with green-gated `40 / 80` escalation are now in place. The remaining gap in this area is mostly refresh-rate controls under `REQ-034`. |
 | Config, observability, and auditability | `REQ-023` to `REQ-025` | 18% | 82% | Config snapshotting exists, but no full config versioning, append-only decisions, or requirement-grade metrics and logs. |
 | Replay, paper, and live safety modes | `REQ-026` to `REQ-029` | 10% | 90% | No true replay engine, importer parity, paper adapter, or shadow-first guarded live flow is present. |
@@ -78,7 +78,7 @@ Work status legend:
 |---|---|---|---|---|---|---|
 | IMP-01 | `REQ-001` | N/A | N/A | Do not implement strict BTC 5-minute whitelist restrictions; treat this requirement as intentionally out of scope for the current product direction. | User direction explicitly rejects restricted market scope. | `TASKS.MD` only unless product docs are updated |
 | IMP-02 | `REQ-002` | Done | Done | Make `pair_id` the mandatory decision key so strategy, risk, and ledger decisions operate on the pair as one instrument. | Implemented: pair identity, pair snapshots, pair-level runtime boundary, execution metadata, and pair persistence are now wired through the monolith. | `src/bot/shared.rs`, `src/bot/public_tail.rs`, `src/bot/runtime/*`, `src/bot/execution/*`, `src/db.rs`, `src/main.rs` |
-| IMP-03 | `REQ-003`, `REQ-022` | Partial | Done | Enforce buy-only hold-to-settlement behavior and ensure settlement, not intrawindow sell logic, closes exposure. | Implemented: `AwaitSettlement`, terminal order drain, settlement-owned finalization, unresolved settlement persistence, and buy-only BOT runtime guard are now in place. Exact late-window timing still depends on `IMP-11`. | `src/bot/runtime/*`, `src/rtds.rs`, `src/db.rs`, `src/main.rs` |
+| IMP-03 | `REQ-003`, `REQ-022` | Partial | Done | Enforce buy-only hold-to-settlement behavior and ensure settlement, not intrawindow sell logic, closes exposure. | Implemented: `AwaitSettlement`, terminal order drain, settlement-owned finalization, unresolved settlement persistence, buy-only BOT runtime guard, and the late-window handoff into settlement are now in place. | `src/bot/runtime/*`, `src/rtds.rs`, `src/db.rs`, `src/main.rs` |
 | IMP-04 | `REQ-004`, `REQ-005`, `REQ-006` | Done | Done | Add pre-open warmup plus exact open-time seeding deadlines: both seed orders within 5 seconds of open and within 1 second of each other. | Implemented: `PreArm` now records readiness before open, `OpenBoth` uses explicit open-confirmed and first-tradable anchors, enforces exact seed timing KPIs, supports one controlled late unlock, and blocks seeding on pre-open cached quotes. | `src/bot/runtime/startup.rs`, `src/bot/runtime/loop.rs`, `src/bot/runtime/policy.rs`, `src/bot/runtime/config.rs`, `src/bot/runtime/state.rs`, `src/bot/runtime/tests.rs` |
 | IMP-05 | `REQ-007`, `REQ-008` | Done | Done | Implement `AwaitSecondFill` completion mode with no scale-up before both sides fill, 15-second target, and 30-second hard stop for accumulation. | Implemented: one-sided first fills now route into `AwaitSecondFill`, normal accumulation stays blocked until both sides fill, the 15-second and 30-second clocks run from first fill, and a one-shot ask-aware missing-side taker rescue now exists after the hard deadline. | `src/bot/runtime/state.rs`, `src/bot/runtime/startup.rs`, `src/bot/runtime/loop.rs`, `src/bot/runtime/policy.rs`, `src/bot/runtime/pair_build/*`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/tests.rs` |
 | IMP-06 | `REQ-009`, `REQ-010` | Done | Done | Replace heuristic imbalance logic with exact unmatched-fraction controls: target below 7%, warning above 12%, disable or reduce-only at 20% or more. | Implemented: unmatched-fraction is now the authoritative imbalance metric, `7% / 12% / 20%` thresholds drive `Normal / Throttle / Warning / HardDisable`, projected hard-disable is blocked, and paired-growth orders are actively canceled when imbalance holds shut off normal adds. | `src/bot/runtime/config.rs`, `src/bot/runtime/state.rs`, `src/bot/runtime/policy.rs`, `src/bot/runtime/metrics.rs`, `src/bot/runtime/pair_build/*`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/tests.rs` |
@@ -86,7 +86,7 @@ Work status legend:
 | IMP-08 | `REQ-014`, `REQ-015` | Done | Done | Make maker-first execution mandatory, require explicit taker exception reasons, and enforce sub-5% target and 10% hard cap for taker share. | Implemented: taker submits now require explicit exception reasons and cap policy, projected market and daily taker share are enforced with shared wallet-aware state, same-wallet sibling pending takers are counted for the daily cap but not leaked into other pairs' market caps, and shared-state locking now survives crash recovery. | `src/bot/execution/*`, `src/bot/runtime/*`, `src/bot/runtime/metrics.rs`, `src/helpers.rs`, `scripts/run-instance.sh` |
 | IMP-09 | `REQ-016`, `REQ-017` | Done | Done | Align clip sizing to `12 / 20 / 40 / 80`, hard-cap single orders at 80, and allow 40 or 80 only when all green conditions are true. | Implemented: `BOT_CLIP_LADDER` is now the authoritative clip policy, seeds default to `12`, paired growth defaults to `20`, `40 / 80` escalate progressively only under green conditions, taper maintenance re-downshifts to the late-phase lot, and repair sizing now respects actual lagging-side spend plus min-notional-safe gap limits. | `src/bot/runtime/config.rs`, `src/bot/runtime/pair_build/decision.rs`, `src/bot/runtime/pair_build/repair.rs`, `src/bot/runtime/taper.rs`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/tests.rs` |
 | IMP-10 | `REQ-018`, `REQ-019` | Done | Done | Hard-block intentional single-side speculative adds and forbid any order that increases residual inventory on the underdog side. | Implemented: pair-build, taper, and `AwaitSecondFill` now classify favorite/underdog and residual direction explicitly, emit stable residual-direction hold reasons, cancel only blocked-side BOT orders when underdog residual would increase, and expose the new residual telemetry in runtime logs. | `src/bot/runtime/pair_build/decision.rs`, `src/bot/runtime/metrics.rs`, `src/bot/runtime/pair_build/orders.rs`, `src/bot/runtime/startup.rs`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/tests.rs` |
-| IMP-11 | `REQ-021` | Partial | Ready | Add exact late-window controls: smaller clips after 180 seconds, balance-only at 225 seconds, and zero new orders after 240 seconds. | Current tapering starts later and still allows behavior outside the required time bands. | `src/bot/runtime/taper.rs`, `src/bot/runtime/loop.rs`, `src/bot/runtime/config.rs` |
+| IMP-11 | `REQ-021` | Done | Done | Add exact late-window controls: smaller clips after 180 seconds, balance-only at 225 seconds, and zero new orders after 240 seconds. | Implemented: the runtime now uses env-configurable `180 / 225 / 240` late-window defaults, downshifts paired growth to maintenance sizing after late reduce starts, enforces balance-only repair routing after the configured balance-only threshold, hands off into `AwaitSettlement` at the configured stop-new-orders cutoff, preserves legacy late-window env compatibility, and emits dynamic late-window metrics keyed to the active thresholds. | `src/bot/runtime/config.rs`, `src/bot/runtime/state.rs`, `src/bot/runtime/taper.rs`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/metrics.rs`, `src/bot/runtime/loop.rs`, `src/env_contract.rs`, `src/bot/runtime/tests.rs` |
 | IMP-12 | `REQ-023` | Partial | Queued | Introduce versioned config with persisted snapshots, explicit `config_version` on decisions, orders, and fills, and rollback-safe reload behavior. | Config loads from env and snapshots exist, but there is no requirement-complete versioned config pipeline. | `src/config.rs`, `src/db.rs`, `src/main.rs` |
 | IMP-13 | `REQ-024`, `REQ-025` | Missing | Queued | Build append-only decision logging and structured metrics for state transitions, risk blocks, intents, acks, fills, reconciliation, and settlement. | Current decision persistence is incomplete, legacy-shaped, and not append-only or fully wired into order flow. | `src/db.rs`, `src/logging.rs`, `src/main.rs`, `src/bot/runtime/*` |
 | IMP-14 | `REQ-028`, `REQ-029` | Missing | Blocked | Add a true paper adapter and make `paper` or `shadow` the default startup mode until clean reconciliation and explicit live enablement pass. | `dry_run` exists, but it is not a real paper adapter, and live-start safeguards are not requirement-complete. | `src/main.rs`, `src/bot.rs`, `src/bot/execution/*`, new paper adapter module |
@@ -116,14 +116,13 @@ Work status legend:
 
 This sequence stays tied to the requirement instead of a refactor roadmap:
 
-1. `IMP-11` late-window balance-only and cutoff logic
-2. `IMP-12` config versioning
-3. `IMP-13` append-only decision audit trail
-4. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
-5. `IMP-14` true paper plus shadow-first startup safety
-6. `IMP-17` analytics importer parity
-7. `IMP-18` deterministic replay
-8. `IMP-22` to `IMP-25` validation and launch gates
+1. `IMP-12` config versioning
+2. `IMP-13` append-only decision audit trail
+3. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
+4. `IMP-14` true paper plus shadow-first startup safety
+5. `IMP-17` analytics importer parity
+6. `IMP-18` deterministic replay
+7. `IMP-22` to `IMP-25` validation and launch gates
 
 ## Short Summary
 
@@ -140,14 +139,15 @@ Recent completed work:
 - `IMP-08` / `REQ-014` and `REQ-015` implementation work is now `Done`: normal BOT flow is maker-first, taker submits now require explicit exception reasons and cap policy, market and daily taker-share caps are enforced with shared wallet-aware state, and multi-instance same-wallet crash recovery no longer silently disables the shared cap ledger.
 - `IMP-09` / `REQ-016` and `REQ-017` implementation work is now `Done`: `BOT_CLIP_LADDER` now controls the exact `12 / 20 / 40 / 80` ladder, seeds and normal adds use the correct base rungs, `40 / 80` only escalate under the required green conditions, taper late maintenance downshifts back to the one-lot clip, and repair sizing now respects actual lagging-side spend and min-notional-safe gaps.
 - `IMP-10` / `REQ-018` and `REQ-019` implementation work is now `Done`: pair-build, taper, and `AwaitSecondFill` now classify favorite and underdog sides from live bids, hard-block speculative one-sided adds, block orders that would increase underdog residual, and cancel only the offending BOT side when that residual-direction guard trips.
+- `IMP-11` / `REQ-021` implementation work is now `Done`: the runtime now enforces exact late-window timing with env-configurable `180 / 225 / 240` defaults, shifts into reduced-clip late trading, flips to balance-only repair after the configured balance-only threshold, stops new orders by handing off into `AwaitSettlement` at the configured cutoff, preserves legacy late-window env compatibility, and emits late-window metrics against the active thresholds rather than hard-coded bucket names.
 
 The biggest remaining requirement gaps are:
 
-- late-window rules
 - append-only decision and audit persistence
 - true paper, replay, and shadow modes
 - startup and post-settlement validation discipline plus strict stale-data behavior
 - validation gates before any guarded live rollout
+- config versioning and rollback-safe config snapshots
 
 Intentional scope exception:
 
@@ -156,5 +156,5 @@ Intentional scope exception:
 
 Current estimate:
 
-- Requirement coverage in current scope: `66%`
-- Remaining requirement gap in current scope: `34%`
+- Requirement coverage in current scope: `70%`
+- Remaining requirement gap in current scope: `30%`

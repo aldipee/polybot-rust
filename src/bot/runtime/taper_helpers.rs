@@ -44,11 +44,11 @@ impl MakerHedgeCapBot {
         cfg: &BotRuntimeConfigSnapshot,
     ) {
         if let Ok(mut st) = self.bot_runtime_state.lock() {
-            if t_into_s >= cfg.taper_start_seconds {
-                st.taper_new_orders_after_240 += 1;
+            if t_into_s >= cfg.late_balance_only_start_seconds {
+                st.late_new_orders_after_225 += 1;
             }
-            if t_into_s >= (300.0 - cfg.final_quiet_seconds) {
-                st.taper_new_orders_after_270 += 1;
+            if t_into_s >= cfg.late_stop_new_orders_start_seconds {
+                st.late_new_orders_after_240 += 1;
             }
         }
     }
@@ -72,9 +72,8 @@ impl MakerHedgeCapBot {
             return;
         }
         if state_kind == "hold"
-            || reason == "final_quiet_rest"
-            || reason.starts_with("late_repair_first_suppress:")
-            || reason.starts_with("late_no_optional_adds_suppress:")
+            || reason.starts_with("late_reduce_clips_repair_first_suppress:")
+            || reason.starts_with("late_balance_only_suppress:")
             || reason.starts_with("late_floor_tail_priority:")
         {
             self._bot_runtime_note_optional_add_skipped();

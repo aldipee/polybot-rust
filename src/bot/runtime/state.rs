@@ -44,9 +44,9 @@ pub(in crate::bot) fn bot_runtime_phase_from_t_into_s(
         BotRuntimePhase::PreArm
     } else if t_into_s < 30.0 {
         BotRuntimePhase::OpenBoth
-    } else if t_into_s < cfg.taper_start_seconds {
+    } else if t_into_s < cfg.late_reduce_start_seconds {
         BotRuntimePhase::PairBuild
-    } else if t_into_s < 300.0 {
+    } else if t_into_s < cfg.late_stop_new_orders_start_seconds {
         BotRuntimePhase::Taper
     } else {
         BotRuntimePhase::AwaitSettlement
@@ -235,10 +235,10 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) daily_taker_fill_shares: f64,
     pub(in crate::bot) fill_events_by_segment: [u32; 5],
     pub(in crate::bot) fill_shares_by_segment: [f64; 5],
-    pub(in crate::bot) taper_fill_events_after_240: u32,
-    pub(in crate::bot) taper_fill_events_after_270: u32,
-    pub(in crate::bot) taper_new_orders_after_240: u32,
-    pub(in crate::bot) taper_new_orders_after_270: u32,
+    pub(in crate::bot) late_fill_events_after_180: u32,
+    pub(in crate::bot) late_fill_events_after_225: u32,
+    pub(in crate::bot) late_new_orders_after_225: u32,
+    pub(in crate::bot) late_new_orders_after_240: u32,
     pub(in crate::bot) skipped_optional_add_count: u32,
     pub(in crate::bot) repair_reserve_blocked_count: u32,
     pub(in crate::bot) floor_tail_blocked_count: u32,
@@ -496,8 +496,8 @@ pub(in crate::bot) struct BotRuntimeTailCapStatus {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::bot) enum BotRuntimeTaperMode {
-    RepairFirst,
-    NoOptionalAdds,
+    ReduceClips,
+    BalanceOnly,
 }
 impl BotRuntimeTaperMode {
     /// Returns the stable string label for this enum or state value.
@@ -506,8 +506,8 @@ impl BotRuntimeTaperMode {
 
     pub(in crate::bot) fn as_str(self) -> &'static str {
         match self {
-            Self::RepairFirst => "repair_first",
-            Self::NoOptionalAdds => "no_optional_adds",
+            Self::ReduceClips => "reduce_clips",
+            Self::BalanceOnly => "balance_only",
         }
     }
 }
@@ -552,10 +552,10 @@ pub(in crate::bot) struct BotRuntimeMetricsSnapshot {
     pub(in crate::bot) pair_coverage: f64,
     pub(in crate::bot) share_skew_ratio: f64,
     pub(in crate::bot) inventory_vwap_sum: f64,
-    pub(in crate::bot) taper_fill_events_after_240: u32,
-    pub(in crate::bot) taper_fill_events_after_270: u32,
-    pub(in crate::bot) taper_new_orders_after_240: u32,
-    pub(in crate::bot) taper_new_orders_after_270: u32,
+    pub(in crate::bot) late_fill_events_after_180: u32,
+    pub(in crate::bot) late_fill_events_after_225: u32,
+    pub(in crate::bot) late_new_orders_after_225: u32,
+    pub(in crate::bot) late_new_orders_after_240: u32,
     pub(in crate::bot) prearm_ready_before_open: bool,
     pub(in crate::bot) open_both_seed_by_deadline_met: bool,
     pub(in crate::bot) open_both_late_seed_used: bool,

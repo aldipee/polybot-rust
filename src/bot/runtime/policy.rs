@@ -424,21 +424,32 @@ pub(in crate::bot) fn bot_runtime_cumulative_budget_fractions(
     if t_into_s < 0.0 {
         return (0.0, 0.0);
     }
+    let (late_budget_start_seconds, taper_budget_start_seconds) =
+        if cfg.legacy_late_window_budget_mode {
+            (180.0, cfg.late_reduce_start_seconds)
+        } else {
+            (
+                cfg.late_reduce_start_seconds,
+                cfg.late_balance_only_start_seconds,
+            )
+        };
     let mut min_fraction = cfg.seed_budget_min_fraction.max(0.0);
     let mut max_fraction = cfg.seed_budget_max_fraction.max(min_fraction);
-    if t_into_s >= 30.0 && 30.0 < cfg.taper_start_seconds {
+    if t_into_s >= 30.0 && 30.0 < cfg.late_reduce_start_seconds {
         min_fraction += cfg.early_budget_min_fraction.max(0.0);
         max_fraction += cfg.early_budget_max_fraction.max(0.0);
     }
-    if t_into_s >= 60.0 && 60.0 < cfg.taper_start_seconds {
+    if t_into_s >= 60.0 && 60.0 < cfg.late_reduce_start_seconds {
         min_fraction += cfg.main_budget_min_fraction.max(0.0);
         max_fraction += cfg.main_budget_max_fraction.max(0.0);
     }
-    if t_into_s >= 180.0 && 180.0 < cfg.taper_start_seconds {
+    if t_into_s >= late_budget_start_seconds
+        && late_budget_start_seconds < taper_budget_start_seconds
+    {
         min_fraction += cfg.late_budget_min_fraction.max(0.0);
         max_fraction += cfg.late_budget_max_fraction.max(0.0);
     }
-    if t_into_s >= cfg.taper_start_seconds {
+    if t_into_s >= taper_budget_start_seconds {
         min_fraction += cfg.taper_budget_min_fraction.max(0.0);
         max_fraction += cfg.taper_budget_max_fraction.max(0.0);
     }

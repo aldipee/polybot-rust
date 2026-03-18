@@ -254,6 +254,52 @@ impl MakerHedgeCapBot {
             );
             return;
         }
+        if bot_runtime_residual_side(q_yes, q_no).is_none() {
+            let cancelled_taper_lighter = self._bot_runtime_cancel_order_family(
+                "BOT_TAPER_LIGHTER",
+                None,
+                "bot_runtime_taper_stale_lighter_repair_balanced",
+            );
+            let cancelled_pair_build_lighter = self._bot_runtime_cancel_order_family(
+                "BOT_PAIR_BUILD_LIGHTER",
+                None,
+                "bot_runtime_taper_stale_lighter_repair_balanced",
+            );
+            if cancelled_taper_lighter || cancelled_pair_build_lighter {
+                self._bot_runtime_log_taper_state(
+                    "rest",
+                    "stale_lighter_repair_balanced",
+                    taper_mode,
+                    None,
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+        }
+        if matches!(taper_mode, BotRuntimeTaperMode::BalanceOnly) {
+            let cancelled_pair_build = self._bot_runtime_cancel_pair_build_growth_orders(
+                None,
+                "bot_runtime_taper_balance_only",
+            );
+            let cancelled_taper = self
+                ._bot_runtime_cancel_taper_growth_orders(None, "bot_runtime_taper_balance_only");
+            if cancelled_pair_build || cancelled_taper {
+                self._bot_runtime_log_taper_state(
+                    "rest",
+                    "late_balance_only_growth_handoff",
+                    taper_mode,
+                    None,
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+        }
         let total_usable_budget =
             usable_budget_after_reserve(self.cfg.max_total_cost, self.cfg.reserve_usd);
         let budget_snapshot =
