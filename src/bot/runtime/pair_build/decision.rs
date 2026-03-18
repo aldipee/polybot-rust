@@ -182,6 +182,38 @@ pub(in crate::bot) fn bot_runtime_pair_build_selected_rung(
     }
 }
 
+fn bot_runtime_pair_build_refresh_residual_direction(
+    decision: &mut BotRuntimePairBuildDecision,
+    q_yes: f64,
+    q_no: f64,
+) {
+    decision.residual_side = bot_runtime_residual_side(q_yes, q_no);
+    decision.projected_residual_side = Some(
+        bot_runtime_projected_residual_side_and_magnitude(
+            decision.mode,
+            decision.side,
+            decision.clip.max(0) as f64,
+            q_yes,
+            q_no,
+        )
+        .0,
+    )
+    .flatten();
+    decision.residual_kind = bot_runtime_residual_kind(
+        decision.favorite_side,
+        decision.underdog_side,
+        decision.residual_side,
+    );
+    decision.increases_underdog_residual = bot_runtime_would_increase_underdog_residual_for_side(
+        decision.mode,
+        decision.side,
+        decision.clip.max(0) as f64,
+        q_yes,
+        q_no,
+        decision.underdog_side,
+    );
+}
+
 pub(in crate::bot) fn bot_runtime_pair_build_decision_with_selected_clip(
     mut decision: BotRuntimePairBuildDecision,
     clip: i64,
@@ -231,6 +263,16 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision_with_selected_clip(
     decision.green_time_ok = green_time_ok;
     decision.green_budget_ok = green_budget_ok;
     decision.green_conditions_met = green_conditions_met;
+    decision.one_side_exception_kind = match decision.mode {
+        BotRuntimePairBuildMode::PairedGrowth => BotRuntimeOneSideExceptionKind::None,
+        BotRuntimePairBuildMode::LighterSideFirst => match decision.one_side_exception_kind {
+            BotRuntimeOneSideExceptionKind::SecondSideCompletion => {
+                BotRuntimeOneSideExceptionKind::SecondSideCompletion
+            }
+            _ => BotRuntimeOneSideExceptionKind::LaggingSideRepair,
+        },
+    };
+    bot_runtime_pair_build_refresh_residual_direction(&mut decision, q_yes, q_no);
     decision
 }
 
@@ -257,6 +299,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     total_cost: f64,
     min_shares: f64,
     min_maker_notional: f64,
+    tick_size: f64,
     cfg: &BotRuntimeConfigSnapshot,
     under_min_target: bool,
 ) -> Result<BotRuntimePairBuildDecision, String> {
@@ -277,6 +320,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     let current_unmatched_fraction = unmatched_fraction(q_yes, q_no);
     let current_match_ratio = match_ratio(q_yes, q_no);
     let current_imbalance_state = bot_runtime_current_imbalance_state(q_yes, q_no, cfg);
+    let (favorite_side, underdog_side) =
+        bot_runtime_favorite_underdog_sides(y_bid, n_bid, tick_size);
     let pair_coverage = pair_coverage(q_yes, q_no);
     let skew_ratio = share_skew_ratio(q_yes, q_no);
     let qty_gap = (q_yes.max(0.0) - q_no.max(0.0)).abs();
@@ -427,6 +472,13 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
                         price_zone,
                         residual_unit_cost,
                         lagging_side_quote: Some(side_bid),
+                        favorite_side,
+                        underdog_side,
+                        residual_side: None,
+                        projected_residual_side: None,
+                        residual_kind: BotRuntimeResidualKind::None,
+                        increases_underdog_residual: false,
+                        one_side_exception_kind: BotRuntimeOneSideExceptionKind::LaggingSideRepair,
                         pair_sum,
                         current_unmatched_fraction,
                         projected_unmatched_fraction,
@@ -553,6 +605,13 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         price_zone,
         residual_unit_cost: None,
         lagging_side_quote: None,
+        favorite_side,
+        underdog_side,
+        residual_side: None,
+        projected_residual_side: None,
+        residual_kind: BotRuntimeResidualKind::None,
+        increases_underdog_residual: false,
+        one_side_exception_kind: BotRuntimeOneSideExceptionKind::None,
         pair_sum,
         current_unmatched_fraction,
         projected_unmatched_fraction,
@@ -908,6 +967,54 @@ pub(in crate::bot) fn bot_runtime_price_zone_reason_requires_lighter_repair_canc
 ) -> bool {
     reason.starts_with("price_zone_stop_add:rebalance_add:")
         || reason.starts_with("price_zone_danger:rebalance_add:")
+}
+
+/// Implements residual-direction hold reason for the BOT runtime.
+/// This is a pure pair-build helper used for policy and handler gating.
+
+pub(in crate::bot) fn bot_runtime_pair_build_residual_direction_hold_reason(
+    decision: &BotRuntimePairBuildDecision,
+) -> Option<String> {
+    if decision.mode != BotRuntimePairBuildMode::LighterSideFirst {
+        return None;
+    }
+    let side = decision.side.unwrap_or(OutcomeSide::Yes);
+    if matches!(
+        decision.one_side_exception_kind,
+        BotRuntimeOneSideExceptionKind::None
+    ) {
+        return Some(format!("single_side_speculative_add:{}", side.as_str()));
+    }
+    if !decision.increases_underdog_residual {
+        return None;
+    }
+    Some(format!(
+        "underdog_residual_increase_block:{}:{}:{}",
+        side.as_str(),
+        decision
+            .residual_side
+            .map(|value| value.as_str())
+            .unwrap_or("NONE"),
+        decision
+            .underdog_side
+            .map(|value| value.as_str())
+            .unwrap_or("NONE")
+    ))
+}
+
+/// Implements residual-direction side cancellation policy for the BOT runtime.
+/// This is a pure pair-build helper used for handler-side cleanup.
+
+pub(in crate::bot) fn bot_runtime_residual_reason_cancel_side(reason: &str) -> Option<OutcomeSide> {
+    let mut parts = reason.split(':');
+    if parts.next() != Some("underdog_residual_increase_block") {
+        return None;
+    }
+    match parts.next().map(|value| value.trim().to_ascii_uppercase()) {
+        Some(side) if side == "YES" => Some(OutcomeSide::Yes),
+        Some(side) if side == "NO" => Some(OutcomeSide::No),
+        _ => None,
+    }
 }
 
 /// Implements lighter-side repair preservation policy for imbalance holds in the BOT runtime.

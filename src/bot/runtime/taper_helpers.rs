@@ -169,9 +169,34 @@ impl MakerHedgeCapBot {
             .unwrap_or(false);
         let green_time_ok = decision.map(|value| value.green_time_ok).unwrap_or(false);
         let green_budget_ok = decision.map(|value| value.green_budget_ok).unwrap_or(false);
+        let favorite_side = decision
+            .and_then(|value| value.favorite_side.map(|side| side.as_str().to_string()))
+            .unwrap_or_else(|| "NA".to_string());
+        let underdog_side = decision
+            .and_then(|value| value.underdog_side.map(|side| side.as_str().to_string()))
+            .unwrap_or_else(|| "NA".to_string());
+        let residual_side = decision
+            .and_then(|value| value.residual_side.map(|side| side.as_str().to_string()))
+            .unwrap_or_else(|| "NA".to_string());
+        let projected_residual_side = decision
+            .and_then(|value| {
+                value
+                    .projected_residual_side
+                    .map(|side| side.as_str().to_string())
+            })
+            .unwrap_or_else(|| "NA".to_string());
+        let residual_kind = decision
+            .map(|value| value.residual_kind.as_str().to_string())
+            .unwrap_or_else(|| BotRuntimeResidualKind::None.as_str().to_string());
+        let increases_underdog_residual = decision
+            .map(|value| value.increases_underdog_residual)
+            .unwrap_or(false);
+        let one_side_exception_kind = decision
+            .map(|value| value.one_side_exception_kind.as_str().to_string())
+            .unwrap_or_else(|| BotRuntimeOneSideExceptionKind::None.as_str().to_string());
         let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][TAPER] pair_id={} {} reason={} taper_mode={} mode={} side={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} current_base={:.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={}",
+            "[BOT][TAPER] pair_id={} {} reason={} taper_mode={} mode={} side={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} current_base={:.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={}",
             pair_id,
             state_kind,
             reason,
@@ -190,6 +215,13 @@ impl MakerHedgeCapBot {
             residual_unit_cost,
             lagging_side_quote,
             heavier_side,
+            favorite_side,
+            underdog_side,
+            residual_side,
+            projected_residual_side,
+            residual_kind,
+            one_side_exception_kind,
+            increases_underdog_residual,
             current_base,
             green_conditions_met,
             green_both_sides_filled,

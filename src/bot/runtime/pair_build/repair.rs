@@ -754,7 +754,7 @@ impl MakerHedgeCapBot {
                     .unwrap_or(false);
                 let bid_cap_applied = (repair_original_bid - repair_bid_capped).abs() > 1e-9;
                 self.logger.info(&format!(
-                    "[BOT][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} requested_clip={:.0} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                    "[BOT][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} requested_clip={:.0} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                     decision.mode.as_str(),
                     active_side.as_str(),
                     decision.clip,
@@ -776,6 +776,25 @@ impl MakerHedgeCapBot {
                         .map(|value| format!("{value:.3}"))
                         .unwrap_or_else(|| "NA".to_string()),
                     active_side.opposite().as_str(),
+                    decision
+                        .favorite_side
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    decision
+                        .underdog_side
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    decision
+                        .residual_side
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    decision
+                        .projected_residual_side
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    decision.residual_kind.as_str(),
+                    decision.one_side_exception_kind.as_str(),
+                    decision.increases_underdog_residual,
                     exact_gap_clip,
                     min_valid_clip,
                     rounded_up_min_valid,

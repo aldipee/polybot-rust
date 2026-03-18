@@ -339,7 +339,8 @@ fn bot_runtime_config_reader_uses_bot_clip_ladder_and_ignores_legacy_split_clip_
 fn taper_maintenance_decision_downshifts_paired_growth_to_min_lot() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
-        60.0, 40.0, 40.0, 12.0, 12.0, 0.30, 0.32, 0.30, 0.32, 500.0, 24.0, 1.0, 1.0, &cfg, false,
+        60.0, 40.0, 40.0, 12.0, 12.0, 0.30, 0.32, 0.30, 0.32, 500.0, 24.0, 1.0, 1.0, 0.01, &cfg,
+        false,
     )
     .expect("green paired growth should start at the large rung before taper maintenance");
     assert_eq!(decision.clip, 80);

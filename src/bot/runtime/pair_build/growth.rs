@@ -454,7 +454,7 @@ impl MakerHedgeCapBot {
                 }
             }
             self.logger.info(&format!(
-                "[BOT][PAIR_BUILD] submit mode={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} requested_clip={:.0} cpp_hint={} paired_cost_band={} projected_paired_cost={:.3} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} clipped_for_band={} optional_buy_guard={} optional_buy_edge_source={} min_snapshot_edge={:.3} below_snapshot_optional={} repair_reserve_side={} likely_repair_clip={} total_reserved_budget={:.2} clipped_for_repair_reserve={} bad_regime_shutdown={} bad_regime_ratio={:.3} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} current_base={:.2} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                "[BOT][PAIR_BUILD] submit mode={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} requested_clip={:.0} cpp_hint={} paired_cost_band={} projected_paired_cost={:.3} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} clipped_for_band={} optional_buy_guard={} optional_buy_edge_source={} min_snapshot_edge={:.3} below_snapshot_optional={} repair_reserve_side={} likely_repair_clip={} total_reserved_budget={:.2} clipped_for_repair_reserve={} bad_regime_shutdown={} bad_regime_ratio={:.3} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} current_base={:.2} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                 decision.mode.as_str(),
                 decision.clip,
                 decision.clip_bucket,
@@ -479,6 +479,25 @@ impl MakerHedgeCapBot {
                     .lagging_side_quote
                     .map(|value| format!("{value:.3}"))
                     .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .favorite_side
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .underdog_side
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .residual_side
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .projected_residual_side
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision.residual_kind.as_str(),
+                decision.one_side_exception_kind.as_str(),
+                decision.increases_underdog_residual,
                 clipped_for_band,
                 optional_buy_guard,
                 optional_buy_edge_source,

@@ -157,6 +157,19 @@ impl MakerHedgeCapBot {
         touched
     }
 
+    /// Implements cancel order family on a single side for the BOT runtime.
+    /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
+    /// BOT runtime.
+
+    pub(in crate::bot) fn _bot_runtime_cancel_order_family_on_side(
+        &self,
+        family_prefix: &str,
+        side: OutcomeSide,
+        reason: &str,
+    ) -> bool {
+        self._bot_runtime_cancel_order_family(family_prefix, Some(side.opposite()), reason)
+    }
+
     /// Implements cancel order family excluding a narrower preserve prefix for the BOT runtime.
     /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
     /// BOT runtime.
@@ -242,6 +255,28 @@ impl MakerHedgeCapBot {
         reason: &str,
     ) -> bool {
         self._bot_runtime_cancel_order_family("BOT_AWAIT_SECOND_FILL", active_side, reason)
+    }
+
+    /// Implements cancel BOT-owned working orders on one side for the BOT runtime.
+    /// This helper supports residual-direction cleanup while preserving the opposite side.
+
+    pub(in crate::bot) fn _bot_runtime_cancel_bot_orders_on_side(
+        &self,
+        side: OutcomeSide,
+        reason: &str,
+    ) -> bool {
+        let cancelled_open_both =
+            self._bot_runtime_cancel_order_family_on_side("BOT_OPEN_BOTH", side, reason);
+        let cancelled_await_second_fill =
+            self._bot_runtime_cancel_order_family_on_side("BOT_AWAIT_SECOND_FILL", side, reason);
+        let cancelled_pair_build =
+            self._bot_runtime_cancel_order_family_on_side("BOT_PAIR_BUILD", side, reason);
+        let cancelled_taper =
+            self._bot_runtime_cancel_order_family_on_side("BOT_TAPER", side, reason);
+        cancelled_open_both
+            || cancelled_await_second_fill
+            || cancelled_pair_build
+            || cancelled_taper
     }
 
     /// Implements pair build await second fill handoff for the BOT runtime.

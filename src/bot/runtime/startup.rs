@@ -1066,13 +1066,38 @@ impl MakerHedgeCapBot {
         }
         self._bot_runtime_note_startup_completion_blocked();
         let pair_id = self.pair_identity().pair_id;
+        let yes_bid = self
+            .yes_asset
+            .as_deref()
+            .and_then(|asset| self._best_bid_ask(asset).map(|(bid, _)| bid))
+            .unwrap_or(0.0);
+        let no_bid = self
+            .no_asset
+            .as_deref()
+            .and_then(|asset| self._best_bid_ask(asset).map(|(bid, _)| bid))
+            .unwrap_or(0.0);
+        let (favorite_side, underdog_side) =
+            bot_runtime_favorite_underdog_sides(yes_bid, no_bid, self.cfg.tick.max(0.0001));
+        let residual_side = bot_runtime_residual_side(q_yes, q_no);
+        let residual_kind = bot_runtime_residual_kind(favorite_side, underdog_side, residual_side);
         self.logger.info(&format!(
-            "[BOT][AWAIT_SECOND_FILL] pair_id={} hold reason={} missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            "[BOT][AWAIT_SECOND_FILL] pair_id={} hold reason={} missing_side={} favorite_side={} underdog_side={} residual_side={} residual_kind={} one_side_exception_kind={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
             pair_id,
             reason,
             missing_side
                 .map(|side| side.as_str().to_string())
                 .unwrap_or_else(|| "NA".to_string()),
+            favorite_side
+                .map(|side| side.as_str().to_string())
+                .unwrap_or_else(|| "NA".to_string()),
+            underdog_side
+                .map(|side| side.as_str().to_string())
+                .unwrap_or_else(|| "NA".to_string()),
+            residual_side
+                .map(|side| side.as_str().to_string())
+                .unwrap_or_else(|| "NA".to_string()),
+            residual_kind.as_str(),
+            BotRuntimeOneSideExceptionKind::SecondSideCompletion.as_str(),
             t_into_s.max(0.0),
             time_since_first_side_s.max(0.0),
             q_yes,
@@ -1670,6 +1695,76 @@ impl MakerHedgeCapBot {
                 );
                 return;
             };
+            let (yes_bid_for_residual, no_bid_for_residual) = match missing_side {
+                OutcomeSide::Yes => (
+                    missing_bid,
+                    self._best_bid_ask(no_asset)
+                        .map(|(bid, _)| bid)
+                        .unwrap_or(0.0),
+                ),
+                OutcomeSide::No => (
+                    self._best_bid_ask(yes_asset)
+                        .map(|(bid, _)| bid)
+                        .unwrap_or(0.0),
+                    missing_bid,
+                ),
+            };
+            let (favorite_side, underdog_side) = bot_runtime_favorite_underdog_sides(
+                yes_bid_for_residual,
+                no_bid_for_residual,
+                self.cfg.tick.max(0.0001),
+            );
+            let residual_side = bot_runtime_residual_side(q_yes, q_no);
+            let projected_residual_side = bot_runtime_projected_residual_side_and_magnitude(
+                BotRuntimePairBuildMode::LighterSideFirst,
+                Some(missing_side),
+                rescue_size as f64,
+                q_yes,
+                q_no,
+            )
+            .0;
+            let residual_kind =
+                bot_runtime_residual_kind(favorite_side, underdog_side, residual_side);
+            let increases_underdog_residual = bot_runtime_would_increase_underdog_residual_for_side(
+                BotRuntimePairBuildMode::LighterSideFirst,
+                Some(missing_side),
+                rescue_size as f64,
+                q_yes,
+                q_no,
+                underdog_side,
+            );
+            if increases_underdog_residual {
+                let reason = format!(
+                    "underdog_residual_increase_block:{}:{}:{}",
+                    missing_side.as_str(),
+                    residual_side.map(|side| side.as_str()).unwrap_or("NONE"),
+                    underdog_side.map(|side| side.as_str()).unwrap_or("NONE")
+                );
+                let _ = self._bot_runtime_cancel_bot_orders_on_side(
+                    missing_side,
+                    "bot_runtime_await_second_fill_residual_hold",
+                );
+                self._bot_runtime_mark_await_second_fill_hard_paused(
+                    now,
+                    reason.as_str(),
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                self._bot_runtime_log_await_second_fill_hold(
+                    reason.as_str(),
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
             if marginal_pair_sum >= 1.0 - 1e-9 {
                 self._bot_runtime_mark_await_second_fill_hard_paused(
                     now,
@@ -1745,13 +1840,28 @@ impl MakerHedgeCapBot {
                     }),
                 );
                 self.logger.warning(&format!(
-                    "[BOT][AWAIT_SECOND_FILL] pair_id={} rescue_attempted missing_side={} ask={:.3} clip={} visible_ask={:.2} marginal_pair_sum={:.3} t_into={:.1}s since_first_side={:.1}s",
+                    "[BOT][AWAIT_SECOND_FILL] pair_id={} rescue_attempted missing_side={} ask={:.3} clip={} visible_ask={:.2} marginal_pair_sum={:.3} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} t_into={:.1}s since_first_side={:.1}s",
                     pair_id,
                     missing_side.as_str(),
                     missing_ask,
                     rescue_size,
                     visible_ask_size.max(0.0),
                     marginal_pair_sum,
+                    favorite_side
+                        .map(|side| side.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    underdog_side
+                        .map(|side| side.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    residual_side
+                        .map(|side| side.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    projected_residual_side
+                        .map(|side| side.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    residual_kind.as_str(),
+                    BotRuntimeOneSideExceptionKind::SecondSideCompletion.as_str(),
+                    increases_underdog_residual,
                     t_into_s.max(0.0),
                     time_since_first_side_s
                 ));
@@ -1862,11 +1972,47 @@ impl MakerHedgeCapBot {
             if is_new_submit {
                 self._bot_runtime_clear_await_second_fill_hold();
                 self.logger.info(&format!(
-                    "[BOT][AWAIT_SECOND_FILL] pair_id={} submit missing_side={} bid={:.3} clip={} t_into={:.1}s since_first_side={:.1}s budget_scope=whole_window maker_first=true",
+                    "[BOT][AWAIT_SECOND_FILL] pair_id={} submit missing_side={} bid={:.3} clip={} favorite_side={} underdog_side={} residual_side={} residual_kind={} one_side_exception_kind={} t_into={:.1}s since_first_side={:.1}s budget_scope=whole_window maker_first=true",
                     pair_id,
                     missing_side.as_str(),
                     missing_bid,
                     size_int,
+                    bot_runtime_favorite_underdog_sides(
+                        self._best_bid_ask(yes_asset).map(|(bid, _)| bid).unwrap_or(0.0),
+                        self._best_bid_ask(no_asset).map(|(bid, _)| bid).unwrap_or(0.0),
+                        self.cfg.tick.max(0.0001),
+                    )
+                    .0
+                    .map(|side| side.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                    bot_runtime_favorite_underdog_sides(
+                        self._best_bid_ask(yes_asset).map(|(bid, _)| bid).unwrap_or(0.0),
+                        self._best_bid_ask(no_asset).map(|(bid, _)| bid).unwrap_or(0.0),
+                        self.cfg.tick.max(0.0001),
+                    )
+                    .1
+                    .map(|side| side.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                    bot_runtime_residual_side(q_yes, q_no)
+                        .map(|side| side.as_str().to_string())
+                        .unwrap_or_else(|| "NA".to_string()),
+                    bot_runtime_residual_kind(
+                        bot_runtime_favorite_underdog_sides(
+                            self._best_bid_ask(yes_asset).map(|(bid, _)| bid).unwrap_or(0.0),
+                            self._best_bid_ask(no_asset).map(|(bid, _)| bid).unwrap_or(0.0),
+                            self.cfg.tick.max(0.0001),
+                        )
+                        .0,
+                        bot_runtime_favorite_underdog_sides(
+                            self._best_bid_ask(yes_asset).map(|(bid, _)| bid).unwrap_or(0.0),
+                            self._best_bid_ask(no_asset).map(|(bid, _)| bid).unwrap_or(0.0),
+                            self.cfg.tick.max(0.0001),
+                        )
+                        .1,
+                        bot_runtime_residual_side(q_yes, q_no),
+                    )
+                    .as_str(),
+                    BotRuntimeOneSideExceptionKind::SecondSideCompletion.as_str(),
                     t_into_s.max(0.0),
                     time_since_first_side_s
                 ));

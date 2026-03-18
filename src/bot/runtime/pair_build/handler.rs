@@ -32,6 +32,7 @@ impl MakerHedgeCapBot {
             total_cost,
             self.cfg.min_shares,
             self.min_maker_notional,
+            self.cfg.tick.max(0.0001),
             cfg,
             budget_snapshot.under_min_target,
         )?;
@@ -54,6 +55,9 @@ impl MakerHedgeCapBot {
             decision.marginal_cost_mode,
             decision.effective_marginal_pair_cost,
         ) {
+            return Err(reason);
+        }
+        if let Some(reason) = bot_runtime_pair_build_residual_direction_hold_reason(&decision) {
             return Err(reason);
         }
 
@@ -446,6 +450,7 @@ impl MakerHedgeCapBot {
         ) {
             Ok(plan) => plan,
             Err(reason) => {
+                let residual_cancel_side = bot_runtime_residual_reason_cancel_side(&reason);
                 let preserve_lighter =
                     if bot_runtime_imbalance_reason_preserves_lighter_repair(&reason) {
                         let qty_gap = (q_yes.max(0.0) - q_no.max(0.0)).abs();
@@ -510,6 +515,11 @@ impl MakerHedgeCapBot {
                         || cancelled_pair_build
                         || cancelled_taper
                         || cancelled_await_second_fill
+                } else if let Some(side) = residual_cancel_side {
+                    self._bot_runtime_cancel_bot_orders_on_side(
+                        side,
+                        "bot_runtime_pair_build_residual_hold",
+                    )
                 } else {
                     false
                 };

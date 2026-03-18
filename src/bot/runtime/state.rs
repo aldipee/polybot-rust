@@ -284,6 +284,36 @@ impl BotRuntimePairBuildMode {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::bot) enum BotRuntimeResidualKind {
+    None,
+    Favorite,
+    Underdog,
+}
+impl BotRuntimeResidualKind {
+    pub(in crate::bot) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Favorite => "favorite",
+            Self::Underdog => "underdog",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::bot) enum BotRuntimeOneSideExceptionKind {
+    None,
+    SecondSideCompletion,
+    LaggingSideRepair,
+}
+impl BotRuntimeOneSideExceptionKind {
+    pub(in crate::bot) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SecondSideCompletion => "second_side_completion",
+            Self::LaggingSideRepair => "lagging_side_repair",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::bot) enum BotRuntimePairBuildCppHint {
     Normal,
     Medium,
@@ -362,6 +392,13 @@ pub(in crate::bot) struct BotRuntimePairBuildDecision {
     pub(in crate::bot) price_zone: BotRuntimePairedCostBand,
     pub(in crate::bot) residual_unit_cost: Option<f64>,
     pub(in crate::bot) lagging_side_quote: Option<f64>,
+    pub(in crate::bot) favorite_side: Option<OutcomeSide>,
+    pub(in crate::bot) underdog_side: Option<OutcomeSide>,
+    pub(in crate::bot) residual_side: Option<OutcomeSide>,
+    pub(in crate::bot) projected_residual_side: Option<OutcomeSide>,
+    pub(in crate::bot) residual_kind: BotRuntimeResidualKind,
+    pub(in crate::bot) increases_underdog_residual: bool,
+    pub(in crate::bot) one_side_exception_kind: BotRuntimeOneSideExceptionKind,
     pub(in crate::bot) pair_sum: f64,
     pub(in crate::bot) current_unmatched_fraction: f64,
     pub(in crate::bot) projected_unmatched_fraction: f64,

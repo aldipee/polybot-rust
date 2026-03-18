@@ -87,6 +87,123 @@ pub(in crate::bot) fn bot_runtime_taker_share_target() -> f64 {
 pub(in crate::bot) fn bot_runtime_taker_share_cap() -> f64 {
     0.10
 }
+
+pub(in crate::bot) fn bot_runtime_favorite_underdog_sides(
+    y_bid: f64,
+    n_bid: f64,
+    tick_size: f64,
+) -> (Option<OutcomeSide>, Option<OutcomeSide>) {
+    let tick = tick_size.max(0.0001);
+    if !y_bid.is_finite() || !n_bid.is_finite() || y_bid <= 0.0 || n_bid <= 0.0 {
+        return (None, None);
+    }
+    if (y_bid - n_bid).abs() <= tick + 1e-9 {
+        (None, None)
+    } else if y_bid > n_bid {
+        (Some(OutcomeSide::Yes), Some(OutcomeSide::No))
+    } else {
+        (Some(OutcomeSide::No), Some(OutcomeSide::Yes))
+    }
+}
+
+pub(in crate::bot) fn bot_runtime_residual_side(q_yes: f64, q_no: f64) -> Option<OutcomeSide> {
+    if q_yes > q_no + 1e-9 {
+        Some(OutcomeSide::Yes)
+    } else if q_no > q_yes + 1e-9 {
+        Some(OutcomeSide::No)
+    } else {
+        None
+    }
+}
+
+pub(in crate::bot) fn bot_runtime_residual_magnitude(q_yes: f64, q_no: f64) -> f64 {
+    (q_yes.max(0.0) - q_no.max(0.0)).abs()
+}
+
+pub(in crate::bot) fn bot_runtime_residual_kind(
+    favorite_side: Option<OutcomeSide>,
+    underdog_side: Option<OutcomeSide>,
+    residual_side: Option<OutcomeSide>,
+) -> BotRuntimeResidualKind {
+    if residual_side.is_none() {
+        BotRuntimeResidualKind::None
+    } else if residual_side == favorite_side {
+        BotRuntimeResidualKind::Favorite
+    } else if residual_side == underdog_side {
+        BotRuntimeResidualKind::Underdog
+    } else {
+        BotRuntimeResidualKind::None
+    }
+}
+
+pub(in crate::bot) fn bot_runtime_projected_residual_side_and_magnitude(
+    mode: BotRuntimePairBuildMode,
+    side: Option<OutcomeSide>,
+    clip: f64,
+    q_yes: f64,
+    q_no: f64,
+) -> (Option<OutcomeSide>, f64) {
+    let mut projected_yes = q_yes.max(0.0);
+    let mut projected_no = q_no.max(0.0);
+    match mode {
+        BotRuntimePairBuildMode::PairedGrowth => {
+            projected_yes += clip.max(0.0);
+            projected_no += clip.max(0.0);
+        }
+        BotRuntimePairBuildMode::LighterSideFirst => match side.unwrap_or(OutcomeSide::Yes) {
+            OutcomeSide::Yes => projected_yes += clip.max(0.0),
+            OutcomeSide::No => projected_no += clip.max(0.0),
+        },
+    }
+    (
+        bot_runtime_residual_side(projected_yes, projected_no),
+        bot_runtime_residual_magnitude(projected_yes, projected_no),
+    )
+}
+
+pub(in crate::bot) fn bot_runtime_would_increase_underdog_residual(
+    mode: BotRuntimePairBuildMode,
+    side: Option<OutcomeSide>,
+    clip: f64,
+    q_yes: f64,
+    q_no: f64,
+    y_bid: f64,
+    n_bid: f64,
+    tick_size: f64,
+) -> bool {
+    let (_, underdog_side) = bot_runtime_favorite_underdog_sides(y_bid, n_bid, tick_size);
+    bot_runtime_would_increase_underdog_residual_for_side(
+        mode,
+        side,
+        clip,
+        q_yes,
+        q_no,
+        underdog_side,
+    )
+}
+
+pub(in crate::bot) fn bot_runtime_would_increase_underdog_residual_for_side(
+    mode: BotRuntimePairBuildMode,
+    side: Option<OutcomeSide>,
+    clip: f64,
+    q_yes: f64,
+    q_no: f64,
+    underdog_side: Option<OutcomeSide>,
+) -> bool {
+    let Some(underdog_side) = underdog_side else {
+        return false;
+    };
+    let current_residual_side = bot_runtime_residual_side(q_yes, q_no);
+    let current_residual_magnitude = bot_runtime_residual_magnitude(q_yes, q_no);
+    let (projected_residual_side, projected_residual_magnitude) =
+        bot_runtime_projected_residual_side_and_magnitude(mode, side, clip, q_yes, q_no);
+    if projected_residual_side != Some(underdog_side) || projected_residual_magnitude <= 1e-9 {
+        return false;
+    }
+    current_residual_side == Some(underdog_side)
+        && projected_residual_magnitude > current_residual_magnitude + 1e-9
+        || current_residual_side != Some(underdog_side)
+}
 /// Implements paired cost band index for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 

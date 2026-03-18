@@ -44,16 +44,16 @@ Work status legend:
 
 ### Overall Estimate
 
-- Estimated requirement coverage in current scope: `61%`
-- Estimated remaining gap in current scope: `39%`
+- Estimated requirement coverage in current scope: `66%`
+- Estimated remaining gap in current scope: `34%`
 
 ### Work Status Snapshot
 
 - Requirement analysis: `Done`
 - Requirement-only backlog definition: `Done`
 - `REQ-001` scope override recorded: `Done`
-- Active implementation tasks completed: `8 / 24`
-- Tasks ready to start now: `6 / 24`
+- Active implementation tasks completed: `9 / 24`
+- Tasks ready to start now: `5 / 24`
 - Tasks queued behind earlier work: `4 / 24`
 - Tasks blocked by prerequisites: `6 / 24`
 - Tasks marked not applicable: `1`
@@ -63,7 +63,7 @@ Work status legend:
 | Requirement area | REQ scope | Coverage | Gap | Current reading |
 |---|---|---:|---:|---|
 | Market scope and paired lifecycle | `REQ-002` to `REQ-008` with `REQ-001` excluded | 82% | 18% | Pair identity, pair snapshots, pair-level runtime decisions, `AwaitSettlement`, buy-only hold-to-settlement flow, exact open-time seeding, and `AwaitSecondFill` with one-shot missing-side rescue are now in place. The remaining gap in this area is mostly the still-partial settlement-owned lifecycle polish under `REQ-003`. |
-| Inventory, pricing, and residual discipline | `REQ-009` to `REQ-013`, `REQ-018` to `REQ-021` | 64% | 36% | Exact unmatched-fraction controls and exact marginal pair-cost zones are now in place, including `7% / 12% / 20%` imbalance thresholds, `0.94 / 0.97 / 1.00 / 1.03` price bands, projected hard-disable blocks, repair-only routing, and live order cancellation when imbalance or rebalance pricing shuts off further adds. The remaining gap in this area is mostly residual underdog protection and strict late-window behavior. |
+| Inventory, pricing, and residual discipline | `REQ-009` to `REQ-013`, `REQ-018` to `REQ-021` | 82% | 18% | Exact unmatched-fraction controls, exact marginal pair-cost zones, and explicit residual-direction blocks are now in place, including `7% / 12% / 20%` imbalance thresholds, `0.94 / 0.97 / 1.00 / 1.03` price bands, projected hard-disable blocks, repair-only routing, live order cancellation when imbalance or rebalance pricing shuts off further adds, and hard blocks on speculative one-sided adds or underdog-residual increases. The remaining gap in this area is mostly strict late-window behavior and the optional model-edge overlay. |
 | Execution controls and clip policy | `REQ-014` to `REQ-017`, `REQ-034` | 80% | 20% | Maker-first execution, explicit taker exception reasons, wallet-aware market and daily taker-share caps, shared pending-taker accounting, crash-tolerant shared-state enforcement, and the exact env-configurable `12 / 20 / 40 / 80` clip ladder with green-gated `40 / 80` escalation are now in place. The remaining gap in this area is mostly refresh-rate controls under `REQ-034`. |
 | Config, observability, and auditability | `REQ-023` to `REQ-025` | 18% | 82% | Config snapshotting exists, but no full config versioning, append-only decisions, or requirement-grade metrics and logs. |
 | Replay, paper, and live safety modes | `REQ-026` to `REQ-029` | 10% | 90% | No true replay engine, importer parity, paper adapter, or shadow-first guarded live flow is present. |
@@ -85,7 +85,7 @@ Work status legend:
 | IMP-07 | `REQ-011`, `REQ-012`, `REQ-013` | Done | Done | Implement exact marginal pair-cost zones using `0.94 / 0.97 / 1.00 / 1.03` thresholds and block all size-increasing intents at `>= 1.00`. | Implemented: balanced adds now use `y_bid + n_bid`, repairs now use heavier-side carried average plus lagging-side bid, `StopAdd` and `Danger` block new size, and live growth or repair orders are canceled when rebalance pricing turns forbidden. | `src/bot/runtime/pair_build/costs.rs`, `src/bot/runtime/pair_build/decision.rs`, `src/bot/runtime/pair_build/handler.rs`, `src/bot/runtime/pair_build/repair.rs`, `src/bot/runtime/taper.rs`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/tests.rs` |
 | IMP-08 | `REQ-014`, `REQ-015` | Done | Done | Make maker-first execution mandatory, require explicit taker exception reasons, and enforce sub-5% target and 10% hard cap for taker share. | Implemented: taker submits now require explicit exception reasons and cap policy, projected market and daily taker share are enforced with shared wallet-aware state, same-wallet sibling pending takers are counted for the daily cap but not leaked into other pairs' market caps, and shared-state locking now survives crash recovery. | `src/bot/execution/*`, `src/bot/runtime/*`, `src/bot/runtime/metrics.rs`, `src/helpers.rs`, `scripts/run-instance.sh` |
 | IMP-09 | `REQ-016`, `REQ-017` | Done | Done | Align clip sizing to `12 / 20 / 40 / 80`, hard-cap single orders at 80, and allow 40 or 80 only when all green conditions are true. | Implemented: `BOT_CLIP_LADDER` is now the authoritative clip policy, seeds default to `12`, paired growth defaults to `20`, `40 / 80` escalate progressively only under green conditions, taper maintenance re-downshifts to the late-phase lot, and repair sizing now respects actual lagging-side spend plus min-notional-safe gap limits. | `src/bot/runtime/config.rs`, `src/bot/runtime/pair_build/decision.rs`, `src/bot/runtime/pair_build/repair.rs`, `src/bot/runtime/taper.rs`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/tests.rs` |
-| IMP-10 | `REQ-018`, `REQ-019` | Partial | Ready | Hard-block intentional single-side speculative adds and forbid any order that increases residual inventory on the underdog side. | Current residual controls are indirect and do not explicitly encode the required block rules. | `src/bot/runtime/pair_build/decision.rs`, `src/bot/runtime/metrics.rs` |
+| IMP-10 | `REQ-018`, `REQ-019` | Done | Done | Hard-block intentional single-side speculative adds and forbid any order that increases residual inventory on the underdog side. | Implemented: pair-build, taper, and `AwaitSecondFill` now classify favorite/underdog and residual direction explicitly, emit stable residual-direction hold reasons, cancel only blocked-side BOT orders when underdog residual would increase, and expose the new residual telemetry in runtime logs. | `src/bot/runtime/pair_build/decision.rs`, `src/bot/runtime/metrics.rs`, `src/bot/runtime/pair_build/orders.rs`, `src/bot/runtime/startup.rs`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/tests.rs` |
 | IMP-11 | `REQ-021` | Partial | Ready | Add exact late-window controls: smaller clips after 180 seconds, balance-only at 225 seconds, and zero new orders after 240 seconds. | Current tapering starts later and still allows behavior outside the required time bands. | `src/bot/runtime/taper.rs`, `src/bot/runtime/loop.rs`, `src/bot/runtime/config.rs` |
 | IMP-12 | `REQ-023` | Partial | Queued | Introduce versioned config with persisted snapshots, explicit `config_version` on decisions, orders, and fills, and rollback-safe reload behavior. | Config loads from env and snapshots exist, but there is no requirement-complete versioned config pipeline. | `src/config.rs`, `src/db.rs`, `src/main.rs` |
 | IMP-13 | `REQ-024`, `REQ-025` | Missing | Queued | Build append-only decision logging and structured metrics for state transitions, risk blocks, intents, acks, fills, reconciliation, and settlement. | Current decision persistence is incomplete, legacy-shaped, and not append-only or fully wired into order flow. | `src/db.rs`, `src/logging.rs`, `src/main.rs`, `src/bot/runtime/*` |
@@ -116,15 +116,14 @@ Work status legend:
 
 This sequence stays tied to the requirement instead of a refactor roadmap:
 
-1. `IMP-10` residual and underdog-side protection
-2. `IMP-11` late-window balance-only and cutoff logic
-3. `IMP-12` config versioning
-4. `IMP-13` append-only decision audit trail
-5. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
-6. `IMP-14` true paper plus shadow-first startup safety
-7. `IMP-17` analytics importer parity
-8. `IMP-18` deterministic replay
-9. `IMP-22` to `IMP-25` validation and launch gates
+1. `IMP-11` late-window balance-only and cutoff logic
+2. `IMP-12` config versioning
+3. `IMP-13` append-only decision audit trail
+4. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
+5. `IMP-14` true paper plus shadow-first startup safety
+6. `IMP-17` analytics importer parity
+7. `IMP-18` deterministic replay
+8. `IMP-22` to `IMP-25` validation and launch gates
 
 ## Short Summary
 
@@ -140,10 +139,11 @@ Recent completed work:
 - `IMP-07` / `REQ-011`, `REQ-012`, and `REQ-013` implementation work is now `Done`: exact marginal pair-cost zones are now authoritative, balanced adds and rebalance adds use the correct requirement formulas, `>= 1.00` blocks new size, and live lighter-side repair orders are canceled when rebalance pricing turns `StopAdd` or `Danger`.
 - `IMP-08` / `REQ-014` and `REQ-015` implementation work is now `Done`: normal BOT flow is maker-first, taker submits now require explicit exception reasons and cap policy, market and daily taker-share caps are enforced with shared wallet-aware state, and multi-instance same-wallet crash recovery no longer silently disables the shared cap ledger.
 - `IMP-09` / `REQ-016` and `REQ-017` implementation work is now `Done`: `BOT_CLIP_LADDER` now controls the exact `12 / 20 / 40 / 80` ladder, seeds and normal adds use the correct base rungs, `40 / 80` only escalate under the required green conditions, taper late maintenance downshifts back to the one-lot clip, and repair sizing now respects actual lagging-side spend and min-notional-safe gaps.
+- `IMP-10` / `REQ-018` and `REQ-019` implementation work is now `Done`: pair-build, taper, and `AwaitSecondFill` now classify favorite and underdog sides from live bids, hard-block speculative one-sided adds, block orders that would increase underdog residual, and cancel only the offending BOT side when that residual-direction guard trips.
 
 The biggest remaining requirement gaps are:
 
-- residual and late-window rules
+- late-window rules
 - append-only decision and audit persistence
 - true paper, replay, and shadow modes
 - startup and post-settlement validation discipline plus strict stale-data behavior
@@ -156,5 +156,5 @@ Intentional scope exception:
 
 Current estimate:
 
-- Requirement coverage in current scope: `61%`
-- Remaining requirement gap in current scope: `39%`
+- Requirement coverage in current scope: `66%`
+- Remaining requirement gap in current scope: `34%`

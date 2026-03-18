@@ -285,6 +285,7 @@ impl MakerHedgeCapBot {
             total_cost,
             self.cfg.min_shares,
             self.min_maker_notional,
+            self.cfg.tick.max(0.0001),
             cfg,
             false,
         )
@@ -306,12 +307,17 @@ impl MakerHedgeCapBot {
                 decision.effective_marginal_pair_cost,
             ) {
                 Err(reason)
+            } else if let Some(reason) =
+                bot_runtime_pair_build_residual_direction_hold_reason(&decision)
+            {
+                Err(reason)
             } else {
                 Ok(decision)
             }
         }) {
             Ok(decision) => decision,
             Err(reason) => {
+                let residual_cancel_side = bot_runtime_residual_reason_cancel_side(&reason);
                 let preserve_lighter =
                     if bot_runtime_imbalance_reason_preserves_lighter_repair(&reason) {
                         let qty_gap = (q_yes.max(0.0) - q_no.max(0.0)).abs();
@@ -369,6 +375,11 @@ impl MakerHedgeCapBot {
                         self._bot_runtime_cancel_pair_build_orders(None, cancel_reason)
                     };
                     cancelled_taper || cancelled_pair_build
+                } else if let Some(side) = residual_cancel_side {
+                    self._bot_runtime_cancel_bot_orders_on_side(
+                        side,
+                        "bot_runtime_taper_residual_hold",
+                    )
                 } else {
                     false
                 };
@@ -585,7 +596,7 @@ impl MakerHedgeCapBot {
                 if is_new_submit {
                     self._bot_runtime_note_taper_submit(t_into_s, cfg);
                     self.logger.info(&format!(
-                        "[BOT][TAPER] submit taper_mode={} mode={} side={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} current_base={:.2} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
+                        "[BOT][TAPER] submit taper_mode={} mode={} side={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} current_base={:.2} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
                         taper_mode.as_str(),
                         decision.mode.as_str(),
                         active_side.as_str(),
@@ -607,6 +618,25 @@ impl MakerHedgeCapBot {
                             .map(|value| format!("{value:.3}"))
                             .unwrap_or_else(|| "NA".to_string()),
                         active_side.opposite().as_str(),
+                        decision
+                            .favorite_side
+                            .map(|value| value.as_str().to_string())
+                            .unwrap_or_else(|| "NA".to_string()),
+                        decision
+                            .underdog_side
+                            .map(|value| value.as_str().to_string())
+                            .unwrap_or_else(|| "NA".to_string()),
+                        decision
+                            .residual_side
+                            .map(|value| value.as_str().to_string())
+                            .unwrap_or_else(|| "NA".to_string()),
+                        decision
+                            .projected_residual_side
+                            .map(|value| value.as_str().to_string())
+                            .unwrap_or_else(|| "NA".to_string()),
+                        decision.residual_kind.as_str(),
+                        decision.one_side_exception_kind.as_str(),
+                        decision.increases_underdog_residual,
                         decision.current_base,
                         late_action_policy.current_tail_size,
                         late_action_policy.projected_tail_size,
@@ -816,7 +846,7 @@ impl MakerHedgeCapBot {
         if yes_new || no_new {
             self._bot_runtime_note_taper_submit(t_into_s, cfg);
             self.logger.info(&format!(
-                "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} current_base={:.2} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
+                "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} current_base={:.2} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
                 taper_mode.as_str(),
                 decision.mode.as_str(),
                 decision.clip,
@@ -839,6 +869,25 @@ impl MakerHedgeCapBot {
                     .lagging_side_quote
                     .map(|value| format!("{value:.3}"))
                     .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .favorite_side
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .underdog_side
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .residual_side
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .projected_residual_side
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision.residual_kind.as_str(),
+                decision.one_side_exception_kind.as_str(),
+                decision.increases_underdog_residual,
                 decision.current_base,
                 late_action_policy.current_tail_size,
                 late_action_policy.projected_tail_size,
