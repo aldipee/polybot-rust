@@ -1,4 +1,10 @@
 use super::super::*;
+use super::costs::{
+    bot_runtime_pair_build_balanced_add_effective_marginal_cost,
+    bot_runtime_pair_build_price_zone_hold_reason,
+    bot_runtime_pair_build_projected_paired_cost_band,
+    bot_runtime_pair_build_rebalance_effective_marginal_cost,
+};
 
 /// Implements pair build clip bucket for the BOT runtime.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
@@ -48,7 +54,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     }
 
     let current_base = q_yes.max(0.0).min(q_no.max(0.0));
-    let pair_sum = y_bid + n_bid;
+    let pair_sum = bot_runtime_pair_build_balanced_add_effective_marginal_cost(y_bid, n_bid);
     let current_unmatched_fraction = unmatched_fraction(q_yes, q_no);
     let current_match_ratio = match_ratio(q_yes, q_no);
     let current_imbalance_state = bot_runtime_current_imbalance_state(q_yes, q_no, cfg);
@@ -135,6 +141,12 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
             OutcomeSide::Yes => y_bid,
             OutcomeSide::No => n_bid,
         };
+        let (effective_marginal_pair_cost, residual_unit_cost) =
+            bot_runtime_pair_build_rebalance_effective_marginal_cost(
+                q_yes, q_no, cost_yes, cost_no, side, side_bid,
+            );
+        let price_zone =
+            bot_runtime_pair_build_projected_paired_cost_band(effective_marginal_pair_cost);
         let exact_gap_repair_executable = bot_runtime_pair_build_exact_gap_repair_is_executable(
             qty_gap,
             side_bid,
@@ -142,6 +154,13 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
             min_maker_notional,
         );
         if side_bid > 0.0 && side_bid.is_finite() && exact_gap_repair_executable {
+            if let Some(reason) = bot_runtime_pair_build_price_zone_hold_reason(
+                price_zone,
+                BotRuntimeMarginalCostMode::RebalanceAdd,
+                effective_marginal_pair_cost,
+            ) {
+                return Err(reason);
+            }
             let budget_clip_cap = (remaining_budget / side_bid).floor();
             let lighter_clip_after_cost_quality =
                 bot_runtime_pair_build_lighter_clip_after_cost_quality(
@@ -184,6 +203,11 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
                     requested_clip,
                     clip_bucket: bot_runtime_pair_build_clip_bucket(clip, cfg),
                     cpp_hint,
+                    marginal_cost_mode: BotRuntimeMarginalCostMode::RebalanceAdd,
+                    effective_marginal_pair_cost,
+                    price_zone,
+                    residual_unit_cost,
+                    lagging_side_quote: Some(side_bid),
                     pair_sum,
                     current_unmatched_fraction,
                     projected_unmatched_fraction,
@@ -221,12 +245,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         };
         return Err(format!("{reason}:{current_unmatched_fraction:.3}"));
     }
-    if pair_sum <= 0.0 || !pair_sum.is_finite() {
-        return Err("pair_sum_unusable".to_string());
-    }
-    if pair_sum >= 1.0 {
-        return Err(format!("pair_sum_too_high({pair_sum:.3})"));
-    }
+    let price_zone = bot_runtime_pair_build_projected_paired_cost_band(pair_sum);
 
     let pair_budget_clip_cap = (remaining_budget / pair_sum).floor();
     let clip = round_down_to_lot(clip_after_cpp_hint.min(pair_budget_clip_cap), min_lot);
@@ -257,6 +276,11 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         requested_clip,
         clip_bucket: bot_runtime_pair_build_clip_bucket(clip, cfg),
         cpp_hint,
+        marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
+        effective_marginal_pair_cost: pair_sum,
+        price_zone,
+        residual_unit_cost: None,
+        lagging_side_quote: None,
         pair_sum,
         current_unmatched_fraction,
         projected_unmatched_fraction,
@@ -578,6 +602,25 @@ pub(in crate::bot) fn bot_runtime_imbalance_reason_requires_growth_order_cancel(
         || reason.starts_with("projected_hard_imbalance_block")
         || reason.starts_with("hard_imbalance_disable")
         || reason.starts_with("repair_does_not_reduce_imbalance")
+}
+
+/// Implements price-zone hold growth order cancellation policy for the BOT runtime.
+/// This is a pure pair-build helper used for policy and handler gating.
+
+pub(in crate::bot) fn bot_runtime_price_zone_reason_requires_growth_order_cancel(
+    reason: &str,
+) -> bool {
+    reason.starts_with("price_zone_stop_add:") || reason.starts_with("price_zone_danger:")
+}
+
+/// Implements rebalance price-zone hold repair cancellation policy for the BOT runtime.
+/// This is a pure pair-build helper used for policy and handler gating.
+
+pub(in crate::bot) fn bot_runtime_price_zone_reason_requires_lighter_repair_cancel(
+    reason: &str,
+) -> bool {
+    reason.starts_with("price_zone_stop_add:rebalance_add:")
+        || reason.starts_with("price_zone_danger:rebalance_add:")
 }
 
 /// Implements lighter-side repair preservation policy for imbalance holds in the BOT runtime.

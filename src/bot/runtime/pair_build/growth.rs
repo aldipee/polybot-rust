@@ -1,8 +1,4 @@
 use super::super::*;
-use super::costs::{
-    bot_runtime_pair_build_projected_inventory_vwap_sum,
-    bot_runtime_pair_build_projected_paired_cost_band,
-};
 use super::decision::bot_runtime_pair_build_cpp_pace_seconds;
 use super::repair::bot_runtime_pair_build_exact_gap_repair_is_executable;
 use super::state::{BotRuntimePairBuildMarketContext, BotRuntimePairBuildPlan};
@@ -12,90 +8,28 @@ use super::state::{BotRuntimePairBuildMarketContext, BotRuntimePairBuildPlan};
 
 pub(in crate::bot) fn bot_runtime_pair_build_optional_growth_policy(
     decision: &BotRuntimePairBuildDecision,
-    q_yes: f64,
-    q_no: f64,
-    cost_yes: f64,
-    cost_no: f64,
-    y_bid: f64,
-    n_bid: f64,
-    min_shares: f64,
-    cfg: &BotRuntimeConfigSnapshot,
+    _q_yes: f64,
+    _q_no: f64,
+    _cost_yes: f64,
+    _cost_no: f64,
+    _y_bid: f64,
+    _n_bid: f64,
+    _min_shares: f64,
+    _cfg: &BotRuntimeConfigSnapshot,
 ) -> Option<BotRuntimePairedGrowthPolicy> {
     if decision.mode != BotRuntimePairBuildMode::PairedGrowth {
         return None;
     }
-    let current_clip = decision.clip.max(0) as f64;
-    if current_clip <= 0.0 {
+    if decision.clip <= 0 {
         return None;
     }
-    let current_projected_paired_cost = bot_runtime_pair_build_projected_inventory_vwap_sum(
-        q_yes,
-        q_no,
-        cost_yes,
-        cost_no,
-        y_bid,
-        n_bid,
-        current_clip,
-    );
-    let current_band =
-        bot_runtime_pair_build_projected_paired_cost_band(current_projected_paired_cost);
-    match current_band {
-        BotRuntimePairedCostBand::StrongGrowth | BotRuntimePairedCostBand::NormalGrowth => {
-            Some(BotRuntimePairedGrowthPolicy {
-                clip: decision.clip.max(0),
-                projected_paired_cost: current_projected_paired_cost,
-                band: current_band,
-                clipped_for_band: false,
-                allowed_averaging_down: false,
-            })
-        }
-        BotRuntimePairedCostBand::ReducedGrowth => {
-            let maintenance_clip_cap = round_down_to_lot(
-                cfg.repair_clip_small
-                    .max(cfg.seed_clip_small)
-                    .max(min_shares.max(1.0)),
-                min_shares.max(1.0),
-            );
-            let reduced_clip =
-                round_down_to_lot(current_clip.min(maintenance_clip_cap), min_shares.max(1.0));
-            if reduced_clip + 1e-9 < min_shares.max(1.0) || reduced_clip + 1e-9 >= current_clip {
-                return Some(BotRuntimePairedGrowthPolicy {
-                    clip: decision.clip.max(0),
-                    projected_paired_cost: current_projected_paired_cost,
-                    band: current_band,
-                    clipped_for_band: false,
-                    allowed_averaging_down: false,
-                });
-            }
-            let reduced_projected_paired_cost = bot_runtime_pair_build_projected_inventory_vwap_sum(
-                q_yes,
-                q_no,
-                cost_yes,
-                cost_no,
-                y_bid,
-                n_bid,
-                reduced_clip,
-            );
-            Some(BotRuntimePairedGrowthPolicy {
-                clip: reduced_clip as i64,
-                projected_paired_cost: reduced_projected_paired_cost,
-                band: bot_runtime_pair_build_projected_paired_cost_band(
-                    reduced_projected_paired_cost,
-                ),
-                clipped_for_band: true,
-                allowed_averaging_down: false,
-            })
-        }
-        BotRuntimePairedCostBand::RepairOnly | BotRuntimePairedCostBand::Freeze => {
-            Some(BotRuntimePairedGrowthPolicy {
-                clip: decision.clip.max(0),
-                projected_paired_cost: current_projected_paired_cost,
-                band: current_band,
-                clipped_for_band: false,
-                allowed_averaging_down: false,
-            })
-        }
-    }
+    Some(BotRuntimePairedGrowthPolicy {
+        clip: decision.clip.max(0),
+        projected_paired_cost: decision.effective_marginal_pair_cost,
+        band: decision.price_zone,
+        clipped_for_band: false,
+        allowed_averaging_down: false,
+    })
 }
 
 /// Implements pair build optional buy policy for the BOT runtime.
@@ -144,14 +78,14 @@ pub(in crate::bot) fn bot_runtime_pair_build_optional_buy_policy(
             no_snapshot_price,
             no_snapshot_source.as_str()
         ))
-    } else if !matches!(
+    } else if matches!(
         projected_band,
-        BotRuntimePairedCostBand::StrongGrowth | BotRuntimePairedCostBand::NormalGrowth
+        BotRuntimePairedCostBand::StopAdd | BotRuntimePairedCostBand::Danger
     ) {
         Some(format!(
             "optional_buy_requires_cheap_core:{}:{:.3}",
             projected_band.as_str(),
-            decision.pair_sum
+            decision.effective_marginal_pair_cost
         ))
     } else {
         None
@@ -219,15 +153,24 @@ impl MakerHedgeCapBot {
         if let Some(policy) = plan.optional_growth_policy.as_ref() {
             if matches!(
                 policy.band,
-                BotRuntimePairedCostBand::RepairOnly | BotRuntimePairedCostBand::Freeze
+                BotRuntimePairedCostBand::StopAdd | BotRuntimePairedCostBand::Danger
             ) {
+                let reason = if policy.band == BotRuntimePairedCostBand::StopAdd {
+                    format!(
+                        "price_zone_stop_add:{}:{:.3}",
+                        decision.marginal_cost_mode.as_str(),
+                        policy.projected_paired_cost
+                    )
+                } else {
+                    format!(
+                        "price_zone_danger:{}:{:.3}",
+                        decision.marginal_cost_mode.as_str(),
+                        policy.projected_paired_cost
+                    )
+                };
                 self._bot_runtime_log_pair_build_state(
                     "hold",
-                    &format!(
-                        "projected_paired_cost_{}:{:.3}",
-                        policy.band.as_str(),
-                        policy.projected_paired_cost
-                    ),
+                    &reason,
                     Some(decision),
                     t_into_s,
                     total_cost,
@@ -500,6 +443,9 @@ impl MakerHedgeCapBot {
                                 "bot_runtime_optional_pair_growth": true,
                                 "bot_runtime_below_snapshot_optional": true,
                                 "bot_runtime_paired_cost_band": paired_cost_band,
+                                "bot_runtime_price_zone": decision.price_zone.as_str(),
+                                "bot_runtime_marginal_cost_mode": decision.marginal_cost_mode.as_str(),
+                                "bot_runtime_effective_marginal_pair_cost": decision.effective_marginal_pair_cost,
                                 "bot_runtime_min_snapshot_edge": min_snapshot_edge,
                                 "bot_runtime_optional_buy_guard": optional_buy_guard,
                                 "bot_runtime_order_size": decision.clip as f64,
@@ -509,7 +455,7 @@ impl MakerHedgeCapBot {
                 }
             }
             self.logger.info(&format!(
-                "[BOT][PAIR_BUILD] submit mode={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} paired_cost_band={} projected_paired_cost={:.3} clipped_for_band={} optional_buy_guard={} optional_buy_edge_source={} min_snapshot_edge={:.3} below_snapshot_optional={} repair_reserve_side={} likely_repair_clip={} total_reserved_budget={:.2} clipped_for_repair_reserve={} bad_regime_shutdown={} bad_regime_ratio={:.3} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} current_base={:.2} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                "[BOT][PAIR_BUILD] submit mode={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} paired_cost_band={} projected_paired_cost={:.3} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} clipped_for_band={} optional_buy_guard={} optional_buy_edge_source={} min_snapshot_edge={:.3} below_snapshot_optional={} repair_reserve_side={} likely_repair_clip={} total_reserved_budget={:.2} clipped_for_repair_reserve={} bad_regime_shutdown={} bad_regime_ratio={:.3} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} current_base={:.2} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                 decision.mode.as_str(),
                 decision.clip,
                 decision.clip_bucket,
@@ -517,6 +463,20 @@ impl MakerHedgeCapBot {
                 decision.cpp_hint.as_str(),
                 paired_cost_band,
                 projected_paired_cost,
+                decision.price_zone.as_str(),
+                decision.marginal_cost_mode.as_str(),
+                decision.effective_marginal_pair_cost,
+                context.y_bid,
+                context.n_bid,
+                decision.pair_sum,
+                decision
+                    .residual_unit_cost
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .lagging_side_quote
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "NA".to_string()),
                 clipped_for_band,
                 optional_buy_guard,
                 optional_buy_edge_source,

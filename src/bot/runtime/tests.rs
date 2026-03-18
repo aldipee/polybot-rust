@@ -695,6 +695,63 @@ fn imbalance_repair_unavailable_cancels_live_taper_orders() {
 }
 
 #[test]
+fn taper_handler_blocks_balanced_add_at_stop_add_zone_after_runtime_gating() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.50, 0.52, 0.50, 0.52, now);
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(260.0, 260.0, 12.0, 20.0, 20.0, 6.0, 6.0, &cfg);
+
+    let state = bot.state.lock().expect("bot state");
+    assert!(!state.open_orders.contains_key("yes_asset_id"));
+    assert!(!state.open_orders.contains_key("no_asset_id"));
+    drop(state);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert!(runtime_state
+        .taper_last_hold_reason
+        .starts_with("hold:price_zone_stop_add:balanced_add:1.000"));
+}
+
+#[test]
+fn rebalance_price_zone_hold_cancels_live_taper_lighter_order() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.max_total_cost = 100.0;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.20, 0.22, 0.70, 0.72, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-lighter-yes".to_string()),
+                origin: "BOT_TAPER_LIGHTER".to_string(),
+                last_submit_ts: 240.0,
+                price: 0.20,
+                remaining: 8.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(260.0, 260.0, 52.8, 40.0, 48.0, 12.0, 40.8, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert!(
+        runtime_state
+            .taper_last_hold_reason
+            .contains("price_zone_danger:rebalance_add:1.050"),
+        "actual_reason={}",
+        runtime_state.taper_last_hold_reason
+    );
+}
+
+#[test]
 fn imbalance_hold_keeps_live_taper_lighter_repair_orders() {
     let bot = make_bot_runtime_test_bot();
     let now = now_ts_f64();

@@ -87,7 +87,7 @@ impl MakerHedgeCapBot {
                     st.bad_regime_early_observations.saturating_add(1);
                 if matches!(
                     band,
-                    BotRuntimePairedCostBand::RepairOnly | BotRuntimePairedCostBand::Freeze
+                    BotRuntimePairedCostBand::StopAdd | BotRuntimePairedCostBand::Danger
                 ) {
                     st.bad_regime_expensive_observations =
                         st.bad_regime_expensive_observations.saturating_add(1);

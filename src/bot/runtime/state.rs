@@ -297,6 +297,23 @@ impl BotRuntimePairBuildCppHint {
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::bot) enum BotRuntimeMarginalCostMode {
+    BalancedAdd,
+    RebalanceAdd,
+}
+impl BotRuntimeMarginalCostMode {
+    /// Returns the stable string label for this enum or state value.
+    /// This is a pure BOT runtime helper used for configuration, policy, or metrics
+    /// calculations.
+
+    pub(in crate::bot) fn as_str(self) -> &'static str {
+        match self {
+            Self::BalancedAdd => "balanced_add",
+            Self::RebalanceAdd => "rebalance_add",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::bot) struct BotRuntimePairBuildDecision {
     pub(in crate::bot) mode: BotRuntimePairBuildMode,
@@ -305,6 +322,11 @@ pub(in crate::bot) struct BotRuntimePairBuildDecision {
     pub(in crate::bot) requested_clip: f64,
     pub(in crate::bot) clip_bucket: &'static str,
     pub(in crate::bot) cpp_hint: BotRuntimePairBuildCppHint,
+    pub(in crate::bot) marginal_cost_mode: BotRuntimeMarginalCostMode,
+    pub(in crate::bot) effective_marginal_pair_cost: f64,
+    pub(in crate::bot) price_zone: BotRuntimePairedCostBand,
+    pub(in crate::bot) residual_unit_cost: Option<f64>,
+    pub(in crate::bot) lagging_side_quote: Option<f64>,
     pub(in crate::bot) pair_sum: f64,
     pub(in crate::bot) current_unmatched_fraction: f64,
     pub(in crate::bot) projected_unmatched_fraction: f64,
@@ -320,11 +342,11 @@ pub(in crate::bot) struct BotRuntimePairBuildDecision {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::bot) enum BotRuntimePairedCostBand {
-    StrongGrowth,
-    NormalGrowth,
-    ReducedGrowth,
-    RepairOnly,
-    Freeze,
+    Preferred,
+    Acceptable,
+    Caution,
+    StopAdd,
+    Danger,
 }
 impl BotRuntimePairedCostBand {
     /// Returns the stable string label for this enum or state value.
@@ -333,11 +355,11 @@ impl BotRuntimePairedCostBand {
 
     pub(in crate::bot) fn as_str(self) -> &'static str {
         match self {
-            Self::StrongGrowth => "strong_growth",
-            Self::NormalGrowth => "normal_growth",
-            Self::ReducedGrowth => "reduced_growth",
-            Self::RepairOnly => "repair_only",
-            Self::Freeze => "freeze",
+            Self::Preferred => "preferred",
+            Self::Acceptable => "acceptable",
+            Self::Caution => "caution",
+            Self::StopAdd => "stop_add",
+            Self::Danger => "danger",
         }
     }
 }

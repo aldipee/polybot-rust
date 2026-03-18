@@ -145,24 +145,130 @@ fn bot_runtime_pair_build_clip_bucket_boundaries() {
 fn bot_runtime_pair_build_paired_cost_band_transitions() {
     assert_eq!(
         bot_runtime_pair_build_projected_paired_cost_band(1.03),
-        BotRuntimePairedCostBand::Freeze
+        BotRuntimePairedCostBand::Danger
     );
     assert_eq!(
         bot_runtime_pair_build_projected_paired_cost_band(1.01),
-        BotRuntimePairedCostBand::RepairOnly
+        BotRuntimePairedCostBand::StopAdd
     );
     assert_eq!(
         bot_runtime_pair_build_projected_paired_cost_band(0.99),
-        BotRuntimePairedCostBand::ReducedGrowth
+        BotRuntimePairedCostBand::Caution
     );
     assert_eq!(
         bot_runtime_pair_build_projected_paired_cost_band(0.95),
-        BotRuntimePairedCostBand::NormalGrowth
+        BotRuntimePairedCostBand::Acceptable
     );
     assert_eq!(
         bot_runtime_pair_build_projected_paired_cost_band(0.90),
-        BotRuntimePairedCostBand::StrongGrowth
+        BotRuntimePairedCostBand::Preferred
     );
+}
+
+#[test]
+fn pair_build_decision_surfaces_balanced_add_stop_add_zone_for_runtime_gating() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = bot_runtime_pair_build_decision(
+        20.0, 20.0, 6.0, 6.0, 0.50, 0.52, 0.50, 0.52, 40.0, 12.0, 1.0, 1.0, &cfg, false,
+    )
+    .expect("raw decision should surface the stop-add zone for later runtime gating");
+    assert_eq!(decision.mode, BotRuntimePairBuildMode::PairedGrowth);
+    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::StopAdd);
+    assert_eq!(
+        decision.marginal_cost_mode,
+        BotRuntimeMarginalCostMode::BalancedAdd
+    );
+    assert!((decision.effective_marginal_pair_cost - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn pair_build_decision_allows_balanced_add_below_one_even_with_high_inventory_vwap() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = bot_runtime_pair_build_decision(
+        20.0, 20.0, 10.4, 10.4, 0.49, 0.51, 0.49, 0.51, 80.0, 20.8, 1.0, 1.0, &cfg, false,
+    )
+    .expect("caution-zone balanced add should remain legal");
+    assert_eq!(decision.mode, BotRuntimePairBuildMode::PairedGrowth);
+    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::Caution);
+    assert_eq!(
+        decision.marginal_cost_mode,
+        BotRuntimeMarginalCostMode::BalancedAdd
+    );
+    assert!((decision.effective_marginal_pair_cost - 0.98).abs() < 1e-9);
+}
+
+#[test]
+fn pair_build_decision_uses_rebalance_effective_marginal_pair_cost() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = bot_runtime_pair_build_decision(
+        14.0, 10.0, 8.4, 6.0, 0.60, 0.62, 0.35, 0.37, 80.0, 14.4, 1.0, 1.0, &cfg, false,
+    )
+    .expect("sub-one rebalance add should remain legal");
+    assert_eq!(decision.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(decision.side, Some(OutcomeSide::No));
+    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::Acceptable);
+    assert_eq!(
+        decision.marginal_cost_mode,
+        BotRuntimeMarginalCostMode::RebalanceAdd
+    );
+    assert_eq!(decision.residual_unit_cost, Some(0.6));
+    assert_eq!(decision.lagging_side_quote, Some(0.35));
+    assert!((decision.effective_marginal_pair_cost - 0.95).abs() < 1e-9);
+}
+
+#[test]
+fn pair_build_decision_blocks_rebalance_add_at_stop_add_zone() {
+    let cfg = bot_runtime_config_defaults();
+    let err = bot_runtime_pair_build_decision(
+        14.0, 10.0, 8.4, 6.0, 0.60, 0.62, 0.40, 0.42, 80.0, 14.4, 1.0, 1.0, &cfg, false,
+    )
+    .expect_err("stop-add rebalance should be blocked");
+    assert!(err.starts_with("price_zone_stop_add:rebalance_add:1.000"));
+}
+
+#[test]
+fn tail_repair_priority_recomputes_rebalance_price_zone_fields() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = BotRuntimePairBuildDecision {
+        mode: BotRuntimePairBuildMode::PairedGrowth,
+        side: None,
+        clip: 12,
+        requested_clip: 12.0,
+        clip_bucket: "small",
+        cpp_hint: BotRuntimePairBuildCppHint::Normal,
+        marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
+        effective_marginal_pair_cost: 1.02,
+        price_zone: BotRuntimePairedCostBand::StopAdd,
+        residual_unit_cost: None,
+        lagging_side_quote: None,
+        pair_sum: 1.02,
+        current_unmatched_fraction: unmatched_fraction(4.0, 8.0),
+        projected_unmatched_fraction: unmatched_fraction(4.0, 8.0),
+        match_ratio: match_ratio(4.0, 8.0),
+        imbalance_state: BotRuntimeImbalanceState::Normal,
+        reduces_imbalance: false,
+        pair_coverage: pair_coverage(4.0, 8.0),
+        skew_ratio: share_skew_ratio(4.0, 8.0),
+        current_base: 4.0,
+        qty_gap: 4.0,
+        inventory_vwap_sum: inventory_vwap_sum(4.0, 8.0, 1.6, 4.8),
+        market_snapshot_vwap_sum: market_snapshot_vwap_sum(0.25, 0.27, 0.77, 0.79),
+    };
+
+    let rewritten = bot_runtime_pair_build_apply_tail_repair_priority(
+        decision, 4.0, 8.0, 1.6, 4.8, 0.25, 0.77, 20.0, 1.0, 1.0, 50.0, &cfg,
+    );
+
+    assert_eq!(rewritten.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(rewritten.side, Some(OutcomeSide::Yes));
+    assert_eq!(
+        rewritten.marginal_cost_mode,
+        BotRuntimeMarginalCostMode::RebalanceAdd
+    );
+    assert_eq!(rewritten.price_zone, BotRuntimePairedCostBand::Preferred);
+    assert_eq!(rewritten.residual_unit_cost, Some(0.6));
+    assert_eq!(rewritten.lagging_side_quote, Some(0.25));
+    assert!((rewritten.effective_marginal_pair_cost - 0.85).abs() < 1e-9);
 }
 
 /// Exercises the BOT runtime pair build optional buy requires below snapshot scenario and
@@ -178,6 +284,11 @@ fn bot_runtime_pair_build_optional_buy_requires_below_snapshot() {
         requested_clip: 5.0,
         clip_bucket: "small",
         cpp_hint: BotRuntimePairBuildCppHint::Normal,
+        marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
+        effective_marginal_pair_cost: 0.90,
+        price_zone: BotRuntimePairedCostBand::Preferred,
+        residual_unit_cost: None,
+        lagging_side_quote: None,
         pair_sum: 0.90,
         current_unmatched_fraction: 0.0,
         projected_unmatched_fraction: 0.0,
@@ -198,7 +309,7 @@ fn bot_runtime_pair_build_optional_buy_requires_below_snapshot() {
         0.46,
         0.46,
         0.46,
-        BotRuntimePairedCostBand::NormalGrowth,
+        BotRuntimePairedCostBand::Acceptable,
         1.0,
         &cfg,
     )
@@ -220,6 +331,11 @@ fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
             requested_clip: 3.0,
             clip_bucket: "small",
             cpp_hint: BotRuntimePairBuildCppHint::Normal,
+            marginal_cost_mode: BotRuntimeMarginalCostMode::RebalanceAdd,
+            effective_marginal_pair_cost: 0.85,
+            price_zone: BotRuntimePairedCostBand::Acceptable,
+            residual_unit_cost: Some(0.40),
+            lagging_side_quote: Some(0.45),
             pair_sum: 0.80,
             current_unmatched_fraction: 0.3333333333,
             projected_unmatched_fraction: 0.25,
@@ -251,6 +367,11 @@ fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
             requested_clip: 4.0,
             clip_bucket: "medium",
             cpp_hint: BotRuntimePairBuildCppHint::Normal,
+            marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
+            effective_marginal_pair_cost: 0.82,
+            price_zone: BotRuntimePairedCostBand::Preferred,
+            residual_unit_cost: None,
+            lagging_side_quote: None,
             pair_sum: 0.82,
             current_unmatched_fraction: 0.1111111111,
             projected_unmatched_fraction: 0.0769230769,
@@ -352,6 +473,44 @@ fn bot_runtime_pair_build_handler_submits_paired_growth_orders() {
     }
 }
 
+#[test]
+fn pair_build_handler_blocks_balanced_add_at_stop_add_zone_without_tail_repair_priority() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 100.0;
+    set_quotes(&bot, 0.50, 0.52, 0.50, 0.52);
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(40.0, 40.0, 0.0, 20.0, 20.0, 6.0, 6.0, &cfg);
+
+    let state = bot.state.lock().expect("bot state");
+    assert!(!state.open_orders.contains_key("yes_asset_id"));
+    assert!(!state.open_orders.contains_key("no_asset_id"));
+    drop(state);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert!(
+        runtime_state
+            .pair_build_last_hold_reason
+            .contains("price_zone_stop_add:balanced_add:1.000"),
+        "actual_reason={}",
+        runtime_state.pair_build_last_hold_reason
+    );
+}
+
+#[test]
+fn pair_build_handler_allows_tail_repair_priority_before_balanced_add_stop_add_hold() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 500.0;
+    set_quotes(&bot, 0.35, 0.37, 0.70, 0.72);
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(250.0, 250.0, 0.0, 200.0, 205.0, 120.0, 123.0, &cfg);
+
+    let state = bot.state.lock().expect("bot state");
+    assert!(state.open_orders.contains_key("yes_asset_id"));
+    assert!(!state.open_orders.contains_key("no_asset_id"));
+}
+
 /// Exercises the BOT runtime pair build handler submits lighter side repair order scenario and
 /// checks the expected BOT behavior.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
@@ -378,6 +537,11 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
         requested_clip: 15.0,
         clip_bucket: "small",
         cpp_hint: BotRuntimePairBuildCppHint::Normal,
+        marginal_cost_mode: BotRuntimeMarginalCostMode::RebalanceAdd,
+        effective_marginal_pair_cost: 0.55,
+        price_zone: BotRuntimePairedCostBand::Preferred,
+        residual_unit_cost: Some(0.30),
+        lagging_side_quote: Some(0.25),
         pair_sum: 0.80,
         current_unmatched_fraction: 0.60,
         projected_unmatched_fraction: 0.0,
@@ -421,6 +585,95 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
     let state = bot.state.lock().expect("bot state");
     assert!(state.open_orders.contains_key("yes_asset_id"));
     assert!(!state.open_orders.contains_key("no_asset_id"));
+}
+
+#[test]
+fn tail_repair_priority_blocks_live_repair_when_rebalance_zone_is_danger() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 200.0;
+    set_quotes(&bot, 0.20, 0.22, 0.70, 0.72);
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(40.0, 40.0, 0.0, 50.0, 56.0, 17.5, 47.6, &cfg);
+
+    let state = bot.state.lock().expect("bot state");
+    assert!(!state.open_orders.contains_key("yes_asset_id"));
+    assert!(!state.open_orders.contains_key("no_asset_id"));
+    drop(state);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert!(runtime_state
+        .pair_build_last_hold_reason
+        .starts_with("hold:price_zone_danger:rebalance_add:1.050"));
+}
+
+#[test]
+fn rebalance_price_zone_hold_cancels_live_pair_build_lighter_order() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 100.0;
+    set_quotes(&bot, 0.20, 0.22, 0.70, 0.72);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-lighter-yes".to_string()),
+                origin: "BOT_PAIR_BUILD_LIGHTER".to_string(),
+                last_submit_ts: 42.0,
+                price: 0.20,
+                remaining: 8.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(60.0, 60.0, 0.0, 40.0, 48.0, 12.0, 40.8, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert!(
+        runtime_state
+            .pair_build_last_hold_reason
+            .contains("price_zone_danger:rebalance_add:1.050"),
+        "actual_reason={}",
+        runtime_state.pair_build_last_hold_reason
+    );
+}
+
+#[test]
+fn tail_rewrite_price_zone_hold_cancels_live_pair_build_lighter_order() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 500.0;
+    bot.cfg.min_shares = 1.0;
+    set_quotes(&bot, 0.34, 0.36, 0.60, 0.62);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-lighter-yes".to_string()),
+                origin: "BOT_PAIR_BUILD_LIGHTER".to_string(),
+                last_submit_ts: 240.0,
+                price: 0.34,
+                remaining: 3.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(250.0, 250.0, 0.0, 100.0, 103.0, 35.0, 77.25, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert!(runtime_state
+        .pair_build_last_hold_reason
+        .contains("price_zone_danger:rebalance_add:1.090"));
 }
 
 #[test]

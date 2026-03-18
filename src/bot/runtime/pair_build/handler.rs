@@ -38,6 +38,8 @@ impl MakerHedgeCapBot {
             decision,
             q_yes,
             q_no,
+            cost_yes,
+            cost_no,
             context.y_bid,
             context.n_bid,
             budget_snapshot.remaining_to_max_cost,
@@ -46,6 +48,13 @@ impl MakerHedgeCapBot {
             t_into_s,
             cfg,
         );
+        if let Some(reason) = bot_runtime_pair_build_price_zone_hold_reason(
+            decision.price_zone,
+            decision.marginal_cost_mode,
+            decision.effective_marginal_pair_cost,
+        ) {
+            return Err(reason);
+        }
 
         let lighter_repair_policy = if decision.mode == BotRuntimePairBuildMode::LighterSideFirst {
             let side = decision.side.unwrap_or(OutcomeSide::Yes);
@@ -71,22 +80,6 @@ impl MakerHedgeCapBot {
         } else {
             None
         };
-
-        if decision.mode == BotRuntimePairBuildMode::LighterSideFirst {
-            let side = decision.side.unwrap_or(OutcomeSide::Yes);
-            let side_bid = match side {
-                OutcomeSide::Yes => context.y_bid,
-                OutcomeSide::No => context.n_bid,
-            };
-            let min_lot = self.cfg.min_shares.max(1.0);
-            let adjusted_clip = bot_runtime_pair_build_lighter_clip_after_projected_cost(
-                &decision, q_yes, q_no, cost_yes, cost_no, side, side_bid, min_lot, cfg,
-            );
-            if adjusted_clip + 1e-9 < decision.clip as f64 {
-                decision.clip = adjusted_clip as i64;
-                decision.clip_bucket = bot_runtime_pair_build_clip_bucket(adjusted_clip, cfg);
-            }
-        }
 
         let repair_reserve_policy = if decision.mode == BotRuntimePairBuildMode::PairedGrowth {
             let policy = bot_runtime_pair_build_repair_reserve_policy(
@@ -140,7 +133,7 @@ impl MakerHedgeCapBot {
             let projected_band = optional_growth_policy
                 .as_ref()
                 .map(|policy| policy.band)
-                .unwrap_or(BotRuntimePairedCostBand::Freeze);
+                .unwrap_or(BotRuntimePairedCostBand::Danger);
             let policy = bot_runtime_pair_build_optional_buy_policy(
                 &decision,
                 context.y_bid,
@@ -453,47 +446,47 @@ impl MakerHedgeCapBot {
                     } else {
                         false
                     };
-                let cancelled =
-                    if bot_runtime_imbalance_reason_requires_growth_order_cancel(&reason) {
-                        let cancelled_open_both = self._bot_runtime_cancel_order_family(
-                            "BOT_OPEN_BOTH",
-                            None,
-                            "bot_runtime_pair_build_imbalance_hold",
-                        );
-                        let cancelled_pair_build = if preserve_lighter {
-                            self._bot_runtime_cancel_pair_build_growth_orders(
-                                None,
-                                "bot_runtime_pair_build_imbalance_hold",
-                            )
-                        } else {
-                            self._bot_runtime_cancel_pair_build_orders(
-                                None,
-                                "bot_runtime_pair_build_imbalance_hold",
-                            )
-                        };
-                        let cancelled_taper = if preserve_lighter {
-                            self._bot_runtime_cancel_taper_growth_orders(
-                                None,
-                                "bot_runtime_pair_build_imbalance_hold",
-                            )
-                        } else {
-                            self._bot_runtime_cancel_taper_orders(
-                                None,
-                                "bot_runtime_pair_build_imbalance_hold",
-                            )
-                        };
-                        let cancelled_await_second_fill = self
-                            ._bot_runtime_cancel_await_second_fill_orders(
-                                None,
-                                "bot_runtime_pair_build_imbalance_hold",
-                            );
-                        cancelled_open_both
-                            || cancelled_pair_build
-                            || cancelled_taper
-                            || cancelled_await_second_fill
+                let imbalance_growth_cancel =
+                    bot_runtime_imbalance_reason_requires_growth_order_cancel(&reason);
+                let price_zone_growth_cancel =
+                    bot_runtime_price_zone_reason_requires_growth_order_cancel(&reason);
+                let cancel_lighter_repairs =
+                    bot_runtime_price_zone_reason_requires_lighter_repair_cancel(&reason);
+                let cancelled = if imbalance_growth_cancel || price_zone_growth_cancel {
+                    let cancel_reason = if price_zone_growth_cancel {
+                        "bot_runtime_pair_build_price_zone_hold"
                     } else {
-                        false
+                        "bot_runtime_pair_build_imbalance_hold"
                     };
+                    let cancelled_open_both =
+                        self._bot_runtime_cancel_order_family("BOT_OPEN_BOTH", None, cancel_reason);
+                    let cancelled_pair_build = if cancel_lighter_repairs {
+                        self._bot_runtime_cancel_pair_build_orders(None, cancel_reason)
+                    } else if preserve_lighter {
+                        self._bot_runtime_cancel_pair_build_growth_orders(None, cancel_reason)
+                    } else if price_zone_growth_cancel {
+                        self._bot_runtime_cancel_pair_build_growth_orders(None, cancel_reason)
+                    } else {
+                        self._bot_runtime_cancel_pair_build_orders(None, cancel_reason)
+                    };
+                    let cancelled_taper = if cancel_lighter_repairs {
+                        self._bot_runtime_cancel_taper_orders(None, cancel_reason)
+                    } else if preserve_lighter {
+                        self._bot_runtime_cancel_taper_growth_orders(None, cancel_reason)
+                    } else if price_zone_growth_cancel {
+                        self._bot_runtime_cancel_taper_growth_orders(None, cancel_reason)
+                    } else {
+                        self._bot_runtime_cancel_taper_orders(None, cancel_reason)
+                    };
+                    let cancelled_await_second_fill =
+                        self._bot_runtime_cancel_await_second_fill_orders(None, cancel_reason);
+                    cancelled_open_both
+                        || cancelled_pair_build
+                        || cancelled_taper
+                        || cancelled_await_second_fill
+                } else {
+                    false
+                };
                 self._bot_runtime_log_pair_build_state(
                     if cancelled { "rest" } else { "hold" },
                     &reason,

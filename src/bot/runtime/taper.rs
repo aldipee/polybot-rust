@@ -135,6 +135,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_apply_tail_repair_priority(
     decision: BotRuntimePairBuildDecision,
     q_yes: f64,
     q_no: f64,
+    cost_yes: f64,
+    cost_no: f64,
     y_bid: f64,
     n_bid: f64,
     remaining_budget: f64,
@@ -186,11 +188,22 @@ pub(in crate::bot) fn bot_runtime_pair_build_apply_tail_repair_priority(
     if clip + 1e-9 < min_lot {
         return decision;
     }
+    let (effective_marginal_pair_cost, residual_unit_cost) =
+        bot_runtime_pair_build_rebalance_effective_marginal_cost(
+            q_yes, q_no, cost_yes, cost_no, side, side_bid,
+        );
+    let price_zone =
+        bot_runtime_pair_build_projected_paired_cost_band(effective_marginal_pair_cost);
     BotRuntimePairBuildDecision {
         mode: BotRuntimePairBuildMode::LighterSideFirst,
         side: Some(side),
         clip: clip as i64,
         clip_bucket: bot_runtime_pair_build_clip_bucket(clip, cfg),
+        marginal_cost_mode: BotRuntimeMarginalCostMode::RebalanceAdd,
+        effective_marginal_pair_cost,
+        price_zone,
+        residual_unit_cost,
+        lagging_side_quote: Some(side_bid),
         ..decision
     }
 }

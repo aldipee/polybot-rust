@@ -286,8 +286,20 @@ impl MakerHedgeCapBot {
             self.min_maker_notional,
             cfg,
             false,
-        ) {
-            Ok(decision) => bot_runtime_taper_maintenance_decision(decision, self.cfg.min_shares),
+        )
+        .map(|decision| bot_runtime_taper_maintenance_decision(decision, self.cfg.min_shares))
+        .and_then(|decision| {
+            if let Some(reason) = bot_runtime_pair_build_price_zone_hold_reason(
+                decision.price_zone,
+                decision.marginal_cost_mode,
+                decision.effective_marginal_pair_cost,
+            ) {
+                Err(reason)
+            } else {
+                Ok(decision)
+            }
+        }) {
+            Ok(decision) => decision,
             Err(reason) => {
                 let preserve_lighter =
                     if bot_runtime_imbalance_reason_preserves_lighter_repair(&reason) {
@@ -315,34 +327,40 @@ impl MakerHedgeCapBot {
                     } else {
                         false
                     };
-                let cancelled =
-                    if bot_runtime_imbalance_reason_requires_growth_order_cancel(&reason) {
-                        let cancelled_taper = if preserve_lighter {
-                            self._bot_runtime_cancel_taper_growth_orders(
-                                None,
-                                "bot_runtime_taper_imbalance_hold",
-                            )
-                        } else {
-                            self._bot_runtime_cancel_taper_orders(
-                                None,
-                                "bot_runtime_taper_imbalance_hold",
-                            )
-                        };
-                        let cancelled_pair_build = if preserve_lighter {
-                            self._bot_runtime_cancel_pair_build_growth_orders(
-                                None,
-                                "bot_runtime_taper_imbalance_hold",
-                            )
-                        } else {
-                            self._bot_runtime_cancel_pair_build_orders(
-                                None,
-                                "bot_runtime_taper_imbalance_hold",
-                            )
-                        };
-                        cancelled_taper || cancelled_pair_build
+                let imbalance_growth_cancel =
+                    bot_runtime_imbalance_reason_requires_growth_order_cancel(&reason);
+                let price_zone_growth_cancel =
+                    bot_runtime_price_zone_reason_requires_growth_order_cancel(&reason);
+                let cancel_lighter_repairs =
+                    bot_runtime_price_zone_reason_requires_lighter_repair_cancel(&reason);
+                let cancelled = if imbalance_growth_cancel || price_zone_growth_cancel {
+                    let cancel_reason = if price_zone_growth_cancel {
+                        "bot_runtime_taper_price_zone_hold"
                     } else {
-                        false
+                        "bot_runtime_taper_imbalance_hold"
                     };
+                    let cancelled_taper = if cancel_lighter_repairs {
+                        self._bot_runtime_cancel_taper_orders(None, cancel_reason)
+                    } else if preserve_lighter {
+                        self._bot_runtime_cancel_taper_growth_orders(None, cancel_reason)
+                    } else if price_zone_growth_cancel {
+                        self._bot_runtime_cancel_taper_growth_orders(None, cancel_reason)
+                    } else {
+                        self._bot_runtime_cancel_taper_orders(None, cancel_reason)
+                    };
+                    let cancelled_pair_build = if cancel_lighter_repairs {
+                        self._bot_runtime_cancel_pair_build_orders(None, cancel_reason)
+                    } else if preserve_lighter {
+                        self._bot_runtime_cancel_pair_build_growth_orders(None, cancel_reason)
+                    } else if price_zone_growth_cancel {
+                        self._bot_runtime_cancel_pair_build_growth_orders(None, cancel_reason)
+                    } else {
+                        self._bot_runtime_cancel_pair_build_orders(None, cancel_reason)
+                    };
+                    cancelled_taper || cancelled_pair_build
+                } else {
+                    false
+                };
                 self._bot_runtime_log_taper_state(
                     if cancelled { "rest" } else { "hold" },
                     &reason,
@@ -556,13 +574,25 @@ impl MakerHedgeCapBot {
                 if is_new_submit {
                     self._bot_runtime_note_taper_submit(t_into_s, cfg);
                     self.logger.info(&format!(
-                        "[BOT][TAPER] submit taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
+                        "[BOT][TAPER] submit taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
                         taper_mode.as_str(),
                         decision.mode.as_str(),
                         active_side.as_str(),
                         decision.clip,
                         decision.clip_bucket,
                         decision.cpp_hint.as_str(),
+                        decision.price_zone.as_str(),
+                        decision.marginal_cost_mode.as_str(),
+                        decision.effective_marginal_pair_cost,
+                        decision
+                            .residual_unit_cost
+                            .map(|value| format!("{value:.3}"))
+                            .unwrap_or_else(|| "NA".to_string()),
+                        decision
+                            .lagging_side_quote
+                            .map(|value| format!("{value:.3}"))
+                            .unwrap_or_else(|| "NA".to_string()),
+                        active_side.opposite().as_str(),
                         late_action_policy.current_tail_size,
                         late_action_policy.projected_tail_size,
                         late_action_policy.current_floor,
@@ -711,7 +741,6 @@ impl MakerHedgeCapBot {
                 q_yes,
                 q_no,
             );
-            return;
         }
         let prev_yes_slot = yes_slot;
         let prev_no_slot = no_slot;
@@ -766,12 +795,26 @@ impl MakerHedgeCapBot {
         if yes_new || no_new {
             self._bot_runtime_note_taper_submit(t_into_s, cfg);
             self.logger.info(&format!(
-                "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} cpp_hint={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
+                "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
                 taper_mode.as_str(),
                 decision.mode.as_str(),
                 decision.clip,
                 decision.clip_bucket,
                 decision.cpp_hint.as_str(),
+                decision.price_zone.as_str(),
+                decision.marginal_cost_mode.as_str(),
+                decision.effective_marginal_pair_cost,
+                y_bid,
+                n_bid,
+                decision.pair_sum,
+                decision
+                    .residual_unit_cost
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "NA".to_string()),
+                decision
+                    .lagging_side_quote
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "NA".to_string()),
                 late_action_policy.current_tail_size,
                 late_action_policy.projected_tail_size,
                 late_action_policy.current_floor,

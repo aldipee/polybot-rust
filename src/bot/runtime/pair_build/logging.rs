@@ -46,7 +46,33 @@ impl MakerHedgeCapBot {
         let cpp_hint = decision
             .map(|value| value.cpp_hint.as_str().to_string())
             .unwrap_or_else(|| "NA".to_string());
+        let price_zone = decision
+            .map(|value| value.price_zone.as_str().to_string())
+            .unwrap_or_else(|| "NA".to_string());
+        let marginal_cost_mode = decision
+            .map(|value| value.marginal_cost_mode.as_str().to_string())
+            .unwrap_or_else(|| "NA".to_string());
+        let effective_marginal_pair_cost = decision
+            .map(|value| value.effective_marginal_pair_cost)
+            .unwrap_or(f64::INFINITY);
         let pair_sum = decision.map(|value| value.pair_sum).unwrap_or(0.0);
+        let residual_unit_cost = decision
+            .and_then(|value| value.residual_unit_cost)
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "NA".to_string());
+        let lagging_side_quote = decision
+            .and_then(|value| value.lagging_side_quote)
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "NA".to_string());
+        let heavier_side = decision
+            .and_then(|value| {
+                if value.marginal_cost_mode == BotRuntimeMarginalCostMode::RebalanceAdd {
+                    value.side.map(|side| side.opposite().as_str().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "NA".to_string());
         let unmatched_fraction = decision
             .map(|value| value.current_unmatched_fraction)
             .unwrap_or_else(|| unmatched_fraction(q_yes, q_no));
@@ -74,7 +100,7 @@ impl MakerHedgeCapBot {
             .unwrap_or(f64::INFINITY);
         let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][PAIR_BUILD] pair_id={} {} reason={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3}",
+            "[BOT][PAIR_BUILD] pair_id={} {} reason={} mode={} side={} clip={} clip_bucket={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3}",
             pair_id,
             state_kind,
             reason,
@@ -83,11 +109,17 @@ impl MakerHedgeCapBot {
             clip,
             clip_bucket,
             cpp_hint,
+            price_zone,
+            marginal_cost_mode,
+            effective_marginal_pair_cost,
+            pair_sum,
+            residual_unit_cost,
+            lagging_side_quote,
+            heavier_side,
             t_into_s.max(0.0),
             q_yes,
             q_no,
             total_cost.max(0.0),
-            pair_sum,
             unmatched_fraction,
             projected_unmatched_fraction,
             match_ratio_value,

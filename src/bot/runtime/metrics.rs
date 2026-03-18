@@ -61,11 +61,11 @@ pub(in crate::bot) fn bot_runtime_fill_distribution_summary_f64(values: &[f64; 5
 
 pub(in crate::bot) fn bot_runtime_paired_cost_band_index(band: BotRuntimePairedCostBand) -> usize {
     match band {
-        BotRuntimePairedCostBand::StrongGrowth => 0,
-        BotRuntimePairedCostBand::NormalGrowth => 1,
-        BotRuntimePairedCostBand::ReducedGrowth => 2,
-        BotRuntimePairedCostBand::RepairOnly => 3,
-        BotRuntimePairedCostBand::Freeze => 4,
+        BotRuntimePairedCostBand::Preferred => 0,
+        BotRuntimePairedCostBand::Acceptable => 1,
+        BotRuntimePairedCostBand::Caution => 2,
+        BotRuntimePairedCostBand::StopAdd => 3,
+        BotRuntimePairedCostBand::Danger => 4,
     }
 }
 /// Implements paired cost band label for the BOT runtime.
@@ -73,11 +73,11 @@ pub(in crate::bot) fn bot_runtime_paired_cost_band_index(band: BotRuntimePairedC
 
 pub(in crate::bot) fn bot_runtime_paired_cost_band_label(index: usize) -> &'static str {
     match index {
-        0 => BotRuntimePairedCostBand::StrongGrowth.as_str(),
-        1 => BotRuntimePairedCostBand::NormalGrowth.as_str(),
-        2 => BotRuntimePairedCostBand::ReducedGrowth.as_str(),
-        3 => BotRuntimePairedCostBand::RepairOnly.as_str(),
-        _ => BotRuntimePairedCostBand::Freeze.as_str(),
+        0 => BotRuntimePairedCostBand::Preferred.as_str(),
+        1 => BotRuntimePairedCostBand::Acceptable.as_str(),
+        2 => BotRuntimePairedCostBand::Caution.as_str(),
+        3 => BotRuntimePairedCostBand::StopAdd.as_str(),
+        _ => BotRuntimePairedCostBand::Danger.as_str(),
     }
 }
 /// Implements paired cost band summary u32 for the BOT runtime.

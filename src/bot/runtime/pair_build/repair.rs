@@ -1,5 +1,6 @@
 use super::super::*;
 use super::costs::{
+    bot_runtime_pair_build_price_zone_hold_reason,
     bot_runtime_pair_build_projected_paired_cost_band,
     bot_runtime_pair_build_projected_repair_inventory_vwap_sum,
 };
@@ -446,7 +447,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_repair_completion_core_bloc
         bot_runtime_pair_build_projected_paired_cost_band(projected_inventory_vwap_sum);
     if !matches!(
         projected_band,
-        BotRuntimePairedCostBand::RepairOnly | BotRuntimePairedCostBand::Freeze
+        BotRuntimePairedCostBand::StopAdd | BotRuntimePairedCostBand::Danger
     ) {
         return None;
     }
@@ -476,8 +477,8 @@ impl MakerHedgeCapBot {
         total_cost: f64,
         q_yes: f64,
         q_no: f64,
-        cost_yes: f64,
-        cost_no: f64,
+        _cost_yes: f64,
+        _cost_no: f64,
         context: &BotRuntimePairBuildMarketContext,
         plan: &BotRuntimePairBuildPlan,
     ) {
@@ -638,25 +639,14 @@ impl MakerHedgeCapBot {
                 return;
             }
         }
-        if let Some(projected_inventory_vwap_sum) =
-            bot_runtime_pair_build_lighter_price_discipline_block(
-                &decision,
-                q_yes,
-                q_no,
-                cost_yes,
-                cost_no,
-                active_side,
-                active_bid,
-                price_tick,
-            )
-        {
+        if let Some(reason) = bot_runtime_pair_build_price_zone_hold_reason(
+            decision.price_zone,
+            decision.marginal_cost_mode,
+            decision.effective_marginal_pair_cost,
+        ) {
             self._bot_runtime_log_pair_build_state(
                 "hold",
-                &format!(
-                    "lighter_side_price_discipline_{}:{:.3}",
-                    decision.cpp_hint.as_str(),
-                    projected_inventory_vwap_sum
-                ),
+                &reason,
                 Some(decision),
                 t_into_s,
                 total_cost,
@@ -665,33 +655,6 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        if let Some(projected_inventory_vwap_sum) =
-            bot_runtime_pair_build_lighter_extreme_projected_cost_block(
-                &decision,
-                q_yes,
-                q_no,
-                cost_yes,
-                cost_no,
-                active_side,
-                active_bid,
-                price_tick,
-            )
-        {
-            self._bot_runtime_log_pair_build_state(
-                "hold",
-                &format!(
-                    "lighter_side_projected_cost_cap:{:.3}",
-                    projected_inventory_vwap_sum
-                ),
-                Some(decision),
-                t_into_s,
-                total_cost,
-                q_yes,
-                q_no,
-            );
-            return;
-        }
-
         let (repair_bid_capped, repair_original_bid) = {
             let (pg_y_bid, pg_n_bid) = self
                 .bot_runtime_state
@@ -729,34 +692,6 @@ impl MakerHedgeCapBot {
             }
         };
 
-        if let Some((projected_inventory_vwap_sum, projected_band, current_inventory_vwap_sum)) =
-            bot_runtime_pair_build_lighter_repair_completion_core_block(
-                &decision,
-                q_yes,
-                q_no,
-                cost_yes,
-                cost_no,
-                active_side,
-                repair_bid_capped,
-            )
-        {
-            self._bot_runtime_log_pair_build_state(
-                "hold",
-                &format!(
-                    "lighter_side_completion_core_too_expensive:{}:{:.3}:{:.3}",
-                    projected_band.as_str(),
-                    projected_inventory_vwap_sum,
-                    current_inventory_vwap_sum
-                ),
-                Some(decision),
-                t_into_s,
-                total_cost,
-                q_yes,
-                q_no,
-            );
-            return;
-        }
-
         self._set_pending_entry_reason("BOT_PAIR_BUILD");
         let oid = self._maker_order_upsert_gtc(
             key,
@@ -792,13 +727,25 @@ impl MakerHedgeCapBot {
                     .unwrap_or(false);
                 let bid_cap_applied = (repair_original_bid - repair_bid_capped).abs() > 1e-9;
                 self.logger.info(&format!(
-                    "[BOT][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                    "[BOT][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                     decision.mode.as_str(),
                     active_side.as_str(),
                     decision.clip,
                     decision.clip_bucket,
                     decision.requested_clip,
                     decision.cpp_hint.as_str(),
+                    decision.price_zone.as_str(),
+                    decision.marginal_cost_mode.as_str(),
+                    decision.effective_marginal_pair_cost,
+                    decision
+                        .residual_unit_cost
+                        .map(|value| format!("{value:.3}"))
+                        .unwrap_or_else(|| "NA".to_string()),
+                    decision
+                        .lagging_side_quote
+                        .map(|value| format!("{value:.3}"))
+                        .unwrap_or_else(|| "NA".to_string()),
+                    active_side.opposite().as_str(),
                     exact_gap_clip,
                     min_valid_clip,
                     rounded_up_min_valid,
