@@ -28,6 +28,21 @@ impl MakerHedgeCapBot {
             .unwrap_or("BUY")
             .to_ascii_uppercase();
         let side = Self::_clob_side(&side_u)?;
+        let origin = signed_order
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if matches!(side, ClobSide::Sell) && origin.starts_with("BOT_") {
+            self.logger.warning(&format!(
+                "[BOT][BUY_ONLY] pair_id={} reject SELL submit origin={} asset={}",
+                self.pair_identity().pair_id,
+                origin,
+                asset_id
+            ));
+            return None;
+        }
         let price = signed_order
             .get("price")
             .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok()))
@@ -315,6 +330,7 @@ impl MakerHedgeCapBot {
             "side": "BUY",
             "price": price,
             "size": size,
+            "origin": "MAKER_POSTONLY_GTC",
         });
         let oid = self._post_order_compat(&signed, "GTC", Some(true))?;
         self._track_order_execution_context(
@@ -421,6 +437,7 @@ impl MakerHedgeCapBot {
             "side": "BUY",
             "price": px,
             "size": size,
+            "origin": origin,
         });
         let oid = self._post_order_compat(&signed, "GTC", post_only)?;
         if let Ok(mut s) = self.state.lock() {
@@ -511,6 +528,7 @@ impl MakerHedgeCapBot {
             "side": "BUY",
             "price": px,
             "size": size,
+            "origin": origin,
         });
         let oid = self._post_order_compat(&signed, "GTC", post_only)?;
         if let Ok(mut s) = self.state.lock() {
@@ -613,6 +631,7 @@ impl MakerHedgeCapBot {
             "side": "BUY",
             "price": px,
             "size": size,
+            "origin": format!("TAKER_{}_BUY", ot),
         });
         let oid = self._post_order_compat(&signed, &ot, None)?;
         self._remember_taker_order(&oid, asset_id, size, px, "BUY");
@@ -682,6 +701,7 @@ impl MakerHedgeCapBot {
             "side": "BUY",
             "price": px,
             "size": size,
+            "origin": format!("TAKER_{}_BUY_EXACT", ot),
         });
         let oid = self._post_order_compat(&signed, &ot, None)?;
         self._remember_taker_order(&oid, asset_id, size, px, "BUY");
@@ -772,6 +792,7 @@ impl MakerHedgeCapBot {
             "side": "SELL",
             "price": px,
             "size": size,
+            "origin": format!("TAKER_{}_SELL", ot),
         });
         let oid = match self._post_order_compat(&signed, &ot, None) {
             Some(v) => v,
@@ -850,6 +871,7 @@ impl MakerHedgeCapBot {
             "side": "SELL",
             "price": px,
             "size": size,
+            "origin": format!("TAKER_{}_SELL_EXACT", ot),
         });
         let oid = match self._post_order_compat(&signed, &ot, None) {
             Some(v) => v,

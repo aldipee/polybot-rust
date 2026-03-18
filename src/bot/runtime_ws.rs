@@ -792,7 +792,7 @@ impl MakerHedgeCapBot {
         // Primary source is Data API positions. Legacy balance-based mode can be
         // explicitly enabled, but mixed per-leg fallback is intentionally disabled.
         let pair_id = self.pair_identity().pair_id;
-        let use_data_api = env_bool("RECONCILE_USE_DATA_API", true);
+        let use_data_api = env_bool("RECONCILE_USE_DATA_API", false);
         let use_legacy_balance = env_bool("MISMATCH_RECONCILE_FROM_BALANCE", false);
         if !use_data_api && !use_legacy_balance {
             return false;

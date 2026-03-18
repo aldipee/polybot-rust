@@ -1273,12 +1273,14 @@ impl MakerHedgeCapBot {
                 "side": "BUY",
                 "price": y_px,
                 "size": y_qty,
+                "origin": format!("{origin}_YES"),
             });
             let signed_n = json!({
                 "asset_id": no,
                 "side": "BUY",
                 "price": n_px,
                 "size": n_qty,
+                "origin": format!("{origin}_NO"),
             });
             let resps = self._post_orders_compat(&[signed_y, signed_n], &resolved, post_only);
             (

@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 use std::sync::OnceLock;
 struct BotRuntimeNoopLogger;
 impl LogLike for BotRuntimeNoopLogger {
@@ -181,7 +182,7 @@ fn bot_runtime_phase_routing_covers_runtime_segments() {
     );
     assert_eq!(
         bot_runtime_phase_from_t_into_s(300.0, &cfg),
-        BotRuntimePhase::HoldSettleRollover
+        BotRuntimePhase::AwaitSettlement
     );
 }
 /// Exercises the BOT runtime owner routes seed completion and taper scenario and checks the
@@ -203,11 +204,8 @@ fn bot_runtime_owner_routes_seed_completion_and_taper() {
         (BotRuntimeControlOwner::Taper, "late_taper")
     );
     assert_eq!(
-        bot_runtime_owner_for_snapshot(BotRuntimePhase::HoldSettleRollover, 12.0, 12.0),
-        (
-            BotRuntimeControlOwner::HoldSettleRollover,
-            "near_expiry_rollover"
-        )
+        bot_runtime_owner_for_snapshot(BotRuntimePhase::AwaitSettlement, 12.0, 12.0),
+        (BotRuntimeControlOwner::AwaitSettlement, "await_settlement")
     );
 }
 /// Exercises the BOT runtime open both handler only runs for open both owner scenario and
@@ -325,4 +323,67 @@ fn apply_fill_updates_pair_owned_position_without_side_orphans() {
     assert!((paired.total_cost - 4.25).abs() < 1e-9);
     assert_eq!(paired.paired_size, 5.0);
     assert_eq!(paired.unmatched_size, 0.0);
+}
+
+#[test]
+fn await_settlement_handler_requests_cancel_then_exits_with_stable_reason() {
+    let bot = make_bot_runtime_test_bot();
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-yes".to_string()),
+                origin: "BOT_PAIR_BUILD_YES".to_string(),
+                last_submit_ts: 10.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+    assert!(!bot._bot_runtime_await_settlement_handler(100.0, 8.0));
+    let slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    assert_eq!(slot.state, MakerOrderLifecycle::CancelPending);
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert!(runtime_state.await_settlement_cancel_requested);
+    assert_eq!(runtime_state.await_settlement_started_ts, 100.0);
+    assert_eq!(runtime_state.await_settlement_orders_cleared_ts, 0.0);
+    assert_eq!(bot._get_exit_reason(), "RUNNING");
+
+    assert!(bot._bot_runtime_await_settlement_handler(104.5, 3.5));
+    assert_eq!(bot._get_exit_reason(), "AWAIT_SETTLEMENT");
+}
+
+#[test]
+fn post_order_compat_rejects_bot_strategy_sell_origin() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    let rejected = bot._post_order_compat(
+        &json!({
+            "asset_id": "yes_asset_id",
+            "side": "SELL",
+            "price": 0.40,
+            "size": 3.0,
+            "origin": "BOT_TAPER_EXIT",
+        }),
+        "FAK",
+        None,
+    );
+    assert!(rejected.is_none());
+
+    let allowed = bot._post_order_compat(
+        &json!({
+            "asset_id": "yes_asset_id",
+            "side": "SELL",
+            "price": 0.40,
+            "size": 3.0,
+            "origin": "TAKER_FAK_SELL",
+        }),
+        "FAK",
+        None,
+    );
+    assert!(allowed.is_some());
 }

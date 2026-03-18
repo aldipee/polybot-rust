@@ -8,11 +8,14 @@ Scope override:
 
 - `REQ-001` is marked `Not Applicable` by current product direction.
 - Reason: market scope should remain unrestricted instead of being hard-limited to BTC 5-minute pairs.
+- `REQ-031` active-market position reconciliation is partially overridden by current product direction.
+- Reason: the current inventory engine is treated as battle-tested during active markets, so Polymarket position API reconciliation should not run every 5 seconds while the market is live. Startup, reconnect, and post-settlement validation remain in scope.
 
 Only requirement-driven work is included here:
 
 - Active scope: `REQ-002` to `REQ-034`
 - Scope exception: `REQ-001` is excluded
+- Scope adjustment: `REQ-031` excludes active-market 5-second position reconciliation from the current product direction
 - Section 4 state-machine behavior
 - Section 5 risk rules
 - Section 6 execution rules
@@ -41,17 +44,17 @@ Work status legend:
 
 ### Overall Estimate
 
-- Estimated requirement coverage in current scope: `29%`
-- Estimated remaining gap in current scope: `71%`
+- Estimated requirement coverage in current scope: `33%`
+- Estimated remaining gap in current scope: `67%`
 
 ### Work Status Snapshot
 
 - Requirement analysis: `Done`
 - Requirement-only backlog definition: `Done`
 - `REQ-001` scope override recorded: `Done`
-- Active implementation tasks completed: `1 / 24`
+- Active implementation tasks completed: `2 / 24`
 - Tasks ready to start now: `12 / 24`
-- Tasks queued behind earlier work: `5 / 24`
+- Tasks queued behind earlier work: `4 / 24`
 - Tasks blocked by prerequisites: `6 / 24`
 - Tasks marked not applicable: `1`
 
@@ -59,12 +62,12 @@ Work status legend:
 
 | Requirement area | REQ scope | Coverage | Gap | Current reading |
 |---|---|---:|---:|---|
-| Market scope and paired lifecycle | `REQ-002` to `REQ-008` with `REQ-001` excluded | 46% | 54% | Pair identity, pair snapshots, pair-level runtime decisions, and pair persistence are now in place, but timing and the full required state machine still do not match spec. |
+| Market scope and paired lifecycle | `REQ-002` to `REQ-008` with `REQ-001` excluded | 54% | 46% | Pair identity, pair snapshots, pair-level runtime decisions, `AwaitSettlement`, buy-only hold-to-settlement flow, and pair persistence are now in place, but exact seeding timing and the full required state machine still do not match spec. |
 | Inventory, pricing, and residual discipline | `REQ-009` to `REQ-013`, `REQ-018` to `REQ-021` | 32% | 68% | Some pair-sum and skew controls exist, but the exact thresholds and hard blocks from the requirement are not enforced. |
 | Execution controls and clip policy | `REQ-014` to `REQ-017`, `REQ-034` | 38% | 62% | Maker-first behavior exists, but taker caps, exact clip ladder rules, and refresh limits are incomplete. |
 | Config, observability, and auditability | `REQ-023` to `REQ-025` | 18% | 82% | Config snapshotting exists, but no full config versioning, append-only decisions, or requirement-grade metrics and logs. |
 | Replay, paper, and live safety modes | `REQ-026` to `REQ-029` | 10% | 90% | No true replay engine, importer parity, paper adapter, or shadow-first guarded live flow is present. |
-| Reliability, stale data, and reconciliation | `REQ-030` to `REQ-033` | 22% | 78% | There are partial dedupe and reconcile pieces, but not the full pause, startup-safe, and periodic reconciliation behavior. |
+| Reliability, stale data, and reconciliation | `REQ-030` to `REQ-033` | 24% | 76% | There are partial dedupe and reconcile pieces. Current direction keeps startup, reconnect, and post-settlement validation in scope, but excludes active-market 5-second position reconciliation from the target behavior. |
 | Validation and launch gates | Section 10 | 8% | 92% | A small unit-test set exists, but replay, simulation, paper KPI, and shadow KPI gates are mostly absent. |
 
 ## Requirement-First Implementation Tasks
@@ -75,7 +78,7 @@ Work status legend:
 |---|---|---|---|---|---|---|
 | IMP-01 | `REQ-001` | N/A | N/A | Do not implement strict BTC 5-minute whitelist restrictions; treat this requirement as intentionally out of scope for the current product direction. | User direction explicitly rejects restricted market scope. | `TASKS.MD` only unless product docs are updated |
 | IMP-02 | `REQ-002` | Done | Done | Make `pair_id` the mandatory decision key so strategy, risk, and ledger decisions operate on the pair as one instrument. | Implemented: pair identity, pair snapshots, pair-level runtime boundary, execution metadata, and pair persistence are now wired through the monolith. | `src/bot/shared.rs`, `src/bot/public_tail.rs`, `src/bot/runtime/*`, `src/bot/execution/*`, `src/db.rs`, `src/main.rs` |
-| IMP-03 | `REQ-003`, `REQ-022` | Partial | Queued | Enforce buy-only hold-to-settlement behavior and ensure settlement, not intrawindow sell logic, closes exposure. | Buy-heavy behavior exists, but settlement and terminal lifecycle handling are not requirement-complete. | `src/bot/runtime/*`, `src/rtds.rs`, `src/db.rs` |
+| IMP-03 | `REQ-003`, `REQ-022` | Partial | Done | Enforce buy-only hold-to-settlement behavior and ensure settlement, not intrawindow sell logic, closes exposure. | Implemented: `AwaitSettlement`, terminal order drain, settlement-owned finalization, unresolved settlement persistence, and buy-only BOT runtime guard are now in place. Exact late-window timing still depends on `IMP-11`. | `src/bot/runtime/*`, `src/rtds.rs`, `src/db.rs`, `src/main.rs` |
 | IMP-04 | `REQ-004`, `REQ-005`, `REQ-006` | Partial | Ready | Add pre-open warmup plus exact open-time seeding deadlines: both seed orders within 5 seconds of open and within 1 second of each other. | Current code seeds early, but there is no spec-accurate pre-open guarantee or enforced same-cycle submit delta. | `src/bot/runtime/startup.rs`, `src/bot/runtime_ws.rs`, `src/config.rs` |
 | IMP-05 | `REQ-007`, `REQ-008` | Partial | Ready | Implement `AwaitSecondFill` completion mode with no scale-up before both sides fill, 15-second target, and 30-second hard stop for accumulation. | Current logic uses looser 30-second and 60-second thresholds and does not match the required phase transitions. | `src/bot/runtime/state.rs`, `src/bot/runtime/startup.rs`, `src/bot/runtime/loop.rs` |
 | IMP-06 | `REQ-009`, `REQ-010` | Partial | Ready | Replace heuristic imbalance logic with exact unmatched-fraction controls: target below 7%, warning above 12%, disable or reduce-only at 20% or more. | Current repo uses coverage and skew heuristics instead of the exact unmatched-fraction policy from the requirement. | `src/bot/runtime/metrics.rs`, `src/bot/runtime/pair_build/decision.rs` |
@@ -87,7 +90,7 @@ Work status legend:
 | IMP-12 | `REQ-023` | Partial | Queued | Introduce versioned config with persisted snapshots, explicit `config_version` on decisions, orders, and fills, and rollback-safe reload behavior. | Config loads from env and snapshots exist, but there is no requirement-complete versioned config pipeline. | `src/config.rs`, `src/db.rs`, `src/main.rs` |
 | IMP-13 | `REQ-024`, `REQ-025` | Missing | Queued | Build append-only decision logging and structured metrics for state transitions, risk blocks, intents, acks, fills, reconciliation, and settlement. | Current decision persistence is incomplete, legacy-shaped, and not append-only or fully wired into order flow. | `src/db.rs`, `src/logging.rs`, `src/main.rs`, `src/bot/runtime/*` |
 | IMP-14 | `REQ-028`, `REQ-029` | Missing | Blocked | Add a true paper adapter and make `paper` or `shadow` the default startup mode until clean reconciliation and explicit live enablement pass. | `dry_run` exists, but it is not a real paper adapter, and live-start safeguards are not requirement-complete. | `src/main.rs`, `src/bot.rs`, `src/bot/execution/*`, new paper adapter module |
-| IMP-15 | `REQ-030`, `REQ-031` | Partial | Ready | Enforce idempotent client order IDs, fill dedupe, dependency-failure pause, and full reconciliation on startup, every 5 seconds, after reconnect, and after settlement. | Some dedupe and reconciliation helpers exist, but not the required safe-mode and continuous reconciliation behavior. | `src/bot/execution/*`, `src/bot/runtime_ws.rs`, `src/db.rs`, `src/main.rs` |
+| IMP-15 | `REQ-030`, adjusted `REQ-031` scope | Partial | Ready | Enforce idempotent client order IDs, fill dedupe, dependency-failure pause, startup reconciliation, reconnect reconciliation, and post-settlement validation without active-market Data API position reconciliation. Use `TRADE_VALIDATE` for startup and post-settlement validation flows. | Some dedupe and reconciliation helpers exist, but the repo still lacks a requirement-complete safe-mode and startup or post-settlement validation policy under the new product direction. | `src/bot/execution/*`, `src/bot/runtime_ws.rs`, `src/db.rs`, `src/main.rs` |
 
 ### P1 Completion Work
 
@@ -123,7 +126,7 @@ This sequence stays tied to the requirement instead of a refactor roadmap:
 8. `IMP-11` late-window balance-only and cutoff logic
 9. `IMP-12` config versioning
 10. `IMP-13` append-only decision audit trail
-11. `IMP-15` full reconciliation and dependency-failure pause
+11. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
 12. `IMP-14` true paper plus shadow-first startup safety
 13. `IMP-17` analytics importer parity
 14. `IMP-18` deterministic replay
@@ -136,20 +139,22 @@ The current codebase already contains the start of the paired engine, but it is 
 Recent completed work:
 
 - `IMP-02` / `REQ-002` is now `Done`: the bot is pair-first at the identity, runtime-context, execution-metadata, and persistence layers.
+- `IMP-03` / `REQ-003` and `REQ-022` implementation work is now `Done`: the bot now hands off into `AwaitSettlement`, drains working orders, persists terminal trade snapshots before unresolved settlement, and closes from settlement data instead of generic rollover.
 
 The biggest remaining requirement gaps are:
 
 - exact seeding, completion, imbalance, and price-zone rules
 - append-only decision and audit persistence
 - true paper, replay, and shadow modes
-- continuous reconciliation and strict stale-data behavior
+- startup and post-settlement validation discipline plus strict stale-data behavior
 - validation gates before any guarded live rollout
 
 Intentional scope exception:
 
 - `REQ-001` strict BTC 5-minute restriction is marked `Not Applicable` by current product direction.
+- `REQ-031` active-market 5-second position reconciliation is intentionally not part of the current product direction; startup, reconnect, and post-settlement validation remain in scope.
 
 Current estimate:
 
-- Requirement coverage in current scope: `29%`
-- Remaining requirement gap in current scope: `71%`
+- Requirement coverage in current scope: `33%`
+- Remaining requirement gap in current scope: `67%`

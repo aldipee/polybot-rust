@@ -27,15 +27,15 @@ use helpers::{generate_market_slug_from_env_now, get_next_slug, segment, segment
 use logging::{setup_item_logger, LogLike};
 use r2_storage::upload_logs_before_rollover;
 use reqwest::blocking::Client;
-use rtds::{get_resolution_snapshot_for_market, RtdsService};
+use rtds::{get_resolution_snapshot_for_market, ResolutionSnapshot, RtdsService};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -580,20 +580,16 @@ the bot so getUpdates can discover one.",
     }
 }
 
-fn realized_lp_from_resolution_snapshot(
-    market_slug: &str,
+fn realized_lp_from_resolution_record(
+    snapshot: &ResolutionSnapshot,
     q_yes: f64,
     q_no: f64,
     total_cost: f64,
-    fallback_lp: f64,
     logger: &Arc<dyn LogLike>,
     realized_log_enabled: bool,
-) -> f64 {
-    let Some(snapshot) = get_resolution_snapshot_for_market(market_slug) else {
-        return fallback_lp;
-    };
+) -> Option<f64> {
     if snapshot.source_ts_ms + 1 < snapshot.resolution_ts_ms {
-        return fallback_lp;
+        return None;
     }
     let diff_price = snapshot
         .diff_vs_price_to_beat
@@ -602,19 +598,14 @@ fn realized_lp_from_resolution_snapshot(
                 .price_to_beat
                 .map(|ptb| snapshot.resolution_price - ptb)
         })
-        .filter(|v| v.is_finite());
-    let Some(diff_price) = diff_price else {
-        return fallback_lp;
-    };
-
+        .filter(|v| v.is_finite())?;
     let (yes_payout, no_payout) = payout_from_resolution_diff(diff_price, q_yes, q_no);
     let realized_lp = yes_payout + no_payout - total_cost;
     if realized_log_enabled {
         logger.info(&format!(
-            "[TRADE][REALIZED] market={} lp={:+.6} fallback_lp={:+.6} q_yes={:.4} q_no={:.4} total_cost={:.6} diff_vs_price_to_beat={:+.6} source_ts_ms={} resolution_ts_ms={}",
-            market_slug,
+            "[TRADE][REALIZED] market={} lp={:+.6} q_yes={:.4} q_no={:.4} total_cost={:.6} diff_vs_price_to_beat={:+.6} source_ts_ms={} resolution_ts_ms={}",
+            snapshot.market_slug,
             realized_lp,
-            fallback_lp,
             q_yes,
             q_no,
             total_cost,
@@ -623,7 +614,111 @@ fn realized_lp_from_resolution_snapshot(
             snapshot.resolution_ts_ms
         ));
     }
-    realized_lp
+    Some(realized_lp)
+}
+
+fn settled_trade_from_resolution_snapshot(
+    market_slug: &str,
+    q_yes: f64,
+    q_no: f64,
+    total_cost: f64,
+    logger: &Arc<dyn LogLike>,
+    realized_log_enabled: bool,
+) -> Option<(ResolutionSnapshot, f64)> {
+    let snapshot = get_resolution_snapshot_for_market(market_slug)?;
+    let realized_lp = realized_lp_from_resolution_record(
+        &snapshot,
+        q_yes,
+        q_no,
+        total_cost,
+        logger,
+        realized_log_enabled,
+    )?;
+    Some((snapshot, realized_lp))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AwaitSettlementTradeSnapshot {
+    end_trade_iso: String,
+    raw_exit_reason: String,
+    exit_reason_category: String,
+    total_cost: f64,
+    cpp: f64,
+    q_yes: f64,
+    q_no: f64,
+    entry_time_iso: Option<String>,
+    holding_duration_seconds: Option<f64>,
+    entry_reason: Option<String>,
+    stop_loss_category: Option<String>,
+    entry_price: Option<f64>,
+}
+
+fn build_await_settlement_trade_snapshot(
+    metrics: &bot::TradeMetrics,
+    run_reason: &str,
+    start_trade_iso: &str,
+    end_trade_iso: &str,
+) -> AwaitSettlementTradeSnapshot {
+    let raw_exit_reason = if metrics.exit_reason.trim().is_empty()
+        || metrics.exit_reason.eq_ignore_ascii_case("RUNNING")
+    {
+        run_reason.to_string()
+    } else {
+        metrics.exit_reason.clone()
+    };
+    let exit_reason_category = analytics_exit_reason(&raw_exit_reason);
+    let effective_entry_iso = metrics.entry_time_iso.as_deref().unwrap_or(start_trade_iso);
+    let holding_duration_seconds = holding_duration_seconds(effective_entry_iso, end_trade_iso);
+    let total_qty = metrics.q_yes + metrics.q_no;
+    let entry_price = if total_qty > 1e-9 {
+        Some(metrics.total_cost / total_qty)
+    } else {
+        None
+    };
+    let stop_loss_category = if exit_reason_category == "STOP_LOSS" {
+        Some(
+            metrics
+                .stop_loss_category
+                .clone()
+                .unwrap_or_else(|| "MARKET".to_string()),
+        )
+    } else {
+        None
+    };
+    AwaitSettlementTradeSnapshot {
+        end_trade_iso: end_trade_iso.to_string(),
+        raw_exit_reason,
+        exit_reason_category,
+        total_cost: metrics.total_cost,
+        cpp: metrics.cpp,
+        q_yes: metrics.q_yes,
+        q_no: metrics.q_no,
+        entry_time_iso: metrics.entry_time_iso.clone(),
+        holding_duration_seconds,
+        entry_reason: metrics.entry_reason.clone(),
+        stop_loss_category,
+        entry_price,
+    }
+}
+
+fn settlement_metadata_json(snapshot: &ResolutionSnapshot, realized_lp: f64) -> Option<String> {
+    serde_json::to_string(&json!({
+        "settlement_source": "RTDS",
+        "market_slug": snapshot.market_slug,
+        "symbol": snapshot.symbol,
+        "asset_id": snapshot.asset_id,
+        "resolution_ts_ms": snapshot.resolution_ts_ms,
+        "source_ts_ms": snapshot.source_ts_ms,
+        "resolution_price": snapshot.resolution_price,
+        "resolution_value": snapshot.resolution_value,
+        "capture_mode": snapshot.capture_mode,
+        "price_to_beat": snapshot.price_to_beat,
+        "diff_vs_price_to_beat": snapshot.diff_vs_price_to_beat,
+        "diff_vs_price_to_beat_percentage": snapshot.diff_vs_price_to_beat_percentage,
+        "captured_at_ms": snapshot.captured_at_ms,
+        "realized_lp": realized_lp,
+    }))
+    .ok()
 }
 
 fn payout_from_resolution_diff(diff_price: f64, q_yes: f64, q_no: f64) -> (f64, f64) {
@@ -632,13 +727,6 @@ fn payout_from_resolution_diff(diff_price: f64, q_yes: f64, q_no: f64) -> (f64, 
     } else {
         (0.0, q_no.max(0.0))
     }
-}
-
-fn now_ts_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
 }
 
 fn value_as_f64(v: Option<&Value>) -> Option<f64> {
@@ -1045,7 +1133,6 @@ fn run() -> Result<()> {
     let trade_validation_enabled = env_bool("TRADE_VALIDATION_ENABLED", false);
     let trade_validation_after_market_enabled =
         env_bool("TRADE_VALIDATION_AFTER_MARKET_ENABLED", false);
-    let trade_validation_poll_seconds = env_float("TRADE_VALIDATION_POLL_SECONDS", 90.0).max(5.0);
     let pnl_stats_at_end_enabled = env_bool("PNL_STATS_AT_END_ENABLED", false);
     let trade_realized_log_enabled = env_bool("TRADE_REALIZED_LOG_ENABLED", false);
 
@@ -1088,23 +1175,20 @@ fn run() -> Result<()> {
 
     cfg.apply_safe_defaults();
     let mut current_slug = slug;
-    let mut last_trade_validation_poll_ts = 0.0_f64;
+    let mut startup_trade_validation_done = false;
     let mut last_daily_limit_telegram_key = String::new();
 
     loop {
         let bot_logger = setup_item_logger(&current_slug);
         bot_logger.info(&format!("\nSTARTING MARKET: {current_slug}"));
         let repo = session_factory.repository();
-        let now_poll_ts = now_ts_f64();
-        if trade_validation_enabled
-            && now_poll_ts - last_trade_validation_poll_ts >= trade_validation_poll_seconds
-        {
+        if trade_validation_enabled && !startup_trade_validation_done {
             if let Err(e) =
                 reconcile_unvalidated_trades_with_polymarket(&repo, &bot_id, &cfg, &bot_logger)
             {
                 bot_logger.warning(&format!("[TRADE_VALIDATE] poll error: {e:#}"));
             }
-            last_trade_validation_poll_ts = now_ts_f64();
+            startup_trade_validation_done = true;
         }
         if daily_take_profit_usd > 0.0 || daily_stop_loss_usd > 0.0 {
             // Keep daily guardrail window exactly aligned with summary daily window bounds.
@@ -1267,11 +1351,6 @@ fn run() -> Result<()> {
         thread::spawn(move || {
             let run_result = bot.run();
 
-            // Close RTDS (waits for resolution price) in background.
-            if let Some(svc) = rtds_service {
-                svc.close();
-            }
-
             let run_reason = match run_result {
                 Ok(r) => r,
                 Err(e) => {
@@ -1288,82 +1367,101 @@ fn run() -> Result<()> {
                 || metrics.q_yes > 1e-9
                 || metrics.q_no > 1e-9;
             if !has_trade_activity {
+                if let Some(svc) = rtds_service {
+                    svc.close();
+                }
                 let _ = repo.delete_trade(&trade_id);
                 bot.persist_state();
                 bg_logger.info(&format!(
                     "Deleted pending trade row {trade_id}. reason=NO_TRADE_ACTIVITY"
                 ));
             } else {
-                metrics.lp = realized_lp_from_resolution_snapshot(
+                let end_trade_iso = now_iso_jakarta();
+                let await_snapshot = build_await_settlement_trade_snapshot(
+                    &metrics,
+                    &run_reason,
+                    bot.start_trade_iso.as_str(),
+                    &end_trade_iso,
+                );
+                let _ = repo.update_trade_await_settlement_snapshot(
+                    &trade_id,
+                    &await_snapshot.end_trade_iso,
+                    await_snapshot.total_cost,
+                    await_snapshot.cpp,
+                    await_snapshot.q_yes,
+                    await_snapshot.q_no,
+                    &await_snapshot.raw_exit_reason,
+                    await_snapshot.entry_time_iso.as_deref(),
+                    await_snapshot.holding_duration_seconds,
+                    await_snapshot.entry_reason.as_deref(),
+                    Some(await_snapshot.exit_reason_category.as_str()),
+                    await_snapshot.stop_loss_category.as_deref(),
+                    await_snapshot.entry_price,
+                );
+                bg_logger.info(&format!(
+                    "Trade row {trade_id} handed off to settlement. reason={}",
+                    await_snapshot.raw_exit_reason
+                ));
+
+                // Close RTDS (waits for resolution price) in background.
+                if let Some(svc) = rtds_service {
+                    svc.close();
+                }
+
+                if let Some((snapshot, realized_lp)) = settled_trade_from_resolution_snapshot(
                     &bg_slug,
                     metrics.q_yes,
                     metrics.q_no,
                     metrics.total_cost,
-                    metrics.lp,
                     &bg_logger,
                     bg_trade_realized_log_enabled,
-                );
-                let end_trade_iso = now_iso_jakarta();
-                let raw_exit_reason = if metrics.exit_reason.trim().is_empty()
-                    || metrics.exit_reason.eq_ignore_ascii_case("RUNNING")
-                {
-                    run_reason.clone()
+                ) {
+                    metrics.lp = realized_lp;
+                    let total_qty = await_snapshot.q_yes + await_snapshot.q_no;
+                    let exit_price = if total_qty > 1e-9 {
+                        Some((metrics.total_cost + metrics.lp) / total_qty)
+                    } else {
+                        None
+                    };
+                    let _ = repo.update_trade_result(
+                        &trade_id,
+                        &await_snapshot.end_trade_iso,
+                        metrics.lp,
+                        metrics.total_cost,
+                        metrics.cpp,
+                        metrics.q_yes,
+                        metrics.q_no,
+                        &await_snapshot.raw_exit_reason,
+                        await_snapshot.entry_time_iso.as_deref(),
+                        await_snapshot.holding_duration_seconds,
+                        await_snapshot.entry_reason.as_deref(),
+                        Some(await_snapshot.exit_reason_category.as_str()),
+                        await_snapshot.stop_loss_category.as_deref(),
+                        await_snapshot.entry_price,
+                        exit_price,
+                    );
+                    let settlement_meta = settlement_metadata_json(&snapshot, metrics.lp);
+                    let _ = repo.update_trade_settlement_fields(
+                        &trade_id,
+                        Some("SETTLED"),
+                        settlement_meta.as_deref(),
+                    );
+                    bot.persist_state();
+                    bg_logger.info(&format!(
+                        "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4} cpp={:.4} qYES={:.2} qNO={:.2} claim_status=SETTLED",
+                        metrics.lp,
+                        metrics.total_cost,
+                        metrics.cpp,
+                        metrics.q_yes,
+                        metrics.q_no
+                    ));
                 } else {
-                    metrics.exit_reason.clone()
-                };
-                let exit_reason_category = analytics_exit_reason(&raw_exit_reason);
-                let effective_entry_iso = metrics
-                    .entry_time_iso
-                    .as_deref()
-                    .unwrap_or(bot.start_trade_iso.as_str());
-                let holding_secs = holding_duration_seconds(effective_entry_iso, &end_trade_iso);
-                let total_qty = metrics.q_yes + metrics.q_no;
-                let entry_price = if total_qty > 1e-9 {
-                    Some(metrics.total_cost / total_qty)
-                } else {
-                    None
-                };
-                let exit_price = if total_qty > 1e-9 {
-                    Some((metrics.total_cost + metrics.lp) / total_qty)
-                } else {
-                    None
-                };
-                let stop_loss_category = if exit_reason_category == "STOP_LOSS" {
-                    Some(
-                        metrics
-                            .stop_loss_category
-                            .clone()
-                            .unwrap_or_else(|| "MARKET".to_string()),
-                    )
-                } else {
-                    None
-                };
-                let _ = repo.update_trade_result(
-                    &trade_id,
-                    &end_trade_iso,
-                    metrics.lp,
-                    metrics.total_cost,
-                    metrics.cpp,
-                    metrics.q_yes,
-                    metrics.q_no,
-                    &raw_exit_reason,
-                    metrics.entry_time_iso.as_deref(),
-                    holding_secs,
-                    metrics.entry_reason.as_deref(),
-                    Some(exit_reason_category.as_str()),
-                    stop_loss_category.as_deref(),
-                    entry_price,
-                    exit_price,
-                );
-                bot.persist_state();
-                bg_logger.info(&format!(
-                    "Updated trade row {trade_id}. reason=FINALIZED lp={:.4} cost={:.4} cpp={:.4} qYES={:.2} qNO={:.2}",
-                    metrics.lp,
-                    metrics.total_cost,
-                    metrics.cpp,
-                    metrics.q_yes,
-                    metrics.q_no
-                ));
+                    bot.persist_state();
+                    bg_logger.info(&format!(
+                        "Trade row {trade_id} remains AWAIT_SETTLEMENT. reason=resolution_snapshot_unavailable pair_id={}",
+                        metrics.pair_id
+                    ));
+                }
             }
 
             if bg_trade_validation_enabled && bg_trade_validation_after_market_enabled {
@@ -1403,7 +1501,7 @@ fn run() -> Result<()> {
         let run_reason = bot_exit_reason
             .lock()
             .map(|r| r.clone())
-            .unwrap_or_else(|_| "ROLLOVER".to_string());
+            .unwrap_or_else(|_| "AWAIT_SETTLEMENT".to_string());
         bot_logger.info(&format!("Bot stopped trading, reason={run_reason}"));
 
         let next_slug = if run_reason.starts_with("SWITCH:") {
@@ -1438,8 +1536,16 @@ fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{payout_from_resolution_diff, require_bot_exec_mode};
+    use super::{
+        build_await_settlement_trade_snapshot, payout_from_resolution_diff,
+        realized_lp_from_resolution_record, require_bot_exec_mode, settlement_metadata_json,
+    };
+    use crate::bot::TradeMetrics;
+    use crate::logging::{setup_item_logger, LogLike};
+    use crate::rtds::ResolutionSnapshot;
+    use serde_json::Value;
     use std::env;
+    use std::sync::Arc;
 
     #[test]
     fn tie_resolves_to_yes() {
@@ -1482,6 +1588,116 @@ mod tests {
             Some(value) => env::set_var("EXEC_MODE", value),
             None => env::remove_var("EXEC_MODE"),
         }
+    }
+
+    #[test]
+    fn realized_lp_from_resolution_record_requires_fresh_resolution_tick() {
+        let logger: Arc<dyn LogLike> = setup_item_logger("resolution_test");
+        let stale_snapshot = ResolutionSnapshot {
+            market_slug: "market-a".to_string(),
+            symbol: "BTC".to_string(),
+            asset_id: "asset-a".to_string(),
+            resolution_ts_ms: 2_000,
+            source_ts_ms: 1_500,
+            resolution_price: 0.55,
+            resolution_value: None,
+            capture_mode: "post".to_string(),
+            price_to_beat: Some(0.50),
+            diff_vs_price_to_beat: Some(0.05),
+            diff_vs_price_to_beat_percentage: Some(0.10),
+            captured_at_ms: 2_010,
+        };
+        assert!(
+            realized_lp_from_resolution_record(&stale_snapshot, 5.0, 5.0, 4.0, &logger, false)
+                .is_none()
+        );
+
+        let fresh_snapshot = ResolutionSnapshot {
+            source_ts_ms: 2_000,
+            ..stale_snapshot
+        };
+        let realized =
+            realized_lp_from_resolution_record(&fresh_snapshot, 5.0, 5.0, 4.0, &logger, false)
+                .expect("fresh snapshot should settle");
+        assert!((realized - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn settlement_metadata_json_contains_resolution_fields() {
+        let snapshot = ResolutionSnapshot {
+            market_slug: "market-b".to_string(),
+            symbol: "ETH".to_string(),
+            asset_id: "asset-b".to_string(),
+            resolution_ts_ms: 3_000,
+            source_ts_ms: 3_000,
+            resolution_price: 0.61,
+            resolution_value: Some(123.0),
+            capture_mode: "first_after_resolution".to_string(),
+            price_to_beat: Some(0.58),
+            diff_vs_price_to_beat: Some(0.03),
+            diff_vs_price_to_beat_percentage: Some(0.0517),
+            captured_at_ms: 3_005,
+        };
+        let meta = settlement_metadata_json(&snapshot, 2.25).expect("metadata json");
+        let parsed: Value = serde_json::from_str(&meta).expect("valid json");
+        assert_eq!(
+            parsed.get("settlement_source").and_then(Value::as_str),
+            Some("RTDS")
+        );
+        assert_eq!(
+            parsed.get("market_slug").and_then(Value::as_str),
+            Some("market-b")
+        );
+        assert_eq!(
+            parsed.get("capture_mode").and_then(Value::as_str),
+            Some("first_after_resolution")
+        );
+        assert_eq!(
+            parsed.get("realized_lp").and_then(Value::as_f64),
+            Some(2.25)
+        );
+    }
+
+    #[test]
+    fn await_settlement_trade_snapshot_preserves_terminal_trade_fields() {
+        let metrics = TradeMetrics {
+            pair_id: "pair-1".to_string(),
+            market_slug: "market-1".to_string(),
+            condition_id: Some("cond-1".to_string()),
+            yes_asset_id: Some("yes-1".to_string()),
+            no_asset_id: Some("no-1".to_string()),
+            lp: 0.0,
+            total_cost: 8.4,
+            q_yes: 10.0,
+            q_no: 8.0,
+            cpp: 0.4666666667,
+            entry_time_iso: Some("2024-01-01T00:00:10Z".to_string()),
+            entry_reason: Some("BOT_OPEN_BOTH".to_string()),
+            stop_loss_category: Some("NONE".to_string()),
+            exit_reason: "RUNNING".to_string(),
+            fill_count: 4,
+        };
+        let snapshot = build_await_settlement_trade_snapshot(
+            &metrics,
+            "AWAIT_SETTLEMENT",
+            "2024-01-01T00:00:00Z",
+            "2024-01-01T00:05:00Z",
+        );
+        assert_eq!(snapshot.raw_exit_reason, "AWAIT_SETTLEMENT");
+        assert_eq!(snapshot.exit_reason_category, "RESOLUTION");
+        assert_eq!(snapshot.total_cost, 8.4);
+        assert_eq!(snapshot.q_yes, 10.0);
+        assert_eq!(snapshot.q_no, 8.0);
+        assert!((snapshot.cpp - 0.4666666667).abs() < 1e-9);
+        assert_eq!(
+            snapshot.entry_time_iso.as_deref(),
+            Some("2024-01-01T00:00:10Z")
+        );
+        assert_eq!(snapshot.entry_reason.as_deref(), Some("BOT_OPEN_BOTH"));
+        assert_eq!(snapshot.stop_loss_category, None);
+        assert_eq!(snapshot.entry_price, Some(8.4 / 18.0));
+        assert!(snapshot.holding_duration_seconds.unwrap_or_default() > 0.0);
+        assert_eq!(snapshot.end_trade_iso, "2024-01-01T00:05:00Z");
     }
 }
 

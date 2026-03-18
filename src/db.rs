@@ -1099,12 +1099,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
              FROM trade
              WHERE bot_id = $1
                AND date >= $2
-               AND status IN ('WON','LOSS','DRAW')
-               AND NOT (
-                    status = 'DRAW'
-                    AND COALESCE(total_cost, 0.0) <= 1e-9
-                    AND COALESCE(q_yes, 0.0) <= 1e-9
-                    AND COALESCE(q_no, 0.0) <= 1e-9
+               AND (
+                    (
+                        status IN ('WON','LOSS','DRAW')
+                        AND NOT (
+                            status = 'DRAW'
+                            AND COALESCE(total_cost, 0.0) <= 1e-9
+                            AND COALESCE(q_yes, 0.0) <= 1e-9
+                            AND COALESCE(q_no, 0.0) <= 1e-9
+                        )
+                    )
+                    OR COALESCE(claim_status, '') IN ('AWAIT_SETTLEMENT', 'SETTLED')
                )
                AND COALESCE(validation_status, 'PENDING') <> 'VALIDATED'
              ORDER BY end_trade ASC, start_trade ASC
@@ -1219,6 +1224,81 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_trade_await_settlement_snapshot(
+        &self,
+        trade_id: &str,
+        end_trade_iso: &str,
+        total_cost: f64,
+        cpp: f64,
+        q_yes: f64,
+        q_no: f64,
+        exit_reason: &str,
+        entry_time_iso: Option<&str>,
+        holding_duration_seconds: Option<f64>,
+        entry_reason: Option<&str>,
+        exit_reason_category: Option<&str>,
+        stop_loss_category: Option<&str>,
+        entry_price: Option<f64>,
+    ) -> Result<()> {
+        let await_settlement = "AWAIT_SETTLEMENT".to_string();
+        let validation_pending = "PENDING".to_string();
+        let validation_checked_at: Option<String> = None;
+        let validation_validated_at: Option<String> = None;
+        let validation_source: Option<String> = None;
+        let exit_time_iso: Option<&str> = Some(end_trade_iso);
+        let exit_price: Option<f64> = None;
+        let mut conn = open_conn(&self.engine)?;
+        conn.execute(
+            "UPDATE trade SET
+                end_trade = $1,
+                exit_time = $2,
+                entry_time = COALESCE($3, entry_time),
+                holding_duration_seconds = COALESCE($4, holding_duration_seconds),
+                entry_reason = COALESCE($5, entry_reason),
+                exit_reason_category = COALESCE($6, exit_reason_category),
+                stop_loss_category = COALESCE($7, stop_loss_category),
+                entry_price = COALESCE($8, entry_price),
+                exit_price = COALESCE($9, exit_price),
+                total_cost = $10,
+                cpp = $11,
+                q_yes = $12,
+                q_no = $13,
+                exit_reason = $14,
+                status = $15,
+                claim_status = $16,
+                validation_status = $17,
+                validation_checked_at = $18,
+                validation_validated_at = $19,
+                validation_source = $20
+             WHERE trade_id = $21",
+            &[
+                &end_trade_iso,
+                &exit_time_iso,
+                &entry_time_iso,
+                &holding_duration_seconds,
+                &entry_reason,
+                &exit_reason_category,
+                &stop_loss_category,
+                &entry_price,
+                &exit_price,
+                &total_cost,
+                &cpp,
+                &q_yes,
+                &q_no,
+                &exit_reason,
+                &await_settlement,
+                &await_settlement,
+                &validation_pending,
+                &validation_checked_at,
+                &validation_validated_at,
+                &validation_source,
+                &trade_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn touch_trade_validation_checked(
         &self,
         trade_id: &str,
@@ -1257,7 +1337,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
                  validation_status = $3,
                  validation_checked_at = $4,
                  validation_validated_at = $5,
-                 validation_source = $6
+                 validation_source = $6,
+                 claim_status = CASE
+                    WHEN COALESCE(claim_status, '') IN ('', 'AWAIT_SETTLEMENT')
+                        THEN 'SETTLED'
+                    ELSE claim_status
+                 END,
+                 end_trade = CASE
+                    WHEN COALESCE(trim(end_trade), '') = ''
+                        THEN $4
+                    ELSE end_trade
+                 END,
+                 exit_time = COALESCE(exit_time, $4),
+                 exit_price = COALESCE(
+                    exit_price,
+                    CASE
+                        WHEN COALESCE(q_yes, 0.0) + COALESCE(q_no, 0.0) > 1e-9
+                            THEN (COALESCE(total_cost, 0.0) + $1)
+                                / (COALESCE(q_yes, 0.0) + COALESCE(q_no, 0.0))
+                        ELSE NULL
+                    END
+                 )
              WHERE trade_id = $7",
             &[
                 &lp,

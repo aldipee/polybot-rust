@@ -6,7 +6,7 @@ pub(in crate::bot) enum BotRuntimePhase {
     OpenBoth,
     PairBuild,
     Taper,
-    HoldSettleRollover,
+    AwaitSettlement,
 }
 impl BotRuntimePhase {
     /// Returns the stable string label for this enum or state value.
@@ -19,7 +19,7 @@ impl BotRuntimePhase {
             Self::OpenBoth => "OpenBoth",
             Self::PairBuild => "PairBuild",
             Self::Taper => "Taper",
-            Self::HoldSettleRollover => "HoldSettleRollover",
+            Self::AwaitSettlement => "AwaitSettlement",
         }
     }
 }
@@ -49,7 +49,7 @@ pub(in crate::bot) fn bot_runtime_phase_from_t_into_s(
     } else if t_into_s < 300.0 {
         BotRuntimePhase::Taper
     } else {
-        BotRuntimePhase::HoldSettleRollover
+        BotRuntimePhase::AwaitSettlement
     }
 }
 /// Implements owner for snapshot for the BOT runtime.
@@ -64,10 +64,9 @@ pub(in crate::bot) fn bot_runtime_owner_for_snapshot(
     let has_no = q_no > 1e-9;
     match phase {
         BotRuntimePhase::PreArm => (BotRuntimeControlOwner::PreArm, "prearm_window"),
-        BotRuntimePhase::HoldSettleRollover => (
-            BotRuntimeControlOwner::HoldSettleRollover,
-            "near_expiry_rollover",
-        ),
+        BotRuntimePhase::AwaitSettlement => {
+            (BotRuntimeControlOwner::AwaitSettlement, "await_settlement")
+        }
         BotRuntimePhase::OpenBoth => {
             if has_yes ^ has_no {
                 (BotRuntimeControlOwner::SeedCompletion, "startup_asymmetry")
@@ -111,7 +110,7 @@ pub(in crate::bot) enum BotRuntimeControlOwner {
     SeedCompletion,
     PairBuild,
     Taper,
-    HoldSettleRollover,
+    AwaitSettlement,
 }
 impl BotRuntimeControlOwner {
     /// Returns the stable string label for this enum or state value.
@@ -125,7 +124,7 @@ impl BotRuntimeControlOwner {
             Self::SeedCompletion => "SeedCompletion",
             Self::PairBuild => "PairBuild",
             Self::Taper => "Taper",
-            Self::HoldSettleRollover => "HoldSettleRollover",
+            Self::AwaitSettlement => "AwaitSettlement",
         }
     }
 }
@@ -162,6 +161,9 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) pair_build_last_paired_growth_yes_bid: f64,
     pub(in crate::bot) pair_build_last_paired_growth_no_bid: f64,
     pub(in crate::bot) taper_last_hold_reason: String,
+    pub(in crate::bot) await_settlement_started_ts: f64,
+    pub(in crate::bot) await_settlement_orders_cleared_ts: f64,
+    pub(in crate::bot) await_settlement_cancel_requested: bool,
     pub(in crate::bot) total_fill_events: u32,
     pub(in crate::bot) total_fill_shares: f64,
     pub(in crate::bot) maker_fill_events: u32,

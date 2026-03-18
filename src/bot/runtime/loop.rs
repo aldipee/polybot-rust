@@ -86,6 +86,146 @@ impl MakerHedgeCapBot {
             metrics.startup_completion_blocked_count
         ));
     }
+
+    /// Returns pair asset ids tracked by the BOT runtime for the active market.
+    pub(in crate::bot) fn _bot_runtime_pair_asset_ids(&self) -> Vec<String> {
+        [self.yes_asset.clone(), self.no_asset.clone()]
+            .into_iter()
+            .flatten()
+            .filter(|asset_id| !asset_id.trim().is_empty())
+            .collect()
+    }
+
+    /// Counts locally tracked BOT strategy orders still considered live by the runtime.
+    pub(in crate::bot) fn _bot_runtime_active_strategy_order_count(&self) -> usize {
+        let slot_count = self
+            .maker_order_slots
+            .lock()
+            .map(|slots| {
+                slots
+                    .values()
+                    .filter(|slot| {
+                        slot.order_id.is_some()
+                            && slot.origin.starts_with("BOT_")
+                            && matches!(
+                                slot.state,
+                                MakerOrderLifecycle::Working
+                                    | MakerOrderLifecycle::SubmitPending
+                                    | MakerOrderLifecycle::CancelPending
+                            )
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let pair_assets: HashSet<String> = self._bot_runtime_pair_asset_ids().into_iter().collect();
+        let open_order_count = self
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .open_orders
+                    .iter()
+                    .filter(|(asset_id, row)| {
+                        pair_assets.contains(asset_id.as_str())
+                            && row
+                                .order_id
+                                .as_deref()
+                                .map(|order_id| !order_id.trim().is_empty())
+                                .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        slot_count + open_order_count
+    }
+
+    /// Drives terminal order drain before handing control to settlement finalization.
+    pub(in crate::bot) fn _bot_runtime_await_settlement_handler(
+        &self,
+        now: f64,
+        seconds_left: f64,
+    ) -> bool {
+        let timeout_s = env_float(
+            "BOT_AWAIT_SETTLEMENT_CANCEL_TIMEOUT_SECONDS",
+            self.cfg.stale_seconds.max(1) as f64,
+        )
+        .clamp(0.5, 30.0);
+        let pair_id = self.pair_identity().pair_id;
+        let pair_assets = self._bot_runtime_pair_asset_ids();
+        let mut started_ts = now;
+        let mut cancel_requested = false;
+        let mut first_entry = false;
+        if let Ok(mut st) = self.bot_runtime_state.lock() {
+            if st.await_settlement_started_ts <= 0.0 {
+                st.await_settlement_started_ts = now;
+                st.await_settlement_orders_cleared_ts = 0.0;
+                st.await_settlement_cancel_requested = false;
+                first_entry = true;
+            }
+            started_ts = st.await_settlement_started_ts.max(0.0);
+            cancel_requested = st.await_settlement_cancel_requested;
+        }
+
+        if !cancel_requested {
+            let reason = "bot_runtime_await_settlement";
+            let _ = self._bot_runtime_cancel_order_family("BOT_OPEN_BOTH", None, reason);
+            let _ = self._bot_runtime_cancel_seed_completion_orders(None, reason);
+            let _ = self._bot_runtime_cancel_pair_build_orders(None, reason);
+            let _ = self._bot_runtime_cancel_taper_orders(None, reason);
+            self.cancel_all_open_orders_local(reason);
+            if !pair_assets.is_empty() {
+                self._cancel_exchange_orders_for_assets(&pair_assets, reason);
+            }
+            if let Ok(mut st) = self.bot_runtime_state.lock() {
+                st.await_settlement_cancel_requested = true;
+            }
+        }
+
+        let active_orders = self._bot_runtime_active_strategy_order_count();
+        if active_orders == 0 {
+            let mut first_clear = false;
+            if let Ok(mut st) = self.bot_runtime_state.lock() {
+                if st.await_settlement_orders_cleared_ts <= 0.0 {
+                    st.await_settlement_orders_cleared_ts = now;
+                    first_clear = true;
+                }
+            }
+            if first_clear || first_entry {
+                self.logger.info(&format!(
+                    "[BOT] pair_id={} AwaitSettlement orders_cleared=true t_left={:.1}s active_orders=0",
+                    pair_id,
+                    seconds_left.max(0.0)
+                ));
+            }
+            self._set_exit_reason("AWAIT_SETTLEMENT");
+            return true;
+        }
+
+        let elapsed_s = (now - started_ts).max(0.0);
+        if first_entry {
+            self.logger.info(&format!(
+                "[BOT] pair_id={} AwaitSettlement start t_left={:.1}s cancel_requested=true active_orders={} timeout_s={:.1}",
+                pair_id,
+                seconds_left.max(0.0),
+                active_orders,
+                timeout_s
+            ));
+        }
+        if elapsed_s >= timeout_s {
+            self.logger.warning(&format!(
+                "[BOT] pair_id={} AwaitSettlement timeout t_left={:.1}s active_orders={} waited_s={:.1}",
+                pair_id,
+                seconds_left.max(0.0),
+                active_orders,
+                elapsed_s
+            ));
+            self._set_exit_reason("AWAIT_SETTLEMENT");
+            return true;
+        }
+
+        false
+    }
+
     /// Returns or derives run BOT runtime loop for the active BOT execution path.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
@@ -120,7 +260,7 @@ impl MakerHedgeCapBot {
             }
             let mut phase = bot_runtime_phase_from_t_into_s(t_into_s, &cfg);
             if bot_runtime_should_stop_for_rollover(seconds_left, self.cfg.stop_buffer_seconds) {
-                phase = BotRuntimePhase::HoldSettleRollover;
+                phase = BotRuntimePhase::AwaitSettlement;
             }
             let pair_snapshot =
                 self._pair_snapshot_from_inputs(phase, t_into_s, qy, qn, cost_yes, cost_no);
@@ -255,6 +395,10 @@ impl MakerHedgeCapBot {
                 self._bot_runtime_taper_handler(
                     now, t_into_s, total_cost, qy, qn, cost_yes, cost_no, &cfg,
                 );
+            } else if matches!(owner, BotRuntimeControlOwner::AwaitSettlement) {
+                if self._bot_runtime_await_settlement_handler(now, seconds_left) {
+                    break;
+                }
             } else {
                 let _ = self._bot_runtime_cancel_pair_build_orders(
                     None,
@@ -402,15 +546,6 @@ impl MakerHedgeCapBot {
                     self.user_connected.load(Ordering::SeqCst)
                 ));
                 last_log = now;
-            }
-            if matches!(phase, BotRuntimePhase::HoldSettleRollover) {
-                self.logger.info(&format!(
-                    "[BOT] Expiring in {:.0}s -> stopping for rollover.",
-                    (seconds_left - 10.0).max(0.0)
-                ));
-                self.cancel_all_orders_exchange("expiry");
-                self._set_exit_reason("ROLLOVER");
-                break;
             }
         }
         let exit_reason = self._get_exit_reason();
