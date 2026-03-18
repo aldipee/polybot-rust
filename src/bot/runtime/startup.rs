@@ -14,10 +14,13 @@ impl MakerHedgeCapBot {
     pub(in crate::bot) fn _log_bot_runtime_cfg(&self) {
         let cfg = self._bot_runtime_cfg();
         self.logger.info(&format!(
-            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% seed_clip={:.0} repair_clip={:.0} large_clips={:.0}/{:.0} startup_targets=both_by_30s:{:.0}% both_by_60s:{:.0}% taper_start={:.0}s final_quiet={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
+            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% seed_clip={:.0} repair_clip={:.0} large_clips={:.0}/{:.0} startup_targets=both_by_30s:{:.0}% both_by_60s:{:.0}% taper_start={:.0}s final_quiet={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
             self.exec_mode,
             cfg.phase_controller,
             cfg.prearm_lead_seconds,
+            cfg.open_both_seed_deadline_seconds,
+            cfg.open_both_submit_delta_max_seconds,
+            cfg.open_both_allow_single_late_seed,
             cfg.seed_budget_min_fraction * 100.0,
             cfg.seed_budget_max_fraction * 100.0,
             cfg.early_budget_min_fraction * 100.0,
@@ -85,6 +88,32 @@ impl MakerHedgeCapBot {
             stale_s,
         )
     }
+
+    /// Implements post-open pair quote status for the BOT runtime.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_post_open_pair_quote_status(
+        &self,
+        now: f64,
+    ) -> (bool, String) {
+        let (Some(yes_asset), Some(no_asset)) = (&self.yes_asset, &self.no_asset) else {
+            return (false, "asset_ids_missing".to_string());
+        };
+        let open_confirmed_ts = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.open_confirmed_ts)
+            .unwrap_or(0.0);
+        let stale_s = self.cfg.market_data_stale_seconds.max(1) as f64;
+        bot_runtime_post_open_pair_quote_status(
+            self._best_bid_ask_with_ts(yes_asset),
+            self._best_bid_ask_with_ts(no_asset),
+            open_confirmed_ts,
+            now,
+            stale_s,
+        )
+    }
     /// Implements prearm status for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
@@ -129,6 +158,184 @@ impl MakerHedgeCapBot {
         }
         status
     }
+
+    /// Records that startup prerequisites became ready before official open.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_note_prearm_ready_before_open(&self) {
+        if let Ok(mut st) = self.bot_runtime_state.lock() {
+            st.prearm_ready_before_open = true;
+        }
+    }
+
+    /// Records the first runtime cycle observed at or after official open.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_note_open_confirmed(&self, now: f64) -> bool {
+        let pair_id = self.pair_identity().pair_id;
+        let should_log = self
+            .bot_runtime_state
+            .lock()
+            .map(|mut st| {
+                if st.open_confirmed_ts > 0.0 {
+                    false
+                } else {
+                    st.open_confirmed_ts = now;
+                    st.open_both_seed_anchor_ts = bot_runtime_open_both_seed_anchor_ts(
+                        st.open_confirmed_ts,
+                        st.open_both_first_tradable_post_open_ts,
+                    );
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_log {
+            self.logger.info(&format!(
+                "[BOT][OPEN_BOTH] pair_id={} open_confirmed t_into={:.1}s",
+                pair_id,
+                (now - self.start_ts as f64).max(0.0)
+            ));
+        }
+        should_log
+    }
+
+    /// Records the first post-open moment where both sides are tradable from fresh quotes.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_note_first_tradable_post_open(&self, now: f64) -> bool {
+        let (ready, _reason) = self._bot_runtime_post_open_pair_quote_status(now);
+        if !ready {
+            return false;
+        }
+        let pair_id = self.pair_identity().pair_id;
+        let should_log = self
+            .bot_runtime_state
+            .lock()
+            .map(|mut st| {
+                if st.open_both_first_tradable_post_open_ts > 0.0 {
+                    false
+                } else {
+                    st.open_both_first_tradable_post_open_ts = now;
+                    st.open_both_seed_anchor_ts = bot_runtime_open_both_seed_anchor_ts(
+                        st.open_confirmed_ts,
+                        st.open_both_first_tradable_post_open_ts,
+                    );
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_log {
+            self.logger.info(&format!(
+                "[BOT][OPEN_BOTH] pair_id={} first_tradable_post_open t_into={:.1}s",
+                pair_id,
+                (now - self.start_ts as f64).max(0.0)
+            ));
+        }
+        should_log
+    }
+
+    /// Records the first time startup seeding missed the initial post-open deadline.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_note_open_both_deadline_miss(
+        &self,
+        now: f64,
+        seed_deadline_ts: f64,
+    ) {
+        let pair_id = self.pair_identity().pair_id;
+        let should_log = self
+            .bot_runtime_state
+            .lock()
+            .map(|mut st| {
+                if st.open_both_seed_deadline_missed_ts > 0.0 {
+                    false
+                } else {
+                    st.open_both_seed_deadline_missed_ts = now;
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_log {
+            self.logger.warning(&format!(
+                "[BOT][OPEN_BOTH] pair_id={} seed_deadline_missed t_into={:.1}s deadline_t_into={:.1}s",
+                pair_id,
+                (now - self.start_ts as f64).max(0.0),
+                if seed_deadline_ts > 0.0 {
+                    (seed_deadline_ts - self.start_ts as f64).max(0.0)
+                } else {
+                    0.0
+                }
+            ));
+        }
+    }
+
+    /// Unlocks a single post-deadline late seed attempt once readiness is clean.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_unlock_late_seed_once(
+        &self,
+        now: f64,
+        seed_deadline_ts: f64,
+    ) -> bool {
+        let pair_id = self.pair_identity().pair_id;
+        let should_log = self
+            .bot_runtime_state
+            .lock()
+            .map(|mut st| {
+                if st.open_both_late_seed_unlock_used || st.open_both_late_seed_exhausted {
+                    false
+                } else {
+                    st.open_both_late_seed_unlock_used = true;
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_log {
+            self.logger.info(&format!(
+                "[BOT][OPEN_BOTH] pair_id={} late_seed_unlock t_into={:.1}s deadline_t_into={:.1}s",
+                pair_id,
+                (now - self.start_ts as f64).max(0.0),
+                if seed_deadline_ts > 0.0 {
+                    (seed_deadline_ts - self.start_ts as f64).max(0.0)
+                } else {
+                    0.0
+                }
+            ));
+        }
+        should_log
+    }
+
+    /// Marks the single post-deadline late seed unlock as exhausted after a no-op submit.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_mark_late_seed_exhausted(&self, now: f64) {
+        let pair_id = self.pair_identity().pair_id;
+        let should_log = self
+            .bot_runtime_state
+            .lock()
+            .map(|mut st| {
+                if st.open_both_late_seed_exhausted {
+                    false
+                } else {
+                    st.open_both_late_seed_exhausted = true;
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_log {
+            self.logger.warning(&format!(
+                "[BOT][OPEN_BOTH] pair_id={} late_seed_exhausted t_into={:.1}s",
+                pair_id,
+                (now - self.start_ts as f64).max(0.0)
+            ));
+        }
+    }
     /// Implements open both hold changed for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
@@ -159,19 +366,86 @@ impl MakerHedgeCapBot {
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
 
-    pub(in crate::bot) fn _bot_runtime_note_open_both_submit(&self, now: f64) -> (u32, bool) {
+    pub(in crate::bot) fn _bot_runtime_note_open_both_submit(
+        &self,
+        now: f64,
+        yes_new: bool,
+        no_new: bool,
+        seed_deadline_ts: f64,
+        cfg: &BotRuntimeConfigSnapshot,
+    ) -> (u32, bool) {
+        let pair_id = self.pair_identity().pair_id;
+        let mut attempt_count = 0;
+        let mut first_submit = false;
+        let mut first_yes_submit = false;
+        let mut first_no_submit = false;
+        let mut delta_logged = false;
+        let mut submit_delta_ms = 0.0;
+        let mut seed_by_deadline_met = false;
+        let mut submit_delta_met = false;
         self.bot_runtime_state
             .lock()
             .map(|mut st| {
                 st.open_both_last_hold_reason.clear();
                 st.open_both_attempt_count = st.open_both_attempt_count.saturating_add(1);
-                let first_submit = st.open_both_first_submit_ts <= 0.0;
-                if first_submit {
+                attempt_count = st.open_both_attempt_count;
+                if st.open_both_first_submit_ts <= 0.0 {
                     st.open_both_first_submit_ts = now;
+                    first_submit = true;
                 }
-                (st.open_both_attempt_count, first_submit)
+                if yes_new && st.open_both_first_yes_submit_ts <= 0.0 {
+                    st.open_both_first_yes_submit_ts = now;
+                    first_yes_submit = true;
+                }
+                if no_new && st.open_both_first_no_submit_ts <= 0.0 {
+                    st.open_both_first_no_submit_ts = now;
+                    first_no_submit = true;
+                }
+                if let Some(delta_ms) = bot_runtime_open_both_submit_delta_ms(
+                    st.open_both_first_yes_submit_ts,
+                    st.open_both_first_no_submit_ts,
+                ) {
+                    st.open_both_first_submit_delta_ms = delta_ms;
+                    let latest_submit_ts = st
+                        .open_both_first_yes_submit_ts
+                        .max(st.open_both_first_no_submit_ts);
+                    st.open_both_seed_by_deadline_met =
+                        seed_deadline_ts > 0.0 && latest_submit_ts <= seed_deadline_ts + 1e-9;
+                    st.open_both_submit_delta_met =
+                        delta_ms <= (cfg.open_both_submit_delta_max_seconds * 1000.0) + 1e-9;
+                    if first_yes_submit || first_no_submit {
+                        delta_logged = true;
+                        submit_delta_ms = delta_ms;
+                        seed_by_deadline_met = st.open_both_seed_by_deadline_met;
+                        submit_delta_met = st.open_both_submit_delta_met;
+                    }
+                }
+                (attempt_count, first_submit)
             })
-            .unwrap_or((0, false))
+            .unwrap_or((0, false));
+        let t_into_s = (now - self.start_ts as f64).max(0.0);
+        if first_yes_submit {
+            self.logger.info(&format!(
+                "[BOT][OPEN_BOTH] pair_id={} first_yes_seed_submit t_into={:.1}s",
+                pair_id, t_into_s
+            ));
+        }
+        if first_no_submit {
+            self.logger.info(&format!(
+                "[BOT][OPEN_BOTH] pair_id={} first_no_seed_submit t_into={:.1}s",
+                pair_id, t_into_s
+            ));
+        }
+        if delta_logged {
+            self.logger.info(&format!(
+                "[BOT][OPEN_BOTH] pair_id={} first_seed_submit_delta_ms={:.0} seed_by_deadline_met={} submit_delta_met={}",
+                pair_id,
+                submit_delta_ms,
+                seed_by_deadline_met,
+                submit_delta_met
+            ));
+        }
+        (attempt_count, first_submit)
     }
     /// Implements note first fill for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
@@ -292,6 +566,36 @@ impl MakerHedgeCapBot {
         let total_cost = pair_snapshot.total_cost;
         let q_yes = pair_snapshot.position.q_yes;
         let q_no = pair_snapshot.position.q_no;
+        self._bot_runtime_note_open_confirmed(now);
+        let (
+            seed_anchor_ts,
+            seed_deadline_ts,
+            no_first_submit_yet,
+            late_seed_unlock_used,
+            late_seed_exhausted,
+        ) = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| {
+                let anchor_ts = bot_runtime_open_both_seed_anchor_ts(
+                    st.open_confirmed_ts,
+                    st.open_both_first_tradable_post_open_ts,
+                );
+                (
+                    anchor_ts,
+                    bot_runtime_open_both_seed_deadline_ts(anchor_ts, cfg),
+                    st.open_both_first_yes_submit_ts <= 0.0
+                        && st.open_both_first_no_submit_ts <= 0.0,
+                    st.open_both_late_seed_unlock_used,
+                    st.open_both_late_seed_exhausted,
+                )
+            })
+            .unwrap_or((0.0, 0.0, true, false, false));
+        let post_deadline_without_entry =
+            no_first_submit_yet && seed_deadline_ts > 0.0 && now > seed_deadline_ts + 1e-9;
+        if post_deadline_without_entry {
+            self._bot_runtime_note_open_both_deadline_miss(now, seed_deadline_ts);
+        }
         let (yes_asset, no_asset) = match (&self.yes_asset, &self.no_asset) {
             (Some(yes_asset), Some(no_asset)) => (yes_asset.as_str(), no_asset.as_str()),
             _ => {
@@ -350,6 +654,19 @@ impl MakerHedgeCapBot {
             );
             return;
         }
+        let (post_open_quotes_ready, post_open_quote_reason) =
+            self._bot_runtime_post_open_pair_quote_status(now);
+        if !post_open_quotes_ready {
+            self._bot_runtime_log_open_both_hold(
+                &format!("post_open_quotes_unready:{post_open_quote_reason}"),
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
+        self._bot_runtime_note_first_tradable_post_open(now);
         let Some((y_bid, _y_ask)) = self._best_bid_ask(yes_asset) else {
             self._bot_runtime_log_open_both_hold(
                 "missing_yes_quotes",
@@ -487,6 +804,54 @@ impl MakerHedgeCapBot {
             }
             return;
         }
+        let mut late_seed_attempt_active = false;
+        if post_deadline_without_entry {
+            if late_seed_exhausted
+                || (late_seed_unlock_used && !cfg.open_both_allow_single_late_seed)
+            {
+                self._bot_runtime_log_open_both_hold(
+                    "late_seed_exhausted",
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+            if cfg.open_both_allow_single_late_seed {
+                if late_seed_unlock_used {
+                    self._bot_runtime_log_open_both_hold(
+                        "late_seed_exhausted",
+                        t_into_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return;
+                }
+                late_seed_attempt_active =
+                    self._bot_runtime_unlock_late_seed_once(now, seed_deadline_ts);
+                if !late_seed_attempt_active {
+                    self._bot_runtime_log_open_both_hold(
+                        "late_seed_exhausted",
+                        t_into_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return;
+                }
+            } else {
+                self._bot_runtime_log_open_both_hold(
+                    "seed_deadline_expired",
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+        }
         self._set_pending_entry_reason("BOT_OPEN_BOTH");
         let submit_started = now_ts_f64();
         let (y_oid, n_oid) = self._maker_submit_pair_orders(
@@ -509,13 +874,23 @@ impl MakerHedgeCapBot {
         let yes_new = maker_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
         let no_new = maker_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
         if yes_new || no_new {
-            let (attempt_count, first_submit) =
-                self._bot_runtime_note_open_both_submit(now_ts_f64());
+            let (attempt_count, first_submit) = self._bot_runtime_note_open_both_submit(
+                submit_started,
+                yes_new,
+                no_new,
+                seed_deadline_ts,
+                cfg,
+            );
             self.logger.info(&format!(
-                "[BOT][OPEN_BOTH] pair_id={} submit attempt={} t_into={:.1}s y_bid={:.3} n_bid={:.3} pair_sum={:.3} clip={} post_only=true neutral=true favorite_gating=false elapsed_ms={:.0} first_submit={}",
+                "[BOT][OPEN_BOTH] pair_id={} submit attempt={} t_into={:.1}s seed_anchor_t_into={} y_bid={:.3} n_bid={:.3} pair_sum={:.3} clip={} post_only=true neutral=true favorite_gating=false elapsed_ms={:.0} first_submit={}",
                 pair_id,
                 attempt_count,
                 t_into_s.max(0.0),
+                if seed_anchor_ts > 0.0 {
+                    format!("{:.1}s", (seed_anchor_ts - self.start_ts as f64).max(0.0))
+                } else {
+                    "NA".to_string()
+                },
                 y_bid,
                 n_bid,
                 pair_sum,
@@ -523,6 +898,9 @@ impl MakerHedgeCapBot {
                 submit_elapsed_ms,
                 first_submit
             ));
+        }
+        if late_seed_attempt_active && !yes_new && !no_new {
+            self._bot_runtime_mark_late_seed_exhausted(now);
         }
         if let Some(asymmetry) =
             self._maker_pair_order_asymmetry(now_ts_f64(), yes_asset, no_asset, "BOT_OPEN_BOTH")

@@ -76,6 +76,49 @@ pub(in crate::bot) fn bot_runtime_open_both_seed_size(
         Some(clip as i64)
     }
 }
+
+/// Returns the canonical startup seed anchor for the BOT runtime.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_open_both_seed_anchor_ts(
+    open_confirmed_ts: f64,
+    first_tradable_post_open_ts: f64,
+) -> f64 {
+    match (open_confirmed_ts > 0.0, first_tradable_post_open_ts > 0.0) {
+        (true, true) => open_confirmed_ts.min(first_tradable_post_open_ts),
+        (true, false) => open_confirmed_ts,
+        (false, true) => first_tradable_post_open_ts,
+        (false, false) => 0.0,
+    }
+}
+
+/// Returns the startup seed deadline timestamp for the BOT runtime.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_open_both_seed_deadline_ts(
+    anchor_ts: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> f64 {
+    if anchor_ts > 0.0 {
+        anchor_ts + cfg.open_both_seed_deadline_seconds.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Returns the first-submit delta between the YES and NO startup legs.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_open_both_submit_delta_ms(
+    yes_submit_ts: f64,
+    no_submit_ts: f64,
+) -> Option<f64> {
+    if yes_submit_ts > 0.0 && no_submit_ts > 0.0 {
+        Some(((yes_submit_ts - no_submit_ts).abs()).max(0.0) * 1000.0)
+    } else {
+        None
+    }
+}
 /// Implements seed completion missing side for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
@@ -175,6 +218,38 @@ pub(in crate::bot) fn bot_runtime_startup_pair_quote_status(
     }
     if pair_sum >= 1.0 {
         return (false, format!("pair_sum_too_high({pair_sum:.3})"));
+    }
+    (true, "ok".to_string())
+}
+
+/// Returns whether both quotes are fresh and observed post-open for startup timing.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_post_open_pair_quote_status(
+    yes_quote: Option<(f64, f64, f64)>,
+    no_quote: Option<(f64, f64, f64)>,
+    open_confirmed_ts: f64,
+    now: f64,
+    stale_s: f64,
+) -> (bool, String) {
+    if open_confirmed_ts <= 0.0 {
+        return (false, "open_unconfirmed".to_string());
+    }
+    let (ready, reason) = bot_runtime_startup_pair_quote_status(yes_quote, no_quote, now, stale_s);
+    if !ready {
+        return (false, reason);
+    }
+    let Some((_, _, yes_ts)) = yes_quote else {
+        return (false, "missing_quotes_YES".to_string());
+    };
+    let Some((_, _, no_ts)) = no_quote else {
+        return (false, "missing_quotes_NO".to_string());
+    };
+    if yes_ts + 1e-9 < open_confirmed_ts {
+        return (false, "yes_quote_pre_open".to_string());
+    }
+    if no_ts + 1e-9 < open_confirmed_ts {
+        return (false, "no_quote_pre_open".to_string());
     }
     (true, "ok".to_string())
 }

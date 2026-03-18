@@ -128,6 +128,20 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
         bot_runtime_cfg: bot_runtime_config_defaults(),
     }
 }
+
+fn set_pair_quotes(
+    bot: &MakerHedgeCapBot,
+    yes_bid: f64,
+    yes_ask: f64,
+    no_bid: f64,
+    no_ask: f64,
+    ts: f64,
+) {
+    if let Ok(mut quotes) = bot.best_quotes.lock() {
+        quotes.insert("yes_asset_id".to_string(), (yes_bid, yes_ask, ts));
+        quotes.insert("no_asset_id".to_string(), (no_bid, no_ask, ts));
+    }
+}
 /// Exercises the exec mode defaults to BOT runtime scenario and checks the expected BOT
 /// behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -185,6 +199,38 @@ fn bot_runtime_phase_routing_covers_runtime_segments() {
         BotRuntimePhase::AwaitSettlement
     );
 }
+
+#[test]
+fn bot_runtime_config_defaults_include_exact_open_time_targets() {
+    let cfg = bot_runtime_config_defaults();
+    assert_eq!(cfg.open_both_seed_deadline_seconds, 5.0);
+    assert_eq!(cfg.open_both_submit_delta_max_seconds, 1.0);
+    assert!(cfg.open_both_allow_single_late_seed);
+}
+
+#[test]
+fn bot_runtime_validate_config_rejects_invalid_open_time_targets() {
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.open_both_seed_deadline_seconds = 0.0;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_open_both_seed_deadline_seconds")
+    );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.open_both_submit_delta_max_seconds = 0.0;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_open_both_submit_delta_max_seconds")
+    );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.open_both_submit_delta_max_seconds = 6.0;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("open_both_submit_delta_exceeds_deadline")
+    );
+}
 /// Exercises the BOT runtime owner routes seed completion and taper scenario and checks the
 /// expected BOT behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -223,6 +269,49 @@ fn bot_runtime_open_both_handler_only_runs_for_open_both_owner() {
     assert!(!bot_runtime_should_run_open_both_handler(
         BotRuntimeControlOwner::Taper
     ));
+}
+
+#[test]
+fn open_both_seed_anchor_prefers_earliest_nonzero_timestamp() {
+    assert_eq!(bot_runtime_open_both_seed_anchor_ts(0.0, 0.0), 0.0);
+    assert_eq!(bot_runtime_open_both_seed_anchor_ts(10.0, 0.0), 10.0);
+    assert_eq!(bot_runtime_open_both_seed_anchor_ts(0.0, 12.0), 12.0);
+    assert_eq!(bot_runtime_open_both_seed_anchor_ts(10.0, 12.0), 10.0);
+    assert_eq!(
+        bot_runtime_open_both_seed_deadline_ts(10.0, &bot_runtime_config_defaults()),
+        15.0
+    );
+}
+
+#[test]
+fn post_open_pair_quote_status_requires_post_open_quote_timestamps() {
+    let now = 105.0;
+    let stale_s = 8.0;
+    let open_confirmed_ts = 100.0;
+    let pre_open = bot_runtime_post_open_pair_quote_status(
+        Some((0.40, 0.42, 99.5)),
+        Some((0.55, 0.57, 101.0)),
+        open_confirmed_ts,
+        now,
+        stale_s,
+    );
+    assert_eq!(pre_open, (false, "yes_quote_pre_open".to_string()));
+
+    let post_open = bot_runtime_post_open_pair_quote_status(
+        Some((0.40, 0.42, 100.1)),
+        Some((0.55, 0.57, 100.2)),
+        open_confirmed_ts,
+        now,
+        stale_s,
+    );
+    assert_eq!(post_open, (true, "ok".to_string()));
+}
+
+#[test]
+fn open_both_submit_delta_math_only_exists_after_both_first_submits() {
+    assert_eq!(bot_runtime_open_both_submit_delta_ms(0.0, 101.0), None);
+    let delta = bot_runtime_open_both_submit_delta_ms(100.0, 101.2).expect("delta");
+    assert!((delta - 1200.0).abs() < 1e-6);
 }
 /// Exercises the trade metrics snapshot reports BOT runtime fields scenario and checks the
 /// expected BOT behavior.
@@ -287,10 +376,7 @@ fn pair_identity_is_present_and_carries_market_metadata() {
 #[test]
 fn pair_snapshot_reports_position_cost_and_quote_state() {
     let bot = make_bot_runtime_test_bot();
-    if let Ok(mut quotes) = bot.best_quotes.lock() {
-        quotes.insert("yes_asset_id".to_string(), (0.40, 0.42, 10.0));
-        quotes.insert("no_asset_id".to_string(), (0.55, 0.57, 11.0));
-    }
+    set_pair_quotes(&bot, 0.40, 0.42, 0.55, 0.57, 10.0);
     let snapshot =
         bot._pair_snapshot_from_inputs(BotRuntimePhase::PairBuild, 42.0, 4.0, 6.0, 1.2, 2.8);
     assert_eq!(snapshot.identity.pair_id, "bot-test");
@@ -386,4 +472,200 @@ fn post_order_compat_rejects_bot_strategy_sell_origin() {
         None,
     );
     assert!(allowed.is_some());
+}
+
+#[test]
+fn prearm_ready_before_open_and_open_confirmed_are_recorded() {
+    let mut bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    bot.start_ts = now.ceil() as i64 + 5;
+    bot.expiry_ts = bot.start_ts + 300;
+    bot.condition_id = Some("condition-test".to_string());
+    set_pair_quotes(&bot, 0.40, 0.42, 0.55, 0.57, now);
+
+    let status = bot._bot_runtime_prearm_status(-1.0);
+    assert!(status.ready);
+    bot._bot_runtime_note_prearm_ready_before_open();
+    assert!(bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.prearm_ready_before_open)
+        .unwrap_or(false));
+
+    assert!(bot._bot_runtime_note_open_confirmed(now + 5.0));
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert!((state.open_confirmed_ts - (now + 5.0)).abs() < 1e-9);
+}
+
+#[test]
+fn first_tradable_post_open_ignores_pre_open_quotes() {
+    let mut bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    bot.start_ts = now.floor() as i64;
+    bot.expiry_ts = bot.start_ts + 300;
+    bot.condition_id = Some("condition-test".to_string());
+    bot._bot_runtime_note_open_confirmed(now);
+
+    set_pair_quotes(&bot, 0.40, 0.42, 0.55, 0.57, now - 0.5);
+    assert!(!bot._bot_runtime_note_first_tradable_post_open(now + 0.1));
+
+    set_pair_quotes(&bot, 0.40, 0.42, 0.55, 0.57, now + 0.2);
+    assert!(bot._bot_runtime_note_first_tradable_post_open(now + 0.3));
+}
+
+#[test]
+fn open_both_handler_rejects_pre_open_cached_quotes_even_when_startup_pair_status_passes() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    let now = now_ts_f64();
+    bot.start_ts = now.floor() as i64;
+    bot.expiry_ts = bot.start_ts + 300;
+    bot.condition_id = Some("condition-test".to_string());
+    set_pair_quotes(&bot, 0.40, 0.42, 0.55, 0.57, now - 0.2);
+    if let Ok(mut st) = bot.bot_runtime_state.lock() {
+        st.open_confirmed_ts = now;
+        st.open_both_seed_anchor_ts = now;
+    }
+
+    bot._bot_runtime_open_both_handler(
+        now + 0.1,
+        now + 0.1 - bot.start_ts as f64,
+        0.0,
+        0.0,
+        0.0,
+        &bot_runtime_config_defaults(),
+    );
+
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert_eq!(state.open_both_attempt_count, 0);
+    assert_eq!(state.open_both_first_tradable_post_open_ts, 0.0);
+    assert_eq!(
+        state.open_both_last_hold_reason,
+        "post_open_quotes_unready:yes_quote_pre_open"
+    );
+}
+
+#[test]
+fn open_both_submit_timing_kpis_track_same_cycle_submits() {
+    let bot = make_bot_runtime_test_bot();
+    let cfg = bot_runtime_config_defaults();
+    let open_ts = 100.0;
+    let deadline_ts = open_ts + cfg.open_both_seed_deadline_seconds;
+
+    let (attempts, first_submit) =
+        bot._bot_runtime_note_open_both_submit(open_ts + 2.0, true, true, deadline_ts, &cfg);
+    assert_eq!(attempts, 1);
+    assert!(first_submit);
+
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert_eq!(state.open_both_first_yes_submit_ts, open_ts + 2.0);
+    assert_eq!(state.open_both_first_no_submit_ts, open_ts + 2.0);
+    assert_eq!(state.open_both_first_submit_delta_ms, 0.0);
+    assert!(state.open_both_seed_by_deadline_met);
+    assert!(state.open_both_submit_delta_met);
+}
+
+#[test]
+fn open_both_submit_timing_distinguishes_deadline_vs_delta_failures() {
+    let bot = make_bot_runtime_test_bot();
+    let cfg = bot_runtime_config_defaults();
+    let open_ts = 100.0;
+    let deadline_ts = open_ts + cfg.open_both_seed_deadline_seconds;
+
+    let _ = bot._bot_runtime_note_open_both_submit(open_ts + 0.5, true, false, deadline_ts, &cfg);
+    let _ = bot._bot_runtime_note_open_both_submit(open_ts + 1.7, false, true, deadline_ts, &cfg);
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert!(state.open_both_seed_by_deadline_met);
+    assert!(!state.open_both_submit_delta_met);
+    assert!((state.open_both_first_submit_delta_ms - 1200.0).abs() < 1e-6);
+
+    let bot = make_bot_runtime_test_bot();
+    let _ = bot._bot_runtime_note_open_both_submit(open_ts + 0.5, true, false, deadline_ts, &cfg);
+    let _ = bot._bot_runtime_note_open_both_submit(open_ts + 5.6, false, true, deadline_ts, &cfg);
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert!(!state.open_both_seed_by_deadline_met);
+    assert!(!state.open_both_submit_delta_met);
+}
+
+#[test]
+fn late_seed_unlock_can_only_be_granted_once_after_deadline_miss() {
+    let bot = make_bot_runtime_test_bot();
+    let open_ts = 100.0;
+    let deadline_ts = open_ts + bot_runtime_config_defaults().open_both_seed_deadline_seconds;
+
+    bot._bot_runtime_note_open_both_deadline_miss(open_ts + 6.0, deadline_ts);
+    assert!(bot._bot_runtime_unlock_late_seed_once(open_ts + 6.0, deadline_ts));
+    assert!(!bot._bot_runtime_unlock_late_seed_once(open_ts + 6.2, deadline_ts));
+
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert_eq!(state.open_both_seed_deadline_missed_ts, open_ts + 6.0);
+    assert!(state.open_both_late_seed_unlock_used);
+    assert!(!state.open_both_late_seed_exhausted);
+}
+
+#[test]
+fn late_seed_exhaustion_blocks_repeated_unlocks() {
+    let bot = make_bot_runtime_test_bot();
+    let open_ts = 100.0;
+    let deadline_ts = open_ts + bot_runtime_config_defaults().open_both_seed_deadline_seconds;
+
+    assert!(bot._bot_runtime_unlock_late_seed_once(open_ts + 6.0, deadline_ts));
+    bot._bot_runtime_mark_late_seed_exhausted(open_ts + 6.1);
+    assert!(!bot._bot_runtime_unlock_late_seed_once(open_ts + 6.2, deadline_ts));
+
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert!(state.open_both_late_seed_unlock_used);
+    assert!(state.open_both_late_seed_exhausted);
+}
+
+#[test]
+fn open_both_missing_leg_followup_does_not_require_late_unlock_once_one_side_exists() {
+    let bot = make_bot_runtime_test_bot();
+    let cfg = bot_runtime_config_defaults();
+    let open_ts = 100.0;
+    let deadline_ts = open_ts + cfg.open_both_seed_deadline_seconds;
+    if let Ok(mut st) = bot.bot_runtime_state.lock() {
+        st.open_confirmed_ts = open_ts;
+        st.open_both_seed_anchor_ts = open_ts;
+        st.open_both_first_yes_submit_ts = open_ts + 2.0;
+        st.open_both_first_submit_ts = open_ts + 2.0;
+    }
+
+    let _ = bot._bot_runtime_note_open_both_submit(open_ts + 6.0, false, true, deadline_ts, &cfg);
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert!(!state.open_both_late_seed_unlock_used);
+    assert!(state.open_both_first_no_submit_ts > 0.0);
+    assert!(!state.open_both_seed_by_deadline_met);
 }

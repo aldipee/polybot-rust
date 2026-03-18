@@ -3,6 +3,9 @@ use super::*;
 pub(in crate::bot) struct BotRuntimeConfigSnapshot {
     pub(in crate::bot) phase_controller: &'static str,
     pub(in crate::bot) prearm_lead_seconds: f64,
+    pub(in crate::bot) open_both_seed_deadline_seconds: f64,
+    pub(in crate::bot) open_both_submit_delta_max_seconds: f64,
+    pub(in crate::bot) open_both_allow_single_late_seed: bool,
     pub(in crate::bot) seed_budget_min_fraction: f64,
     pub(in crate::bot) seed_budget_max_fraction: f64,
     pub(in crate::bot) early_budget_min_fraction: f64,
@@ -37,6 +40,9 @@ pub(in crate::bot) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot 
     BotRuntimeConfigSnapshot {
         phase_controller: "time_plus_inventory",
         prearm_lead_seconds: 20.0,
+        open_both_seed_deadline_seconds: 5.0,
+        open_both_submit_delta_max_seconds: 1.0,
+        open_both_allow_single_late_seed: true,
         seed_budget_min_fraction: 0.10,
         seed_budget_max_fraction: 0.15,
         early_budget_min_fraction: 0.15,
@@ -142,6 +148,21 @@ where
     let mut cfg = bot_runtime_config_defaults();
     cfg.prearm_lead_seconds =
         bot_runtime_env_float(&mut get, "BOT_PREARM_LEAD_SECONDS", cfg.prearm_lead_seconds);
+    cfg.open_both_seed_deadline_seconds = bot_runtime_env_float(
+        &mut get,
+        "BOT_OPEN_BOTH_SEED_DEADLINE_SECONDS",
+        cfg.open_both_seed_deadline_seconds,
+    );
+    cfg.open_both_submit_delta_max_seconds = bot_runtime_env_float(
+        &mut get,
+        "BOT_OPEN_BOTH_SUBMIT_DELTA_MAX_SECONDS",
+        cfg.open_both_submit_delta_max_seconds,
+    );
+    cfg.open_both_allow_single_late_seed = bot_runtime_env_bool(
+        &mut get,
+        "BOT_OPEN_BOTH_ALLOW_SINGLE_LATE_SEED",
+        cfg.open_both_allow_single_late_seed,
+    );
     cfg.seed_clip_small =
         bot_runtime_env_float(&mut get, "BOT_SEED_CLIP_SMALL", cfg.seed_clip_small);
     cfg.repair_clip_small =
@@ -276,6 +297,19 @@ pub(in crate::bot) fn bot_runtime_validate_config(
     }
     if !cfg.prearm_lead_seconds.is_finite() || cfg.prearm_lead_seconds < 0.0 {
         return Err("invalid_prearm_lead_seconds");
+    }
+    if !cfg.open_both_seed_deadline_seconds.is_finite()
+        || cfg.open_both_seed_deadline_seconds <= 0.0
+    {
+        return Err("invalid_open_both_seed_deadline_seconds");
+    }
+    if !cfg.open_both_submit_delta_max_seconds.is_finite()
+        || cfg.open_both_submit_delta_max_seconds <= 0.0
+    {
+        return Err("invalid_open_both_submit_delta_max_seconds");
+    }
+    if cfg.open_both_submit_delta_max_seconds > cfg.open_both_seed_deadline_seconds + 1e-9 {
+        return Err("open_both_submit_delta_exceeds_deadline");
     }
     if !cfg.taper_start_seconds.is_finite() || cfg.taper_start_seconds <= 0.0 {
         return Err("invalid_taper_start_seconds");

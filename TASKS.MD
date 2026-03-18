@@ -44,16 +44,16 @@ Work status legend:
 
 ### Overall Estimate
 
-- Estimated requirement coverage in current scope: `33%`
-- Estimated remaining gap in current scope: `67%`
+- Estimated requirement coverage in current scope: `38%`
+- Estimated remaining gap in current scope: `62%`
 
 ### Work Status Snapshot
 
 - Requirement analysis: `Done`
 - Requirement-only backlog definition: `Done`
 - `REQ-001` scope override recorded: `Done`
-- Active implementation tasks completed: `2 / 24`
-- Tasks ready to start now: `12 / 24`
+- Active implementation tasks completed: `3 / 24`
+- Tasks ready to start now: `11 / 24`
 - Tasks queued behind earlier work: `4 / 24`
 - Tasks blocked by prerequisites: `6 / 24`
 - Tasks marked not applicable: `1`
@@ -62,7 +62,7 @@ Work status legend:
 
 | Requirement area | REQ scope | Coverage | Gap | Current reading |
 |---|---|---:|---:|---|
-| Market scope and paired lifecycle | `REQ-002` to `REQ-008` with `REQ-001` excluded | 54% | 46% | Pair identity, pair snapshots, pair-level runtime decisions, `AwaitSettlement`, buy-only hold-to-settlement flow, and pair persistence are now in place, but exact seeding timing and the full required state machine still do not match spec. |
+| Market scope and paired lifecycle | `REQ-002` to `REQ-008` with `REQ-001` excluded | 68% | 32% | Pair identity, pair snapshots, pair-level runtime decisions, `AwaitSettlement`, buy-only hold-to-settlement flow, pair persistence, and exact open-time seeding are now in place. The biggest remaining gap in this area is the explicit `AwaitSecondFill` lifecycle and hard no-scale-before-both-filled behavior. |
 | Inventory, pricing, and residual discipline | `REQ-009` to `REQ-013`, `REQ-018` to `REQ-021` | 32% | 68% | Some pair-sum and skew controls exist, but the exact thresholds and hard blocks from the requirement are not enforced. |
 | Execution controls and clip policy | `REQ-014` to `REQ-017`, `REQ-034` | 38% | 62% | Maker-first behavior exists, but taker caps, exact clip ladder rules, and refresh limits are incomplete. |
 | Config, observability, and auditability | `REQ-023` to `REQ-025` | 18% | 82% | Config snapshotting exists, but no full config versioning, append-only decisions, or requirement-grade metrics and logs. |
@@ -79,7 +79,7 @@ Work status legend:
 | IMP-01 | `REQ-001` | N/A | N/A | Do not implement strict BTC 5-minute whitelist restrictions; treat this requirement as intentionally out of scope for the current product direction. | User direction explicitly rejects restricted market scope. | `TASKS.MD` only unless product docs are updated |
 | IMP-02 | `REQ-002` | Done | Done | Make `pair_id` the mandatory decision key so strategy, risk, and ledger decisions operate on the pair as one instrument. | Implemented: pair identity, pair snapshots, pair-level runtime boundary, execution metadata, and pair persistence are now wired through the monolith. | `src/bot/shared.rs`, `src/bot/public_tail.rs`, `src/bot/runtime/*`, `src/bot/execution/*`, `src/db.rs`, `src/main.rs` |
 | IMP-03 | `REQ-003`, `REQ-022` | Partial | Done | Enforce buy-only hold-to-settlement behavior and ensure settlement, not intrawindow sell logic, closes exposure. | Implemented: `AwaitSettlement`, terminal order drain, settlement-owned finalization, unresolved settlement persistence, and buy-only BOT runtime guard are now in place. Exact late-window timing still depends on `IMP-11`. | `src/bot/runtime/*`, `src/rtds.rs`, `src/db.rs`, `src/main.rs` |
-| IMP-04 | `REQ-004`, `REQ-005`, `REQ-006` | Partial | Ready | Add pre-open warmup plus exact open-time seeding deadlines: both seed orders within 5 seconds of open and within 1 second of each other. | Current code seeds early, but there is no spec-accurate pre-open guarantee or enforced same-cycle submit delta. | `src/bot/runtime/startup.rs`, `src/bot/runtime_ws.rs`, `src/config.rs` |
+| IMP-04 | `REQ-004`, `REQ-005`, `REQ-006` | Done | Done | Add pre-open warmup plus exact open-time seeding deadlines: both seed orders within 5 seconds of open and within 1 second of each other. | Implemented: `PreArm` now records readiness before open, `OpenBoth` uses explicit open-confirmed and first-tradable anchors, enforces exact seed timing KPIs, supports one controlled late unlock, and blocks seeding on pre-open cached quotes. | `src/bot/runtime/startup.rs`, `src/bot/runtime/loop.rs`, `src/bot/runtime/policy.rs`, `src/bot/runtime/config.rs`, `src/bot/runtime/state.rs`, `src/bot/runtime/tests.rs` |
 | IMP-05 | `REQ-007`, `REQ-008` | Partial | Ready | Implement `AwaitSecondFill` completion mode with no scale-up before both sides fill, 15-second target, and 30-second hard stop for accumulation. | Current logic uses looser 30-second and 60-second thresholds and does not match the required phase transitions. | `src/bot/runtime/state.rs`, `src/bot/runtime/startup.rs`, `src/bot/runtime/loop.rs` |
 | IMP-06 | `REQ-009`, `REQ-010` | Partial | Ready | Replace heuristic imbalance logic with exact unmatched-fraction controls: target below 7%, warning above 12%, disable or reduce-only at 20% or more. | Current repo uses coverage and skew heuristics instead of the exact unmatched-fraction policy from the requirement. | `src/bot/runtime/metrics.rs`, `src/bot/runtime/pair_build/decision.rs` |
 | IMP-07 | `REQ-011`, `REQ-012`, `REQ-013` | Partial | Ready | Implement exact marginal pair-cost zones using `0.94 / 0.97 / 1.00 / 1.03` thresholds and block all size-increasing intents at `>= 1.00`. | Current zone thresholds are different and the stop-add and danger logic do not match the requirement exactly. | `src/bot/runtime/pair_build/costs.rs`, `src/bot/runtime/pair_build/decision.rs` |
@@ -117,20 +117,20 @@ Work status legend:
 This sequence stays tied to the requirement instead of a refactor roadmap:
 
 1. `IMP-04` exact seeding and open-time behavior
-2. `IMP-05` second-side completion mode and no-scale-before-both-filled
-3. `IMP-06` unmatched-fraction risk rules
-4. `IMP-07` exact price-zone and stop-add guards
-5. `IMP-08` maker-first plus taker-cap enforcement
-6. `IMP-09` clip ladder alignment
-7. `IMP-10` residual and underdog-side protection
-8. `IMP-11` late-window balance-only and cutoff logic
-9. `IMP-12` config versioning
-10. `IMP-13` append-only decision audit trail
-11. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
-12. `IMP-14` true paper plus shadow-first startup safety
-13. `IMP-17` analytics importer parity
-14. `IMP-18` deterministic replay
-15. `IMP-22` to `IMP-25` validation and launch gates
+1. `IMP-05` second-side completion mode and no-scale-before-both-filled
+2. `IMP-06` unmatched-fraction risk rules
+3. `IMP-07` exact price-zone and stop-add guards
+4. `IMP-08` maker-first plus taker-cap enforcement
+5. `IMP-09` clip ladder alignment
+6. `IMP-10` residual and underdog-side protection
+7. `IMP-11` late-window balance-only and cutoff logic
+8. `IMP-12` config versioning
+9. `IMP-13` append-only decision audit trail
+10. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
+11. `IMP-14` true paper plus shadow-first startup safety
+12. `IMP-17` analytics importer parity
+13. `IMP-18` deterministic replay
+14. `IMP-22` to `IMP-25` validation and launch gates
 
 ## Short Summary
 
@@ -140,10 +140,11 @@ Recent completed work:
 
 - `IMP-02` / `REQ-002` is now `Done`: the bot is pair-first at the identity, runtime-context, execution-metadata, and persistence layers.
 - `IMP-03` / `REQ-003` and `REQ-022` implementation work is now `Done`: the bot now hands off into `AwaitSettlement`, drains working orders, persists terminal trade snapshots before unresolved settlement, and closes from settlement data instead of generic rollover.
+- `IMP-04` / `REQ-004`, `REQ-005`, and `REQ-006` implementation work is now `Done`: the bot now tracks pre-open readiness, anchors startup timing to open-confirmed and first-tradable post-open events, enforces exact first-seed timing KPIs, allows only one controlled late seed unlock, and blocks opening seeds from pre-open cached quotes.
 
 The biggest remaining requirement gaps are:
 
-- exact seeding, completion, imbalance, and price-zone rules
+- second-fill completion, imbalance, and price-zone rules
 - append-only decision and audit persistence
 - true paper, replay, and shadow modes
 - startup and post-settlement validation discipline plus strict stale-data behavior
@@ -156,5 +157,5 @@ Intentional scope exception:
 
 Current estimate:
 
-- Requirement coverage in current scope: `33%`
-- Remaining requirement gap in current scope: `67%`
+- Requirement coverage in current scope: `38%`
+- Remaining requirement gap in current scope: `62%`
