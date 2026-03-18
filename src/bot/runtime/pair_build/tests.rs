@@ -179,6 +179,11 @@ fn bot_runtime_pair_build_optional_buy_requires_below_snapshot() {
         clip_bucket: "small",
         cpp_hint: BotRuntimePairBuildCppHint::Normal,
         pair_sum: 0.90,
+        current_unmatched_fraction: 0.0,
+        projected_unmatched_fraction: 0.0,
+        match_ratio: 1.0,
+        imbalance_state: BotRuntimeImbalanceState::Normal,
+        reduces_imbalance: false,
         pair_coverage: 1.0,
         skew_ratio: 1.0,
         current_base: 4.0,
@@ -216,6 +221,11 @@ fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
             clip_bucket: "small",
             cpp_hint: BotRuntimePairBuildCppHint::Normal,
             pair_sum: 0.80,
+            current_unmatched_fraction: 0.3333333333,
+            projected_unmatched_fraction: 0.25,
+            match_ratio: 0.5,
+            imbalance_state: BotRuntimeImbalanceState::Warning,
+            reduces_imbalance: true,
             pair_coverage: 0.5,
             skew_ratio: 2.0,
             current_base: 2.0,
@@ -242,6 +252,11 @@ fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
             clip_bucket: "medium",
             cpp_hint: BotRuntimePairBuildCppHint::Normal,
             pair_sum: 0.82,
+            current_unmatched_fraction: 0.1111111111,
+            projected_unmatched_fraction: 0.0769230769,
+            match_ratio: 0.8,
+            imbalance_state: BotRuntimeImbalanceState::Throttle,
+            reduces_imbalance: true,
             pair_coverage: 0.80,
             skew_ratio: 1.2,
             current_base: 3.0,
@@ -364,6 +379,11 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
         clip_bucket: "small",
         cpp_hint: BotRuntimePairBuildCppHint::Normal,
         pair_sum: 0.80,
+        current_unmatched_fraction: 0.60,
+        projected_unmatched_fraction: 0.0,
+        match_ratio: 0.25,
+        imbalance_state: BotRuntimeImbalanceState::HardDisable,
+        reduces_imbalance: true,
         pair_coverage: 0.25,
         skew_ratio: 4.0,
         current_base: 5.0,
@@ -401,4 +421,250 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
     let state = bot.state.lock().expect("bot state");
     assert!(state.open_orders.contains_key("yes_asset_id"));
     assert!(!state.open_orders.contains_key("no_asset_id"));
+}
+
+#[test]
+fn hard_disable_cancels_lingering_open_both_orders_before_returning() {
+    let bot = make_pair_build_test_bot();
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.imbalance_state = BotRuntimeImbalanceState::HardDisable;
+    }
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-open-both-yes".to_string()),
+                origin: "BOT_OPEN_BOTH_YES".to_string(),
+                last_submit_ts: 12.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(40.0, 40.0, 5.0, 12.0, 8.0, 4.2, 2.8, &cfg);
+
+    let slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    assert_eq!(slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn hard_disable_cancels_multiple_bot_families_without_short_circuiting() {
+    let bot = make_pair_build_test_bot();
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.imbalance_state = BotRuntimeImbalanceState::HardDisable;
+    }
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-open-both-yes".to_string()),
+                origin: "BOT_OPEN_BOTH_YES".to_string(),
+                last_submit_ts: 12.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-await-second-fill-no".to_string()),
+                origin: "BOT_AWAIT_SECOND_FILL_NO".to_string(),
+                last_submit_ts: 12.5,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(40.0, 40.0, 5.0, 12.0, 8.0, 4.2, 2.8, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn imbalance_repair_unavailable_cancels_live_pair_build_orders() {
+    let bot = make_pair_build_test_bot();
+    set_quotes(&bot, 0.10, 0.12, 0.10, 0.12);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-yes".to_string()),
+                origin: "BOT_PAIR_BUILD_YES".to_string(),
+                last_submit_ts: 18.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-no".to_string()),
+                origin: "BOT_PAIR_BUILD_NO".to_string(),
+                last_submit_ts: 18.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(60.0, 60.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn imbalance_hold_cancels_growth_but_keeps_live_lighter_repair() {
+    let bot = make_pair_build_test_bot();
+    set_quotes(&bot, 0.10, 0.12, 0.10, 0.12);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-lighter-yes".to_string()),
+                origin: "BOT_PAIR_BUILD_LIGHTER".to_string(),
+                last_submit_ts: 18.0,
+                price: 0.10,
+                remaining: 0.50,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-no".to_string()),
+                origin: "BOT_PAIR_BUILD_NO".to_string(),
+                last_submit_ts: 18.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(60.0, 60.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::Working);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn imbalance_hold_cancels_oversized_live_lighter_repair() {
+    let bot = make_pair_build_test_bot();
+    set_quotes(&bot, 0.10, 0.12, 0.10, 0.12);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-lighter-yes".to_string()),
+                origin: "BOT_PAIR_BUILD_LIGHTER".to_string(),
+                last_submit_ts: 18.0,
+                price: 0.10,
+                remaining: 1.50,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-no".to_string()),
+                origin: "BOT_PAIR_BUILD_NO".to_string(),
+                last_submit_ts: 18.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(60.0, 60.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn imbalance_hold_cancels_wrong_side_live_lighter_repair_after_side_flip() {
+    let bot = make_pair_build_test_bot();
+    set_quotes(&bot, 0.10, 0.12, 0.10, 0.12);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-lighter-yes".to_string()),
+                origin: "BOT_PAIR_BUILD_LIGHTER".to_string(),
+                last_submit_ts: 18.0,
+                price: 0.10,
+                remaining: 0.50,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-pair-build-no".to_string()),
+                origin: "BOT_PAIR_BUILD_NO".to_string(),
+                last_submit_ts: 18.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(60.0, 60.0, 0.60, 3.5, 2.5, 0.35, 0.25, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn pair_build_decision_uses_exact_unmatched_fraction_thresholds() {
+    let cfg = bot_runtime_config_defaults();
+    let normal = bot_runtime_pair_build_decision(
+        100.0, 100.0, 35.0, 35.0, 0.30, 0.32, 0.30, 0.32, 200.0, 70.0, 1.0, 1.0, &cfg, false,
+    )
+    .expect("normal paired growth");
+    assert_eq!(normal.mode, BotRuntimePairBuildMode::PairedGrowth);
+    assert_eq!(normal.imbalance_state, BotRuntimeImbalanceState::Normal);
+
+    let throttle = bot_runtime_pair_build_decision(
+        100.0, 85.0, 35.0, 29.75, 0.30, 0.32, 0.30, 0.32, 200.0, 64.75, 1.0, 1.0, &cfg, false,
+    )
+    .expect("throttle repair");
+    assert_eq!(throttle.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(throttle.imbalance_state, BotRuntimeImbalanceState::Throttle);
+    assert!(throttle.reduces_imbalance);
+
+    let warning = bot_runtime_pair_build_decision(
+        100.0, 75.0, 35.0, 26.25, 0.30, 0.32, 0.30, 0.32, 200.0, 61.25, 1.0, 1.0, &cfg, false,
+    )
+    .expect("warning repair");
+    assert_eq!(warning.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(warning.imbalance_state, BotRuntimeImbalanceState::Warning);
+
+    let hard_disable = bot_runtime_pair_build_decision(
+        12.0, 8.0, 4.2, 2.8, 0.30, 0.32, 0.30, 0.32, 100.0, 7.0, 1.0, 1.0, &cfg, false,
+    )
+    .expect_err("hard disable should block");
+    assert!(hard_disable.starts_with("hard_imbalance_disable:"));
 }

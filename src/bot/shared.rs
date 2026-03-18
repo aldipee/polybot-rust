@@ -345,6 +345,33 @@ pub(super) fn share_skew_ratio(q_yes: f64, q_no: f64) -> f64 {
     }
 }
 
+/// Computes unmatched fraction for the BOT runtime.
+/// This is a helper used by the BOT runtime for normalization, state labels, or calculations.
+
+pub(super) fn unmatched_fraction(q_yes: f64, q_no: f64) -> f64 {
+    let yes = q_yes.max(0.0);
+    let no = q_no.max(0.0);
+    let total = yes + no;
+    if total > 1e-9 {
+        ((yes - no).abs() / total).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Computes match ratio for the BOT runtime.
+/// This is a helper used by the BOT runtime for normalization, state labels, or calculations.
+
+pub(super) fn match_ratio(q_yes: f64, q_no: f64) -> f64 {
+    let mn = q_yes.max(0.0).min(q_no.max(0.0));
+    let mx = q_yes.max(0.0).max(q_no.max(0.0));
+    if mx > 1e-9 {
+        (mn / mx).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 /// Computes complement price for the BOT runtime.
 /// This is a helper used by the BOT runtime for normalization, state labels, or calculations.
 

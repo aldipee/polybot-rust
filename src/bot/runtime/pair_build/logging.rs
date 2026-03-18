@@ -24,6 +24,15 @@ impl MakerHedgeCapBot {
                 self._bot_runtime_note_repair_reserve_blocked();
             }
         }
+        if reason.starts_with("imbalance_")
+            || reason.starts_with("projected_hard_imbalance_block")
+            || reason.starts_with("hard_imbalance_disable")
+            || reason.starts_with("repair_does_not_reduce_imbalance")
+        {
+            if let Ok(mut st) = self.bot_runtime_state.lock() {
+                st.imbalance_last_hold_reason = reason.to_string();
+            }
+        }
         let mode = decision
             .map(|value| value.mode.as_str().to_string())
             .unwrap_or_else(|| "NA".to_string());
@@ -38,6 +47,26 @@ impl MakerHedgeCapBot {
             .map(|value| value.cpp_hint.as_str().to_string())
             .unwrap_or_else(|| "NA".to_string());
         let pair_sum = decision.map(|value| value.pair_sum).unwrap_or(0.0);
+        let unmatched_fraction = decision
+            .map(|value| value.current_unmatched_fraction)
+            .unwrap_or_else(|| unmatched_fraction(q_yes, q_no));
+        let projected_unmatched_fraction = decision
+            .map(|value| value.projected_unmatched_fraction)
+            .unwrap_or(unmatched_fraction);
+        let match_ratio_value = decision
+            .map(|value| value.match_ratio)
+            .unwrap_or_else(|| match_ratio(q_yes, q_no));
+        let imbalance_state = decision
+            .map(|value| value.imbalance_state.as_str().to_string())
+            .unwrap_or_else(|| {
+                self.bot_runtime_state
+                    .lock()
+                    .map(|st| st.imbalance_state.as_str().to_string())
+                    .unwrap_or_else(|_| BotRuntimeImbalanceState::Normal.as_str().to_string())
+            });
+        let reduces_imbalance = decision
+            .map(|value| value.reduces_imbalance)
+            .unwrap_or(false);
         let pair_coverage = decision.map(|value| value.pair_coverage).unwrap_or(0.0);
         let skew_ratio = decision.map(|value| value.skew_ratio).unwrap_or(0.0);
         let inventory_vwap_sum = decision
@@ -45,7 +74,7 @@ impl MakerHedgeCapBot {
             .unwrap_or(f64::INFINITY);
         let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][PAIR_BUILD] pair_id={} {} reason={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3}",
+            "[BOT][PAIR_BUILD] pair_id={} {} reason={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3}",
             pair_id,
             state_kind,
             reason,
@@ -59,6 +88,11 @@ impl MakerHedgeCapBot {
             q_no,
             total_cost.max(0.0),
             pair_sum,
+            unmatched_fraction,
+            projected_unmatched_fraction,
+            match_ratio_value,
+            imbalance_state,
+            reduces_imbalance,
             pair_coverage,
             skew_ratio,
             inventory_vwap_sum

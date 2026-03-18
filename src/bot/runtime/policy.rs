@@ -119,6 +119,74 @@ pub(in crate::bot) fn bot_runtime_open_both_submit_delta_ms(
         None
     }
 }
+
+/// Returns the current runtime imbalance state from unmatched fraction.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_imbalance_state_from_fraction(
+    unmatched_fraction: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> BotRuntimeImbalanceState {
+    if unmatched_fraction + 1e-9 >= cfg.imbalance_disable_fraction {
+        BotRuntimeImbalanceState::HardDisable
+    } else if unmatched_fraction > cfg.imbalance_warning_fraction + 1e-9 {
+        BotRuntimeImbalanceState::Warning
+    } else if unmatched_fraction + 1e-9 >= cfg.imbalance_target_fraction {
+        BotRuntimeImbalanceState::Throttle
+    } else {
+        BotRuntimeImbalanceState::Normal
+    }
+}
+
+/// Returns the current runtime imbalance state from filled inventory.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_current_imbalance_state(
+    q_yes: f64,
+    q_no: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> BotRuntimeImbalanceState {
+    bot_runtime_imbalance_state_from_fraction(unmatched_fraction(q_yes, q_no), cfg)
+}
+
+/// Returns the projected unmatched fraction after a candidate add.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_projected_unmatched_fraction(
+    mode: BotRuntimePairBuildMode,
+    side: Option<OutcomeSide>,
+    clip: f64,
+    q_yes: f64,
+    q_no: f64,
+) -> f64 {
+    let clip = clip.max(0.0);
+    if clip <= 0.0 {
+        return unmatched_fraction(q_yes, q_no);
+    }
+    let mut projected_yes = q_yes.max(0.0);
+    let mut projected_no = q_no.max(0.0);
+    match mode {
+        BotRuntimePairBuildMode::PairedGrowth => {
+            projected_yes += clip;
+            projected_no += clip;
+        }
+        BotRuntimePairBuildMode::LighterSideFirst => match side.unwrap_or(OutcomeSide::Yes) {
+            OutcomeSide::Yes => projected_yes += clip,
+            OutcomeSide::No => projected_no += clip,
+        },
+    }
+    unmatched_fraction(projected_yes, projected_no)
+}
+
+/// Returns whether a projected candidate reduces unmatched fraction.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_order_reduces_imbalance(
+    current_unmatched_fraction: f64,
+    projected_unmatched_fraction: f64,
+) -> bool {
+    projected_unmatched_fraction + 1e-9 < current_unmatched_fraction
+}
 /// Returns the target completion threshold for AwaitSecondFill.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 

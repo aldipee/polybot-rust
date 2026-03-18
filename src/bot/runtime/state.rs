@@ -144,6 +144,28 @@ impl BotRuntimeControlOwner {
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::bot) enum BotRuntimeImbalanceState {
+    #[default]
+    Normal,
+    Throttle,
+    Warning,
+    HardDisable,
+}
+impl BotRuntimeImbalanceState {
+    /// Returns the stable string label for this enum or state value.
+    /// This is a pure BOT runtime helper used for configuration, policy, or metrics
+    /// calculations.
+
+    pub(in crate::bot) fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Throttle => "Throttle",
+            Self::Warning => "Warning",
+            Self::HardDisable => "HardDisable",
+        }
+    }
+}
 #[derive(Debug, Clone, Default)]
 pub(in crate::bot) struct BotRuntimePairBuildSideRepostState {
     pub(in crate::bot) last_cancel_ts: f64,
@@ -189,6 +211,9 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) second_side_by_30s: bool,
     pub(in crate::bot) first_fill_to_second_fill_ms: f64,
     pub(in crate::bot) await_second_fill_last_hold_reason: String,
+    pub(in crate::bot) imbalance_state: BotRuntimeImbalanceState,
+    pub(in crate::bot) imbalance_state_enter_ts: f64,
+    pub(in crate::bot) imbalance_last_hold_reason: String,
     pub(in crate::bot) pair_build_last_hold_reason: String,
     pub(in crate::bot) pair_build_last_optional_growth_submit_ts: f64,
     pub(in crate::bot) pair_build_yes_repost: BotRuntimePairBuildSideRepostState,
@@ -281,6 +306,11 @@ pub(in crate::bot) struct BotRuntimePairBuildDecision {
     pub(in crate::bot) clip_bucket: &'static str,
     pub(in crate::bot) cpp_hint: BotRuntimePairBuildCppHint,
     pub(in crate::bot) pair_sum: f64,
+    pub(in crate::bot) current_unmatched_fraction: f64,
+    pub(in crate::bot) projected_unmatched_fraction: f64,
+    pub(in crate::bot) match_ratio: f64,
+    pub(in crate::bot) imbalance_state: BotRuntimeImbalanceState,
+    pub(in crate::bot) reduces_imbalance: bool,
     pub(in crate::bot) pair_coverage: f64,
     pub(in crate::bot) skew_ratio: f64,
     pub(in crate::bot) current_base: f64,
@@ -410,6 +440,9 @@ pub(in crate::bot) struct BotRuntimeMetricsSnapshot {
     pub(in crate::bot) fill_shares_by_segment: [f64; 5],
     pub(in crate::bot) paired_size: f64,
     pub(in crate::bot) unmatched_size: f64,
+    pub(in crate::bot) unmatched_fraction: f64,
+    pub(in crate::bot) match_ratio: f64,
+    pub(in crate::bot) imbalance_state: BotRuntimeImbalanceState,
     pub(in crate::bot) pair_coverage: f64,
     pub(in crate::bot) share_skew_ratio: f64,
     pub(in crate::bot) inventory_vwap_sum: f64,

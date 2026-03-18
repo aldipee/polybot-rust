@@ -206,6 +206,9 @@ fn bot_runtime_config_defaults_include_exact_open_time_targets() {
     assert_eq!(cfg.open_both_seed_deadline_seconds, 5.0);
     assert_eq!(cfg.open_both_submit_delta_max_seconds, 1.0);
     assert!(cfg.open_both_allow_single_late_seed);
+    assert_eq!(cfg.imbalance_target_fraction, 0.07);
+    assert_eq!(cfg.imbalance_warning_fraction, 0.12);
+    assert_eq!(cfg.imbalance_disable_fraction, 0.20);
 }
 
 #[test]
@@ -230,6 +233,80 @@ fn bot_runtime_validate_config_rejects_invalid_open_time_targets() {
         bot_runtime_validate_config(&cfg),
         Err("open_both_submit_delta_exceeds_deadline")
     );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.imbalance_target_fraction = 0.0;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_imbalance_target_fraction")
+    );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.imbalance_warning_fraction = cfg.imbalance_target_fraction;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_imbalance_warning_fraction")
+    );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.imbalance_disable_fraction = cfg.imbalance_warning_fraction;
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_imbalance_disable_fraction")
+    );
+}
+
+#[test]
+fn unmatched_fraction_match_ratio_and_imbalance_state_follow_requirement_thresholds() {
+    let cfg = bot_runtime_config_defaults();
+    assert_eq!(unmatched_fraction(0.0, 0.0), 0.0);
+    assert_eq!(match_ratio(0.0, 0.0), 1.0);
+    assert!((unmatched_fraction(10.0, 10.0) - 0.0).abs() < 1e-9);
+    assert!((match_ratio(10.0, 10.0) - 1.0).abs() < 1e-9);
+    assert!((unmatched_fraction(12.0, 8.0) - 0.20).abs() < 1e-9);
+    assert!((match_ratio(12.0, 8.0) - (8.0 / 12.0)).abs() < 1e-9);
+
+    assert_eq!(
+        bot_runtime_imbalance_state_from_fraction(0.069, &cfg),
+        BotRuntimeImbalanceState::Normal
+    );
+    assert_eq!(
+        bot_runtime_imbalance_state_from_fraction(0.07, &cfg),
+        BotRuntimeImbalanceState::Throttle
+    );
+    assert_eq!(
+        bot_runtime_imbalance_state_from_fraction(0.1200001, &cfg),
+        BotRuntimeImbalanceState::Warning
+    );
+    assert_eq!(
+        bot_runtime_imbalance_state_from_fraction(0.20, &cfg),
+        BotRuntimeImbalanceState::HardDisable
+    );
+}
+
+#[test]
+fn projected_unmatched_fraction_math_matches_paired_and_repair_cases() {
+    let paired = bot_runtime_projected_unmatched_fraction(
+        BotRuntimePairBuildMode::PairedGrowth,
+        None,
+        10.0,
+        12.0,
+        8.0,
+    );
+    assert!((paired - (4.0 / 40.0)).abs() < 1e-9);
+
+    let repair = bot_runtime_projected_unmatched_fraction(
+        BotRuntimePairBuildMode::LighterSideFirst,
+        Some(OutcomeSide::No),
+        3.0,
+        12.0,
+        8.0,
+    );
+    assert!((repair - (1.0 / 23.0)).abs() < 1e-9);
+    assert!(bot_runtime_order_reduces_imbalance(
+        unmatched_fraction(12.0, 8.0),
+        repair
+    ));
 }
 /// Exercises the BOT runtime owner routes seed completion and taper scenario and checks the
 /// expected BOT behavior.
@@ -409,6 +486,60 @@ fn trade_metrics_snapshot_reports_bot_runtime_fields() {
     assert_eq!(snapshot.exit_reason, "DONE");
 }
 
+#[test]
+fn metrics_snapshot_reports_exact_unmatched_fraction_and_state() {
+    let mut state = BotRuntimeState::default();
+    state.imbalance_state = BotRuntimeImbalanceState::Warning;
+    let snapshot = bot_runtime_metrics_snapshot(&state, 14.0, 10.0, 5.6, 4.0, 9.6);
+    assert_eq!(snapshot.unmatched_size, 4.0);
+    assert!((snapshot.unmatched_fraction - (4.0 / 24.0)).abs() < 1e-9);
+    assert!((snapshot.match_ratio - (10.0 / 14.0)).abs() < 1e-9);
+    assert_eq!(snapshot.imbalance_state, BotRuntimeImbalanceState::Warning);
+}
+
+#[test]
+fn startup_one_sided_fill_does_not_latch_hard_disable_forever() {
+    let bot = make_bot_runtime_test_bot();
+    let cfg = bot_runtime_config_defaults();
+
+    assert_eq!(
+        bot._bot_runtime_note_imbalance_state(10.0, 5.0, 0.0, &cfg),
+        BotRuntimeImbalanceState::Normal
+    );
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert_eq!(state.imbalance_state, BotRuntimeImbalanceState::Normal);
+
+    assert_eq!(
+        bot._bot_runtime_note_imbalance_state(12.0, 5.0, 5.0, &cfg),
+        BotRuntimeImbalanceState::Normal
+    );
+    let state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert_eq!(state.imbalance_state, BotRuntimeImbalanceState::Normal);
+}
+
+#[test]
+fn post_completion_hard_disable_remains_sticky() {
+    let bot = make_bot_runtime_test_bot();
+    let cfg = bot_runtime_config_defaults();
+
+    assert_eq!(
+        bot._bot_runtime_note_imbalance_state(20.0, 12.0, 8.0, &cfg),
+        BotRuntimeImbalanceState::HardDisable
+    );
+    assert_eq!(
+        bot._bot_runtime_note_imbalance_state(25.0, 12.0, 12.0, &cfg),
+        BotRuntimeImbalanceState::HardDisable
+    );
+}
+
 /// Exercises the pair identity normalization scenario and checks the expected BOT behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
@@ -524,6 +655,160 @@ fn post_order_compat_rejects_bot_strategy_sell_origin() {
         None,
     );
     assert!(allowed.is_some());
+}
+
+#[test]
+fn imbalance_repair_unavailable_cancels_live_taper_orders() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.10, 0.12, 0.10, 0.12, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-yes".to_string()),
+                origin: "BOT_TAPER_YES".to_string(),
+                last_submit_ts: 200.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-no".to_string()),
+                origin: "BOT_TAPER_NO".to_string(),
+                last_submit_ts: 200.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(260.0, 260.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn imbalance_hold_keeps_live_taper_lighter_repair_orders() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.10, 0.12, 0.10, 0.12, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-lighter-yes".to_string()),
+                origin: "BOT_TAPER_LIGHTER".to_string(),
+                last_submit_ts: 200.0,
+                price: 0.10,
+                remaining: 0.50,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-no".to_string()),
+                origin: "BOT_TAPER_NO".to_string(),
+                last_submit_ts: 200.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(260.0, 260.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::Working);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn imbalance_hold_cancels_oversized_live_taper_lighter_repair() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.10, 0.12, 0.10, 0.12, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-lighter-yes".to_string()),
+                origin: "BOT_TAPER_LIGHTER".to_string(),
+                last_submit_ts: 200.0,
+                price: 0.10,
+                remaining: 1.50,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-no".to_string()),
+                origin: "BOT_TAPER_NO".to_string(),
+                last_submit_ts: 200.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(260.0, 260.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+}
+
+#[test]
+fn imbalance_hold_cancels_wrong_side_live_taper_lighter_repair_after_side_flip() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.10, 0.12, 0.10, 0.12, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-lighter-yes".to_string()),
+                origin: "BOT_TAPER_LIGHTER".to_string(),
+                last_submit_ts: 200.0,
+                price: 0.10,
+                remaining: 0.50,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-no".to_string()),
+                origin: "BOT_TAPER_NO".to_string(),
+                last_submit_ts: 200.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(260.0, 260.0, 0.60, 3.5, 2.5, 0.35, 0.25, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::CancelPending);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
 }
 
 #[test]

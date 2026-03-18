@@ -82,6 +82,15 @@ impl MakerHedgeCapBot {
         if reason.starts_with("late_floor_tail_priority:") {
             self._bot_runtime_note_floor_tail_blocked();
         }
+        if reason.starts_with("imbalance_")
+            || reason.starts_with("projected_hard_imbalance_block")
+            || reason.starts_with("hard_imbalance_disable")
+            || reason.starts_with("repair_does_not_reduce_imbalance")
+        {
+            if let Ok(mut st) = self.bot_runtime_state.lock() {
+                st.imbalance_last_hold_reason = reason.to_string();
+            }
+        }
         let mode = decision
             .map(|value| value.mode.as_str().to_string())
             .unwrap_or_else(|| "NA".to_string());
@@ -95,9 +104,26 @@ impl MakerHedgeCapBot {
         let cpp_hint = decision
             .map(|value| value.cpp_hint.as_str().to_string())
             .unwrap_or_else(|| "NA".to_string());
+        let unmatched_fraction = decision
+            .map(|value| value.current_unmatched_fraction)
+            .unwrap_or_else(|| unmatched_fraction(q_yes, q_no));
+        let projected_unmatched_fraction = decision
+            .map(|value| value.projected_unmatched_fraction)
+            .unwrap_or(unmatched_fraction);
+        let match_ratio_value = decision
+            .map(|value| value.match_ratio)
+            .unwrap_or_else(|| match_ratio(q_yes, q_no));
+        let imbalance_state = decision
+            .map(|value| value.imbalance_state.as_str().to_string())
+            .unwrap_or_else(|| {
+                self.bot_runtime_state
+                    .lock()
+                    .map(|st| st.imbalance_state.as_str().to_string())
+                    .unwrap_or_else(|_| BotRuntimeImbalanceState::Normal.as_str().to_string())
+            });
         let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][TAPER] pair_id={} {} reason={} taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            "[BOT][TAPER] pair_id={} {} reason={} taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={}",
             pair_id,
             state_kind,
             reason,
@@ -110,7 +136,11 @@ impl MakerHedgeCapBot {
             t_into_s.max(0.0),
             q_yes,
             q_no,
-            total_cost.max(0.0)
+            total_cost.max(0.0),
+            unmatched_fraction,
+            projected_unmatched_fraction,
+            match_ratio_value,
+            imbalance_state
         ));
     }
 
@@ -124,5 +154,23 @@ impl MakerHedgeCapBot {
         reason: &str,
     ) -> bool {
         self._bot_runtime_cancel_order_family("BOT_TAPER", active_side, reason)
+    }
+
+    /// Implements cancel paired-growth taper orders while preserving lighter-side repair orders
+    /// for the BOT runtime.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_cancel_taper_growth_orders(
+        &self,
+        active_side: Option<OutcomeSide>,
+        reason: &str,
+    ) -> bool {
+        self._bot_runtime_cancel_order_family_excluding(
+            "BOT_TAPER",
+            "BOT_TAPER_LIGHTER",
+            active_side,
+            reason,
+        )
     }
 }

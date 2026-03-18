@@ -157,6 +157,51 @@ impl MakerHedgeCapBot {
         touched
     }
 
+    /// Implements cancel order family excluding a narrower preserve prefix for the BOT runtime.
+    /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
+    /// BOT runtime.
+
+    pub(in crate::bot) fn _bot_runtime_cancel_order_family_excluding(
+        &self,
+        family_prefix: &str,
+        exclude_prefix: &str,
+        active_side: Option<OutcomeSide>,
+        reason: &str,
+    ) -> bool {
+        let mut touched = false;
+        for side in [OutcomeSide::Yes, OutcomeSide::No] {
+            if active_side == Some(side) {
+                continue;
+            }
+            let Some(asset_id) = (match side {
+                OutcomeSide::Yes => self.yes_asset.as_deref(),
+                OutcomeSide::No => self.no_asset.as_deref(),
+            }) else {
+                continue;
+            };
+            let key = MakerOrderKey::buy(asset_id);
+            let slot = self._maker_order_slot_get(&key);
+            if !slot.origin.starts_with(family_prefix)
+                || slot.origin.starts_with(exclude_prefix)
+                || slot.order_id.is_none()
+            {
+                continue;
+            }
+            if matches!(
+                slot.state,
+                MakerOrderLifecycle::Working
+                    | MakerOrderLifecycle::SubmitPending
+                    | MakerOrderLifecycle::CancelPending
+            ) {
+                touched = true;
+                if slot.state != MakerOrderLifecycle::CancelPending {
+                    let _ = self._maker_order_request_cancel(&key, reason);
+                }
+            }
+        }
+        touched
+    }
+
     /// Implements cancel pair build orders for the BOT runtime.
     /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
     /// BOT runtime.
@@ -167,6 +212,24 @@ impl MakerHedgeCapBot {
         reason: &str,
     ) -> bool {
         self._bot_runtime_cancel_order_family("BOT_PAIR_BUILD", active_side, reason)
+    }
+
+    /// Implements cancel paired-growth pair-build orders while preserving lighter-side repair
+    /// orders for the BOT runtime.
+    /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
+    /// BOT runtime.
+
+    pub(in crate::bot) fn _bot_runtime_cancel_pair_build_growth_orders(
+        &self,
+        active_side: Option<OutcomeSide>,
+        reason: &str,
+    ) -> bool {
+        self._bot_runtime_cancel_order_family_excluding(
+            "BOT_PAIR_BUILD",
+            "BOT_PAIR_BUILD_LIGHTER",
+            active_side,
+            reason,
+        )
     }
 
     /// Implements cancel await second fill orders for the BOT runtime.

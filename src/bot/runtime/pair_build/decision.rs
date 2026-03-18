@@ -49,11 +49,22 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
 
     let current_base = q_yes.max(0.0).min(q_no.max(0.0));
     let pair_sum = y_bid + n_bid;
+    let current_unmatched_fraction = unmatched_fraction(q_yes, q_no);
+    let current_match_ratio = match_ratio(q_yes, q_no);
+    let current_imbalance_state = bot_runtime_current_imbalance_state(q_yes, q_no, cfg);
     let pair_coverage = pair_coverage(q_yes, q_no);
     let skew_ratio = share_skew_ratio(q_yes, q_no);
     let qty_gap = (q_yes.max(0.0) - q_no.max(0.0)).abs();
     let inventory_vwap_sum = inventory_vwap_sum(q_yes, q_no, cost_yes, cost_no);
     let market_snapshot_vwap_sum = market_snapshot_vwap_sum(y_bid, y_ask, n_bid, n_ask);
+    if matches!(
+        current_imbalance_state,
+        BotRuntimeImbalanceState::HardDisable
+    ) {
+        return Err(format!(
+            "hard_imbalance_disable:{current_unmatched_fraction:.3}"
+        ));
+    }
 
     let requested_clip = if current_base < (2.0 * cfg.seed_clip_small).max(min_lot) {
         cfg.seed_clip_small.max(min_lot)
@@ -107,6 +118,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         None
     };
 
+    let repair_only_imbalance =
+        !matches!(current_imbalance_state, BotRuntimeImbalanceState::Normal);
     let lighter_side_first = lighter_side.is_some()
         && bot_runtime_pair_build_materially_skewed(
             pair_coverage,
@@ -114,7 +127,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
             qty_gap,
             min_lot,
             cfg,
-        );
+        )
+        || (repair_only_imbalance && lighter_side.is_some());
     if lighter_side_first {
         let side = lighter_side.unwrap_or(OutcomeSide::Yes);
         let side_bid = match side {
@@ -142,6 +156,27 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
                 min_lot,
             );
             if clip + 1e-9 >= min_lot {
+                let projected_unmatched_fraction = bot_runtime_projected_unmatched_fraction(
+                    BotRuntimePairBuildMode::LighterSideFirst,
+                    Some(side),
+                    clip,
+                    q_yes,
+                    q_no,
+                );
+                if projected_unmatched_fraction + 1e-9 >= cfg.imbalance_disable_fraction {
+                    return Err(format!(
+                        "projected_hard_imbalance_block:{projected_unmatched_fraction:.3}"
+                    ));
+                }
+                let reduces_imbalance = bot_runtime_order_reduces_imbalance(
+                    current_unmatched_fraction,
+                    projected_unmatched_fraction,
+                );
+                if !reduces_imbalance {
+                    return Err(format!(
+                        "repair_does_not_reduce_imbalance:{current_unmatched_fraction:.3}:{projected_unmatched_fraction:.3}"
+                    ));
+                }
                 return Ok(BotRuntimePairBuildDecision {
                     mode: BotRuntimePairBuildMode::LighterSideFirst,
                     side: Some(side),
@@ -150,6 +185,11 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
                     clip_bucket: bot_runtime_pair_build_clip_bucket(clip, cfg),
                     cpp_hint,
                     pair_sum,
+                    current_unmatched_fraction,
+                    projected_unmatched_fraction,
+                    match_ratio: current_match_ratio,
+                    imbalance_state: current_imbalance_state,
+                    reduces_imbalance,
                     pair_coverage,
                     skew_ratio,
                     current_base,
@@ -159,8 +199,28 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
                 });
             }
         }
+        if repair_only_imbalance {
+            let reason = match current_imbalance_state {
+                BotRuntimeImbalanceState::Throttle => "imbalance_throttle_repair_unavailable",
+                BotRuntimeImbalanceState::Warning => "imbalance_warning_repair_unavailable",
+                BotRuntimeImbalanceState::HardDisable => "hard_imbalance_disable",
+                BotRuntimeImbalanceState::Normal => "imbalance_repair_unavailable",
+            };
+            return Err(format!(
+                "{reason}:{current_unmatched_fraction:.3}:{qty_gap:.2}"
+            ));
+        }
     }
 
+    if repair_only_imbalance {
+        let reason = match current_imbalance_state {
+            BotRuntimeImbalanceState::Throttle => "imbalance_throttle",
+            BotRuntimeImbalanceState::Warning => "imbalance_warning",
+            BotRuntimeImbalanceState::HardDisable => "hard_imbalance_disable",
+            BotRuntimeImbalanceState::Normal => "imbalance_repair_only",
+        };
+        return Err(format!("{reason}:{current_unmatched_fraction:.3}"));
+    }
     if pair_sum <= 0.0 || !pair_sum.is_finite() {
         return Err("pair_sum_unusable".to_string());
     }
@@ -173,6 +233,22 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     if clip + 1e-9 < min_lot {
         return Err("budget_too_small".to_string());
     }
+    let projected_unmatched_fraction = bot_runtime_projected_unmatched_fraction(
+        BotRuntimePairBuildMode::PairedGrowth,
+        None,
+        clip,
+        q_yes,
+        q_no,
+    );
+    if projected_unmatched_fraction + 1e-9 >= cfg.imbalance_disable_fraction {
+        return Err(format!(
+            "projected_hard_imbalance_block:{projected_unmatched_fraction:.3}"
+        ));
+    }
+    let reduces_imbalance = bot_runtime_order_reduces_imbalance(
+        current_unmatched_fraction,
+        projected_unmatched_fraction,
+    );
 
     Ok(BotRuntimePairBuildDecision {
         mode: BotRuntimePairBuildMode::PairedGrowth,
@@ -182,6 +258,11 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         clip_bucket: bot_runtime_pair_build_clip_bucket(clip, cfg),
         cpp_hint,
         pair_sum,
+        current_unmatched_fraction,
+        projected_unmatched_fraction,
+        match_ratio: current_match_ratio,
+        imbalance_state: current_imbalance_state,
+        reduces_imbalance,
         pair_coverage,
         skew_ratio,
         current_base,
@@ -340,6 +421,32 @@ pub(in crate::bot) fn bot_runtime_lighter_repair_opposite_order_remaining(
     }
 }
 
+/// Implements live lighter repair compatibility for the BOT runtime.
+/// This is a pure pair-build helper used for policy and handler gating.
+
+pub(in crate::bot) fn bot_runtime_live_lighter_repair_is_compatible(
+    slot: &MakerOrderSlot,
+    family_prefix: &str,
+    target_price: f64,
+    current_gap: f64,
+    tick_size: f64,
+) -> bool {
+    if !maker_slot_family_live(slot, family_prefix) {
+        return false;
+    }
+    if slot.state == MakerOrderLifecycle::CancelPending {
+        return false;
+    }
+    let remaining = bot_runtime_lighter_repair_opposite_order_remaining(slot);
+    let price_compatible = !bot_runtime_pair_build_buy_order_is_economically_invalid(
+        slot.price,
+        target_price,
+        tick_size,
+    );
+    let size_compatible = remaining > 1e-9 && remaining <= current_gap.max(0.0) + 1e-9;
+    price_compatible && size_compatible
+}
+
 /// Implements lighter repair opposite order policy for the BOT runtime.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
 
@@ -461,6 +568,25 @@ pub(in crate::bot) fn bot_runtime_origin_is_pair_build(origin: &str) -> bool {
     origin.trim().starts_with("BOT_PAIR_BUILD")
 }
 
+/// Implements imbalance hold growth order cancellation policy for the BOT runtime.
+/// This is a pure pair-build helper used for policy and handler gating.
+
+pub(in crate::bot) fn bot_runtime_imbalance_reason_requires_growth_order_cancel(
+    reason: &str,
+) -> bool {
+    reason.starts_with("imbalance_")
+        || reason.starts_with("projected_hard_imbalance_block")
+        || reason.starts_with("hard_imbalance_disable")
+        || reason.starts_with("repair_does_not_reduce_imbalance")
+}
+
+/// Implements lighter-side repair preservation policy for imbalance holds in the BOT runtime.
+/// This is a pure pair-build helper used for policy and handler gating.
+
+pub(in crate::bot) fn bot_runtime_imbalance_reason_preserves_lighter_repair(reason: &str) -> bool {
+    reason.contains("_repair_unavailable")
+}
+
 /// Implements await second fill bypasses open both reject cooldown for the BOT runtime.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
 
@@ -532,7 +658,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_cpp_pace_seconds(
 ) -> Option<f64> {
     if under_min_target
         || decision.mode != BotRuntimePairBuildMode::PairedGrowth
-        || decision.pair_coverage < 0.90
+        || !matches!(decision.imbalance_state, BotRuntimeImbalanceState::Normal)
     {
         return None;
     }

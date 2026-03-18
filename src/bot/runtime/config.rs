@@ -20,6 +20,9 @@ pub(in crate::bot) struct BotRuntimeConfigSnapshot {
     pub(in crate::bot) target_both_sides_by_60s: f64,
     pub(in crate::bot) taper_start_seconds: f64,
     pub(in crate::bot) final_quiet_seconds: f64,
+    pub(in crate::bot) imbalance_target_fraction: f64,
+    pub(in crate::bot) imbalance_warning_fraction: f64,
+    pub(in crate::bot) imbalance_disable_fraction: f64,
     pub(in crate::bot) seed_clip_small: f64,
     pub(in crate::bot) repair_clip_small: f64,
     pub(in crate::bot) repair_reserve_buffer_usd: f64,
@@ -57,6 +60,9 @@ pub(in crate::bot) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot 
         target_both_sides_by_60s: 0.95,
         taper_start_seconds: 240.0,
         final_quiet_seconds: 30.0,
+        imbalance_target_fraction: 0.07,
+        imbalance_warning_fraction: 0.12,
+        imbalance_disable_fraction: 0.20,
         seed_clip_small: 15.0,
         repair_clip_small: 15.0,
         repair_reserve_buffer_usd: 1.0,
@@ -238,6 +244,21 @@ where
         bot_runtime_env_float(&mut get, "BOT_TAPER_START_SECONDS", cfg.taper_start_seconds);
     cfg.final_quiet_seconds =
         bot_runtime_env_float(&mut get, "BOT_FINAL_QUIET_SECONDS", cfg.final_quiet_seconds);
+    cfg.imbalance_target_fraction = bot_runtime_env_float(
+        &mut get,
+        "BOT_IMBALANCE_TARGET_FRACTION",
+        cfg.imbalance_target_fraction,
+    );
+    cfg.imbalance_warning_fraction = bot_runtime_env_float(
+        &mut get,
+        "BOT_IMBALANCE_WARNING_FRACTION",
+        cfg.imbalance_warning_fraction,
+    );
+    cfg.imbalance_disable_fraction = bot_runtime_env_float(
+        &mut get,
+        "BOT_IMBALANCE_DISABLE_FRACTION",
+        cfg.imbalance_disable_fraction,
+    );
     cfg.buy_only_normal_flow = bot_runtime_env_bool(
         &mut get,
         "BOT_BUY_ONLY_NORMAL_FLOW",
@@ -316,6 +337,20 @@ pub(in crate::bot) fn bot_runtime_validate_config(
     }
     if !cfg.final_quiet_seconds.is_finite() || cfg.final_quiet_seconds < 0.0 {
         return Err("invalid_final_quiet_seconds");
+    }
+    if !cfg.imbalance_target_fraction.is_finite() || cfg.imbalance_target_fraction <= 0.0 {
+        return Err("invalid_imbalance_target_fraction");
+    }
+    if !cfg.imbalance_warning_fraction.is_finite()
+        || cfg.imbalance_warning_fraction <= cfg.imbalance_target_fraction
+    {
+        return Err("invalid_imbalance_warning_fraction");
+    }
+    if !cfg.imbalance_disable_fraction.is_finite()
+        || cfg.imbalance_disable_fraction <= cfg.imbalance_warning_fraction
+        || cfg.imbalance_disable_fraction > 1.0
+    {
+        return Err("invalid_imbalance_disable_fraction");
     }
     if !cfg.tail_cap_mid_start_seconds.is_finite() || cfg.tail_cap_mid_start_seconds < 0.0 {
         return Err("invalid_tail_cap_mid_start_seconds");

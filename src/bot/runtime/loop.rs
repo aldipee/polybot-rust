@@ -1,5 +1,50 @@
 use super::*;
 impl MakerHedgeCapBot {
+    /// Tracks the runtime imbalance state for the active pair.
+    pub(in crate::bot) fn _bot_runtime_note_imbalance_state(
+        &self,
+        now: f64,
+        q_yes: f64,
+        q_no: f64,
+        cfg: &BotRuntimeConfigSnapshot,
+    ) -> BotRuntimeImbalanceState {
+        let current_fraction = unmatched_fraction(q_yes, q_no);
+        let computed_state = bot_runtime_imbalance_state_from_fraction(current_fraction, cfg);
+        let match_ratio = match_ratio(q_yes, q_no);
+        let pair_id = self.pair_identity().pair_id;
+        if let Ok(mut st) = self.bot_runtime_state.lock() {
+            let previous_state = st.imbalance_state;
+            let pair_completed =
+                st.await_second_fill_second_fill_ts > 0.0 || (q_yes > 1e-9 && q_no > 1e-9);
+            let next_state = if !pair_completed {
+                previous_state
+            } else if matches!(previous_state, BotRuntimeImbalanceState::HardDisable) {
+                BotRuntimeImbalanceState::HardDisable
+            } else {
+                computed_state
+            };
+            if previous_state != next_state {
+                st.imbalance_state = next_state;
+                st.imbalance_state_enter_ts = now;
+                self.logger.info(&format!(
+                    "[BOT] pair_id={} imbalance_state {} -> {} unmatched_fraction={:.3} match_ratio={:.3} qYES={:.2} qNO={:.2}",
+                    pair_id,
+                    previous_state.as_str(),
+                    next_state.as_str(),
+                    current_fraction,
+                    match_ratio,
+                    q_yes.max(0.0),
+                    q_no.max(0.0)
+                ));
+            }
+            if st.imbalance_state_enter_ts <= 0.0 {
+                st.imbalance_state_enter_ts = now;
+            }
+            return st.imbalance_state;
+        }
+        computed_state
+    }
+
     /// Implements log final metrics for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
@@ -63,7 +108,7 @@ impl MakerHedgeCapBot {
             "NA".to_string()
         };
         self.logger.info(&format!(
-            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} fills_after_taper_start={} fills_after_final_quiet={} new_orders_after_taper_start={} new_orders_after_final_quiet={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
+            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} fills_after_taper_start={} fills_after_final_quiet={} new_orders_after_taper_start={} new_orders_after_final_quiet={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
             pair_id,
             exit_reason,
             metrics.market_participated,
@@ -75,6 +120,9 @@ impl MakerHedgeCapBot {
             bot_runtime_fill_distribution_summary_f64(&metrics.fill_shares_by_segment),
             metrics.paired_size,
             metrics.unmatched_size,
+            metrics.unmatched_fraction,
+            metrics.match_ratio,
+            metrics.imbalance_state.as_str(),
             metrics.pair_coverage,
             metrics.share_skew_ratio,
             combined_avg_paid,
@@ -420,6 +468,7 @@ impl MakerHedgeCapBot {
             self._bot_runtime_note_await_second_fill_progress(
                 now, t_into_s, qy, qn, cost_yes, cost_no,
             );
+            self._bot_runtime_note_imbalance_state(now, qy, qn, &cfg);
             if bot_runtime_should_run_open_both_handler(owner) {
                 self._bot_runtime_open_both_handler(now, t_into_s, total_cost, qy, qn, &cfg);
             } else if matches!(owner, BotRuntimeControlOwner::AwaitSecondFill) {
@@ -489,6 +538,7 @@ impl MakerHedgeCapBot {
                     first_fill_to_second_fill_ms,
                     await_second_fill_rescue_used,
                     await_second_fill_hard_paused,
+                    imbalance_state,
                     taper_fill_events_after_240,
                     taper_fill_events_after_270,
                     taper_new_orders_after_240,
@@ -526,6 +576,7 @@ impl MakerHedgeCapBot {
                             st.first_fill_to_second_fill_ms,
                             st.await_second_fill_rescue_used,
                             st.await_second_fill_hard_paused,
+                            st.imbalance_state,
                             st.taper_fill_events_after_240,
                             st.taper_fill_events_after_270,
                             st.taper_new_orders_after_240,
@@ -557,13 +608,14 @@ impl MakerHedgeCapBot {
                         0.0,
                         false,
                         false,
+                        BotRuntimeImbalanceState::Normal,
                         0,
                         0,
                         0,
                         0,
                     ));
                 self.logger.info(&format!(
-                    "[BOT] pair_id={} hold phase={} owner={} owner_reason={} armed={} prearm_ready={} prearm_ready_before_open={} prearm_hold_reason={} open_attempts={} seed_anchor_t_into={} first_seed_submit_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} first_fill_t_into={} second_side_t_into={} first_fill_to_second_fill_ms={} second_side_by_15s={} second_side_by_30s={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} taper_fill_events_240={} taper_fill_events_270={} taper_new_orders_240={} taper_new_orders_270={} t_left={:.1}s prearm_lead={:.0}s qYES={:.2} qNO={:.2} total_cost={:.2} market_data_fresh={} market_connected={} user_connected={}",
+                    "[BOT] pair_id={} hold phase={} owner={} owner_reason={} armed={} prearm_ready={} prearm_ready_before_open={} prearm_hold_reason={} open_attempts={} seed_anchor_t_into={} first_seed_submit_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} first_fill_t_into={} second_side_t_into={} first_fill_to_second_fill_ms={} second_side_by_15s={} second_side_by_30s={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} imbalance_state={} unmatched_fraction={:.3} match_ratio={:.3} taper_fill_events_240={} taper_fill_events_270={} taper_new_orders_240={} taper_new_orders_270={} t_left={:.1}s prearm_lead={:.0}s qYES={:.2} qNO={:.2} total_cost={:.2} market_data_fresh={} market_connected={} user_connected={}",
                     pair_id,
                     phase.as_str(),
                     owner.as_str(),
@@ -661,6 +713,9 @@ impl MakerHedgeCapBot {
                     },
                     await_second_fill_rescue_used,
                     await_second_fill_hard_paused,
+                    imbalance_state.as_str(),
+                    unmatched_fraction(qy, qn),
+                    match_ratio(qy, qn),
                     taper_fill_events_after_240,
                     taper_fill_events_after_270,
                     taper_new_orders_after_240,

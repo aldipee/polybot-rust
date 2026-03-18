@@ -792,7 +792,7 @@ impl MakerHedgeCapBot {
                     .unwrap_or(false);
                 let bid_cap_applied = (repair_original_bid - repair_bid_capped).abs() > 1e-9;
                 self.logger.info(&format!(
-                    "[BOT][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                    "[BOT][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                     decision.mode.as_str(),
                     active_side.as_str(),
                     decision.clip,
@@ -811,6 +811,11 @@ impl MakerHedgeCapBot {
                     q_no,
                     total_cost.max(0.0),
                     decision.qty_gap,
+                    decision.current_unmatched_fraction,
+                    decision.projected_unmatched_fraction,
+                    decision.match_ratio,
+                    decision.imbalance_state.as_str(),
+                    decision.reduces_imbalance,
                     decision.pair_coverage,
                     decision.skew_ratio,
                     decision.inventory_vwap_sum,

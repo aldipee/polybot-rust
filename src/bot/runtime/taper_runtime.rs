@@ -34,6 +34,11 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|st| st.await_second_fill_hard_paused)
             .unwrap_or(false);
+        let imbalance_state = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.imbalance_state)
+            .unwrap_or_else(|_| bot_runtime_current_imbalance_state(q_yes, q_no, cfg));
         if await_second_fill_hard_paused {
             let cancelled = self._bot_runtime_cancel_pair_build_orders(
                 None,
@@ -47,6 +52,38 @@ impl MakerHedgeCapBot {
             self._bot_runtime_log_taper_state(
                 if cancelled { "rest" } else { "hold" },
                 "startup_hard_paused",
+                taper_mode,
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
+        if matches!(imbalance_state, BotRuntimeImbalanceState::HardDisable) {
+            let cancelled_open_both = self._bot_runtime_cancel_order_family(
+                "BOT_OPEN_BOTH",
+                None,
+                "bot_runtime_taper_hard_imbalance_disable",
+            );
+            let cancelled_pair_build = self._bot_runtime_cancel_pair_build_orders(
+                None,
+                "bot_runtime_taper_hard_imbalance_disable",
+            );
+            let cancelled_taper = self
+                ._bot_runtime_cancel_taper_orders(None, "bot_runtime_taper_hard_imbalance_disable");
+            let cancelled_await_second_fill = self._bot_runtime_cancel_await_second_fill_orders(
+                None,
+                "bot_runtime_taper_hard_imbalance_disable",
+            );
+            let cancelled = cancelled_open_both
+                || cancelled_pair_build
+                || cancelled_taper
+                || cancelled_await_second_fill;
+            self._bot_runtime_log_taper_state(
+                if cancelled { "rest" } else { "hold" },
+                "hard_imbalance_disable",
                 taper_mode,
                 None,
                 t_into_s,
@@ -252,8 +289,69 @@ impl MakerHedgeCapBot {
         ) {
             Ok(decision) => bot_runtime_taper_maintenance_decision(decision, self.cfg.min_shares),
             Err(reason) => {
+                let preserve_lighter =
+                    if bot_runtime_imbalance_reason_preserves_lighter_repair(&reason) {
+                        let qty_gap = (q_yes.max(0.0) - q_no.max(0.0)).abs();
+                        let tick_size = self.cfg.tick.max(0.0001);
+                        if q_yes + 1e-9 < q_no {
+                            bot_runtime_live_lighter_repair_is_compatible(
+                                &yes_slot,
+                                "BOT_TAPER_LIGHTER",
+                                y_bid,
+                                qty_gap,
+                                tick_size,
+                            )
+                        } else if q_no + 1e-9 < q_yes {
+                            bot_runtime_live_lighter_repair_is_compatible(
+                                &no_slot,
+                                "BOT_TAPER_LIGHTER",
+                                n_bid,
+                                qty_gap,
+                                tick_size,
+                            )
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                let cancelled =
+                    if bot_runtime_imbalance_reason_requires_growth_order_cancel(&reason) {
+                        let cancelled_taper = if preserve_lighter {
+                            self._bot_runtime_cancel_taper_growth_orders(
+                                None,
+                                "bot_runtime_taper_imbalance_hold",
+                            )
+                        } else {
+                            self._bot_runtime_cancel_taper_orders(
+                                None,
+                                "bot_runtime_taper_imbalance_hold",
+                            )
+                        };
+                        let cancelled_pair_build = if preserve_lighter {
+                            self._bot_runtime_cancel_pair_build_growth_orders(
+                                None,
+                                "bot_runtime_taper_imbalance_hold",
+                            )
+                        } else {
+                            self._bot_runtime_cancel_pair_build_orders(
+                                None,
+                                "bot_runtime_taper_imbalance_hold",
+                            )
+                        };
+                        cancelled_taper || cancelled_pair_build
+                    } else {
+                        false
+                    };
                 self._bot_runtime_log_taper_state(
-                    "hold", &reason, taper_mode, None, t_into_s, total_cost, q_yes, q_no,
+                    if cancelled { "rest" } else { "hold" },
+                    &reason,
+                    taper_mode,
+                    None,
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
                 );
                 return;
             }
@@ -458,7 +556,7 @@ impl MakerHedgeCapBot {
                 if is_new_submit {
                     self._bot_runtime_note_taper_submit(t_into_s, cfg);
                     self.logger.info(&format!(
-                        "[BOT][TAPER] submit taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+                        "[BOT][TAPER] submit taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
                         taper_mode.as_str(),
                         decision.mode.as_str(),
                         active_side.as_str(),
@@ -472,7 +570,12 @@ impl MakerHedgeCapBot {
                         t_into_s.max(0.0),
                         q_yes,
                         q_no,
-                        total_cost.max(0.0)
+                        total_cost.max(0.0),
+                        decision.current_unmatched_fraction,
+                        decision.projected_unmatched_fraction,
+                        decision.match_ratio,
+                        decision.imbalance_state.as_str(),
+                        decision.reduces_imbalance
                     ));
                 }
             } else {
@@ -663,7 +766,7 @@ impl MakerHedgeCapBot {
         if yes_new || no_new {
             self._bot_runtime_note_taper_submit(t_into_s, cfg);
             self.logger.info(&format!(
-                "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} cpp_hint={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2}",
+                "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} cpp_hint={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
                 taper_mode.as_str(),
                 decision.mode.as_str(),
                 decision.clip,
@@ -677,7 +780,12 @@ impl MakerHedgeCapBot {
                 submit_elapsed_ms,
                 q_yes,
                 q_no,
-                total_cost.max(0.0)
+                total_cost.max(0.0),
+                decision.current_unmatched_fraction,
+                decision.projected_unmatched_fraction,
+                decision.match_ratio,
+                decision.imbalance_state.as_str(),
+                decision.reduces_imbalance
             ));
         }
     }
