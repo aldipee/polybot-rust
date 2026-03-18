@@ -29,6 +29,54 @@ impl MakerHedgeCapBot {
         let cost_yes = pair_snapshot.position.c_yes;
         let cost_no = pair_snapshot.position.c_no;
         let taper_mode = bot_runtime_taper_mode(t_into_s, cfg);
+        let await_second_fill_hard_paused = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.await_second_fill_hard_paused)
+            .unwrap_or(false);
+        if await_second_fill_hard_paused {
+            let cancelled = self._bot_runtime_cancel_pair_build_orders(
+                None,
+                "bot_runtime_taper_startup_hard_paused",
+            ) || self
+                ._bot_runtime_cancel_taper_orders(None, "bot_runtime_taper_startup_hard_paused")
+                || self._bot_runtime_cancel_await_second_fill_orders(
+                    None,
+                    "bot_runtime_taper_startup_hard_paused",
+                );
+            self._bot_runtime_log_taper_state(
+                if cancelled { "rest" } else { "hold" },
+                "startup_hard_paused",
+                taper_mode,
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
+        if q_yes <= 1e-9 || q_no <= 1e-9 {
+            let cancelled = self
+                ._bot_runtime_cancel_pair_build_orders(None, "bot_runtime_taper_await_second_fill")
+                || self
+                    ._bot_runtime_cancel_taper_orders(None, "bot_runtime_taper_await_second_fill")
+                || self._bot_runtime_cancel_await_second_fill_orders(
+                    None,
+                    "bot_runtime_taper_await_second_fill",
+                );
+            self._bot_runtime_log_taper_state(
+                if cancelled { "rest" } else { "hold" },
+                "await_second_fill_block",
+                taper_mode,
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
         if q_yes <= 1e-9 && q_no <= 1e-9 {
             let cancelled = self
                 ._bot_runtime_cancel_pair_build_orders(None, "bot_runtime_taper_no_inventory")

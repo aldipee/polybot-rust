@@ -236,21 +236,21 @@ fn bot_runtime_validate_config_rejects_invalid_open_time_targets() {
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
 #[test]
-fn bot_runtime_owner_routes_seed_completion_and_taper() {
+fn bot_runtime_owner_routes_await_second_fill_and_taper() {
     assert_eq!(
-        bot_runtime_owner_for_snapshot(BotRuntimePhase::OpenBoth, 10.0, 0.0),
-        (BotRuntimeControlOwner::SeedCompletion, "startup_asymmetry")
+        bot_runtime_owner_for_snapshot(BotRuntimePhase::OpenBoth, 10.0, 0.0, false),
+        (BotRuntimeControlOwner::AwaitSecondFill, "startup_asymmetry")
     );
     assert_eq!(
-        bot_runtime_owner_for_snapshot(BotRuntimePhase::PairBuild, 12.0, 12.0),
+        bot_runtime_owner_for_snapshot(BotRuntimePhase::PairBuild, 12.0, 12.0, false),
         (BotRuntimeControlOwner::PairBuild, "paired_replenishment")
     );
     assert_eq!(
-        bot_runtime_owner_for_snapshot(BotRuntimePhase::Taper, 12.0, 12.0),
+        bot_runtime_owner_for_snapshot(BotRuntimePhase::Taper, 12.0, 12.0, false),
         (BotRuntimeControlOwner::Taper, "late_taper")
     );
     assert_eq!(
-        bot_runtime_owner_for_snapshot(BotRuntimePhase::AwaitSettlement, 12.0, 12.0),
+        bot_runtime_owner_for_snapshot(BotRuntimePhase::AwaitSettlement, 12.0, 12.0, false),
         (BotRuntimeControlOwner::AwaitSettlement, "await_settlement")
     );
 }
@@ -264,11 +264,52 @@ fn bot_runtime_open_both_handler_only_runs_for_open_both_owner() {
         BotRuntimeControlOwner::OpenBoth
     ));
     assert!(!bot_runtime_should_run_open_both_handler(
-        BotRuntimeControlOwner::SeedCompletion
+        BotRuntimeControlOwner::AwaitSecondFill
     ));
     assert!(!bot_runtime_should_run_open_both_handler(
         BotRuntimeControlOwner::Taper
     ));
+}
+
+#[test]
+fn await_second_fill_thresholds_and_rescue_helpers_follow_requirement_constants() {
+    assert_eq!(bot_runtime_await_second_fill_target_seconds(), 15.0);
+    assert_eq!(bot_runtime_await_second_fill_deadline_seconds(), 30.0);
+    assert_eq!(
+        bot_runtime_await_second_fill_missing_side(5.0, 2.0, 0.0, 0.0),
+        Some(OutcomeSide::No)
+    );
+    assert_eq!(
+        bot_runtime_await_second_fill_missing_side(0.0, 0.0, 3.0, 1.2),
+        Some(OutcomeSide::Yes)
+    );
+    assert_eq!(
+        bot_runtime_await_second_fill_missing_side(3.0, 1.2, 3.0, 1.1),
+        None
+    );
+    assert_eq!(
+        bot_runtime_await_second_fill_rescue_size(15, 9.0, 6.0, 1.0),
+        Some(6)
+    );
+    assert_eq!(
+        bot_runtime_await_second_fill_rescue_size(15, 0.5, 6.0, 1.0),
+        None
+    );
+    let pair_sum =
+        bot_runtime_await_second_fill_marginal_pair_sum(OutcomeSide::No, 5.0, 0.0, 2.0, 0.0, 0.39)
+            .expect("pair sum");
+    assert!((pair_sum - 0.79).abs() < 1e-9);
+}
+
+#[test]
+fn startup_hard_pause_keeps_owner_in_await_second_fill_even_after_both_sides_fill() {
+    assert_eq!(
+        bot_runtime_owner_for_snapshot(BotRuntimePhase::PairBuild, 4.0, 4.0, true),
+        (
+            BotRuntimeControlOwner::AwaitSecondFill,
+            "startup_hard_paused"
+        )
+    );
 }
 
 #[test]
@@ -305,6 +346,17 @@ fn post_open_pair_quote_status_requires_post_open_quote_timestamps() {
         stale_s,
     );
     assert_eq!(post_open, (true, "ok".to_string()));
+}
+
+#[test]
+fn ask_snapshot_status_allows_fresh_ask_only_quotes() {
+    let now = 105.0;
+    let stale_s = 8.0;
+    let ask_only = bot_runtime_ask_snapshot_status("NO", Some((0.0, 0.39, 104.5)), now, stale_s);
+    assert_eq!(ask_only, (true, "ok".to_string()));
+
+    let missing_ask = bot_runtime_ask_snapshot_status("NO", Some((0.0, 0.0, 104.5)), now, stale_s);
+    assert_eq!(missing_ask, (false, "zero_ask_NO".to_string()));
 }
 
 #[test]
@@ -668,4 +720,58 @@ fn open_both_missing_leg_followup_does_not_require_late_unlock_once_one_side_exi
     assert!(!state.open_both_late_seed_unlock_used);
     assert!(state.open_both_first_no_submit_ts > 0.0);
     assert!(!state.open_both_seed_by_deadline_met);
+}
+
+#[test]
+fn await_second_fill_deadline_rescue_can_use_ask_only_missing_side_quote() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    let now = now_ts_f64();
+    bot.start_ts = now.floor() as i64 - 60;
+    bot.expiry_ts = bot.start_ts + 300;
+    if let Ok(mut state) = bot.state.lock() {
+        state.q_yes = 5.0;
+        state.c_yes = 2.0;
+        state.q_no = 0.0;
+        state.c_no = 0.0;
+    }
+    set_pair_quotes(&bot, 0.40, 0.42, 0.0, 0.39, now);
+    if let Ok(mut books) = bot.book_cache.lock() {
+        books.insert(
+            "no_asset_id".to_string(),
+            (
+                json!({
+                    "asks": [
+                        { "price": 0.39, "size": 8.0 }
+                    ],
+                    "bids": []
+                }),
+                now,
+            ),
+        );
+    }
+    if let Ok(mut st) = bot.bot_runtime_state.lock() {
+        st.open_both_first_fill_ts = now - 31.0;
+        st.await_second_fill_started_ts = now - 31.0;
+        st.await_second_fill_missing_side = Some(OutcomeSide::No);
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_await_second_fill_handler(now, 31.0, 2.0, 5.0, 0.0, 2.0, 0.0, &cfg);
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default();
+    assert!(runtime_state.await_second_fill_rescue_used);
+    assert!(!runtime_state.await_second_fill_hard_paused);
+
+    let contexts = bot.order_exec_context.lock().expect("exec context");
+    assert!(contexts.values().any(|value| {
+        value
+            .get("bot_runtime_await_second_fill_rescue")
+            .and_then(|field| field.as_bool())
+            .unwrap_or(false)
+    }));
 }

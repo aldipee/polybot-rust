@@ -59,6 +59,7 @@ pub(in crate::bot) fn bot_runtime_owner_for_snapshot(
     phase: BotRuntimePhase,
     q_yes: f64,
     q_no: f64,
+    await_second_fill_hard_paused: bool,
 ) -> (BotRuntimeControlOwner, &'static str) {
     let has_yes = q_yes > 1e-9;
     let has_no = q_no > 1e-9;
@@ -68,8 +69,13 @@ pub(in crate::bot) fn bot_runtime_owner_for_snapshot(
             (BotRuntimeControlOwner::AwaitSettlement, "await_settlement")
         }
         BotRuntimePhase::OpenBoth => {
-            if has_yes ^ has_no {
-                (BotRuntimeControlOwner::SeedCompletion, "startup_asymmetry")
+            if await_second_fill_hard_paused {
+                (
+                    BotRuntimeControlOwner::AwaitSecondFill,
+                    "startup_hard_paused",
+                )
+            } else if has_yes ^ has_no {
+                (BotRuntimeControlOwner::AwaitSecondFill, "startup_asymmetry")
             } else if has_yes && has_no {
                 (BotRuntimeControlOwner::PairBuild, "both_sides_live")
             } else {
@@ -77,8 +83,13 @@ pub(in crate::bot) fn bot_runtime_owner_for_snapshot(
             }
         }
         BotRuntimePhase::PairBuild => {
-            if has_yes ^ has_no {
-                (BotRuntimeControlOwner::SeedCompletion, "startup_asymmetry")
+            if await_second_fill_hard_paused {
+                (
+                    BotRuntimeControlOwner::AwaitSecondFill,
+                    "startup_hard_paused",
+                )
+            } else if has_yes ^ has_no {
+                (BotRuntimeControlOwner::AwaitSecondFill, "startup_asymmetry")
             } else if has_yes || has_no {
                 (BotRuntimeControlOwner::PairBuild, "paired_replenishment")
             } else {
@@ -86,8 +97,13 @@ pub(in crate::bot) fn bot_runtime_owner_for_snapshot(
             }
         }
         BotRuntimePhase::Taper => {
-            if has_yes ^ has_no {
-                (BotRuntimeControlOwner::SeedCompletion, "startup_asymmetry")
+            if await_second_fill_hard_paused {
+                (
+                    BotRuntimeControlOwner::AwaitSecondFill,
+                    "startup_hard_paused",
+                )
+            } else if has_yes ^ has_no {
+                (BotRuntimeControlOwner::AwaitSecondFill, "startup_asymmetry")
             } else {
                 (BotRuntimeControlOwner::Taper, "late_taper")
             }
@@ -107,7 +123,7 @@ pub(in crate::bot) enum BotRuntimeControlOwner {
     #[default]
     PreArm,
     OpenBoth,
-    SeedCompletion,
+    AwaitSecondFill,
     PairBuild,
     Taper,
     AwaitSettlement,
@@ -121,7 +137,7 @@ impl BotRuntimeControlOwner {
         match self {
             Self::PreArm => "PreArm",
             Self::OpenBoth => "OpenBoth",
-            Self::SeedCompletion => "SeedCompletion",
+            Self::AwaitSecondFill => "AwaitSecondFill",
             Self::PairBuild => "PairBuild",
             Self::Taper => "Taper",
             Self::AwaitSettlement => "AwaitSettlement",
@@ -162,10 +178,17 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) open_both_first_fill_ts: f64,
     pub(in crate::bot) open_both_attempt_count: u32,
     pub(in crate::bot) open_both_last_hold_reason: String,
-    pub(in crate::bot) seed_completion_started_ts: f64,
-    pub(in crate::bot) seed_completion_both_sides_ts: f64,
-    pub(in crate::bot) seed_completion_failure_logged: bool,
-    pub(in crate::bot) seed_completion_last_hold_reason: String,
+    pub(in crate::bot) await_second_fill_started_ts: f64,
+    pub(in crate::bot) await_second_fill_missing_side: Option<OutcomeSide>,
+    pub(in crate::bot) await_second_fill_target_missed_ts: f64,
+    pub(in crate::bot) await_second_fill_second_fill_ts: f64,
+    pub(in crate::bot) await_second_fill_rescue_used: bool,
+    pub(in crate::bot) await_second_fill_rescue_attempted_ts: f64,
+    pub(in crate::bot) await_second_fill_hard_paused: bool,
+    pub(in crate::bot) second_side_by_15s: bool,
+    pub(in crate::bot) second_side_by_30s: bool,
+    pub(in crate::bot) first_fill_to_second_fill_ms: f64,
+    pub(in crate::bot) await_second_fill_last_hold_reason: String,
     pub(in crate::bot) pair_build_last_hold_reason: String,
     pub(in crate::bot) pair_build_last_optional_growth_submit_ts: f64,
     pub(in crate::bot) pair_build_yes_repost: BotRuntimePairBuildSideRepostState,
@@ -399,6 +422,11 @@ pub(in crate::bot) struct BotRuntimeMetricsSnapshot {
     pub(in crate::bot) open_both_late_seed_used: bool,
     pub(in crate::bot) open_both_first_submit_delta_ms: f64,
     pub(in crate::bot) open_both_submit_delta_met: bool,
+    pub(in crate::bot) second_side_by_15s: bool,
+    pub(in crate::bot) second_side_by_30s: bool,
+    pub(in crate::bot) first_fill_to_second_fill_ms: f64,
+    pub(in crate::bot) await_second_fill_rescue_used: bool,
+    pub(in crate::bot) await_second_fill_hard_paused: bool,
     pub(in crate::bot) skipped_optional_add_count: u32,
     pub(in crate::bot) repair_reserve_blocked_count: u32,
     pub(in crate::bot) floor_tail_blocked_count: u32,

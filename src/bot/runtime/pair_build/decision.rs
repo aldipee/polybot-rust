@@ -191,10 +191,10 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     })
 }
 
-/// Implements seed completion live order timeout seconds for the BOT runtime.
+/// Implements await second fill live order timeout seconds for the BOT runtime.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
 
-pub(in crate::bot) fn bot_runtime_seed_completion_live_order_timeout_seconds(
+pub(in crate::bot) fn bot_runtime_await_second_fill_live_order_timeout_seconds(
     stale_seconds: f64,
 ) -> f64 {
     (stale_seconds.max(1.0) * 2.0).max(6.0)
@@ -461,14 +461,14 @@ pub(in crate::bot) fn bot_runtime_origin_is_pair_build(origin: &str) -> bool {
     origin.trim().starts_with("BOT_PAIR_BUILD")
 }
 
-/// Implements seed completion bypasses open both reject cooldown for the BOT runtime.
+/// Implements await second fill bypasses open both reject cooldown for the BOT runtime.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
 
-pub(in crate::bot) fn bot_runtime_seed_completion_bypasses_open_both_reject_cooldown(
+pub(in crate::bot) fn bot_runtime_await_second_fill_bypasses_open_both_reject_cooldown(
     origin: &str,
     slot: &MakerOrderSlot,
 ) -> bool {
-    origin.starts_with("BOT_SEED_COMPLETION")
+    origin.starts_with("BOT_AWAIT_SECOND_FILL")
         && slot.last_reject_ts > 0.0
         && slot.last_reject_origin.starts_with("BOT_OPEN_BOTH")
 }
@@ -509,7 +509,7 @@ pub(in crate::bot) fn maker_order_effective_reject_cooldown_seconds(
     if reject_cooldown <= 0.0 || slot.last_reject_ts <= 0.0 {
         return 0.0;
     }
-    if bot_runtime_seed_completion_bypasses_open_both_reject_cooldown(origin, slot) {
+    if bot_runtime_await_second_fill_bypasses_open_both_reject_cooldown(origin, slot) {
         return 0.0;
     }
     let base_cooldown =

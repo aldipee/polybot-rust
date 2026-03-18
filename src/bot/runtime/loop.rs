@@ -5,7 +5,6 @@ impl MakerHedgeCapBot {
     /// active market.
 
     pub(in crate::bot) fn _bot_runtime_log_final_metrics(&self, exit_reason: &str) {
-        let cfg = *self._bot_runtime_cfg();
         let pair_id = self.pair_identity().pair_id;
         let (q_yes, q_no, cost_yes, cost_no, total_cost) = self
             .state
@@ -24,14 +23,6 @@ impl MakerHedgeCapBot {
         } else {
             "NA".to_string()
         };
-        let both_by_30s_achieved = state.seed_completion_both_sides_ts > 0.0
-            && (state.seed_completion_both_sides_ts - self.start_ts as f64) <= 30.0 + 1e-9;
-        let both_by_60s_achieved = state.seed_completion_both_sides_ts > 0.0
-            && (state.seed_completion_both_sides_ts - self.start_ts as f64) <= 60.0 + 1e-9;
-        let both_by_30s_target_met =
-            (if both_by_30s_achieved { 1.0 } else { 0.0 }) + 1e-9 >= cfg.target_both_sides_by_30s;
-        let both_by_60s_target_met =
-            (if both_by_60s_achieved { 1.0 } else { 0.0 }) + 1e-9 >= cfg.target_both_sides_by_60s;
         let paired_cost_band_occupancy =
             bot_runtime_paired_cost_band_summary_u32(&metrics.paired_cost_band_observations);
         let paired_cost_band_occupancy_rate =
@@ -72,7 +63,7 @@ impl MakerHedgeCapBot {
             "NA".to_string()
         };
         self.logger.info(&format!(
-            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} fills_after_taper_start={} fills_after_final_quiet={} new_orders_after_taper_start={} new_orders_after_final_quiet={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} both_by_30s={} both_by_60s={} target_both_by_30s={:.2} target_both_by_60s={:.2} target_both_by_30s_met={} target_both_by_60s_met={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
+            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} fills_after_taper_start={} fills_after_final_quiet={} new_orders_after_taper_start={} new_orders_after_final_quiet={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
             pair_id,
             exit_reason,
             metrics.market_participated,
@@ -113,12 +104,11 @@ impl MakerHedgeCapBot {
             metrics.open_both_late_seed_used,
             seed_submit_delta_ms,
             metrics.open_both_submit_delta_met,
-            both_by_30s_achieved,
-            both_by_60s_achieved,
-            cfg.target_both_sides_by_30s,
-            cfg.target_both_sides_by_60s,
-            both_by_30s_target_met,
-            both_by_60s_target_met,
+            metrics.second_side_by_15s,
+            metrics.second_side_by_30s,
+            format!("{:.0}", metrics.first_fill_to_second_fill_ms),
+            metrics.await_second_fill_rescue_used,
+            metrics.await_second_fill_hard_paused,
             metrics.skipped_optional_add_count,
             metrics.repair_reserve_blocked_count,
             metrics.floor_tail_blocked_count,
@@ -208,7 +198,7 @@ impl MakerHedgeCapBot {
         if !cancel_requested {
             let reason = "bot_runtime_await_settlement";
             let _ = self._bot_runtime_cancel_order_family("BOT_OPEN_BOTH", None, reason);
-            let _ = self._bot_runtime_cancel_seed_completion_orders(None, reason);
+            let _ = self._bot_runtime_cancel_await_second_fill_orders(None, reason);
             let _ = self._bot_runtime_cancel_pair_build_orders(None, reason);
             let _ = self._bot_runtime_cancel_taper_orders(None, reason);
             self.cancel_all_open_orders_local(reason);
@@ -307,7 +297,13 @@ impl MakerHedgeCapBot {
             let pair_snapshot =
                 self._pair_snapshot_from_inputs(phase, t_into_s, qy, qn, cost_yes, cost_no);
             let pair_id = pair_snapshot.identity.pair_id.clone();
-            let (owner, owner_reason) = bot_runtime_owner_for_snapshot(phase, qy, qn);
+            let await_second_fill_hard_paused = self
+                .bot_runtime_state
+                .lock()
+                .map(|st| st.await_second_fill_hard_paused)
+                .unwrap_or(false);
+            let (owner, owner_reason) =
+                bot_runtime_owner_for_snapshot(phase, qy, qn, await_second_fill_hard_paused);
             let prearm_status = matches!(phase, BotRuntimePhase::PreArm)
                 .then(|| self._bot_runtime_prearm_status(t_into_s));
             if let Ok(mut st) = self.bot_runtime_state.lock() {
@@ -421,13 +417,13 @@ impl MakerHedgeCapBot {
                 }
             }
             self._bot_runtime_note_first_fill(now, qy, qn, cost_yes, cost_no);
-            self._bot_runtime_note_seed_completion_progress(
+            self._bot_runtime_note_await_second_fill_progress(
                 now, t_into_s, qy, qn, cost_yes, cost_no,
             );
             if bot_runtime_should_run_open_both_handler(owner) {
                 self._bot_runtime_open_both_handler(now, t_into_s, total_cost, qy, qn, &cfg);
-            } else if matches!(owner, BotRuntimeControlOwner::SeedCompletion) {
-                self._bot_runtime_seed_completion_handler(
+            } else if matches!(owner, BotRuntimeControlOwner::AwaitSecondFill) {
+                self._bot_runtime_await_second_fill_handler(
                     now, t_into_s, total_cost, qy, qn, cost_yes, cost_no, &cfg,
                 );
             } else if matches!(owner, BotRuntimeControlOwner::PairBuild) {
@@ -486,9 +482,13 @@ impl MakerHedgeCapBot {
                     open_both_late_seed_unlock_used,
                     open_both_submit_delta_met,
                     open_both_first_fill_ts,
-                    seed_completion_started_ts,
-                    seed_completion_both_sides_ts,
-                    seed_completion_failure_logged,
+                    await_second_fill_started_ts,
+                    await_second_fill_second_fill_ts,
+                    second_side_by_15s,
+                    second_side_by_30s,
+                    first_fill_to_second_fill_ms,
+                    await_second_fill_rescue_used,
+                    await_second_fill_hard_paused,
                     taper_fill_events_after_240,
                     taper_fill_events_after_270,
                     taper_new_orders_after_240,
@@ -519,9 +519,13 @@ impl MakerHedgeCapBot {
                             st.open_both_late_seed_unlock_used,
                             st.open_both_submit_delta_met,
                             st.open_both_first_fill_ts,
-                            st.seed_completion_started_ts,
-                            st.seed_completion_both_sides_ts,
-                            st.seed_completion_failure_logged,
+                            st.await_second_fill_started_ts,
+                            st.await_second_fill_second_fill_ts,
+                            st.second_side_by_15s,
+                            st.second_side_by_30s,
+                            st.first_fill_to_second_fill_ms,
+                            st.await_second_fill_rescue_used,
+                            st.await_second_fill_hard_paused,
                             st.taper_fill_events_after_240,
                             st.taper_fill_events_after_270,
                             st.taper_new_orders_after_240,
@@ -549,13 +553,17 @@ impl MakerHedgeCapBot {
                         0.0,
                         0.0,
                         false,
+                        false,
+                        0.0,
+                        false,
+                        false,
                         0,
                         0,
                         0,
                         0,
                     ));
                 self.logger.info(&format!(
-                    "[BOT] pair_id={} hold phase={} owner={} owner_reason={} armed={} prearm_ready={} prearm_ready_before_open={} prearm_hold_reason={} open_attempts={} seed_anchor_t_into={} first_seed_submit_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} first_fill_t_into={} second_side_t_into={} second_side_latency={} both_by_30s={} both_by_60s={} seed_completion_failed={} taper_fill_events_240={} taper_fill_events_270={} taper_new_orders_240={} taper_new_orders_270={} t_left={:.1}s prearm_lead={:.0}s qYES={:.2} qNO={:.2} total_cost={:.2} market_data_fresh={} market_connected={} user_connected={}",
+                    "[BOT] pair_id={} hold phase={} owner={} owner_reason={} armed={} prearm_ready={} prearm_ready_before_open={} prearm_hold_reason={} open_attempts={} seed_anchor_t_into={} first_seed_submit_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} first_fill_t_into={} second_side_t_into={} first_fill_to_second_fill_ms={} second_side_by_15s={} second_side_by_30s={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} taper_fill_events_240={} taper_fill_events_270={} taper_new_orders_240={} taper_new_orders_270={} t_left={:.1}s prearm_lead={:.0}s qYES={:.2} qNO={:.2} total_cost={:.2} market_data_fresh={} market_connected={} user_connected={}",
                     pair_id,
                     phase.as_str(),
                     owner.as_str(),
@@ -620,31 +628,39 @@ impl MakerHedgeCapBot {
                     } else {
                         "NA".to_string()
                     },
-                    if seed_completion_both_sides_ts > 0.0 {
-                        format!("{:.1}s", (seed_completion_both_sides_ts - self.start_ts as f64).max(0.0))
+                    if await_second_fill_second_fill_ts > 0.0 {
+                        format!(
+                            "{:.1}s",
+                            (await_second_fill_second_fill_ts - self.start_ts as f64).max(0.0)
+                        )
                     } else {
                         "NA".to_string()
                     },
-                    if open_both_first_fill_ts > 0.0 && seed_completion_both_sides_ts > 0.0 {
-                        format!("{:.1}s", (seed_completion_both_sides_ts - open_both_first_fill_ts).max(0.0))
+                    if await_second_fill_second_fill_ts > 0.0 {
+                        format!("{:.0}", first_fill_to_second_fill_ms.max(0.0))
                     } else {
                         "NA".to_string()
                     },
-                    if seed_completion_both_sides_ts > 0.0 {
-                        ((seed_completion_both_sides_ts - self.start_ts as f64) <= 30.0 + 1e-9).to_string()
-                    } else if t_into_s >= 30.0 && seed_completion_started_ts > 0.0 {
+                    if await_second_fill_second_fill_ts > 0.0 {
+                        second_side_by_15s.to_string()
+                    } else if await_second_fill_started_ts > 0.0
+                        && t_into_s >= bot_runtime_await_second_fill_target_seconds() - 1e-9
+                    {
                         "false".to_string()
                     } else {
                         "pending".to_string()
                     },
-                    if seed_completion_both_sides_ts > 0.0 {
-                        ((seed_completion_both_sides_ts - self.start_ts as f64) <= 60.0 + 1e-9).to_string()
-                    } else if t_into_s >= 60.0 && seed_completion_started_ts > 0.0 {
+                    if await_second_fill_second_fill_ts > 0.0 {
+                        second_side_by_30s.to_string()
+                    } else if await_second_fill_started_ts > 0.0
+                        && t_into_s >= bot_runtime_await_second_fill_deadline_seconds() - 1e-9
+                    {
                         "false".to_string()
                     } else {
                         "pending".to_string()
                     },
-                    seed_completion_failure_logged,
+                    await_second_fill_rescue_used,
+                    await_second_fill_hard_paused,
                     taper_fill_events_after_240,
                     taper_fill_events_after_270,
                     taper_new_orders_after_240,

@@ -119,10 +119,24 @@ pub(in crate::bot) fn bot_runtime_open_both_submit_delta_ms(
         None
     }
 }
-/// Implements seed completion missing side for the BOT runtime.
+/// Returns the target completion threshold for AwaitSecondFill.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_seed_completion_missing_side(
+pub(in crate::bot) fn bot_runtime_await_second_fill_target_seconds() -> f64 {
+    15.0
+}
+
+/// Returns the hard completion deadline for AwaitSecondFill.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_await_second_fill_deadline_seconds() -> f64 {
+    30.0
+}
+
+/// Implements await second fill missing side for the BOT runtime.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_await_second_fill_missing_side(
     q_yes: f64,
     cost_yes: f64,
     q_no: f64,
@@ -136,17 +150,17 @@ pub(in crate::bot) fn bot_runtime_seed_completion_missing_side(
         _ => None,
     }
 }
-/// Implements seed completion repair size for the BOT runtime.
+/// Implements await second fill repair size for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_seed_completion_repair_size(
+pub(in crate::bot) fn bot_runtime_await_second_fill_repair_size(
     configured_clip: f64,
     min_shares: f64,
-    missing_bid: f64,
+    missing_price: f64,
     total_usable_budget: f64,
     total_cost: f64,
 ) -> Option<i64> {
-    if missing_bid <= 0.0 || !missing_bid.is_finite() {
+    if missing_price <= 0.0 || !missing_price.is_finite() {
         return None;
     }
     let remaining_budget = (total_usable_budget.max(0.0) - total_cost.max(0.0)).max(0.0);
@@ -155,12 +169,67 @@ pub(in crate::bot) fn bot_runtime_seed_completion_repair_size(
     }
     let min_lot = min_shares.max(1.0).floor();
     let preferred_clip = configured_clip.max(min_lot).floor();
-    let budget_clip_cap = (remaining_budget / missing_bid).floor();
+    let budget_clip_cap = (remaining_budget / missing_price).floor();
     let clip = preferred_clip.min(budget_clip_cap).floor();
     if clip < min_lot || clip <= 0.0 {
         None
     } else {
         Some(clip as i64)
+    }
+}
+
+/// Returns the unmatched filled size available for a missing-side rescue.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_await_second_fill_unmatched_size(q_yes: f64, q_no: f64) -> f64 {
+    (q_yes.max(0.0) - q_no.max(0.0)).abs()
+}
+
+/// Returns the marginal pair sum for a missing-side rescue decision.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_await_second_fill_marginal_pair_sum(
+    missing_side: OutcomeSide,
+    q_yes: f64,
+    q_no: f64,
+    cost_yes: f64,
+    cost_no: f64,
+    missing_ask: f64,
+) -> Option<f64> {
+    if missing_ask <= 0.0 || !missing_ask.is_finite() {
+        return None;
+    }
+    let (filled_qty, filled_cost) = match missing_side {
+        OutcomeSide::Yes => (q_no.max(0.0), cost_no.max(0.0)),
+        OutcomeSide::No => (q_yes.max(0.0), cost_yes.max(0.0)),
+    };
+    if filled_qty <= 1e-9 {
+        return None;
+    }
+    Some((filled_cost / filled_qty.max(1e-9)).max(0.0) + missing_ask.max(0.0))
+}
+
+/// Returns the one-shot taker rescue clip for AwaitSecondFill.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_await_second_fill_rescue_size(
+    repair_size: i64,
+    unmatched_size: f64,
+    visible_ask_size: f64,
+    min_shares: f64,
+) -> Option<i64> {
+    if repair_size <= 0 {
+        return None;
+    }
+    let min_lot = min_shares.max(1.0).floor();
+    let capped = (repair_size as f64)
+        .min(unmatched_size.max(0.0).floor())
+        .min(visible_ask_size.max(0.0).floor())
+        .floor();
+    if capped < min_lot || capped <= 0.0 {
+        None
+    } else {
+        Some(capped as i64)
     }
 }
 /// Implements quote snapshot status for the BOT runtime.
@@ -177,6 +246,30 @@ pub(in crate::bot) fn bot_runtime_quote_snapshot_status(
     };
     if bid <= 0.0 || ask <= 0.0 {
         return (false, format!("zero_bid_ask_{label}"));
+    }
+    if ts <= 0.0 {
+        return (false, format!("quote_ts_missing_{label}"));
+    }
+    if (now - ts) > stale_s {
+        return (false, format!("quote_ts_stale_{label}"));
+    }
+    (true, "ok".to_string())
+}
+
+/// Returns whether the ask side of a quote is fresh enough for an ask-driven taker rescue.
+/// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
+
+pub(in crate::bot) fn bot_runtime_ask_snapshot_status(
+    label: &str,
+    quote: Option<(f64, f64, f64)>,
+    now: f64,
+    stale_s: f64,
+) -> (bool, String) {
+    let Some((_bid, ask, ts)) = quote else {
+        return (false, format!("missing_quotes_{label}"));
+    };
+    if ask <= 0.0 {
+        return (false, format!("zero_ask_{label}"));
     }
     if ts <= 0.0 {
         return (false, format!("quote_ts_missing_{label}"));

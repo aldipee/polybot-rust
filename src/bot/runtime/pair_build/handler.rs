@@ -216,6 +216,49 @@ impl MakerHedgeCapBot {
         let q_no = pair_snapshot.position.q_no;
         let cost_yes = pair_snapshot.position.c_yes;
         let cost_no = pair_snapshot.position.c_no;
+        let await_second_fill_hard_paused = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.await_second_fill_hard_paused)
+            .unwrap_or(false);
+        if await_second_fill_hard_paused {
+            let cancelled = self._bot_runtime_cancel_pair_build_orders(
+                None,
+                "bot_runtime_pair_build_startup_hard_paused",
+            ) || self._bot_runtime_cancel_await_second_fill_orders(
+                None,
+                "bot_runtime_pair_build_startup_hard_paused",
+            );
+            self._bot_runtime_log_pair_build_state(
+                if cancelled { "rest" } else { "hold" },
+                "startup_hard_paused",
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
+        if q_yes <= 1e-9 || q_no <= 1e-9 {
+            let cancelled = self._bot_runtime_cancel_pair_build_orders(
+                None,
+                "bot_runtime_pair_build_await_second_fill",
+            ) || self._bot_runtime_cancel_await_second_fill_orders(
+                None,
+                "bot_runtime_pair_build_await_second_fill",
+            );
+            self._bot_runtime_log_pair_build_state(
+                if cancelled { "rest" } else { "hold" },
+                "await_second_fill_block",
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
         let (yes_asset, no_asset) = match (&self.yes_asset, &self.no_asset) {
             (Some(yes_asset), Some(no_asset)) => (yes_asset.as_str(), no_asset.as_str()),
             _ => {
@@ -235,7 +278,7 @@ impl MakerHedgeCapBot {
         let no_key = MakerOrderKey::buy(no_asset);
         let yes_slot = self._maker_order_slot_get(&yes_key);
         let no_slot = self._maker_order_slot_get(&no_key);
-        if self._bot_runtime_pair_build_seed_completion_handoff(
+        if self._bot_runtime_pair_build_await_second_fill_handoff(
             now, t_into_s, total_cost, q_yes, q_no, &yes_slot, &no_slot,
         ) {
             return;

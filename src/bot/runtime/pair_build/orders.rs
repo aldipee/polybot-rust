@@ -169,23 +169,23 @@ impl MakerHedgeCapBot {
         self._bot_runtime_cancel_order_family("BOT_PAIR_BUILD", active_side, reason)
     }
 
-    /// Implements cancel seed completion orders for the BOT runtime.
+    /// Implements cancel await second fill orders for the BOT runtime.
     /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
     /// BOT runtime.
 
-    pub(in crate::bot) fn _bot_runtime_cancel_seed_completion_orders(
+    pub(in crate::bot) fn _bot_runtime_cancel_await_second_fill_orders(
         &self,
         active_side: Option<OutcomeSide>,
         reason: &str,
     ) -> bool {
-        self._bot_runtime_cancel_order_family("BOT_SEED_COMPLETION", active_side, reason)
+        self._bot_runtime_cancel_order_family("BOT_AWAIT_SECOND_FILL", active_side, reason)
     }
 
-    /// Implements pair build seed completion handoff for the BOT runtime.
+    /// Implements pair build await second fill handoff for the BOT runtime.
     /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
     /// BOT runtime.
 
-    pub(in crate::bot) fn _bot_runtime_pair_build_seed_completion_handoff(
+    pub(in crate::bot) fn _bot_runtime_pair_build_await_second_fill_handoff(
         &self,
         now: f64,
         t_into_s: f64,
@@ -196,18 +196,18 @@ impl MakerHedgeCapBot {
         no_slot: &MakerOrderSlot,
     ) -> bool {
         for (side, slot) in [(OutcomeSide::Yes, yes_slot), (OutcomeSide::No, no_slot)] {
-            if !maker_slot_family_live(slot, "BOT_SEED_COMPLETION") {
+            if !maker_slot_family_live(slot, "BOT_AWAIT_SECOND_FILL") {
                 continue;
             }
             let age_s = (now - slot.last_submit_ts).max(0.0);
-            let _ = self._bot_runtime_cancel_seed_completion_orders(
+            let _ = self._bot_runtime_cancel_await_second_fill_orders(
                 None,
-                "bot_runtime_pair_build_seed_completion_handoff",
+                "bot_runtime_pair_build_await_second_fill_handoff",
             );
             self._bot_runtime_log_pair_build_state(
                 "rest",
                 &format!(
-                    "awaiting_seed_completion_handoff:{}:{}:{:.1}",
+                    "awaiting_await_second_fill_handoff:{}:{}:{:.1}",
                     side.as_str(),
                     maker_order_lifecycle_label(slot.state),
                     age_s

@@ -14,7 +14,7 @@ impl MakerHedgeCapBot {
     pub(in crate::bot) fn _log_bot_runtime_cfg(&self) {
         let cfg = self._bot_runtime_cfg();
         self.logger.info(&format!(
-            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% seed_clip={:.0} repair_clip={:.0} large_clips={:.0}/{:.0} startup_targets=both_by_30s:{:.0}% both_by_60s:{:.0}% taper_start={:.0}s final_quiet={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
+            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% seed_clip={:.0} repair_clip={:.0} large_clips={:.0}/{:.0} await_second_fill_target={:.0}s await_second_fill_deadline={:.0}s await_second_fill_rescue_once=true taper_start={:.0}s final_quiet={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
             self.exec_mode,
             cfg.phase_controller,
             cfg.prearm_lead_seconds,
@@ -35,8 +35,8 @@ impl MakerHedgeCapBot {
             cfg.repair_clip_small,
             cfg.large_clip_ladder[0],
             cfg.large_clip_ladder[1],
-            cfg.target_both_sides_by_30s * 100.0,
-            cfg.target_both_sides_by_60s * 100.0,
+            bot_runtime_await_second_fill_target_seconds(),
+            bot_runtime_await_second_fill_deadline_seconds(),
             cfg.taper_start_seconds,
             cfg.final_quiet_seconds,
             cfg.buy_only_normal_flow,
@@ -932,30 +932,30 @@ impl MakerHedgeCapBot {
             self._bot_runtime_clear_open_both_hold();
         }
     }
-    /// Implements seed completion hold changed for the BOT runtime.
+    /// Implements await second fill hold changed for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
 
-    pub(in crate::bot) fn _bot_runtime_seed_completion_hold_changed(&self, reason: &str) -> bool {
+    pub(in crate::bot) fn _bot_runtime_await_second_fill_hold_changed(&self, reason: &str) -> bool {
         self.bot_runtime_state
             .lock()
             .map(|mut st| {
-                if st.seed_completion_last_hold_reason == reason {
+                if st.await_second_fill_last_hold_reason == reason {
                     false
                 } else {
-                    st.seed_completion_last_hold_reason = reason.to_string();
+                    st.await_second_fill_last_hold_reason = reason.to_string();
                     true
                 }
             })
             .unwrap_or(true)
     }
-    /// Implements clear seed completion hold for the BOT runtime.
+    /// Implements clear await second fill hold for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
 
-    pub(in crate::bot) fn _bot_runtime_clear_seed_completion_hold(&self) {
+    pub(in crate::bot) fn _bot_runtime_clear_await_second_fill_hold(&self) {
         if let Ok(mut st) = self.bot_runtime_state.lock() {
-            st.seed_completion_last_hold_reason.clear();
+            st.await_second_fill_last_hold_reason.clear();
         }
     }
     /// Implements fill clears pair build repost for the BOT runtime.
@@ -1047,30 +1047,32 @@ impl MakerHedgeCapBot {
             self._bot_runtime_note_below_snapshot_optional_fill(filled);
         }
     }
-    /// Implements log seed completion hold for the BOT runtime.
+    /// Implements log await second fill hold for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
 
-    pub(in crate::bot) fn _bot_runtime_log_seed_completion_hold(
+    pub(in crate::bot) fn _bot_runtime_log_await_second_fill_hold(
         &self,
         reason: &str,
-        missing_side: OutcomeSide,
+        missing_side: Option<OutcomeSide>,
         t_into_s: f64,
         time_since_first_side_s: f64,
         total_cost: f64,
         q_yes: f64,
         q_no: f64,
     ) {
-        if !self._bot_runtime_seed_completion_hold_changed(reason) {
+        if !self._bot_runtime_await_second_fill_hold_changed(reason) {
             return;
         }
         self._bot_runtime_note_startup_completion_blocked();
         let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
-            "[BOT][SEED_COMPLETION] pair_id={} hold reason={} missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+            "[BOT][AWAIT_SECOND_FILL] pair_id={} hold reason={} missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
             pair_id,
             reason,
-            missing_side.as_str(),
+            missing_side
+                .map(|side| side.as_str().to_string())
+                .unwrap_or_else(|| "NA".to_string()),
             t_into_s.max(0.0),
             time_since_first_side_s.max(0.0),
             q_yes,
@@ -1078,11 +1080,99 @@ impl MakerHedgeCapBot {
             total_cost.max(0.0)
         ));
     }
-    /// Implements note seed completion progress for the BOT runtime.
+
+    /// Marks the AwaitSecondFill 15-second target as missed.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
 
-    pub(in crate::bot) fn _bot_runtime_note_seed_completion_progress(
+    pub(in crate::bot) fn _bot_runtime_mark_await_second_fill_target_missed(
+        &self,
+        started_ts: f64,
+        t_into_s: f64,
+        missing_side: OutcomeSide,
+        q_yes: f64,
+        q_no: f64,
+    ) {
+        let pair_id = self.pair_identity().pair_id;
+        let should_log = self
+            .bot_runtime_state
+            .lock()
+            .map(|mut st| {
+                if st.await_second_fill_target_missed_ts > 0.0 {
+                    false
+                } else {
+                    st.await_second_fill_target_missed_ts =
+                        started_ts + bot_runtime_await_second_fill_target_seconds();
+                    st.second_side_by_15s = false;
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_log {
+            self.logger.warning(&format!(
+                "[BOT][AWAIT_SECOND_FILL] pair_id={} target_missed missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2}",
+                pair_id,
+                missing_side.as_str(),
+                t_into_s.max(0.0),
+                bot_runtime_await_second_fill_target_seconds(),
+                q_yes,
+                q_no
+            ));
+        }
+    }
+
+    /// Marks AwaitSecondFill as permanently hard-paused for the rest of the market.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_mark_await_second_fill_hard_paused(
+        &self,
+        now: f64,
+        reason: &str,
+        missing_side: Option<OutcomeSide>,
+        t_into_s: f64,
+        time_since_first_side_s: f64,
+        total_cost: f64,
+        q_yes: f64,
+        q_no: f64,
+    ) {
+        let pair_id = self.pair_identity().pair_id;
+        let should_log = self
+            .bot_runtime_state
+            .lock()
+            .map(|mut st| {
+                if st.await_second_fill_hard_paused {
+                    false
+                } else {
+                    st.await_second_fill_hard_paused = true;
+                    st.await_second_fill_rescue_attempted_ts =
+                        st.await_second_fill_rescue_attempted_ts.max(now);
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_log {
+            self.logger.warning(&format!(
+                "[BOT][AWAIT_SECOND_FILL] pair_id={} hard_pause reason={} missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
+                pair_id,
+                reason,
+                missing_side
+                    .map(|side| side.as_str().to_string())
+                    .unwrap_or_else(|| "NA".to_string()),
+                t_into_s.max(0.0),
+                time_since_first_side_s.max(0.0),
+                q_yes,
+                q_no,
+                total_cost.max(0.0)
+            ));
+        }
+    }
+
+    /// Implements note await second fill progress for the BOT runtime.
+    /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
+    /// active market.
+
+    pub(in crate::bot) fn _bot_runtime_note_await_second_fill_progress(
         &self,
         now: f64,
         t_into_s: f64,
@@ -1105,36 +1195,52 @@ impl MakerHedgeCapBot {
         }
         let yes_live = has_side_participation(q_yes, cost_yes);
         let no_live = has_side_participation(q_no, cost_no);
-        let missing_side = bot_runtime_seed_completion_missing_side(q_yes, cost_yes, q_no, cost_no);
+        let missing_side =
+            bot_runtime_await_second_fill_missing_side(q_yes, cost_yes, q_no, cost_no);
         if yes_live && no_live {
-            let _ = self._bot_runtime_cancel_seed_completion_orders(
+            let _ = self._bot_runtime_cancel_await_second_fill_orders(
                 None,
-                "bot_runtime_seed_completion_restored",
+                "bot_runtime_await_second_fill_restored",
             );
-            let should_log = self
+            let transition = self
                 .bot_runtime_state
                 .lock()
                 .map(|mut st| {
-                    if st.seed_completion_both_sides_ts > 0.0 {
-                        false
+                    if st.await_second_fill_second_fill_ts > 0.0 {
+                        None
                     } else {
-                        st.seed_completion_both_sides_ts = now;
-                        st.seed_completion_last_hold_reason.clear();
-                        true
+                        let started_ts = if st.await_second_fill_started_ts > 0.0 {
+                            st.await_second_fill_started_ts
+                        } else {
+                            first_fill_ts
+                        };
+                        let second_fill_ts = if st.await_second_fill_started_ts > 0.0 {
+                            now
+                        } else {
+                            first_fill_ts
+                        };
+                        let latency_s = (second_fill_ts - started_ts).max(0.0);
+                        st.await_second_fill_started_ts = started_ts;
+                        st.await_second_fill_second_fill_ts = second_fill_ts;
+                        st.await_second_fill_missing_side = None;
+                        st.await_second_fill_last_hold_reason.clear();
+                        st.first_fill_to_second_fill_ms = latency_s * 1000.0;
+                        st.second_side_by_15s =
+                            latency_s <= bot_runtime_await_second_fill_target_seconds() + 1e-9;
+                        st.second_side_by_30s =
+                            latency_s <= bot_runtime_await_second_fill_deadline_seconds() + 1e-9;
+                        Some((latency_s, st.second_side_by_15s, st.second_side_by_30s))
                     }
                 })
-                .unwrap_or(false);
-            if should_log {
-                let second_side_latency_s = (now - first_fill_ts).max(0.0);
-                let both_by_30s = (now - self.start_ts as f64) <= 30.0 + 1e-9;
-                let both_by_60s = (now - self.start_ts as f64) <= 60.0 + 1e-9;
+                .unwrap_or(None);
+            if let Some((latency_s, by_15s, by_30s)) = transition {
                 self.logger.info(&format!(
-                    "[BOT][SEED_COMPLETION] pair_id={} success reason=missing_side_restored t_into={:.1}s since_first_side={:.1}s both_by_30s={} both_by_60s={} qYES={:.2} qNO={:.2}",
+                    "[BOT][AWAIT_SECOND_FILL] pair_id={} success reason=missing_side_restored t_into={:.1}s since_first_side={:.1}s second_side_by_15s={} second_side_by_30s={} qYES={:.2} qNO={:.2}",
                     pair_id,
                     t_into_s.max(0.0),
-                    second_side_latency_s,
-                    both_by_30s,
-                    both_by_60s,
+                    latency_s,
+                    by_15s,
+                    by_30s,
                     q_yes,
                     q_no
                 ));
@@ -1144,22 +1250,29 @@ impl MakerHedgeCapBot {
         let Some(missing_side) = missing_side else {
             return;
         };
-        let time_since_first_side_s = (now - first_fill_ts).max(0.0);
         let should_log_start = self
             .bot_runtime_state
             .lock()
             .map(|mut st| {
-                if st.seed_completion_started_ts > 0.0 {
+                if st.await_second_fill_started_ts > 0.0 {
+                    st.await_second_fill_missing_side = Some(missing_side);
                     false
                 } else {
-                    st.seed_completion_started_ts = now;
+                    st.await_second_fill_started_ts = first_fill_ts;
+                    st.await_second_fill_missing_side = Some(missing_side);
                     true
                 }
             })
             .unwrap_or(false);
+        let started_ts = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.await_second_fill_started_ts)
+            .unwrap_or(first_fill_ts);
+        let time_since_first_side_s = (now - started_ts).max(0.0);
         if should_log_start {
             self.logger.info(&format!(
-                "[BOT][SEED_COMPLETION] pair_id={} start reason=startup_asymmetry missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2}",
+                "[BOT][AWAIT_SECOND_FILL] pair_id={} start reason=startup_asymmetry missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2}",
                 pair_id,
                 missing_side.as_str(),
                 t_into_s.max(0.0),
@@ -1168,37 +1281,21 @@ impl MakerHedgeCapBot {
                 q_no
             ));
         }
-        if t_into_s >= 60.0 {
-            let should_log_failure = self
-                .bot_runtime_state
-                .lock()
-                .map(|mut st| {
-                    if st.seed_completion_failure_logged {
-                        false
-                    } else {
-                        st.seed_completion_failure_logged = true;
-                        true
-                    }
-                })
-                .unwrap_or(false);
-            if should_log_failure {
-                self.logger.info(&format!(
-                    "[BOT][SEED_COMPLETION] pair_id={} failure reason=still_one_sided_by_60s missing_side={} t_into={:.1}s since_first_side={:.1}s qYES={:.2} qNO={:.2}",
-                    pair_id,
-                    missing_side.as_str(),
-                    t_into_s.max(0.0),
-                    time_since_first_side_s,
-                    q_yes,
-                    q_no
-                ));
-            }
+        if time_since_first_side_s >= bot_runtime_await_second_fill_target_seconds() - 1e-9 {
+            self._bot_runtime_mark_await_second_fill_target_missed(
+                started_ts,
+                t_into_s,
+                missing_side,
+                q_yes,
+                q_no,
+            );
         }
     }
     /// Implements seed completion handler for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
 
-    pub(in crate::bot) fn _bot_runtime_seed_completion_handler(
+    pub(in crate::bot) fn _bot_runtime_await_second_fill_handler(
         &self,
         now: f64,
         t_into_s: f64,
@@ -1228,32 +1325,48 @@ impl MakerHedgeCapBot {
         let q_no = pair_snapshot.position.q_no;
         let cost_yes = pair_snapshot.position.c_yes;
         let cost_no = pair_snapshot.position.c_no;
-        let Some(missing_side) =
-            bot_runtime_seed_completion_missing_side(q_yes, cost_yes, q_no, cost_no)
-        else {
-            let _ = self._bot_runtime_cancel_seed_completion_orders(
-                None,
-                "bot_runtime_seed_completion_restored",
-            );
-            self._bot_runtime_clear_seed_completion_hold();
-            return;
-        };
         let first_fill_ts = self
             .bot_runtime_state
             .lock()
             .map(|st| st.open_both_first_fill_ts)
             .unwrap_or(0.0);
-        let time_since_first_side_s = if first_fill_ts > 0.0 {
-            (now_ts_f64() - first_fill_ts).max(0.0)
+        let (started_ts, rescue_used, hard_paused, latched_missing_side) = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| {
+                (
+                    if st.await_second_fill_started_ts > 0.0 {
+                        st.await_second_fill_started_ts
+                    } else {
+                        first_fill_ts
+                    },
+                    st.await_second_fill_rescue_used,
+                    st.await_second_fill_hard_paused,
+                    st.await_second_fill_missing_side,
+                )
+            })
+            .unwrap_or((first_fill_ts, false, false, None));
+        let time_since_first_side_s = if started_ts > 0.0 {
+            (now - started_ts).max(0.0)
         } else {
             0.0
+        };
+        let missing_side = latched_missing_side
+            .or_else(|| bot_runtime_await_second_fill_missing_side(q_yes, cost_yes, q_no, cost_no));
+        let Some(missing_side) = missing_side else {
+            let _ = self._bot_runtime_cancel_await_second_fill_orders(
+                None,
+                "bot_runtime_await_second_fill_restored",
+            );
+            self._bot_runtime_clear_await_second_fill_hold();
+            return;
         };
         let (yes_asset, no_asset) = match (&self.yes_asset, &self.no_asset) {
             (Some(yes_asset), Some(no_asset)) => (yes_asset.as_str(), no_asset.as_str()),
             _ => {
-                self._bot_runtime_log_seed_completion_hold(
+                self._bot_runtime_log_await_second_fill_hold(
                     "missing_assets",
-                    missing_side,
+                    Some(missing_side),
                     t_into_s,
                     time_since_first_side_s,
                     total_cost,
@@ -1263,10 +1376,56 @@ impl MakerHedgeCapBot {
                 return;
             }
         };
+        let _ = self._bot_runtime_cancel_order_family(
+            "BOT_OPEN_BOTH",
+            Some(missing_side),
+            "bot_runtime_await_second_fill_filled_side_cancel",
+        );
+        let _ = self._bot_runtime_cancel_pair_build_orders(
+            Some(missing_side),
+            "bot_runtime_await_second_fill_filled_side_cancel",
+        );
+        let _ = self._bot_runtime_cancel_taper_orders(
+            Some(missing_side),
+            "bot_runtime_await_second_fill_filled_side_cancel",
+        );
+        let _ = self._bot_runtime_cancel_await_second_fill_orders(
+            Some(missing_side),
+            "bot_runtime_await_second_fill_filled_side_cancel",
+        );
+        if hard_paused {
+            let _ = self._bot_runtime_cancel_order_family(
+                "BOT_OPEN_BOTH",
+                None,
+                "bot_runtime_await_second_fill_hard_paused",
+            );
+            let _ = self._bot_runtime_cancel_pair_build_orders(
+                None,
+                "bot_runtime_await_second_fill_hard_paused",
+            );
+            let _ = self._bot_runtime_cancel_taper_orders(
+                None,
+                "bot_runtime_await_second_fill_hard_paused",
+            );
+            let _ = self._bot_runtime_cancel_await_second_fill_orders(
+                None,
+                "bot_runtime_await_second_fill_hard_paused",
+            );
+            self._bot_runtime_log_await_second_fill_hold(
+                "hard_paused",
+                Some(missing_side),
+                t_into_s,
+                time_since_first_side_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        }
         if !self.market_connected.load(Ordering::SeqCst) {
-            self._bot_runtime_log_seed_completion_hold(
+            self._bot_runtime_log_await_second_fill_hold(
                 "market_ws_disconnected",
-                missing_side,
+                Some(missing_side),
                 t_into_s,
                 time_since_first_side_s,
                 total_cost,
@@ -1278,9 +1437,9 @@ impl MakerHedgeCapBot {
         if env_bool("REQUIRE_USER_WS_CONNECTED", true)
             && !self.user_connected.load(Ordering::SeqCst)
         {
-            self._bot_runtime_log_seed_completion_hold(
+            self._bot_runtime_log_await_second_fill_hold(
                 "user_ws_disconnected",
-                missing_side,
+                Some(missing_side),
                 t_into_s,
                 time_since_first_side_s,
                 total_cost,
@@ -1298,33 +1457,18 @@ impl MakerHedgeCapBot {
             OutcomeSide::No => "NO",
         };
         let stale_s = self.cfg.market_data_stale_seconds.max(1) as f64;
-        let (missing_quote_ready, missing_quote_reason) = bot_runtime_quote_snapshot_status(
-            missing_label,
-            self._best_bid_ask_with_ts(missing_asset),
-            now_ts_f64(),
-            stale_s,
-        );
+        let deadline_elapsed =
+            time_since_first_side_s >= bot_runtime_await_second_fill_deadline_seconds() - 1e-9;
+        let missing_quote = self._best_bid_ask_with_ts(missing_asset);
+        let (missing_quote_ready, missing_quote_reason) = if deadline_elapsed {
+            bot_runtime_ask_snapshot_status(missing_label, missing_quote, now, stale_s)
+        } else {
+            bot_runtime_quote_snapshot_status(missing_label, missing_quote, now, stale_s)
+        };
         if !missing_quote_ready {
-            self._bot_runtime_log_seed_completion_hold(
+            self._bot_runtime_log_await_second_fill_hold(
                 &format!("missing_side_quote_unready:{missing_quote_reason}"),
-                missing_side,
-                t_into_s,
-                time_since_first_side_s,
-                total_cost,
-                q_yes,
-                q_no,
-            );
-            return;
-        }
-        let missing_bid = match missing_side {
-            OutcomeSide::Yes => self._best_bid_ask(yes_asset).map(|quote| quote.0),
-            OutcomeSide::No => self._best_bid_ask(no_asset).map(|quote| quote.0),
-        }
-        .unwrap_or(0.0);
-        if missing_bid <= 0.0 {
-            self._bot_runtime_log_seed_completion_hold(
-                "zero_missing_bid",
-                missing_side,
+                Some(missing_side),
                 t_into_s,
                 time_since_first_side_s,
                 total_cost,
@@ -1335,38 +1479,286 @@ impl MakerHedgeCapBot {
         }
         let total_usable_budget =
             usable_budget_after_reserve(self.cfg.max_total_cost, self.cfg.reserve_usd);
-        let Some(size_int) = bot_runtime_seed_completion_repair_size(
-            cfg.repair_clip_small,
-            self.cfg.min_shares,
-            missing_bid,
-            total_usable_budget,
-            total_cost,
-        ) else {
-            self._bot_runtime_log_seed_completion_hold(
-                "budget_too_small",
-                missing_side,
-                t_into_s,
-                time_since_first_side_s,
+        let (missing_bid, missing_ask) = missing_quote
+            .map(|(bid, ask, _)| (bid, ask))
+            .unwrap_or((0.0, 0.0));
+        let size_int = if deadline_elapsed {
+            None
+        } else {
+            if missing_bid <= 0.0 {
+                self._bot_runtime_log_await_second_fill_hold(
+                    "zero_missing_bid",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+            let Some(size_int) = bot_runtime_await_second_fill_repair_size(
+                cfg.repair_clip_small,
+                self.cfg.min_shares,
+                missing_bid,
+                total_usable_budget,
                 total_cost,
-                q_yes,
-                q_no,
-            );
-            return;
+            ) else {
+                self._bot_runtime_log_await_second_fill_hold(
+                    "budget_too_small",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            };
+            Some(size_int)
         };
         let key = MakerOrderKey::buy(missing_asset);
         let prev_slot = self._maker_order_slot_get(&key);
-        let live_order_timeout_s = bot_runtime_seed_completion_live_order_timeout_seconds(
+        let live_order_timeout_s = bot_runtime_await_second_fill_live_order_timeout_seconds(
             self.cfg.stale_seconds.max(1) as f64,
         );
-        if maker_slot_family_live(&prev_slot, "BOT_SEED_COMPLETION") {
+        if time_since_first_side_s >= bot_runtime_await_second_fill_target_seconds() - 1e-9 {
+            self._bot_runtime_mark_await_second_fill_target_missed(
+                started_ts,
+                t_into_s,
+                missing_side,
+                q_yes,
+                q_no,
+            );
+        }
+        if time_since_first_side_s >= bot_runtime_await_second_fill_deadline_seconds() - 1e-9 {
+            if maker_slot_family_live(&prev_slot, "BOT_AWAIT_SECOND_FILL")
+                && prev_slot.state != MakerOrderLifecycle::CancelPending
+            {
+                let _ = self._maker_order_request_cancel(
+                    &key,
+                    "bot_runtime_await_second_fill_deadline_cancel",
+                );
+                self._bot_runtime_log_await_second_fill_hold(
+                    "deadline_cancel_missing_side_maker",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+            if prev_slot.order_id.is_some()
+                && matches!(
+                    prev_slot.state,
+                    MakerOrderLifecycle::Working
+                        | MakerOrderLifecycle::SubmitPending
+                        | MakerOrderLifecycle::CancelPending
+                )
+            {
+                if prev_slot.state != MakerOrderLifecycle::CancelPending {
+                    let _ = self._maker_order_request_cancel(
+                        &key,
+                        "bot_runtime_await_second_fill_deadline_handoff",
+                    );
+                }
+                self._bot_runtime_log_await_second_fill_hold(
+                    &format!(
+                        "awaiting_missing_side_deadline_handoff:{}:{}",
+                        prev_slot.origin,
+                        maker_order_lifecycle_label(prev_slot.state)
+                    ),
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+            if rescue_used {
+                self._bot_runtime_mark_await_second_fill_hard_paused(
+                    now,
+                    "still_one_sided_after_rescue",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                self._bot_runtime_log_await_second_fill_hold(
+                    "hard_paused",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+            let rescue_budget_clip = bot_runtime_await_second_fill_repair_size(
+                cfg.repair_clip_small,
+                self.cfg.min_shares,
+                missing_ask,
+                total_usable_budget,
+                total_cost,
+            );
+            let visible_ask_size =
+                self._cum_depth(missing_asset, "asks", missing_ask, Some(1), Some(stale_s));
+            let rescue_size = rescue_budget_clip.and_then(|repair_clip| {
+                bot_runtime_await_second_fill_rescue_size(
+                    repair_clip,
+                    bot_runtime_await_second_fill_unmatched_size(q_yes, q_no),
+                    visible_ask_size,
+                    self.cfg.min_shares,
+                )
+            });
+            let marginal_pair_sum = bot_runtime_await_second_fill_marginal_pair_sum(
+                missing_side,
+                q_yes,
+                q_no,
+                cost_yes,
+                cost_no,
+                missing_ask,
+            );
+            let Some(rescue_size) = rescue_size else {
+                self._bot_runtime_mark_await_second_fill_hard_paused(
+                    now,
+                    "rescue_clip_unavailable",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                self._bot_runtime_log_await_second_fill_hold(
+                    "rescue_clip_unavailable",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            };
+            let Some(marginal_pair_sum) = marginal_pair_sum else {
+                self._bot_runtime_mark_await_second_fill_hard_paused(
+                    now,
+                    "rescue_pair_sum_unavailable",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                self._bot_runtime_log_await_second_fill_hold(
+                    "rescue_pair_sum_unavailable",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            };
+            if marginal_pair_sum >= 1.0 - 1e-9 {
+                self._bot_runtime_mark_await_second_fill_hard_paused(
+                    now,
+                    "rescue_pair_sum_too_high",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                self._bot_runtime_log_await_second_fill_hold(
+                    &format!("rescue_pair_sum_too_high:{marginal_pair_sum:.3}"),
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
+            self._set_pending_entry_reason("BOT_AWAIT_SECOND_FILL_RESCUE");
+            let oid = self._place_taker_bid_fak(
+                missing_asset,
+                missing_ask,
+                rescue_size as f64,
+                Some("FAK"),
+            );
+            if let Some(order_id) = oid.as_deref() {
+                if let Ok(mut st) = self.bot_runtime_state.lock() {
+                    st.await_second_fill_rescue_used = true;
+                    st.await_second_fill_rescue_attempted_ts = now;
+                    st.second_side_by_30s = false;
+                    st.await_second_fill_last_hold_reason.clear();
+                }
+                self._track_order_execution_context(
+                    order_id,
+                    &json!({
+                        "origin": "BOT_AWAIT_SECOND_FILL_RESCUE",
+                        "bot_runtime_await_second_fill_rescue": true,
+                        "missing_side": missing_side.as_str(),
+                    }),
+                );
+                self.logger.warning(&format!(
+                    "[BOT][AWAIT_SECOND_FILL] pair_id={} rescue_attempted missing_side={} ask={:.3} clip={} visible_ask={:.2} marginal_pair_sum={:.3} t_into={:.1}s since_first_side={:.1}s",
+                    pair_id,
+                    missing_side.as_str(),
+                    missing_ask,
+                    rescue_size,
+                    visible_ask_size.max(0.0),
+                    marginal_pair_sum,
+                    t_into_s.max(0.0),
+                    time_since_first_side_s
+                ));
+                self._bot_runtime_clear_await_second_fill_hold();
+            } else {
+                self._bot_runtime_mark_await_second_fill_hard_paused(
+                    now,
+                    "rescue_submit_failed",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                self._bot_runtime_log_await_second_fill_hold(
+                    "rescue_submit_failed",
+                    Some(missing_side),
+                    t_into_s,
+                    time_since_first_side_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+            }
+            return;
+        }
+        if maker_slot_family_live(&prev_slot, "BOT_AWAIT_SECOND_FILL") {
             let age_s = (now - prev_slot.last_submit_ts).max(0.0);
             if age_s >= live_order_timeout_s
                 && prev_slot.state != MakerOrderLifecycle::CancelPending
             {
-                let _ = self._maker_order_request_cancel(&key, "bot_runtime_seed_completion_stale");
-                self._bot_runtime_log_seed_completion_hold(
+                let _ =
+                    self._maker_order_request_cancel(&key, "bot_runtime_await_second_fill_stale");
+                self._bot_runtime_log_await_second_fill_hold(
                     "missing_side_live_order_stale_cancel",
-                    missing_side,
+                    Some(missing_side),
                     t_into_s,
                     time_since_first_side_s,
                     total_cost,
@@ -1374,12 +1766,12 @@ impl MakerHedgeCapBot {
                     q_no,
                 );
             } else {
-                self._bot_runtime_log_seed_completion_hold(
+                self._bot_runtime_log_await_second_fill_hold(
                     &format!(
                         "awaiting_missing_side_live_order:{}",
                         maker_order_lifecycle_label(prev_slot.state)
                     ),
-                    missing_side,
+                    Some(missing_side),
                     t_into_s,
                     time_since_first_side_s,
                     total_cost,
@@ -1399,15 +1791,15 @@ impl MakerHedgeCapBot {
         {
             if prev_slot.state != MakerOrderLifecycle::CancelPending {
                 let _ =
-                    self._maker_order_request_cancel(&key, "bot_runtime_seed_completion_handoff");
+                    self._maker_order_request_cancel(&key, "bot_runtime_await_second_fill_handoff");
             }
-            self._bot_runtime_log_seed_completion_hold(
+            self._bot_runtime_log_await_second_fill_hold(
                 &format!(
                     "awaiting_missing_side_handoff:{}:{}",
                     prev_slot.origin,
                     maker_order_lifecycle_label(prev_slot.state)
                 ),
-                missing_side,
+                Some(missing_side),
                 t_into_s,
                 time_since_first_side_s,
                 total_cost,
@@ -1416,15 +1808,31 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        let oid =
-            self._maker_order_upsert_gtc(&key, missing_bid, size_int as f64, "BOT_SEED_COMPLETION");
+        let Some(size_int) = size_int else {
+            self._bot_runtime_log_await_second_fill_hold(
+                "maker_size_unavailable",
+                Some(missing_side),
+                t_into_s,
+                time_since_first_side_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            return;
+        };
+        let oid = self._maker_order_upsert_gtc(
+            &key,
+            missing_bid,
+            size_int as f64,
+            "BOT_AWAIT_SECOND_FILL",
+        );
         if let Some(order_id) = oid.as_deref() {
             let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
                 || prev_slot.state != MakerOrderLifecycle::Working;
             if is_new_submit {
-                self._bot_runtime_clear_seed_completion_hold();
+                self._bot_runtime_clear_await_second_fill_hold();
                 self.logger.info(&format!(
-                    "[BOT][SEED_COMPLETION] pair_id={} submit missing_side={} bid={:.3} clip={} t_into={:.1}s since_first_side={:.1}s budget_scope=whole_window gates_bypassed=hard_skew,shape_target,cpp",
+                    "[BOT][AWAIT_SECOND_FILL] pair_id={} submit missing_side={} bid={:.3} clip={} t_into={:.1}s since_first_side={:.1}s budget_scope=whole_window maker_first=true",
                     pair_id,
                     missing_side.as_str(),
                     missing_bid,
@@ -1433,12 +1841,12 @@ impl MakerHedgeCapBot {
                     time_since_first_side_s
                 ));
             } else {
-                self._bot_runtime_clear_seed_completion_hold();
+                self._bot_runtime_clear_await_second_fill_hold();
             }
         } else {
-            self._bot_runtime_log_seed_completion_hold(
+            self._bot_runtime_log_await_second_fill_hold(
                 "no_missing_side_order_live",
-                missing_side,
+                Some(missing_side),
                 t_into_s,
                 time_since_first_side_s,
                 total_cost,
