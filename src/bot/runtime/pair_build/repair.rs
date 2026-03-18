@@ -7,7 +7,7 @@ use super::costs::{
 use super::decision::{
     bot_runtime_lighter_repair_opposite_order_policy,
     bot_runtime_pair_build_buy_order_is_economically_invalid,
-    bot_runtime_pair_build_lighter_live_order_timeout_seconds,
+    bot_runtime_pair_build_lighter_live_order_timeout_seconds, bot_runtime_repair_clip_choice,
 };
 use super::state::{BotRuntimePairBuildMarketContext, BotRuntimePairBuildPlan};
 
@@ -73,6 +73,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_repair_policy(
     remaining_budget: f64,
     min_shares: f64,
     min_maker_notional: f64,
+    cfg: &BotRuntimeConfigSnapshot,
 ) -> Option<BotRuntimeLighterRepairPolicy> {
     if decision.mode != BotRuntimePairBuildMode::LighterSideFirst {
         return None;
@@ -110,7 +111,28 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_repair_policy(
             )),
         });
     }
-    let clip = sizing.exact_gap_clip.min(max_affordable_clip);
+    let clip = bot_runtime_repair_clip_choice(
+        (decision.clip.max(0) as f64).min(max_affordable_clip as f64),
+        decision.qty_gap,
+        Some(sizing.exact_gap_clip as f64),
+        Some(sizing.min_valid_clip as f64),
+        cfg,
+    )
+    .map(|(clip, _)| clip as i64)
+    .unwrap_or(0);
+    if clip <= 0 {
+        return Some(BotRuntimeLighterRepairPolicy {
+            clip: 0,
+            exact_gap_clip: sizing.exact_gap_clip,
+            min_valid_clip: sizing.min_valid_clip,
+            rounded_up_min_valid: false,
+            clipped_to_budget: true,
+            hold_reason: Some(format!(
+                "lighter_side_repair_clip_unavailable:{}:{}:{:.2}",
+                max_affordable_clip, sizing.exact_gap_clip, side_price
+            )),
+        });
+    }
     Some(BotRuntimeLighterRepairPolicy {
         clip,
         exact_gap_clip: sizing.exact_gap_clip,
@@ -161,7 +183,14 @@ pub(in crate::bot) fn bot_runtime_pair_build_repair_reserve_policy(
     if sizing.min_valid_clip > sizing.exact_gap_clip {
         return None;
     }
-    let executable_repair_clip = bot_runtime_pair_build_executable_repair_clip(sizing);
+    let executable_repair_clip = bot_runtime_repair_clip_choice(
+        decision.qty_gap,
+        decision.qty_gap,
+        Some(sizing.exact_gap_clip as f64),
+        Some(sizing.min_valid_clip as f64),
+        cfg,
+    )
+    .map(|(clip, _)| clip as i64)?;
     let reserve_buffer_usd = cfg.repair_reserve_buffer_usd.max(0.0);
     let required_repair_cost = executable_repair_clip as f64 * lighter_price.max(0.0);
     let total_reserved_budget = required_repair_cost + reserve_buffer_usd;
@@ -219,8 +248,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_clip_after_cost_quality(
     let lighter_clip = requested_clip.min(max_gap_clip);
     match cpp_hint {
         BotRuntimePairBuildCppHint::Normal => lighter_clip,
-        BotRuntimePairBuildCppHint::Medium => lighter_clip.min(cfg.repair_clip_small.max(min_lot)),
-        BotRuntimePairBuildCppHint::Small => lighter_clip.min(min_lot),
+        BotRuntimePairBuildCppHint::Medium => lighter_clip.min(cfg.clip_ladder[1].max(min_lot)),
+        BotRuntimePairBuildCppHint::Small => lighter_clip.min(cfg.clip_ladder[0].max(min_lot)),
     }
 }
 
@@ -265,10 +294,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_clip_after_projected_cost(
     {
         return requested_clip;
     }
-    let reduced_clip = round_down_to_lot(
-        requested_clip.min(cfg.repair_clip_small.max(min_lot)),
-        min_lot,
-    );
+    let reduced_clip =
+        round_down_to_lot(requested_clip.min(cfg.clip_ladder[0].max(min_lot)), min_lot);
     if reduced_clip + 1e-9 < requested_clip {
         reduced_clip
     } else {
@@ -727,11 +754,14 @@ impl MakerHedgeCapBot {
                     .unwrap_or(false);
                 let bid_cap_applied = (repair_original_bid - repair_bid_capped).abs() > 1e-9;
                 self.logger.info(&format!(
-                    "[BOT][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                    "[BOT][PAIR_BUILD] submit mode={} side={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} requested_clip={:.0} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} exact_gap_clip={} min_valid_repair_clip={} rounded_up_min_valid={} clipped_to_budget={} bid_cap_applied={} bid={:.3} original_bid={:.3} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} qty_gap={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                     decision.mode.as_str(),
                     active_side.as_str(),
                     decision.clip,
                     decision.clip_bucket,
+                    decision.selected_rung.as_str(),
+                    decision.requested_rung.as_str(),
+                    decision.requested_large_clip,
                     decision.requested_clip,
                     decision.cpp_hint.as_str(),
                     decision.price_zone.as_str(),
@@ -753,6 +783,12 @@ impl MakerHedgeCapBot {
                     bid_cap_applied,
                     repair_bid_capped,
                     repair_original_bid,
+                    decision.green_conditions_met,
+                    decision.green_both_sides_filled,
+                    decision.green_price_ok,
+                    decision.green_imbalance_ok,
+                    decision.green_time_ok,
+                    decision.green_budget_ok,
                     t_into_s.max(0.0),
                     q_yes,
                     q_no,

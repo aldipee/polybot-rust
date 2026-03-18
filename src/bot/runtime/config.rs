@@ -23,10 +23,8 @@ pub(in crate::bot) struct BotRuntimeConfigSnapshot {
     pub(in crate::bot) imbalance_target_fraction: f64,
     pub(in crate::bot) imbalance_warning_fraction: f64,
     pub(in crate::bot) imbalance_disable_fraction: f64,
-    pub(in crate::bot) seed_clip_small: f64,
-    pub(in crate::bot) repair_clip_small: f64,
+    pub(in crate::bot) clip_ladder: [f64; 4],
     pub(in crate::bot) repair_reserve_buffer_usd: f64,
-    pub(in crate::bot) large_clip_ladder: [f64; 2],
     pub(in crate::bot) buy_only_normal_flow: bool,
     pub(in crate::bot) tail_cap_mid_start_seconds: f64,
     pub(in crate::bot) tail_cap_late_start_seconds: f64,
@@ -63,10 +61,8 @@ pub(in crate::bot) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot 
         imbalance_target_fraction: 0.07,
         imbalance_warning_fraction: 0.12,
         imbalance_disable_fraction: 0.20,
-        seed_clip_small: 15.0,
-        repair_clip_small: 15.0,
+        clip_ladder: [12.0, 20.0, 40.0, 80.0],
         repair_reserve_buffer_usd: 1.0,
-        large_clip_ladder: [40.0, 80.0],
         buy_only_normal_flow: true,
         tail_cap_mid_start_seconds: 210.0,
         tail_cap_late_start_seconds: 240.0,
@@ -121,11 +117,11 @@ where
 /// Implements env clip ladder large for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_env_clip_ladder_large<F>(
+pub(in crate::bot) fn bot_runtime_env_clip_ladder<F>(
     get: &mut F,
     key: &str,
-    default: [f64; 2],
-) -> [f64; 2]
+    default: [f64; 4],
+) -> [f64; 4]
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -138,11 +134,11 @@ where
         .filter_map(|token| token.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect();
-    if values.len() != 2 {
+    if values.len() != 4 {
         return default;
     }
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    [values[0], values[1]]
+    [values[0], values[1], values[2], values[3]]
 }
 /// Implements config from reader for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -169,17 +165,12 @@ where
         "BOT_OPEN_BOTH_ALLOW_SINGLE_LATE_SEED",
         cfg.open_both_allow_single_late_seed,
     );
-    cfg.seed_clip_small =
-        bot_runtime_env_float(&mut get, "BOT_SEED_CLIP_SMALL", cfg.seed_clip_small);
-    cfg.repair_clip_small =
-        bot_runtime_env_float(&mut get, "BOT_REPAIR_CLIP_SMALL", cfg.repair_clip_small);
+    cfg.clip_ladder = bot_runtime_env_clip_ladder(&mut get, "BOT_CLIP_LADDER", cfg.clip_ladder);
     cfg.repair_reserve_buffer_usd = bot_runtime_env_float(
         &mut get,
         "BOT_REPAIR_RESERVE_BUFFER_USD",
         cfg.repair_reserve_buffer_usd,
     );
-    cfg.large_clip_ladder =
-        bot_runtime_env_clip_ladder_large(&mut get, "BOT_CLIP_LADDER_LARGE", cfg.large_clip_ladder);
     cfg.seed_budget_min_fraction = bot_runtime_env_float(
         &mut get,
         "BOT_BUDGET_SEED_MIN_FRACTION",
@@ -351,6 +342,22 @@ pub(in crate::bot) fn bot_runtime_validate_config(
         || cfg.imbalance_disable_fraction > 1.0
     {
         return Err("invalid_imbalance_disable_fraction");
+    }
+    if cfg
+        .clip_ladder
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err("invalid_clip_ladder");
+    }
+    if !(cfg.clip_ladder[0] + 1e-9 < cfg.clip_ladder[1]
+        && cfg.clip_ladder[1] + 1e-9 < cfg.clip_ladder[2]
+        && cfg.clip_ladder[2] + 1e-9 < cfg.clip_ladder[3])
+    {
+        return Err("invalid_clip_ladder");
+    }
+    if cfg.clip_ladder[3] > 80.0 + 1e-9 {
+        return Err("clip_ladder_exceeds_hard_cap");
     }
     if !cfg.tail_cap_mid_start_seconds.is_finite() || cfg.tail_cap_mid_start_seconds < 0.0 {
         return Err("invalid_tail_cap_mid_start_seconds");

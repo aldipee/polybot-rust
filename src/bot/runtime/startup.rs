@@ -14,7 +14,7 @@ impl MakerHedgeCapBot {
     pub(in crate::bot) fn _log_bot_runtime_cfg(&self) {
         let cfg = self._bot_runtime_cfg();
         self.logger.info(&format!(
-            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% seed_clip={:.0} repair_clip={:.0} large_clips={:.0}/{:.0} await_second_fill_target={:.0}s await_second_fill_deadline={:.0}s await_second_fill_rescue_once=true taper_start={:.0}s final_quiet={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
+            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% clip_ladder={:.0}/{:.0}/{:.0}/{:.0} await_second_fill_target={:.0}s await_second_fill_deadline={:.0}s await_second_fill_rescue_once=true taper_start={:.0}s final_quiet={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
             self.exec_mode,
             cfg.phase_controller,
             cfg.prearm_lead_seconds,
@@ -31,10 +31,10 @@ impl MakerHedgeCapBot {
             cfg.late_budget_max_fraction * 100.0,
             cfg.taper_budget_min_fraction * 100.0,
             cfg.taper_budget_max_fraction * 100.0,
-            cfg.seed_clip_small,
-            cfg.repair_clip_small,
-            cfg.large_clip_ladder[0],
-            cfg.large_clip_ladder[1],
+            cfg.clip_ladder[0],
+            cfg.clip_ladder[1],
+            cfg.clip_ladder[2],
+            cfg.clip_ladder[3],
             bot_runtime_await_second_fill_target_seconds(),
             bot_runtime_await_second_fill_deadline_seconds(),
             cfg.taper_start_seconds,
@@ -723,7 +723,7 @@ impl MakerHedgeCapBot {
             return;
         }
         let Some(size_int) = bot_runtime_open_both_seed_size(
-            cfg.seed_clip_small,
+            cfg.clip_ladder[0],
             self.cfg.min_shares,
             pair_sum,
             total_cost + budget_snapshot.remaining_to_max_cost,
@@ -1498,7 +1498,7 @@ impl MakerHedgeCapBot {
                 return;
             }
             let Some(size_int) = bot_runtime_await_second_fill_repair_size(
-                cfg.repair_clip_small,
+                cfg.clip_ladder[0],
                 self.cfg.min_shares,
                 missing_bid,
                 total_usable_budget,
@@ -1602,7 +1602,7 @@ impl MakerHedgeCapBot {
                 return;
             }
             let rescue_budget_clip = bot_runtime_await_second_fill_repair_size(
-                cfg.repair_clip_small,
+                cfg.clip_ladder[0],
                 self.cfg.min_shares,
                 missing_ask,
                 total_usable_budget,

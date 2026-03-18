@@ -19,6 +19,7 @@ impl MakerHedgeCapBot {
         cfg: &BotRuntimeConfigSnapshot,
     ) -> Result<BotRuntimePairBuildPlan, String> {
         let mut decision = bot_runtime_pair_build_decision(
+            t_into_s,
             q_yes,
             q_no,
             cost_yes,
@@ -68,12 +69,19 @@ impl MakerHedgeCapBot {
                 budget_snapshot.remaining_to_max_cost,
                 self.cfg.min_shares,
                 self.min_maker_notional,
+                cfg,
             );
             if let Some(policy) = policy.as_ref() {
                 if policy.hold_reason.is_none() && policy.clip > 0 && policy.clip != decision.clip {
-                    decision.clip = policy.clip;
-                    decision.clip_bucket =
-                        bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
+                    decision = bot_runtime_pair_build_decision_with_selected_clip(
+                        decision,
+                        policy.clip,
+                        q_yes,
+                        q_no,
+                        budget_snapshot.remaining_to_max_cost,
+                        t_into_s,
+                        cfg,
+                    );
                 }
             }
             policy
@@ -95,9 +103,15 @@ impl MakerHedgeCapBot {
             );
             if let Some(policy) = policy.as_ref() {
                 if policy.clip > 0 && policy.clip < decision.clip {
-                    decision.clip = policy.clip;
-                    decision.clip_bucket =
-                        bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
+                    decision = bot_runtime_pair_build_decision_with_selected_clip(
+                        decision,
+                        policy.clip,
+                        q_yes,
+                        q_no,
+                        budget_snapshot.remaining_to_max_cost,
+                        t_into_s,
+                        cfg,
+                    );
                 }
             }
             policy
@@ -119,9 +133,15 @@ impl MakerHedgeCapBot {
             );
             if let Some(policy) = policy {
                 if policy.clip > 0 && policy.clip < decision.clip {
-                    decision.clip = policy.clip;
-                    decision.clip_bucket =
-                        bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
+                    decision = bot_runtime_pair_build_decision_with_selected_clip(
+                        decision,
+                        policy.clip,
+                        q_yes,
+                        q_no,
+                        budget_snapshot.remaining_to_max_cost,
+                        t_into_s,
+                        cfg,
+                    );
                 }
             }
             policy
@@ -146,9 +166,15 @@ impl MakerHedgeCapBot {
             );
             if let Some(policy) = policy.as_ref() {
                 if policy.clip > 0 && policy.clip < decision.clip {
-                    decision.clip = policy.clip;
-                    decision.clip_bucket =
-                        bot_runtime_pair_build_clip_bucket(policy.clip as f64, cfg);
+                    decision = bot_runtime_pair_build_decision_with_selected_clip(
+                        decision,
+                        policy.clip,
+                        q_yes,
+                        q_no,
+                        budget_snapshot.remaining_to_max_cost,
+                        t_into_s,
+                        cfg,
+                    );
                 }
             }
             policy

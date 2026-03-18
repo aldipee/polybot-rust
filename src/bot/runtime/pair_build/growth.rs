@@ -91,8 +91,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_optional_buy_policy(
         None
     };
     let lot = min_shares.max(1.0);
-    let small_clip_cap =
-        round_down_to_lot(cfg.repair_clip_small.max(cfg.seed_clip_small).max(lot), lot);
+    let small_clip_cap = round_down_to_lot(cfg.clip_ladder[0].max(lot), lot);
     let reduced_clip = round_down_to_lot(current_clip.min(small_clip_cap), lot);
     let weak_edge_reduced = hold_reason.is_none()
         && (!snapshot_reliable || min_snapshot_edge + 1e-9 < 0.05)
@@ -455,10 +454,13 @@ impl MakerHedgeCapBot {
                 }
             }
             self.logger.info(&format!(
-                "[BOT][PAIR_BUILD] submit mode={} clip={} clip_bucket={} requested_clip={:.0} cpp_hint={} paired_cost_band={} projected_paired_cost={:.3} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} clipped_for_band={} optional_buy_guard={} optional_buy_edge_source={} min_snapshot_edge={:.3} below_snapshot_optional={} repair_reserve_side={} likely_repair_clip={} total_reserved_budget={:.2} clipped_for_repair_reserve={} bad_regime_shutdown={} bad_regime_ratio={:.3} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} current_base={:.2} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
+                "[BOT][PAIR_BUILD] submit mode={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} requested_clip={:.0} cpp_hint={} paired_cost_band={} projected_paired_cost={:.3} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} clipped_for_band={} optional_buy_guard={} optional_buy_edge_source={} min_snapshot_edge={:.3} below_snapshot_optional={} repair_reserve_side={} likely_repair_clip={} total_reserved_budget={:.2} clipped_for_repair_reserve={} bad_regime_shutdown={} bad_regime_ratio={:.3} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} pair_sum={:.3} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={} pair_coverage={:.3} skew={:.3} current_base={:.2} inventory_vwap_sum={:.3} market_snapshot_vwap_sum={:.3}",
                 decision.mode.as_str(),
                 decision.clip,
                 decision.clip_bucket,
+                decision.selected_rung.as_str(),
+                decision.requested_rung.as_str(),
+                decision.requested_large_clip,
                 decision.requested_clip,
                 decision.cpp_hint.as_str(),
                 paired_cost_band,
@@ -488,6 +490,12 @@ impl MakerHedgeCapBot {
                 clipped_for_repair_reserve,
                 plan.bad_regime_shutdown.0,
                 plan.bad_regime_shutdown.1,
+                decision.green_conditions_met,
+                decision.green_both_sides_filled,
+                decision.green_price_ok,
+                decision.green_imbalance_ok,
+                decision.green_time_ok,
+                decision.green_budget_ok,
                 t_into_s.max(0.0),
                 submit_elapsed_ms,
                 q_yes,

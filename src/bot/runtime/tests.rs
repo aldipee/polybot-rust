@@ -253,6 +253,7 @@ fn bot_runtime_config_defaults_include_exact_open_time_targets() {
     assert_eq!(cfg.imbalance_target_fraction, 0.07);
     assert_eq!(cfg.imbalance_warning_fraction, 0.12);
     assert_eq!(cfg.imbalance_disable_fraction, 0.20);
+    assert_eq!(cfg.clip_ladder, [12.0, 20.0, 40.0, 80.0]);
 }
 
 #[test]
@@ -298,6 +299,58 @@ fn bot_runtime_validate_config_rejects_invalid_open_time_targets() {
         bot_runtime_validate_config(&cfg),
         Err("invalid_imbalance_disable_fraction")
     );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.clip_ladder = [12.0, 12.0, 40.0, 80.0];
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("invalid_clip_ladder")
+    );
+
+    let mut cfg = bot_runtime_config_defaults();
+    cfg.clip_ladder = [12.0, 20.0, 40.0, 81.0];
+    assert_eq!(
+        bot_runtime_validate_config(&cfg),
+        Err("clip_ladder_exceeds_hard_cap")
+    );
+}
+
+#[test]
+fn bot_runtime_config_reader_uses_bot_clip_ladder_and_ignores_legacy_split_clip_envs() {
+    let env = HashMap::from([
+        ("BOT_CLIP_LADDER".to_string(), "14,22,44,80".to_string()),
+        ("BOT_SEED_CLIP_SMALL".to_string(), "99".to_string()),
+        ("BOT_REPAIR_CLIP_SMALL".to_string(), "77".to_string()),
+        ("BOT_CLIP_LADDER_LARGE".to_string(), "55,80".to_string()),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| env.get(key).cloned());
+    assert_eq!(cfg.clip_ladder, [14.0, 22.0, 44.0, 80.0]);
+
+    let legacy_only = HashMap::from([
+        ("BOT_SEED_CLIP_SMALL".to_string(), "99".to_string()),
+        ("BOT_REPAIR_CLIP_SMALL".to_string(), "77".to_string()),
+        ("BOT_CLIP_LADDER_LARGE".to_string(), "55,80".to_string()),
+    ]);
+    let cfg = bot_runtime_config_from_reader(|key| legacy_only.get(key).cloned());
+    assert_eq!(cfg.clip_ladder, [12.0, 20.0, 40.0, 80.0]);
+}
+
+#[test]
+fn taper_maintenance_decision_downshifts_paired_growth_to_min_lot() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = bot_runtime_pair_build_decision(
+        60.0, 40.0, 40.0, 12.0, 12.0, 0.30, 0.32, 0.30, 0.32, 500.0, 24.0, 1.0, 1.0, &cfg, false,
+    )
+    .expect("green paired growth should start at the large rung before taper maintenance");
+    assert_eq!(decision.clip, 80);
+
+    let tapered =
+        bot_runtime_taper_maintenance_decision(decision, 5.0, 40.0, 40.0, 100.0, 250.0, &cfg);
+    assert_eq!(tapered.mode, BotRuntimePairBuildMode::PairedGrowth);
+    assert_eq!(tapered.clip, 5);
+    assert_eq!(tapered.selected_rung, BotRuntimeClipRung::Seed);
+    assert_eq!(tapered.clip_bucket, "small");
+    assert!(!tapered.green_time_ok);
 }
 
 #[test]
@@ -913,7 +966,8 @@ fn imbalance_repair_unavailable_cancels_live_taper_orders() {
 
 #[test]
 fn taper_handler_blocks_balanced_add_at_stop_add_zone_after_runtime_gating() {
-    let bot = make_bot_runtime_test_bot();
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.max_total_cost = 500.0;
     let now = now_ts_f64();
     set_pair_quotes(&bot, 0.50, 0.52, 0.50, 0.52, now);
 
@@ -926,9 +980,13 @@ fn taper_handler_blocks_balanced_add_at_stop_add_zone_after_runtime_gating() {
     drop(state);
 
     let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
-    assert!(runtime_state
-        .taper_last_hold_reason
-        .starts_with("hold:price_zone_stop_add:balanced_add:1.000"));
+    assert!(
+        runtime_state
+            .taper_last_hold_reason
+            .starts_with("hold:price_zone_stop_add:balanced_add:1.000"),
+        "actual_reason={}",
+        runtime_state.taper_last_hold_reason
+    );
 }
 
 #[test]

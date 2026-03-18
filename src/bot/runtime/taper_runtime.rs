@@ -272,6 +272,7 @@ impl MakerHedgeCapBot {
             return;
         }
         let decision = match bot_runtime_pair_build_decision(
+            t_into_s,
             q_yes,
             q_no,
             cost_yes,
@@ -287,7 +288,17 @@ impl MakerHedgeCapBot {
             cfg,
             false,
         )
-        .map(|decision| bot_runtime_taper_maintenance_decision(decision, self.cfg.min_shares))
+        .map(|decision| {
+            bot_runtime_taper_maintenance_decision(
+                decision,
+                self.cfg.min_shares,
+                q_yes,
+                q_no,
+                budget_snapshot.remaining_to_max_cost,
+                t_into_s,
+                cfg,
+            )
+        })
         .and_then(|decision| {
             if let Some(reason) = bot_runtime_pair_build_price_zone_hold_reason(
                 decision.price_zone,
@@ -574,12 +585,15 @@ impl MakerHedgeCapBot {
                 if is_new_submit {
                     self._bot_runtime_note_taper_submit(t_into_s, cfg);
                     self.logger.info(&format!(
-                        "[BOT][TAPER] submit taper_mode={} mode={} side={} clip={} clip_bucket={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
+                        "[BOT][TAPER] submit taper_mode={} mode={} side={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} residual_unit_cost={} lagging_side_quote={} heavier_side={} current_base={:.2} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
                         taper_mode.as_str(),
                         decision.mode.as_str(),
                         active_side.as_str(),
                         decision.clip,
                         decision.clip_bucket,
+                        decision.selected_rung.as_str(),
+                        decision.requested_rung.as_str(),
+                        decision.requested_large_clip,
                         decision.cpp_hint.as_str(),
                         decision.price_zone.as_str(),
                         decision.marginal_cost_mode.as_str(),
@@ -593,10 +607,17 @@ impl MakerHedgeCapBot {
                             .map(|value| format!("{value:.3}"))
                             .unwrap_or_else(|| "NA".to_string()),
                         active_side.opposite().as_str(),
+                        decision.current_base,
                         late_action_policy.current_tail_size,
                         late_action_policy.projected_tail_size,
                         late_action_policy.current_floor,
                         late_action_policy.projected_floor,
+                        decision.green_conditions_met,
+                        decision.green_both_sides_filled,
+                        decision.green_price_ok,
+                        decision.green_imbalance_ok,
+                        decision.green_time_ok,
+                        decision.green_budget_ok,
                         t_into_s.max(0.0),
                         q_yes,
                         q_no,
@@ -795,11 +816,14 @@ impl MakerHedgeCapBot {
         if yes_new || no_new {
             self._bot_runtime_note_taper_submit(t_into_s, cfg);
             self.logger.info(&format!(
-                "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
+                "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} current_base={:.2} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",
                 taper_mode.as_str(),
                 decision.mode.as_str(),
                 decision.clip,
                 decision.clip_bucket,
+                decision.selected_rung.as_str(),
+                decision.requested_rung.as_str(),
+                decision.requested_large_clip,
                 decision.cpp_hint.as_str(),
                 decision.price_zone.as_str(),
                 decision.marginal_cost_mode.as_str(),
@@ -815,10 +839,17 @@ impl MakerHedgeCapBot {
                     .lagging_side_quote
                     .map(|value| format!("{value:.3}"))
                     .unwrap_or_else(|| "NA".to_string()),
+                decision.current_base,
                 late_action_policy.current_tail_size,
                 late_action_policy.projected_tail_size,
                 late_action_policy.current_floor,
                 late_action_policy.projected_floor,
+                decision.green_conditions_met,
+                decision.green_both_sides_filled,
+                decision.green_price_ok,
+                decision.green_imbalance_ok,
+                decision.green_time_ok,
+                decision.green_budget_ok,
                 t_into_s.max(0.0),
                 submit_elapsed_ms,
                 q_yes,

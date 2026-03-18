@@ -1,7 +1,6 @@
 use super::super::*;
 use super::costs::{
     bot_runtime_pair_build_balanced_add_effective_marginal_cost,
-    bot_runtime_pair_build_price_zone_hold_reason,
     bot_runtime_pair_build_projected_paired_cost_band,
     bot_runtime_pair_build_rebalance_effective_marginal_cost,
 };
@@ -13,19 +12,239 @@ pub(in crate::bot) fn bot_runtime_pair_build_clip_bucket(
     clip: f64,
     cfg: &BotRuntimeConfigSnapshot,
 ) -> &'static str {
-    if clip + 1e-9 >= cfg.large_clip_ladder[1].max(cfg.large_clip_ladder[0]) {
+    if clip + 1e-9 >= cfg.clip_ladder[2] {
         "large"
-    } else if clip + 1e-9 >= cfg.large_clip_ladder[0].max(cfg.seed_clip_small) {
+    } else if clip + 1e-9 >= cfg.clip_ladder[1] {
         "medium"
     } else {
         "small"
     }
 }
 
+pub(in crate::bot) fn bot_runtime_clip_rung_value(
+    rung: BotRuntimeClipRung,
+    cfg: &BotRuntimeConfigSnapshot,
+    exact_gap_clip: Option<f64>,
+) -> f64 {
+    match rung {
+        BotRuntimeClipRung::Seed => cfg.clip_ladder[0],
+        BotRuntimeClipRung::Normal => cfg.clip_ladder[1],
+        BotRuntimeClipRung::Large1 => cfg.clip_ladder[2],
+        BotRuntimeClipRung::Large2 => cfg.clip_ladder[3],
+        BotRuntimeClipRung::ExactGapRepair => exact_gap_clip.unwrap_or(0.0).max(0.0),
+    }
+}
+
+fn bot_runtime_growth_requested_rung(
+    current_base: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> BotRuntimeClipRung {
+    if current_base + 1e-9 >= cfg.clip_ladder[2] {
+        BotRuntimeClipRung::Large2
+    } else if current_base + 1e-9 >= cfg.clip_ladder[1] {
+        BotRuntimeClipRung::Large1
+    } else {
+        BotRuntimeClipRung::Normal
+    }
+}
+
+fn bot_runtime_growth_cpp_clip_cap(
+    requested_clip: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+    cpp_hint: BotRuntimePairBuildCppHint,
+    under_min_target: bool,
+) -> f64 {
+    match cpp_hint {
+        BotRuntimePairBuildCppHint::Normal => requested_clip,
+        BotRuntimePairBuildCppHint::Medium => requested_clip.min(cfg.clip_ladder[2]),
+        BotRuntimePairBuildCppHint::Small => {
+            if under_min_target {
+                requested_clip.min(cfg.clip_ladder[2])
+            } else {
+                requested_clip.min(cfg.clip_ladder[1])
+            }
+        }
+    }
+}
+
+fn bot_runtime_repair_cpp_clip_cap(
+    requested_clip: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+    cpp_hint: BotRuntimePairBuildCppHint,
+) -> f64 {
+    match cpp_hint {
+        BotRuntimePairBuildCppHint::Normal => requested_clip,
+        BotRuntimePairBuildCppHint::Medium => requested_clip.min(cfg.clip_ladder[1]),
+        BotRuntimePairBuildCppHint::Small => requested_clip.min(cfg.clip_ladder[0]),
+    }
+}
+
+fn bot_runtime_growth_clip_choice(
+    max_clip: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> Option<(f64, BotRuntimeClipRung)> {
+    for (clip, rung) in [
+        (cfg.clip_ladder[3], BotRuntimeClipRung::Large2),
+        (cfg.clip_ladder[2], BotRuntimeClipRung::Large1),
+        (cfg.clip_ladder[1], BotRuntimeClipRung::Normal),
+        (cfg.clip_ladder[0], BotRuntimeClipRung::Seed),
+    ] {
+        if clip <= max_clip + 1e-9 {
+            return Some((clip, rung));
+        }
+    }
+    None
+}
+
+pub(in crate::bot) fn bot_runtime_repair_clip_choice(
+    max_clip: f64,
+    qty_gap: f64,
+    exact_gap_clip: Option<f64>,
+    min_valid_clip: Option<f64>,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> Option<(f64, BotRuntimeClipRung)> {
+    let gap = qty_gap.max(0.0);
+    let min_valid_clip = min_valid_clip.unwrap_or(0.0).max(0.0);
+    for (clip, rung) in [
+        (cfg.clip_ladder[3], BotRuntimeClipRung::Large2),
+        (cfg.clip_ladder[2], BotRuntimeClipRung::Large1),
+        (cfg.clip_ladder[1], BotRuntimeClipRung::Normal),
+        (cfg.clip_ladder[0], BotRuntimeClipRung::Seed),
+    ] {
+        if clip <= max_clip + 1e-9 && clip <= gap + 1e-9 && clip + 1e-9 >= min_valid_clip {
+            return Some((clip, rung));
+        }
+    }
+    exact_gap_clip
+        .filter(|clip| {
+            *clip > 0.0
+                && *clip <= max_clip + 1e-9
+                && *clip + 1e-9 < cfg.clip_ladder[0]
+                && *clip + 1e-9 >= min_valid_clip
+        })
+        .map(|clip| (clip, BotRuntimeClipRung::ExactGapRepair))
+}
+
+pub(in crate::bot) fn bot_runtime_repair_requested_rung(
+    qty_gap: f64,
+    exact_gap_clip: Option<f64>,
+    min_valid_clip: Option<f64>,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> Option<(BotRuntimeClipRung, f64)> {
+    bot_runtime_repair_clip_choice(f64::INFINITY, qty_gap, exact_gap_clip, min_valid_clip, cfg)
+        .map(|(clip, rung)| (rung, clip))
+}
+
+pub(in crate::bot) fn bot_runtime_pair_build_green_conditions(
+    mode: BotRuntimePairBuildMode,
+    side: Option<OutcomeSide>,
+    clip: f64,
+    q_yes: f64,
+    q_no: f64,
+    remaining_budget: f64,
+    effective_marginal_pair_cost: f64,
+    budget_reference_cost: f64,
+    t_into_s: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> (bool, bool, bool, bool, bool, bool) {
+    let both_sides_filled = q_yes > 1e-9 && q_no > 1e-9;
+    let projected_unmatched_fraction =
+        bot_runtime_projected_unmatched_fraction(mode, side, clip.max(0.0), q_yes, q_no);
+    let price_ok = effective_marginal_pair_cost + 1e-9 < 0.94;
+    let imbalance_ok = projected_unmatched_fraction + 1e-9 < cfg.imbalance_target_fraction;
+    let time_ok = t_into_s + 1e-9 < 180.0;
+    let budget_ok = remaining_budget + 1e-9 >= clip.max(0.0) * budget_reference_cost.max(0.0);
+    (
+        both_sides_filled,
+        price_ok,
+        imbalance_ok,
+        time_ok,
+        budget_ok,
+        both_sides_filled && price_ok && imbalance_ok && time_ok && budget_ok,
+    )
+}
+
+pub(in crate::bot) fn bot_runtime_pair_build_selected_rung(
+    mode: BotRuntimePairBuildMode,
+    clip: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> BotRuntimeClipRung {
+    if mode == BotRuntimePairBuildMode::LighterSideFirst && clip + 1e-9 < cfg.clip_ladder[0] {
+        BotRuntimeClipRung::ExactGapRepair
+    } else if clip + 1e-9 >= cfg.clip_ladder[3] {
+        BotRuntimeClipRung::Large2
+    } else if clip + 1e-9 >= cfg.clip_ladder[2] {
+        BotRuntimeClipRung::Large1
+    } else if clip + 1e-9 >= cfg.clip_ladder[1] {
+        BotRuntimeClipRung::Normal
+    } else {
+        BotRuntimeClipRung::Seed
+    }
+}
+
+pub(in crate::bot) fn bot_runtime_pair_build_decision_with_selected_clip(
+    mut decision: BotRuntimePairBuildDecision,
+    clip: i64,
+    q_yes: f64,
+    q_no: f64,
+    remaining_budget: f64,
+    t_into_s: f64,
+    cfg: &BotRuntimeConfigSnapshot,
+) -> BotRuntimePairBuildDecision {
+    let clip_f = clip.max(0) as f64;
+    decision.clip = clip.max(0);
+    decision.selected_rung = bot_runtime_pair_build_selected_rung(decision.mode, clip_f, cfg);
+    decision.clip_bucket = bot_runtime_pair_build_clip_bucket(clip_f, cfg);
+    decision.projected_unmatched_fraction =
+        bot_runtime_projected_unmatched_fraction(decision.mode, decision.side, clip_f, q_yes, q_no);
+    decision.reduces_imbalance = bot_runtime_order_reduces_imbalance(
+        decision.current_unmatched_fraction,
+        decision.projected_unmatched_fraction,
+    );
+    let (
+        green_both_sides_filled,
+        green_price_ok,
+        green_imbalance_ok,
+        green_time_ok,
+        green_budget_ok,
+        green_conditions_met,
+    ) = bot_runtime_pair_build_green_conditions(
+        decision.mode,
+        decision.side,
+        clip_f,
+        q_yes,
+        q_no,
+        remaining_budget,
+        decision.effective_marginal_pair_cost,
+        match decision.marginal_cost_mode {
+            BotRuntimeMarginalCostMode::BalancedAdd => decision.effective_marginal_pair_cost,
+            BotRuntimeMarginalCostMode::RebalanceAdd => decision
+                .lagging_side_quote
+                .unwrap_or(decision.effective_marginal_pair_cost),
+        },
+        t_into_s,
+        cfg,
+    );
+    decision.green_both_sides_filled = green_both_sides_filled;
+    decision.green_price_ok = green_price_ok;
+    decision.green_imbalance_ok = green_imbalance_ok;
+    decision.green_time_ok = green_time_ok;
+    decision.green_budget_ok = green_budget_ok;
+    decision.green_conditions_met = green_conditions_met;
+    decision
+}
+
+pub(in crate::bot) fn bot_runtime_pair_build_has_large_clip_intent(
+    decision: &BotRuntimePairBuildDecision,
+) -> bool {
+    decision.requested_large_clip || decision.selected_rung.is_large()
+}
+
 /// Implements pair build decision for the BOT runtime.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
 
 pub(in crate::bot) fn bot_runtime_pair_build_decision(
+    t_into_s: f64,
     q_yes: f64,
     q_no: f64,
     cost_yes: f64,
@@ -72,24 +291,6 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         ));
     }
 
-    let requested_clip = if current_base < (2.0 * cfg.seed_clip_small).max(min_lot) {
-        cfg.seed_clip_small.max(min_lot)
-    } else if under_min_target {
-        cfg.large_clip_ladder[1]
-            .max(cfg.large_clip_ladder[0])
-            .max(min_lot)
-    } else if current_base < cfg.large_clip_ladder[0].max(min_lot) {
-        cfg.large_clip_ladder[0].max(min_lot)
-    } else {
-        cfg.large_clip_ladder[1]
-            .max(cfg.large_clip_ladder[0])
-            .max(min_lot)
-    };
-
-    let medium_clip_cap = cfg.large_clip_ladder[0]
-        .max(cfg.seed_clip_small)
-        .max(min_lot);
-    let small_clip_cap = cfg.repair_clip_small.max(cfg.seed_clip_small).max(min_lot);
     let cpp_hint = if !inventory_vwap_sum.is_finite() || !market_snapshot_vwap_sum.is_finite() {
         BotRuntimePairBuildCppHint::Small
     } else {
@@ -101,18 +302,6 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
             BotRuntimePairBuildCppHint::Medium
         } else {
             BotRuntimePairBuildCppHint::Normal
-        }
-    };
-
-    let clip_after_cpp_hint = match cpp_hint {
-        BotRuntimePairBuildCppHint::Normal => requested_clip,
-        BotRuntimePairBuildCppHint::Medium => requested_clip.min(medium_clip_cap),
-        BotRuntimePairBuildCppHint::Small => {
-            if under_min_target {
-                requested_clip.min(medium_clip_cap)
-            } else {
-                requested_clip.min(small_clip_cap)
-            }
         }
     };
 
@@ -141,86 +330,132 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
             OutcomeSide::Yes => y_bid,
             OutcomeSide::No => n_bid,
         };
+        let sizing = bot_runtime_pair_build_repair_clip_sizing(
+            qty_gap,
+            side_bid,
+            min_lot,
+            min_maker_notional,
+        );
+        let exact_gap_clip = sizing
+            .filter(|sizing| sizing.min_valid_clip <= sizing.exact_gap_clip)
+            .map(|sizing| sizing.exact_gap_clip as f64);
+        let min_valid_clip = sizing.map(|sizing| sizing.min_valid_clip as f64);
         let (effective_marginal_pair_cost, residual_unit_cost) =
             bot_runtime_pair_build_rebalance_effective_marginal_cost(
                 q_yes, q_no, cost_yes, cost_no, side, side_bid,
             );
         let price_zone =
             bot_runtime_pair_build_projected_paired_cost_band(effective_marginal_pair_cost);
-        let exact_gap_repair_executable = bot_runtime_pair_build_exact_gap_repair_is_executable(
-            qty_gap,
-            side_bid,
-            min_lot,
-            min_maker_notional,
-        );
-        if side_bid > 0.0 && side_bid.is_finite() && exact_gap_repair_executable {
-            if let Some(reason) = bot_runtime_pair_build_price_zone_hold_reason(
-                price_zone,
-                BotRuntimeMarginalCostMode::RebalanceAdd,
-                effective_marginal_pair_cost,
-            ) {
-                return Err(reason);
-            }
-            let budget_clip_cap = (remaining_budget / side_bid).floor();
-            let lighter_clip_after_cost_quality =
-                bot_runtime_pair_build_lighter_clip_after_cost_quality(
-                    clip_after_cpp_hint,
-                    qty_gap,
-                    min_lot,
-                    cfg,
-                    cpp_hint,
-                );
-            let clip = round_down_to_lot(
-                lighter_clip_after_cost_quality.min(budget_clip_cap),
-                min_lot,
-            );
-            if clip + 1e-9 >= min_lot {
-                let projected_unmatched_fraction = bot_runtime_projected_unmatched_fraction(
+        if side_bid > 0.0 && side_bid.is_finite() {
+            if let Some((requested_rung, requested_clip)) =
+                bot_runtime_repair_requested_rung(qty_gap, exact_gap_clip, min_valid_clip, cfg)
+            {
+                let requested_large_clip = requested_rung.is_large();
+                let (
+                    requested_green_both_sides_filled,
+                    requested_green_price_ok,
+                    requested_green_imbalance_ok,
+                    requested_green_time_ok,
+                    _requested_green_budget_ok,
+                    _requested_green_conditions_met,
+                ) = bot_runtime_pair_build_green_conditions(
                     BotRuntimePairBuildMode::LighterSideFirst,
                     Some(side),
-                    clip,
+                    requested_clip,
                     q_yes,
                     q_no,
-                );
-                if projected_unmatched_fraction + 1e-9 >= cfg.imbalance_disable_fraction {
-                    return Err(format!(
-                        "projected_hard_imbalance_block:{projected_unmatched_fraction:.3}"
-                    ));
-                }
-                let reduces_imbalance = bot_runtime_order_reduces_imbalance(
-                    current_unmatched_fraction,
-                    projected_unmatched_fraction,
-                );
-                if !reduces_imbalance {
-                    return Err(format!(
-                        "repair_does_not_reduce_imbalance:{current_unmatched_fraction:.3}:{projected_unmatched_fraction:.3}"
-                    ));
-                }
-                return Ok(BotRuntimePairBuildDecision {
-                    mode: BotRuntimePairBuildMode::LighterSideFirst,
-                    side: Some(side),
-                    clip: clip as i64,
-                    requested_clip,
-                    clip_bucket: bot_runtime_pair_build_clip_bucket(clip, cfg),
-                    cpp_hint,
-                    marginal_cost_mode: BotRuntimeMarginalCostMode::RebalanceAdd,
+                    remaining_budget,
                     effective_marginal_pair_cost,
-                    price_zone,
-                    residual_unit_cost,
-                    lagging_side_quote: Some(side_bid),
-                    pair_sum,
-                    current_unmatched_fraction,
-                    projected_unmatched_fraction,
-                    match_ratio: current_match_ratio,
-                    imbalance_state: current_imbalance_state,
-                    reduces_imbalance,
-                    pair_coverage,
-                    skew_ratio,
-                    current_base,
+                    side_bid,
+                    t_into_s,
+                    cfg,
+                );
+                let structural_green = requested_green_both_sides_filled
+                    && requested_green_price_ok
+                    && requested_green_imbalance_ok
+                    && requested_green_time_ok;
+                let large_allowed_clip_cap = if requested_large_clip && !structural_green {
+                    cfg.clip_ladder[1]
+                } else {
+                    requested_clip
+                };
+                let budget_clip_cap = (remaining_budget / side_bid.max(0.0001)).floor();
+                let repair_cpp_cap = bot_runtime_repair_cpp_clip_cap(requested_clip, cfg, cpp_hint);
+                let final_clip_cap = large_allowed_clip_cap
+                    .min(repair_cpp_cap)
+                    .min(budget_clip_cap);
+                if let Some((clip, selected_rung)) = bot_runtime_repair_clip_choice(
+                    final_clip_cap,
                     qty_gap,
-                    inventory_vwap_sum,
-                    market_snapshot_vwap_sum,
-                });
+                    exact_gap_clip,
+                    min_valid_clip,
+                    cfg,
+                ) {
+                    let projected_unmatched_fraction = bot_runtime_projected_unmatched_fraction(
+                        BotRuntimePairBuildMode::LighterSideFirst,
+                        Some(side),
+                        clip,
+                        q_yes,
+                        q_no,
+                    );
+                    if projected_unmatched_fraction + 1e-9 >= cfg.imbalance_disable_fraction {
+                        return Err(format!(
+                            "projected_hard_imbalance_block:{projected_unmatched_fraction:.3}"
+                        ));
+                    }
+                    let reduces_imbalance = bot_runtime_order_reduces_imbalance(
+                        current_unmatched_fraction,
+                        projected_unmatched_fraction,
+                    );
+                    if !reduces_imbalance {
+                        return Err(format!(
+                            "repair_does_not_reduce_imbalance:{current_unmatched_fraction:.3}:{projected_unmatched_fraction:.3}"
+                        ));
+                    }
+                    let decision = BotRuntimePairBuildDecision {
+                        mode: BotRuntimePairBuildMode::LighterSideFirst,
+                        side: Some(side),
+                        clip: clip as i64,
+                        selected_rung,
+                        requested_rung,
+                        requested_clip,
+                        requested_large_clip,
+                        clip_bucket: bot_runtime_pair_build_clip_bucket(clip, cfg),
+                        cpp_hint,
+                        marginal_cost_mode: BotRuntimeMarginalCostMode::RebalanceAdd,
+                        effective_marginal_pair_cost,
+                        price_zone,
+                        residual_unit_cost,
+                        lagging_side_quote: Some(side_bid),
+                        pair_sum,
+                        current_unmatched_fraction,
+                        projected_unmatched_fraction,
+                        match_ratio: current_match_ratio,
+                        imbalance_state: current_imbalance_state,
+                        reduces_imbalance,
+                        green_both_sides_filled: false,
+                        green_price_ok: false,
+                        green_imbalance_ok: false,
+                        green_time_ok: false,
+                        green_budget_ok: false,
+                        green_conditions_met: false,
+                        pair_coverage,
+                        skew_ratio,
+                        current_base,
+                        qty_gap,
+                        inventory_vwap_sum,
+                        market_snapshot_vwap_sum,
+                    };
+                    return Ok(bot_runtime_pair_build_decision_with_selected_clip(
+                        decision,
+                        clip as i64,
+                        q_yes,
+                        q_no,
+                        remaining_budget,
+                        t_into_s,
+                        cfg,
+                    ));
+                }
             }
         }
         if repair_only_imbalance {
@@ -246,12 +481,46 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         return Err(format!("{reason}:{current_unmatched_fraction:.3}"));
     }
     let price_zone = bot_runtime_pair_build_projected_paired_cost_band(pair_sum);
-
-    let pair_budget_clip_cap = (remaining_budget / pair_sum).floor();
-    let clip = round_down_to_lot(clip_after_cpp_hint.min(pair_budget_clip_cap), min_lot);
-    if clip + 1e-9 < min_lot {
+    let requested_rung = bot_runtime_growth_requested_rung(current_base, cfg);
+    let requested_clip = bot_runtime_clip_rung_value(requested_rung, cfg, None);
+    let requested_large_clip = requested_rung.is_large();
+    let (
+        requested_green_both_sides_filled,
+        requested_green_price_ok,
+        requested_green_imbalance_ok,
+        requested_green_time_ok,
+        _requested_green_budget_ok,
+        _requested_green_conditions_met,
+    ) = bot_runtime_pair_build_green_conditions(
+        BotRuntimePairBuildMode::PairedGrowth,
+        None,
+        requested_clip,
+        q_yes,
+        q_no,
+        remaining_budget,
+        pair_sum,
+        pair_sum,
+        t_into_s,
+        cfg,
+    );
+    let structural_green = requested_green_both_sides_filled
+        && requested_green_price_ok
+        && requested_green_imbalance_ok
+        && requested_green_time_ok;
+    let large_allowed_clip_cap = if requested_large_clip && !structural_green {
+        cfg.clip_ladder[1]
+    } else {
+        requested_clip
+    };
+    let pair_budget_clip_cap = (remaining_budget / pair_sum.max(0.0001)).floor();
+    let cpp_clip_cap =
+        bot_runtime_growth_cpp_clip_cap(requested_clip, cfg, cpp_hint, under_min_target);
+    let final_clip_cap = large_allowed_clip_cap
+        .min(cpp_clip_cap)
+        .min(pair_budget_clip_cap);
+    let Some((clip, selected_rung)) = bot_runtime_growth_clip_choice(final_clip_cap, cfg) else {
         return Err("budget_too_small".to_string());
-    }
+    };
     let projected_unmatched_fraction = bot_runtime_projected_unmatched_fraction(
         BotRuntimePairBuildMode::PairedGrowth,
         None,
@@ -269,11 +538,14 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         projected_unmatched_fraction,
     );
 
-    Ok(BotRuntimePairBuildDecision {
+    let decision = BotRuntimePairBuildDecision {
         mode: BotRuntimePairBuildMode::PairedGrowth,
         side: None,
         clip: clip as i64,
+        selected_rung,
+        requested_rung,
         requested_clip,
+        requested_large_clip,
         clip_bucket: bot_runtime_pair_build_clip_bucket(clip, cfg),
         cpp_hint,
         marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
@@ -287,13 +559,28 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
         match_ratio: current_match_ratio,
         imbalance_state: current_imbalance_state,
         reduces_imbalance,
+        green_both_sides_filled: false,
+        green_price_ok: false,
+        green_imbalance_ok: false,
+        green_time_ok: false,
+        green_budget_ok: false,
+        green_conditions_met: false,
         pair_coverage,
         skew_ratio,
         current_base,
         qty_gap,
         inventory_vwap_sum,
         market_snapshot_vwap_sum,
-    })
+    };
+    Ok(bot_runtime_pair_build_decision_with_selected_clip(
+        decision,
+        clip as i64,
+        q_yes,
+        q_no,
+        remaining_budget,
+        t_into_s,
+        cfg,
+    ))
 }
 
 /// Implements await second fill live order timeout seconds for the BOT runtime.
@@ -313,7 +600,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_lighter_live_order_timeout_seconds(
     decision: &BotRuntimePairBuildDecision,
 ) -> f64 {
     let base = (stale_seconds.max(1.0) * 2.0).max(6.0);
-    if decision.clip_bucket == "large" || decision.requested_clip >= 10.0 {
+    if bot_runtime_pair_build_has_large_clip_intent(decision) {
         base.max(7.0)
     } else {
         base
@@ -333,7 +620,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_paired_live_order_timeout_seconds(
         BotRuntimePairBuildCppHint::Medium => (base * 2.5).max(7.0),
         BotRuntimePairBuildCppHint::Small => (base * 3.0).max(8.0),
     };
-    if decision.clip_bucket == "large" || decision.requested_clip >= 10.0 {
+    if bot_runtime_pair_build_has_large_clip_intent(decision) {
         timeout.max(8.0)
     } else {
         timeout
@@ -350,7 +637,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_asymmetry_timeout_seconds(
 ) -> f64 {
     let base = stale_seconds.max(1.0);
     if broken_submit && decision.mode == BotRuntimePairBuildMode::PairedGrowth {
-        return if decision.clip_bucket == "large" || decision.requested_clip >= 10.0 {
+        return if bot_runtime_pair_build_has_large_clip_intent(decision) {
             1.5
         } else {
             1.0
@@ -364,7 +651,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_asymmetry_timeout_seconds(
             BotRuntimePairBuildCppHint::Small => (base * 2.0).max(6.0),
         },
     };
-    if decision.clip_bucket == "large" || decision.requested_clip >= 10.0 {
+    if bot_runtime_pair_build_has_large_clip_intent(decision) {
         timeout.max(6.0)
     } else {
         timeout
@@ -559,7 +846,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_repost_cooldown_seconds(
     decision: &BotRuntimePairBuildDecision,
 ) -> f64 {
     let base = replace_min_seconds.max(1.0);
-    if decision.clip_bucket == "large" || decision.requested_clip >= 10.0 {
+    if bot_runtime_pair_build_has_large_clip_intent(decision) {
         base.max(1.5)
     } else {
         base
@@ -723,7 +1010,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_materially_skewed(
     cfg: &BotRuntimeConfigSnapshot,
 ) -> bool {
     let lot_repairable = qty_gap + 1e-9 >= min_lot.max(1.0);
-    let repair_gap_threshold = cfg.repair_clip_small.max(min_lot);
+    let repair_gap_threshold = cfg.clip_ladder[0].max(min_lot);
     lot_repairable
         && (pair_coverage <= 0.97 + 1e-9
             || skew_ratio >= 1.05 - 1e-9

@@ -319,12 +319,42 @@ impl BotRuntimeMarginalCostMode {
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::bot) enum BotRuntimeClipRung {
+    Seed,
+    Normal,
+    Large1,
+    Large2,
+    ExactGapRepair,
+}
+impl BotRuntimeClipRung {
+    /// Returns the stable string label for this enum or state value.
+    /// This is a pure BOT runtime helper used for configuration, policy, or metrics
+    /// calculations.
+
+    pub(in crate::bot) fn as_str(self) -> &'static str {
+        match self {
+            Self::Seed => "seed",
+            Self::Normal => "normal",
+            Self::Large1 => "large_1",
+            Self::Large2 => "large_2",
+            Self::ExactGapRepair => "exact_gap_repair",
+        }
+    }
+
+    pub(in crate::bot) fn is_large(self) -> bool {
+        matches!(self, Self::Large1 | Self::Large2)
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::bot) struct BotRuntimePairBuildDecision {
     pub(in crate::bot) mode: BotRuntimePairBuildMode,
     pub(in crate::bot) side: Option<OutcomeSide>,
     pub(in crate::bot) clip: i64,
+    pub(in crate::bot) selected_rung: BotRuntimeClipRung,
+    pub(in crate::bot) requested_rung: BotRuntimeClipRung,
     pub(in crate::bot) requested_clip: f64,
+    pub(in crate::bot) requested_large_clip: bool,
     pub(in crate::bot) clip_bucket: &'static str,
     pub(in crate::bot) cpp_hint: BotRuntimePairBuildCppHint,
     pub(in crate::bot) marginal_cost_mode: BotRuntimeMarginalCostMode,
@@ -338,6 +368,12 @@ pub(in crate::bot) struct BotRuntimePairBuildDecision {
     pub(in crate::bot) match_ratio: f64,
     pub(in crate::bot) imbalance_state: BotRuntimeImbalanceState,
     pub(in crate::bot) reduces_imbalance: bool,
+    pub(in crate::bot) green_both_sides_filled: bool,
+    pub(in crate::bot) green_price_ok: bool,
+    pub(in crate::bot) green_imbalance_ok: bool,
+    pub(in crate::bot) green_time_ok: bool,
+    pub(in crate::bot) green_budget_ok: bool,
+    pub(in crate::bot) green_conditions_met: bool,
     pub(in crate::bot) pair_coverage: f64,
     pub(in crate::bot) skew_ratio: f64,
     pub(in crate::bot) current_base: f64,

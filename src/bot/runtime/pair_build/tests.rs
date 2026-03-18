@@ -137,11 +137,11 @@ fn bot_runtime_pair_build_clip_bucket_boundaries() {
     let cfg = bot_runtime_config_defaults();
     assert_eq!(bot_runtime_pair_build_clip_bucket(1.0, &cfg), "small");
     assert_eq!(
-        bot_runtime_pair_build_clip_bucket(cfg.large_clip_ladder[0], &cfg),
+        bot_runtime_pair_build_clip_bucket(cfg.clip_ladder[1], &cfg),
         "medium"
     );
     assert_eq!(
-        bot_runtime_pair_build_clip_bucket(cfg.large_clip_ladder[1], &cfg),
+        bot_runtime_pair_build_clip_bucket(cfg.clip_ladder[2], &cfg),
         "large"
     );
 }
@@ -178,7 +178,7 @@ fn bot_runtime_pair_build_paired_cost_band_transitions() {
 fn pair_build_decision_surfaces_balanced_add_stop_add_zone_for_runtime_gating() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
-        20.0, 20.0, 6.0, 6.0, 0.50, 0.52, 0.50, 0.52, 40.0, 12.0, 1.0, 1.0, &cfg, false,
+        60.0, 20.0, 20.0, 6.0, 6.0, 0.50, 0.52, 0.50, 0.52, 40.0, 12.0, 1.0, 1.0, &cfg, false,
     )
     .expect("raw decision should surface the stop-add zone for later runtime gating");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::PairedGrowth);
@@ -194,7 +194,7 @@ fn pair_build_decision_surfaces_balanced_add_stop_add_zone_for_runtime_gating() 
 fn pair_build_decision_allows_balanced_add_below_one_even_with_high_inventory_vwap() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
-        20.0, 20.0, 10.4, 10.4, 0.49, 0.51, 0.49, 0.51, 80.0, 20.8, 1.0, 1.0, &cfg, false,
+        60.0, 20.0, 20.0, 10.4, 10.4, 0.49, 0.51, 0.49, 0.51, 80.0, 20.8, 1.0, 1.0, &cfg, false,
     )
     .expect("caution-zone balanced add should remain legal");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::PairedGrowth);
@@ -210,7 +210,7 @@ fn pair_build_decision_allows_balanced_add_below_one_even_with_high_inventory_vw
 fn pair_build_decision_uses_rebalance_effective_marginal_pair_cost() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
-        14.0, 10.0, 8.4, 6.0, 0.60, 0.62, 0.35, 0.37, 80.0, 14.4, 1.0, 1.0, &cfg, false,
+        60.0, 14.0, 10.0, 8.4, 6.0, 0.60, 0.62, 0.35, 0.37, 80.0, 14.4, 1.0, 1.0, &cfg, false,
     )
     .expect("sub-one rebalance add should remain legal");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::LighterSideFirst);
@@ -226,13 +226,121 @@ fn pair_build_decision_uses_rebalance_effective_marginal_pair_cost() {
 }
 
 #[test]
-fn pair_build_decision_blocks_rebalance_add_at_stop_add_zone() {
+fn pair_build_growth_downgrades_to_normal_20_when_large_clip_is_not_green() {
     let cfg = bot_runtime_config_defaults();
-    let err = bot_runtime_pair_build_decision(
-        14.0, 10.0, 8.4, 6.0, 0.60, 0.62, 0.40, 0.42, 80.0, 14.4, 1.0, 1.0, &cfg, false,
+    let decision = bot_runtime_pair_build_decision(
+        200.0, 25.0, 25.0, 7.5, 7.5, 0.30, 0.32, 0.30, 0.32, 500.0, 15.0, 1.0, 1.0, &cfg, false,
     )
-    .expect_err("stop-add rebalance should be blocked");
-    assert!(err.starts_with("price_zone_stop_add:rebalance_add:1.000"));
+    .expect("non-green paired growth should downgrade to the normal rung");
+    assert_eq!(decision.requested_rung, BotRuntimeClipRung::Large1);
+    assert_eq!(decision.selected_rung, BotRuntimeClipRung::Normal);
+    assert_eq!(decision.clip, 20);
+    assert!(!decision.requested_large_clip || !decision.green_conditions_met);
+    assert!(!decision.green_time_ok);
+}
+
+#[test]
+fn pair_build_growth_allows_green_large_40_and_80_progressively() {
+    let cfg = bot_runtime_config_defaults();
+    let large_40 = bot_runtime_pair_build_decision(
+        60.0, 20.0, 20.0, 6.0, 6.0, 0.30, 0.32, 0.30, 0.32, 500.0, 12.0, 1.0, 1.0, &cfg, false,
+    )
+    .expect("green paired growth should allow the 40-share rung");
+    assert_eq!(large_40.requested_rung, BotRuntimeClipRung::Large1);
+    assert_eq!(large_40.selected_rung, BotRuntimeClipRung::Large1);
+    assert_eq!(large_40.clip, 40);
+    assert!(large_40.green_conditions_met);
+
+    let large_80 = bot_runtime_pair_build_decision(
+        60.0, 40.0, 40.0, 12.0, 12.0, 0.30, 0.32, 0.30, 0.32, 500.0, 24.0, 1.0, 1.0, &cfg, false,
+    )
+    .expect("green paired growth should allow the 80-share rung");
+    assert_eq!(large_80.requested_rung, BotRuntimeClipRung::Large2);
+    assert_eq!(large_80.selected_rung, BotRuntimeClipRung::Large2);
+    assert_eq!(large_80.clip, 80);
+    assert!(large_80.green_conditions_met);
+}
+
+#[test]
+fn pair_build_growth_budget_downgrades_80_to_40() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = bot_runtime_pair_build_decision(
+        60.0, 40.0, 40.0, 12.0, 12.0, 0.30, 0.32, 0.30, 0.32, 60.0, 24.0, 1.0, 1.0, &cfg, false,
+    )
+    .expect("budget-constrained paired growth should downgrade to the next legal rung");
+    assert_eq!(decision.requested_rung, BotRuntimeClipRung::Large2);
+    assert_eq!(decision.selected_rung, BotRuntimeClipRung::Large1);
+    assert_eq!(decision.clip, 40);
+}
+
+#[test]
+fn pair_build_repair_uses_largest_legal_rung_or_exact_gap_clip() {
+    let cfg = bot_runtime_config_defaults();
+    let rung_repair = bot_runtime_pair_build_decision(
+        60.0, 110.0, 75.0, 33.0, 22.5, 0.30, 0.32, 0.30, 0.32, 500.0, 55.5, 1.0, 1.0, &cfg, false,
+    )
+    .expect("repair should use the largest legal rung that does not overshoot the gap");
+    assert_eq!(rung_repair.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(rung_repair.requested_rung, BotRuntimeClipRung::Normal);
+    assert_eq!(rung_repair.selected_rung, BotRuntimeClipRung::Normal);
+    assert_eq!(rung_repair.clip, 20);
+
+    let exact_gap = bot_runtime_pair_build_decision(
+        60.0, 20.0, 14.0, 6.0, 4.2, 0.30, 0.32, 0.30, 0.32, 500.0, 10.2, 1.0, 1.0, &cfg, false,
+    )
+    .expect("sub-ladder repair should use the exact gap clip");
+    assert_eq!(exact_gap.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(exact_gap.requested_rung, BotRuntimeClipRung::ExactGapRepair);
+    assert_eq!(exact_gap.selected_rung, BotRuntimeClipRung::ExactGapRepair);
+    assert_eq!(exact_gap.clip, 6);
+}
+
+#[test]
+fn pair_build_repair_downgrades_large_repair_to_20_when_green_conditions_fail() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = bot_runtime_pair_build_decision(
+        220.0, 280.0, 200.0, 84.0, 60.0, 0.30, 0.32, 0.30, 0.32, 500.0, 144.0, 1.0, 1.0, &cfg,
+        false,
+    )
+    .expect("non-green large repair should downgrade to the normal rung");
+    assert_eq!(decision.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(decision.requested_rung, BotRuntimeClipRung::Large2);
+    assert_eq!(decision.selected_rung, BotRuntimeClipRung::Normal);
+    assert_eq!(decision.clip, 20);
+    assert!(!decision.green_time_ok);
+}
+
+#[test]
+fn pair_build_repair_budget_cap_uses_lagging_side_order_price() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = bot_runtime_pair_build_decision(
+        60.0, 100.0, 80.0, 80.0, 8.0, 0.30, 0.32, 0.10, 0.12, 90.0, 88.0, 1.0, 1.0, &cfg, false,
+    )
+    .expect("repair should be affordable from the actual lagging-side order spend");
+    assert_eq!(decision.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(decision.side, Some(OutcomeSide::No));
+    assert_eq!(decision.selected_rung, BotRuntimeClipRung::Normal);
+    assert_eq!(decision.clip, 20);
+    assert_eq!(decision.lagging_side_quote, Some(0.10));
+    assert!((decision.effective_marginal_pair_cost - 0.90).abs() < 1e-9);
+    assert!(decision.green_budget_ok);
+}
+
+#[test]
+fn pair_build_decision_surfaces_rebalance_add_stop_add_zone_for_runtime_gating() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = bot_runtime_pair_build_decision(
+        60.0, 14.0, 10.0, 8.4, 6.0, 0.60, 0.62, 0.40, 0.42, 80.0, 14.4, 1.0, 1.0, &cfg, false,
+    )
+    .expect("raw repair decision should surface the stop-add zone for later runtime gating");
+    assert_eq!(decision.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(decision.side, Some(OutcomeSide::No));
+    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::StopAdd);
+    assert_eq!(
+        decision.marginal_cost_mode,
+        BotRuntimeMarginalCostMode::RebalanceAdd
+    );
+    assert!((decision.effective_marginal_pair_cost - 1.0).abs() < 1e-9);
 }
 
 #[test]
@@ -242,7 +350,10 @@ fn tail_repair_priority_recomputes_rebalance_price_zone_fields() {
         mode: BotRuntimePairBuildMode::PairedGrowth,
         side: None,
         clip: 12,
+        selected_rung: BotRuntimeClipRung::Seed,
+        requested_rung: BotRuntimeClipRung::Seed,
         requested_clip: 12.0,
+        requested_large_clip: false,
         clip_bucket: "small",
         cpp_hint: BotRuntimePairBuildCppHint::Normal,
         marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
@@ -256,6 +367,12 @@ fn tail_repair_priority_recomputes_rebalance_price_zone_fields() {
         match_ratio: match_ratio(4.0, 8.0),
         imbalance_state: BotRuntimeImbalanceState::Normal,
         reduces_imbalance: false,
+        green_both_sides_filled: false,
+        green_price_ok: false,
+        green_imbalance_ok: false,
+        green_time_ok: false,
+        green_budget_ok: false,
+        green_conditions_met: false,
         pair_coverage: pair_coverage(4.0, 8.0),
         skew_ratio: share_skew_ratio(4.0, 8.0),
         current_base: 4.0,
@@ -280,6 +397,109 @@ fn tail_repair_priority_recomputes_rebalance_price_zone_fields() {
     assert!((rewritten.effective_marginal_pair_cost - 0.85).abs() < 1e-9);
 }
 
+#[test]
+fn tail_repair_priority_uses_lagging_side_order_price_for_budget_cap() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = BotRuntimePairBuildDecision {
+        mode: BotRuntimePairBuildMode::PairedGrowth,
+        side: None,
+        clip: 20,
+        selected_rung: BotRuntimeClipRung::Normal,
+        requested_rung: BotRuntimeClipRung::Normal,
+        requested_clip: 20.0,
+        requested_large_clip: false,
+        clip_bucket: "medium",
+        cpp_hint: BotRuntimePairBuildCppHint::Normal,
+        marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
+        effective_marginal_pair_cost: 1.10,
+        price_zone: BotRuntimePairedCostBand::Danger,
+        residual_unit_cost: None,
+        lagging_side_quote: None,
+        pair_sum: 1.10,
+        current_unmatched_fraction: unmatched_fraction(100.0, 80.0),
+        projected_unmatched_fraction: unmatched_fraction(100.0, 80.0),
+        match_ratio: match_ratio(100.0, 80.0),
+        imbalance_state: BotRuntimeImbalanceState::Normal,
+        reduces_imbalance: false,
+        green_both_sides_filled: false,
+        green_price_ok: false,
+        green_imbalance_ok: false,
+        green_time_ok: false,
+        green_budget_ok: false,
+        green_conditions_met: false,
+        pair_coverage: pair_coverage(100.0, 80.0),
+        skew_ratio: share_skew_ratio(100.0, 80.0),
+        current_base: 80.0,
+        qty_gap: 20.0,
+        inventory_vwap_sum: inventory_vwap_sum(100.0, 80.0, 80.0, 8.0),
+        market_snapshot_vwap_sum: market_snapshot_vwap_sum(0.30, 0.32, 0.10, 0.12),
+    };
+
+    let rewritten = bot_runtime_pair_build_apply_tail_repair_priority(
+        decision, 100.0, 80.0, 80.0, 8.0, 0.30, 0.10, 2.0, 1.0, 1.0, 250.0, &cfg,
+    );
+
+    assert_eq!(rewritten.mode, BotRuntimePairBuildMode::LighterSideFirst);
+    assert_eq!(rewritten.side, Some(OutcomeSide::No));
+    assert_eq!(rewritten.clip, 20);
+    assert_eq!(rewritten.selected_rung, BotRuntimeClipRung::Normal);
+    assert!(rewritten.green_budget_ok);
+}
+
+#[test]
+fn repair_requested_rung_rejects_ladder_when_min_valid_clip_exceeds_gap() {
+    let cfg = bot_runtime_config_defaults();
+    assert!(bot_runtime_repair_requested_rung(12.0, None, Some(20.0), &cfg).is_none());
+    assert!(bot_runtime_repair_clip_choice(f64::INFINITY, 12.0, None, Some(20.0), &cfg).is_none());
+}
+
+#[test]
+fn tail_repair_priority_keeps_paired_growth_when_min_notional_would_overshoot_gap() {
+    let cfg = bot_runtime_config_defaults();
+    let decision = BotRuntimePairBuildDecision {
+        mode: BotRuntimePairBuildMode::PairedGrowth,
+        side: None,
+        clip: 20,
+        selected_rung: BotRuntimeClipRung::Normal,
+        requested_rung: BotRuntimeClipRung::Normal,
+        requested_clip: 20.0,
+        requested_large_clip: false,
+        clip_bucket: "medium",
+        cpp_hint: BotRuntimePairBuildCppHint::Normal,
+        marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
+        effective_marginal_pair_cost: 0.65,
+        price_zone: BotRuntimePairedCostBand::Acceptable,
+        residual_unit_cost: None,
+        lagging_side_quote: None,
+        pair_sum: 0.65,
+        current_unmatched_fraction: unmatched_fraction(24.0, 12.0),
+        projected_unmatched_fraction: unmatched_fraction(24.0, 12.0),
+        match_ratio: match_ratio(24.0, 12.0),
+        imbalance_state: BotRuntimeImbalanceState::Normal,
+        reduces_imbalance: false,
+        green_both_sides_filled: false,
+        green_price_ok: false,
+        green_imbalance_ok: false,
+        green_time_ok: false,
+        green_budget_ok: false,
+        green_conditions_met: false,
+        pair_coverage: pair_coverage(24.0, 12.0),
+        skew_ratio: share_skew_ratio(24.0, 12.0),
+        current_base: 12.0,
+        qty_gap: 12.0,
+        inventory_vwap_sum: inventory_vwap_sum(24.0, 12.0, 7.2, 3.6),
+        market_snapshot_vwap_sum: market_snapshot_vwap_sum(0.30, 0.32, 0.05, 0.07),
+    };
+
+    let rewritten = bot_runtime_pair_build_apply_tail_repair_priority(
+        decision, 24.0, 12.0, 7.2, 3.6, 0.30, 0.05, 20.0, 1.0, 1.0, 250.0, &cfg,
+    );
+
+    assert_eq!(rewritten.mode, BotRuntimePairBuildMode::PairedGrowth);
+    assert_eq!(rewritten.side, None);
+    assert_eq!(rewritten.clip, 20);
+}
+
 /// Exercises the BOT runtime pair build optional buy requires below snapshot scenario and
 /// checks the expected BOT behavior.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
@@ -290,7 +510,10 @@ fn bot_runtime_pair_build_optional_buy_requires_below_snapshot() {
         mode: BotRuntimePairBuildMode::PairedGrowth,
         side: None,
         clip: 5,
+        selected_rung: BotRuntimeClipRung::Seed,
+        requested_rung: BotRuntimeClipRung::Seed,
         requested_clip: 5.0,
+        requested_large_clip: false,
         clip_bucket: "small",
         cpp_hint: BotRuntimePairBuildCppHint::Normal,
         marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
@@ -304,6 +527,12 @@ fn bot_runtime_pair_build_optional_buy_requires_below_snapshot() {
         match_ratio: 1.0,
         imbalance_state: BotRuntimeImbalanceState::Normal,
         reduces_imbalance: false,
+        green_both_sides_filled: false,
+        green_price_ok: false,
+        green_imbalance_ok: false,
+        green_time_ok: false,
+        green_budget_ok: false,
+        green_conditions_met: false,
         pair_coverage: 1.0,
         skew_ratio: 1.0,
         current_base: 4.0,
@@ -332,12 +561,16 @@ fn bot_runtime_pair_build_optional_buy_requires_below_snapshot() {
 
 #[test]
 fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
+    let cfg = bot_runtime_config_defaults();
     let repair_policy = bot_runtime_pair_build_lighter_repair_policy(
         &BotRuntimePairBuildDecision {
             mode: BotRuntimePairBuildMode::LighterSideFirst,
             side: Some(OutcomeSide::Yes),
             clip: 3,
+            selected_rung: BotRuntimeClipRung::ExactGapRepair,
+            requested_rung: BotRuntimeClipRung::ExactGapRepair,
             requested_clip: 3.0,
+            requested_large_clip: false,
             clip_bucket: "small",
             cpp_hint: BotRuntimePairBuildCppHint::Normal,
             marginal_cost_mode: BotRuntimeMarginalCostMode::RebalanceAdd,
@@ -351,6 +584,12 @@ fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
             match_ratio: 0.5,
             imbalance_state: BotRuntimeImbalanceState::Warning,
             reduces_imbalance: true,
+            green_both_sides_filled: false,
+            green_price_ok: false,
+            green_imbalance_ok: false,
+            green_time_ok: false,
+            green_budget_ok: false,
+            green_conditions_met: false,
             pair_coverage: 0.5,
             skew_ratio: 2.0,
             current_base: 2.0,
@@ -362,18 +601,21 @@ fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
         0.20,
         1.0,
         1.0,
+        &cfg,
     )
     .expect("repair policy");
     assert_eq!(repair_policy.clip, 0);
     assert!(repair_policy.hold_reason.is_some());
 
-    let cfg = bot_runtime_config_defaults();
     let reserve_policy = bot_runtime_pair_build_repair_reserve_policy(
         &BotRuntimePairBuildDecision {
             mode: BotRuntimePairBuildMode::PairedGrowth,
             side: None,
             clip: 4,
+            selected_rung: BotRuntimeClipRung::Seed,
+            requested_rung: BotRuntimeClipRung::Seed,
             requested_clip: 4.0,
+            requested_large_clip: false,
             clip_bucket: "medium",
             cpp_hint: BotRuntimePairBuildCppHint::Normal,
             marginal_cost_mode: BotRuntimeMarginalCostMode::BalancedAdd,
@@ -387,6 +629,12 @@ fn bot_runtime_pair_build_repair_policy_and_reserve_blocks() {
             match_ratio: 0.8,
             imbalance_state: BotRuntimeImbalanceState::Throttle,
             reduces_imbalance: true,
+            green_both_sides_filled: false,
+            green_price_ok: false,
+            green_imbalance_ok: false,
+            green_time_ok: false,
+            green_budget_ok: false,
+            green_conditions_met: false,
             pair_coverage: 0.80,
             skew_ratio: 1.2,
             current_base: 3.0,
@@ -453,7 +701,8 @@ fn bot_runtime_pair_build_handler_sets_hold_reason_when_quotes_missing() {
 
 #[test]
 fn bot_runtime_pair_build_handler_submits_paired_growth_orders() {
-    let bot = make_pair_build_test_bot();
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 500.0;
     set_quotes(&bot, 0.30, 0.35, 0.30, 0.35);
     let cfg = *bot._bot_runtime_cfg();
     bot._bot_runtime_pair_build_handler(40.0, 40.0, 0.0, 5.0, 5.0, 0.0, 0.0, &cfg);
@@ -468,8 +717,19 @@ fn bot_runtime_pair_build_handler_submits_paired_growth_orders() {
                 .map(ToString::to_string)
         })
         .collect();
-    assert!(origins.iter().any(|origin| origin == "BOT_PAIR_BUILD_YES"));
-    assert!(origins.iter().any(|origin| origin == "BOT_PAIR_BUILD_NO"));
+    let hold_reason = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.pair_build_last_hold_reason.clone())
+        .unwrap_or_default();
+    assert!(
+        origins.iter().any(|origin| origin == "BOT_PAIR_BUILD_YES"),
+        "origins={origins:?} hold_reason={hold_reason}"
+    );
+    assert!(
+        origins.iter().any(|origin| origin == "BOT_PAIR_BUILD_NO"),
+        "origins={origins:?} hold_reason={hold_reason}"
+    );
     for value in contexts.values() {
         assert_eq!(
             value.get("pair_id").and_then(|field| field.as_str()),
@@ -527,6 +787,7 @@ fn pair_build_handler_allows_tail_repair_priority_before_balanced_add_stop_add_h
 #[test]
 fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
     let bot = make_pair_build_test_bot();
+    let cfg = *bot._bot_runtime_cfg();
     let context = BotRuntimePairBuildMarketContext {
         yes_asset: "yes_asset_id".to_string(),
         no_asset: "no_asset_id".to_string(),
@@ -542,8 +803,11 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
     let decision = BotRuntimePairBuildDecision {
         mode: BotRuntimePairBuildMode::LighterSideFirst,
         side: Some(OutcomeSide::Yes),
-        clip: 15,
-        requested_clip: 15.0,
+        clip: 12,
+        selected_rung: BotRuntimeClipRung::Seed,
+        requested_rung: BotRuntimeClipRung::Seed,
+        requested_clip: 12.0,
+        requested_large_clip: false,
         clip_bucket: "small",
         cpp_hint: BotRuntimePairBuildCppHint::Normal,
         marginal_cost_mode: BotRuntimeMarginalCostMode::RebalanceAdd,
@@ -557,6 +821,12 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
         match_ratio: 0.25,
         imbalance_state: BotRuntimeImbalanceState::HardDisable,
         reduces_imbalance: true,
+        green_both_sides_filled: false,
+        green_price_ok: false,
+        green_imbalance_ok: false,
+        green_time_ok: false,
+        green_budget_ok: false,
+        green_conditions_met: false,
         pair_coverage: 0.25,
         skew_ratio: 4.0,
         current_base: 5.0,
@@ -580,6 +850,7 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
             10.5,
             bot.cfg.min_shares,
             bot.min_maker_notional,
+            &cfg,
         ),
         repair_reserve_policy: None,
         optional_growth_policy: None,
@@ -599,7 +870,7 @@ fn bot_runtime_pair_build_handler_submits_lighter_side_repair_order() {
 #[test]
 fn tail_repair_priority_blocks_live_repair_when_rebalance_zone_is_danger() {
     let mut bot = make_pair_build_test_bot();
-    bot.cfg.max_total_cost = 200.0;
+    bot.cfg.max_total_cost = 500.0;
     set_quotes(&bot, 0.20, 0.22, 0.70, 0.72);
 
     let cfg = *bot._bot_runtime_cfg();
@@ -611,9 +882,13 @@ fn tail_repair_priority_blocks_live_repair_when_rebalance_zone_is_danger() {
     drop(state);
 
     let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
-    assert!(runtime_state
-        .pair_build_last_hold_reason
-        .starts_with("hold:price_zone_danger:rebalance_add:1.050"));
+    assert!(
+        runtime_state
+            .pair_build_last_hold_reason
+            .starts_with("hold:price_zone_danger:rebalance_add:1.050"),
+        "actual_reason={}",
+        runtime_state.pair_build_last_hold_reason
+    );
 }
 
 #[test]
@@ -903,14 +1178,15 @@ fn imbalance_hold_cancels_wrong_side_live_lighter_repair_after_side_flip() {
 fn pair_build_decision_uses_exact_unmatched_fraction_thresholds() {
     let cfg = bot_runtime_config_defaults();
     let normal = bot_runtime_pair_build_decision(
-        100.0, 100.0, 35.0, 35.0, 0.30, 0.32, 0.30, 0.32, 200.0, 70.0, 1.0, 1.0, &cfg, false,
+        100.0, 100.0, 100.0, 35.0, 35.0, 0.30, 0.32, 0.30, 0.32, 200.0, 70.0, 1.0, 1.0, &cfg, false,
     )
     .expect("normal paired growth");
     assert_eq!(normal.mode, BotRuntimePairBuildMode::PairedGrowth);
     assert_eq!(normal.imbalance_state, BotRuntimeImbalanceState::Normal);
 
     let throttle = bot_runtime_pair_build_decision(
-        100.0, 85.0, 35.0, 29.75, 0.30, 0.32, 0.30, 0.32, 200.0, 64.75, 1.0, 1.0, &cfg, false,
+        100.0, 100.0, 85.0, 35.0, 29.75, 0.30, 0.32, 0.30, 0.32, 200.0, 64.75, 1.0, 1.0, &cfg,
+        false,
     )
     .expect("throttle repair");
     assert_eq!(throttle.mode, BotRuntimePairBuildMode::LighterSideFirst);
@@ -918,14 +1194,15 @@ fn pair_build_decision_uses_exact_unmatched_fraction_thresholds() {
     assert!(throttle.reduces_imbalance);
 
     let warning = bot_runtime_pair_build_decision(
-        100.0, 75.0, 35.0, 26.25, 0.30, 0.32, 0.30, 0.32, 200.0, 61.25, 1.0, 1.0, &cfg, false,
+        100.0, 100.0, 75.0, 35.0, 26.25, 0.30, 0.32, 0.30, 0.32, 200.0, 61.25, 1.0, 1.0, &cfg,
+        false,
     )
     .expect("warning repair");
     assert_eq!(warning.mode, BotRuntimePairBuildMode::LighterSideFirst);
     assert_eq!(warning.imbalance_state, BotRuntimeImbalanceState::Warning);
 
     let hard_disable = bot_runtime_pair_build_decision(
-        12.0, 8.0, 4.2, 2.8, 0.30, 0.32, 0.30, 0.32, 100.0, 7.0, 1.0, 1.0, &cfg, false,
+        100.0, 12.0, 8.0, 4.2, 2.8, 0.30, 0.32, 0.30, 0.32, 100.0, 7.0, 1.0, 1.0, &cfg, false,
     )
     .expect_err("hard disable should block");
     assert!(hard_disable.starts_with("hard_imbalance_disable:"));
