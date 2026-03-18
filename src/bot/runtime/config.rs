@@ -1,45 +1,45 @@
 use super::*;
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::bot) struct BotRuntimeConfigSnapshot {
-    pub(in crate::bot) phase_controller: &'static str,
-    pub(in crate::bot) prearm_lead_seconds: f64,
-    pub(in crate::bot) open_both_seed_deadline_seconds: f64,
-    pub(in crate::bot) open_both_submit_delta_max_seconds: f64,
-    pub(in crate::bot) open_both_allow_single_late_seed: bool,
-    pub(in crate::bot) seed_budget_min_fraction: f64,
-    pub(in crate::bot) seed_budget_max_fraction: f64,
-    pub(in crate::bot) early_budget_min_fraction: f64,
-    pub(in crate::bot) early_budget_max_fraction: f64,
-    pub(in crate::bot) main_budget_min_fraction: f64,
-    pub(in crate::bot) main_budget_max_fraction: f64,
-    pub(in crate::bot) late_budget_min_fraction: f64,
-    pub(in crate::bot) late_budget_max_fraction: f64,
-    pub(in crate::bot) taper_budget_min_fraction: f64,
-    pub(in crate::bot) taper_budget_max_fraction: f64,
-    pub(in crate::bot) target_both_sides_by_30s: f64,
-    pub(in crate::bot) target_both_sides_by_60s: f64,
-    pub(in crate::bot) late_reduce_start_seconds: f64,
-    pub(in crate::bot) late_balance_only_start_seconds: f64,
-    pub(in crate::bot) late_stop_new_orders_start_seconds: f64,
-    pub(in crate::bot) legacy_late_window_budget_mode: bool,
-    pub(in crate::bot) imbalance_target_fraction: f64,
-    pub(in crate::bot) imbalance_warning_fraction: f64,
-    pub(in crate::bot) imbalance_disable_fraction: f64,
-    pub(in crate::bot) clip_ladder: [f64; 4],
-    pub(in crate::bot) repair_reserve_buffer_usd: f64,
-    pub(in crate::bot) buy_only_normal_flow: bool,
-    pub(in crate::bot) tail_cap_mid_start_seconds: f64,
-    pub(in crate::bot) tail_cap_late_start_seconds: f64,
-    pub(in crate::bot) tail_cap_early_fraction: f64,
-    pub(in crate::bot) tail_cap_mid_fraction: f64,
-    pub(in crate::bot) tail_cap_late_fraction: f64,
-    pub(in crate::bot) bad_regime_window_seconds: f64,
-    pub(in crate::bot) bad_regime_expensive_fraction: f64,
+pub(crate) struct BotRuntimeConfigSnapshot {
+    pub(crate) phase_controller: &'static str,
+    pub(crate) prearm_lead_seconds: f64,
+    pub(crate) open_both_seed_deadline_seconds: f64,
+    pub(crate) open_both_submit_delta_max_seconds: f64,
+    pub(crate) open_both_allow_single_late_seed: bool,
+    pub(crate) seed_budget_min_fraction: f64,
+    pub(crate) seed_budget_max_fraction: f64,
+    pub(crate) early_budget_min_fraction: f64,
+    pub(crate) early_budget_max_fraction: f64,
+    pub(crate) main_budget_min_fraction: f64,
+    pub(crate) main_budget_max_fraction: f64,
+    pub(crate) late_budget_min_fraction: f64,
+    pub(crate) late_budget_max_fraction: f64,
+    pub(crate) taper_budget_min_fraction: f64,
+    pub(crate) taper_budget_max_fraction: f64,
+    pub(crate) target_both_sides_by_30s: f64,
+    pub(crate) target_both_sides_by_60s: f64,
+    pub(crate) late_reduce_start_seconds: f64,
+    pub(crate) late_balance_only_start_seconds: f64,
+    pub(crate) late_stop_new_orders_start_seconds: f64,
+    pub(crate) legacy_late_window_budget_mode: bool,
+    pub(crate) imbalance_target_fraction: f64,
+    pub(crate) imbalance_warning_fraction: f64,
+    pub(crate) imbalance_disable_fraction: f64,
+    pub(crate) clip_ladder: [f64; 4],
+    pub(crate) repair_reserve_buffer_usd: f64,
+    pub(crate) buy_only_normal_flow: bool,
+    pub(crate) tail_cap_mid_start_seconds: f64,
+    pub(crate) tail_cap_late_start_seconds: f64,
+    pub(crate) tail_cap_early_fraction: f64,
+    pub(crate) tail_cap_mid_fraction: f64,
+    pub(crate) tail_cap_late_fraction: f64,
+    pub(crate) bad_regime_window_seconds: f64,
+    pub(crate) bad_regime_expensive_fraction: f64,
 }
 /// Implements config defaults for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot {
+pub(crate) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot {
     BotRuntimeConfigSnapshot {
         phase_controller: "time_plus_inventory",
         prearm_lead_seconds: 20.0,
@@ -80,7 +80,7 @@ pub(in crate::bot) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot 
 /// Implements env float for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_env_float<F>(get: &mut F, key: &str, default: f64) -> f64
+pub(crate) fn bot_runtime_env_float<F>(get: &mut F, key: &str, default: f64) -> f64
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -97,7 +97,7 @@ where
         .unwrap_or(default)
 }
 
-pub(in crate::bot) fn bot_runtime_env_float_optional<F>(get: &mut F, key: &str) -> Option<f64>
+pub(crate) fn bot_runtime_env_float_optional<F>(get: &mut F, key: &str) -> Option<f64>
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -115,7 +115,7 @@ where
 /// Implements env bool for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_env_bool<F>(get: &mut F, key: &str, default: bool) -> bool
+pub(crate) fn bot_runtime_env_bool<F>(get: &mut F, key: &str, default: bool) -> bool
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -137,11 +137,7 @@ where
 /// Implements env clip ladder large for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_env_clip_ladder<F>(
-    get: &mut F,
-    key: &str,
-    default: [f64; 4],
-) -> [f64; 4]
+pub(crate) fn bot_runtime_env_clip_ladder<F>(get: &mut F, key: &str, default: [f64; 4]) -> [f64; 4]
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -163,7 +159,7 @@ where
 /// Implements config from reader for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_config_from_reader<F>(mut get: F) -> BotRuntimeConfigSnapshot
+pub(crate) fn bot_runtime_config_from_reader<F>(mut get: F) -> BotRuntimeConfigSnapshot
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -342,13 +338,13 @@ where
 /// Implements config from env for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_config_from_env() -> BotRuntimeConfigSnapshot {
+pub(crate) fn bot_runtime_config_from_env() -> BotRuntimeConfigSnapshot {
     bot_runtime_config_from_reader(|key| std::env::var(key).ok())
 }
 /// Implements validate config for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
-pub(in crate::bot) fn bot_runtime_validate_config(
+pub(crate) fn bot_runtime_validate_config(
     cfg: &BotRuntimeConfigSnapshot,
 ) -> Result<(), &'static str> {
     if !cfg.buy_only_normal_flow {

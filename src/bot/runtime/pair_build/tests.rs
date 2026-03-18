@@ -45,6 +45,7 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
         cfg,
         logger: Arc::new(BotRuntimeNoopLogger),
         market_slug: "pair-build-test".to_string(),
+        config_version: "cfgv1_test".to_string(),
         pair_identity: PairIdentity {
             pair_id: canonical_pair_id_from_slug("pair-build-test"),
             market_slug: "pair-build-test".to_string(),
@@ -70,6 +71,7 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
         reconcile_sell_credit_mult: 1.0,
         first_clip_shares: 0.0,
         first_hedge_full: false,
+        min_entry_edge_ticks: 0,
         start_ts: 0,
         expiry_ts: 300,
         warmup_seconds: 0,
@@ -86,6 +88,7 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
         exec_mode: "BOT".to_string(),
         loop_wait_seconds_maker: 1.0,
         loop_wait_seconds_taker: 0.2,
+        clob_order_meta_warmup: true,
         condition_id: None,
         market_fees_enabled: None,
         yes_asset: Some("yes_asset_id".to_string()),

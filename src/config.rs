@@ -1,8 +1,17 @@
+use crate::bot::{
+    bot_runtime_config_from_reader, bot_runtime_validate_config, BotRuntimeConfigSnapshot,
+};
+use crate::env_utils::{env_bool, env_float, env_int};
 use crate::helpers::{segment, segment_defaults};
+use anyhow::{anyhow, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BotConfig {
     pub clob_host: String,
     pub ws_base: String,
@@ -130,5 +139,583 @@ impl BotConfig {
         self.market_data_stale_seconds = 8;
         self.cancel_all_on_start = true;
         self.log_every = 5;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BotExecutionConfigSnapshot {
+    pub wallet_address: String,
+    pub min_maker_notional: f64,
+    pub min_taker_notional: f64,
+    pub reconcile_sell_credit_mult: f64,
+    pub first_clip_shares: f64,
+    pub first_hedge_full: bool,
+    pub warmup_seconds: i64,
+    pub max_spread_ticks: i64,
+    pub parity_tolerance: f64,
+    pub unhedged_timeout_seconds: f64,
+    pub hedge_slippage_ticks: i64,
+    pub hedge_taker_order_type: String,
+    pub taker_order_ttl_seconds: i64,
+    pub taker_fill_fallback_from_order_events: bool,
+    pub taker_strict_inflight: bool,
+    pub taker_hedge_min_interval: f64,
+    pub exec_mode: String,
+    pub loop_wait_seconds_maker: f64,
+    pub loop_wait_seconds_taker: f64,
+    pub min_entry_edge_ticks: i64,
+    pub exec_latency_log_enabled: bool,
+    pub exec_latency_file_log_enabled: bool,
+    pub exec_latency_jsonl_enabled: bool,
+    pub exec_latency_csv_enabled: bool,
+    pub exec_latency_log_dir: String,
+    pub exec_latency_jsonl_path: String,
+    pub exec_latency_csv_path: String,
+    pub clob_gamma_host: String,
+    pub clob_order_meta_warmup: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BotRuntimeConfigSnapshotV1 {
+    pub phase_controller: String,
+    pub prearm_lead_seconds: f64,
+    pub open_both_seed_deadline_seconds: f64,
+    pub open_both_submit_delta_max_seconds: f64,
+    pub open_both_allow_single_late_seed: bool,
+    pub seed_budget_min_fraction: f64,
+    pub seed_budget_max_fraction: f64,
+    pub early_budget_min_fraction: f64,
+    pub early_budget_max_fraction: f64,
+    pub main_budget_min_fraction: f64,
+    pub main_budget_max_fraction: f64,
+    pub late_budget_min_fraction: f64,
+    pub late_budget_max_fraction: f64,
+    pub taper_budget_min_fraction: f64,
+    pub taper_budget_max_fraction: f64,
+    pub target_both_sides_by_30s: f64,
+    pub target_both_sides_by_60s: f64,
+    pub late_reduce_start_seconds: f64,
+    pub late_balance_only_start_seconds: f64,
+    pub late_stop_new_orders_start_seconds: f64,
+    pub legacy_late_window_budget_mode: bool,
+    pub imbalance_target_fraction: f64,
+    pub imbalance_warning_fraction: f64,
+    pub imbalance_disable_fraction: f64,
+    pub clip_ladder: [f64; 4],
+    pub repair_reserve_buffer_usd: f64,
+    pub buy_only_normal_flow: bool,
+    pub tail_cap_mid_start_seconds: f64,
+    pub tail_cap_late_start_seconds: f64,
+    pub tail_cap_early_fraction: f64,
+    pub tail_cap_mid_fraction: f64,
+    pub tail_cap_late_fraction: f64,
+    pub bad_regime_window_seconds: f64,
+    pub bad_regime_expensive_fraction: f64,
+}
+
+impl From<&BotRuntimeConfigSnapshot> for BotRuntimeConfigSnapshotV1 {
+    fn from(value: &BotRuntimeConfigSnapshot) -> Self {
+        Self {
+            phase_controller: value.phase_controller.to_string(),
+            prearm_lead_seconds: value.prearm_lead_seconds,
+            open_both_seed_deadline_seconds: value.open_both_seed_deadline_seconds,
+            open_both_submit_delta_max_seconds: value.open_both_submit_delta_max_seconds,
+            open_both_allow_single_late_seed: value.open_both_allow_single_late_seed,
+            seed_budget_min_fraction: value.seed_budget_min_fraction,
+            seed_budget_max_fraction: value.seed_budget_max_fraction,
+            early_budget_min_fraction: value.early_budget_min_fraction,
+            early_budget_max_fraction: value.early_budget_max_fraction,
+            main_budget_min_fraction: value.main_budget_min_fraction,
+            main_budget_max_fraction: value.main_budget_max_fraction,
+            late_budget_min_fraction: value.late_budget_min_fraction,
+            late_budget_max_fraction: value.late_budget_max_fraction,
+            taper_budget_min_fraction: value.taper_budget_min_fraction,
+            taper_budget_max_fraction: value.taper_budget_max_fraction,
+            target_both_sides_by_30s: value.target_both_sides_by_30s,
+            target_both_sides_by_60s: value.target_both_sides_by_60s,
+            late_reduce_start_seconds: value.late_reduce_start_seconds,
+            late_balance_only_start_seconds: value.late_balance_only_start_seconds,
+            late_stop_new_orders_start_seconds: value.late_stop_new_orders_start_seconds,
+            legacy_late_window_budget_mode: value.legacy_late_window_budget_mode,
+            imbalance_target_fraction: value.imbalance_target_fraction,
+            imbalance_warning_fraction: value.imbalance_warning_fraction,
+            imbalance_disable_fraction: value.imbalance_disable_fraction,
+            clip_ladder: value.clip_ladder,
+            repair_reserve_buffer_usd: value.repair_reserve_buffer_usd,
+            buy_only_normal_flow: value.buy_only_normal_flow,
+            tail_cap_mid_start_seconds: value.tail_cap_mid_start_seconds,
+            tail_cap_late_start_seconds: value.tail_cap_late_start_seconds,
+            tail_cap_early_fraction: value.tail_cap_early_fraction,
+            tail_cap_mid_fraction: value.tail_cap_mid_fraction,
+            tail_cap_late_fraction: value.tail_cap_late_fraction,
+            bad_regime_window_seconds: value.bad_regime_window_seconds,
+            bad_regime_expensive_fraction: value.bad_regime_expensive_fraction,
+        }
+    }
+}
+
+impl BotRuntimeConfigSnapshotV1 {
+    pub fn to_runtime_config(&self) -> BotRuntimeConfigSnapshot {
+        BotRuntimeConfigSnapshot {
+            phase_controller: Box::leak(self.phase_controller.clone().into_boxed_str()),
+            prearm_lead_seconds: self.prearm_lead_seconds,
+            open_both_seed_deadline_seconds: self.open_both_seed_deadline_seconds,
+            open_both_submit_delta_max_seconds: self.open_both_submit_delta_max_seconds,
+            open_both_allow_single_late_seed: self.open_both_allow_single_late_seed,
+            seed_budget_min_fraction: self.seed_budget_min_fraction,
+            seed_budget_max_fraction: self.seed_budget_max_fraction,
+            early_budget_min_fraction: self.early_budget_min_fraction,
+            early_budget_max_fraction: self.early_budget_max_fraction,
+            main_budget_min_fraction: self.main_budget_min_fraction,
+            main_budget_max_fraction: self.main_budget_max_fraction,
+            late_budget_min_fraction: self.late_budget_min_fraction,
+            late_budget_max_fraction: self.late_budget_max_fraction,
+            taper_budget_min_fraction: self.taper_budget_min_fraction,
+            taper_budget_max_fraction: self.taper_budget_max_fraction,
+            target_both_sides_by_30s: self.target_both_sides_by_30s,
+            target_both_sides_by_60s: self.target_both_sides_by_60s,
+            late_reduce_start_seconds: self.late_reduce_start_seconds,
+            late_balance_only_start_seconds: self.late_balance_only_start_seconds,
+            late_stop_new_orders_start_seconds: self.late_stop_new_orders_start_seconds,
+            legacy_late_window_budget_mode: self.legacy_late_window_budget_mode,
+            imbalance_target_fraction: self.imbalance_target_fraction,
+            imbalance_warning_fraction: self.imbalance_warning_fraction,
+            imbalance_disable_fraction: self.imbalance_disable_fraction,
+            clip_ladder: self.clip_ladder,
+            repair_reserve_buffer_usd: self.repair_reserve_buffer_usd,
+            buy_only_normal_flow: self.buy_only_normal_flow,
+            tail_cap_mid_start_seconds: self.tail_cap_mid_start_seconds,
+            tail_cap_late_start_seconds: self.tail_cap_late_start_seconds,
+            tail_cap_early_fraction: self.tail_cap_early_fraction,
+            tail_cap_mid_fraction: self.tail_cap_mid_fraction,
+            tail_cap_late_fraction: self.tail_cap_late_fraction,
+            bad_regime_window_seconds: self.bad_regime_window_seconds,
+            bad_regime_expensive_fraction: self.bad_regime_expensive_fraction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VersionedConfigSnapshotV1 {
+    pub schema_version: String,
+    pub source: String,
+    pub loaded_at: String,
+    pub config_version: String,
+    pub config_hash: String,
+    pub bot_config: BotConfig,
+    pub runtime_config: BotRuntimeConfigSnapshotV1,
+    pub execution_config: BotExecutionConfigSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedVersionedConfigBundle {
+    pub snapshot: VersionedConfigSnapshotV1,
+    pub effective_bot_config: BotConfig,
+    pub runtime_config: BotRuntimeConfigSnapshot,
+    pub execution_config: BotExecutionConfigSnapshot,
+}
+
+impl ResolvedVersionedConfigBundle {
+    pub fn config_version(&self) -> &str {
+        self.snapshot.config_version.as_str()
+    }
+
+    pub fn config_hash(&self) -> &str {
+        self.snapshot.config_hash.as_str()
+    }
+
+    pub fn loaded_at(&self) -> &str {
+        self.snapshot.loaded_at.as_str()
+    }
+
+    pub fn config_text(&self) -> Result<String> {
+        serde_json::to_string(&self.snapshot).map_err(|err| anyhow!(err))
+    }
+}
+
+fn canonicalize_json(v: Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut out = BTreeMap::new();
+            for (k, val) in map {
+                out.insert(k, canonicalize_json(val));
+            }
+            let mut m = serde_json::Map::new();
+            for (k, val) in out {
+                m.insert(k, val);
+            }
+            Value::Object(m)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(canonicalize_json).collect()),
+        other => other,
+    }
+}
+
+fn wallet_address_from_env(cfg: &BotConfig) -> String {
+    let mut wallet_address = env::var("WALLET_ADDRESS").unwrap_or_default();
+    if wallet_address.trim().is_empty() {
+        wallet_address = env::var("POLYMARKET_WALLET_ADDRESS").unwrap_or_default();
+    }
+    if wallet_address.trim().is_empty() {
+        wallet_address = env::var("POLYMARKET_FUNDER").unwrap_or_default();
+    }
+    if wallet_address.trim().is_empty() {
+        wallet_address = cfg.funder.clone().unwrap_or_default();
+    }
+    wallet_address.trim().to_ascii_lowercase()
+}
+
+fn exec_latency_jsonl_path_from_env(log_dir: &str) -> String {
+    let path = env::var("EXEC_LATENCY_JSONL_PATH").unwrap_or_default();
+    if path.trim().is_empty() {
+        format!("{log_dir}/exec_latency.jsonl")
+    } else {
+        path.trim().to_string()
+    }
+}
+
+fn exec_latency_csv_path_from_env(log_dir: &str) -> String {
+    let path = env::var("EXEC_LATENCY_CSV_PATH").unwrap_or_default();
+    if path.trim().is_empty() {
+        format!("{log_dir}/exec_latency.csv")
+    } else {
+        path.trim().to_string()
+    }
+}
+
+pub fn build_effective_bot_config_from_env() -> Result<BotConfig> {
+    let mut cfg = BotConfig::from_env();
+
+    let seg = segment(&env::var("MARKET_SEGMENT").unwrap_or_else(|_| "15M".to_string()));
+    let defaults = segment_defaults(&seg);
+    cfg.market_segment = seg;
+    cfg.market_duration_seconds = env::var("MARKET_DURATION_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(defaults.duration);
+    cfg.market_step_seconds = env::var("MARKET_STEP_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(defaults.step);
+    cfg.stop_buffer_seconds = env::var("STOP_BUFFER_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(defaults.stop_buffer);
+
+    let sig = env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "1".to_string());
+    let funder = env::var("POLYMARKET_FUNDER").unwrap_or_default();
+    if !sig.trim().is_empty() && !funder.trim().is_empty() {
+        cfg.signature_type = sig.trim().parse::<i64>().ok();
+        cfg.funder = Some(funder.trim().to_string());
+    }
+
+    cfg.apply_safe_defaults();
+    cfg.min_shares = env_float("MIN_SHARES", cfg.min_shares);
+    cfg.clip_shares = env_float("CLIP_SHARES", cfg.clip_shares);
+    cfg.max_total_cost = env_float("MAX_TOTAL_COST", cfg.max_total_cost);
+    cfg.reserve_usd = env_float("RESERVE_USD", cfg.reserve_usd);
+    cfg.dry_run = env_bool("DRY_RUN", cfg.dry_run);
+    cfg.log_every = env_int("LOG_EVERY_SECONDS", cfg.log_every) as i64;
+    cfg.market_data_stale_seconds =
+        env_int("MARKET_DATA_STALE_SECONDS", cfg.market_data_stale_seconds) as i64;
+    cfg.stop_buffer_seconds = env_int("STOP_BUFFER_SECONDS", cfg.stop_buffer_seconds) as i64;
+    cfg.entry_edge_ticks = env_int("ENTRY_EDGE_TICKS", cfg.entry_edge_ticks) as i64;
+    cfg.hedge_buffer_ticks = env_int("HEDGE_BUFFER_TICKS", cfg.hedge_buffer_ticks) as i64;
+    cfg.maker_buffer_ticks = env_int("MAKER_BUFFER_TICKS", cfg.maker_buffer_ticks) as i64;
+    cfg.improve_bid_ticks = env_int("IMPROVE_BID_TICKS", cfg.improve_bid_ticks) as i64;
+    cfg.replace_if_price_moves_ticks = env_int(
+        "REPLACE_IF_PRICE_MOVES_TICKS",
+        cfg.replace_if_price_moves_ticks,
+    ) as i64;
+    cfg.stale_seconds = env_int("STALE_SECONDS", cfg.stale_seconds) as i64;
+
+    if cfg.private_key.trim().is_empty() {
+        return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
+    }
+    if cfg.funder.clone().unwrap_or_default().trim().is_empty() {
+        return Err(anyhow!("Missing POLYMARKET_FUNDER"));
+    }
+
+    Ok(cfg)
+}
+
+pub fn build_execution_config_from_env(cfg: &BotConfig) -> Result<BotExecutionConfigSnapshot> {
+    let log_dir = env::var("EXEC_LATENCY_LOG_DIR")
+        .unwrap_or_else(|_| "./logs".to_string())
+        .trim()
+        .to_string();
+    let warmup_default = segment_defaults(&cfg.market_segment).warmup;
+    let exec_mode = env::var("EXEC_MODE")
+        .unwrap_or_else(|_| "BOT".to_string())
+        .trim()
+        .to_ascii_uppercase();
+    if exec_mode != "BOT" {
+        return Err(anyhow!(
+            "Unsupported EXEC_MODE={exec_mode}. Only BOT is supported."
+        ));
+    }
+
+    Ok(BotExecutionConfigSnapshot {
+        wallet_address: wallet_address_from_env(cfg),
+        min_maker_notional: env_float("MIN_MAKER_NOTIONAL", 1.0),
+        min_taker_notional: env_float("MIN_TAKER_NOTIONAL", 1.0),
+        reconcile_sell_credit_mult: env_float("RECONCILE_SELL_CREDIT_MULT", 1.0).clamp(0.0, 1.0),
+        first_clip_shares: env_float("FIRST_CLIP_SHARES", 0.0),
+        first_hedge_full: matches!(
+            env::var("FIRST_HEDGE_FULL")
+                .unwrap_or_else(|_| "false".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "y"
+        ),
+        warmup_seconds: env_int("WARMUP_SECONDS", warmup_default) as i64,
+        max_spread_ticks: env_int("MAX_SPREAD_TICKS", 6) as i64,
+        parity_tolerance: env_float("PARITY_TOLERANCE", 0.025),
+        unhedged_timeout_seconds: env_float("UNHEDGED_TIMEOUT_SECONDS", 2.0),
+        hedge_slippage_ticks: env_int("HEDGE_SLIPPAGE_TICKS", 1) as i64,
+        hedge_taker_order_type: env::var("HEDGE_TAKER_ORDER_TYPE")
+            .unwrap_or_else(|_| "FAK".to_string())
+            .trim()
+            .to_ascii_uppercase(),
+        taker_order_ttl_seconds: env_int("TAKER_ORDER_TTL_SECONDS", 120) as i64,
+        taker_fill_fallback_from_order_events: env_bool(
+            "TAKER_FILL_FALLBACK_FROM_ORDER_EVENTS",
+            true,
+        ),
+        taker_strict_inflight: env_bool("TAKER_STRICT_INFLIGHT", true),
+        taker_hedge_min_interval: env_float("TAKER_HEDGE_MIN_INTERVAL", 1.0),
+        exec_mode,
+        loop_wait_seconds_maker: env_float("LOOP_WAIT_SECONDS_MAKER", 1.0),
+        loop_wait_seconds_taker: env_float("LOOP_WAIT_SECONDS_TAKER", 0.2),
+        min_entry_edge_ticks: env_int("MIN_ENTRY_EDGE_TICKS", cfg.entry_edge_ticks).max(0) as i64,
+        exec_latency_log_enabled: env_bool("EXEC_LATENCY_LOG_ENABLED", true),
+        exec_latency_file_log_enabled: env_bool("EXEC_LATENCY_FILE_LOG_ENABLED", true),
+        exec_latency_jsonl_enabled: env_bool("EXEC_LATENCY_JSONL_ENABLED", true),
+        exec_latency_csv_enabled: env_bool("EXEC_LATENCY_CSV_ENABLED", true),
+        exec_latency_log_dir: log_dir.clone(),
+        exec_latency_jsonl_path: exec_latency_jsonl_path_from_env(log_dir.as_str()),
+        exec_latency_csv_path: exec_latency_csv_path_from_env(log_dir.as_str()),
+        clob_gamma_host: env::var("CLOB_GAMMA_API_URL")
+            .or_else(|_| env::var("GAMMA_HOST"))
+            .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string()),
+        clob_order_meta_warmup: env_bool("CLOB_ORDER_META_WARMUP", true),
+    })
+}
+
+fn sanitized_bot_config(cfg: &BotConfig) -> BotConfig {
+    let mut sanitized = cfg.clone();
+    sanitized.private_key.clear();
+    sanitized
+}
+
+fn config_version_payload(
+    bot_config: &BotConfig,
+    runtime_config: &BotRuntimeConfigSnapshotV1,
+    execution_config: &BotExecutionConfigSnapshot,
+) -> Value {
+    serde_json::json!({
+        "schema_version": "v1",
+        "source": "env",
+        "bot_config": sanitized_bot_config(bot_config),
+        "runtime_config": runtime_config,
+        "execution_config": execution_config,
+    })
+}
+
+fn version_hash_from_payload(payload: &Value) -> Result<String> {
+    let canonical = canonicalize_json(payload.clone());
+    let serialized = serde_json::to_string(&canonical)?;
+    let mut hasher = Sha256::new();
+    hasher.update(serialized.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn config_version_from_hash(hash: &str) -> String {
+    let short = hash.chars().take(12).collect::<String>();
+    format!("cfgv1_{short}")
+}
+
+pub fn load_versioned_config_bundle_from_env() -> Result<ResolvedVersionedConfigBundle> {
+    let effective_bot_config = build_effective_bot_config_from_env()?;
+    let runtime_config = bot_runtime_config_from_reader(|key| env::var(key).ok());
+    bot_runtime_validate_config(&runtime_config).map_err(|err| anyhow!(err))?;
+    let execution_config = build_execution_config_from_env(&effective_bot_config)?;
+    let runtime_snapshot = BotRuntimeConfigSnapshotV1::from(&runtime_config);
+    let payload =
+        config_version_payload(&effective_bot_config, &runtime_snapshot, &execution_config);
+    let config_hash = version_hash_from_payload(&payload)?;
+    let snapshot = VersionedConfigSnapshotV1 {
+        schema_version: "v1".to_string(),
+        source: "env".to_string(),
+        loaded_at: Utc::now().to_rfc3339(),
+        config_version: config_version_from_hash(config_hash.as_str()),
+        config_hash,
+        bot_config: sanitized_bot_config(&effective_bot_config),
+        runtime_config: runtime_snapshot,
+        execution_config: execution_config.clone(),
+    };
+    Ok(ResolvedVersionedConfigBundle {
+        snapshot,
+        effective_bot_config,
+        runtime_config,
+        execution_config,
+    })
+}
+
+pub fn resolve_versioned_config_bundle_from_snapshot(
+    snapshot: VersionedConfigSnapshotV1,
+) -> Result<ResolvedVersionedConfigBundle> {
+    let runtime_config = snapshot.runtime_config.to_runtime_config();
+    bot_runtime_validate_config(&runtime_config).map_err(|err| anyhow!(err))?;
+    let mut effective_bot_config = snapshot.bot_config.clone();
+    if effective_bot_config.private_key.trim().is_empty() {
+        effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
+    if effective_bot_config.private_key.trim().is_empty() {
+        return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
+    }
+    if effective_bot_config
+        .funder
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Err(anyhow!("Missing POLYMARKET_FUNDER"));
+    }
+    Ok(ResolvedVersionedConfigBundle {
+        execution_config: snapshot.execution_config.clone(),
+        snapshot,
+        effective_bot_config,
+        runtime_config,
+    })
+}
+
+pub fn build_legacy_versioned_config_bundle(
+    mut effective_bot_config: BotConfig,
+    config_hash: String,
+    config_version: String,
+    loaded_at: String,
+) -> Result<ResolvedVersionedConfigBundle> {
+    if effective_bot_config.private_key.trim().is_empty() {
+        effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
+    if effective_bot_config.private_key.trim().is_empty() {
+        return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
+    }
+    if effective_bot_config
+        .funder
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Err(anyhow!("Missing POLYMARKET_FUNDER"));
+    }
+    let runtime_config = bot_runtime_config_from_reader(|key| env::var(key).ok());
+    bot_runtime_validate_config(&runtime_config).map_err(|err| anyhow!(err))?;
+    let execution_config = build_execution_config_from_env(&effective_bot_config)?;
+    let snapshot = VersionedConfigSnapshotV1 {
+        schema_version: "legacy_flat_row".to_string(),
+        source: "configuration_row".to_string(),
+        loaded_at,
+        config_version,
+        config_hash,
+        bot_config: sanitized_bot_config(&effective_bot_config),
+        runtime_config: BotRuntimeConfigSnapshotV1::from(&runtime_config),
+        execution_config: execution_config.clone(),
+    };
+    Ok(ResolvedVersionedConfigBundle {
+        snapshot,
+        effective_bot_config,
+        runtime_config,
+        execution_config,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let saved = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in vars {
+            match value {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+        f();
+        for (key, value) in saved {
+            match value {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn versioned_config_bundle_reuses_version_for_identical_effective_config() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("BOT_PREARM_LEAD_SECONDS", Some("20")),
+                ("MIN_MAKER_NOTIONAL", Some("1.0")),
+            ],
+            || {
+                let left = load_versioned_config_bundle_from_env().expect("left bundle");
+                let right = load_versioned_config_bundle_from_env().expect("right bundle");
+                assert_eq!(left.config_hash(), right.config_hash());
+                assert_eq!(left.config_version(), right.config_version());
+            },
+        );
+    }
+
+    #[test]
+    fn runtime_only_change_rolls_config_version() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("BOT_PREARM_LEAD_SECONDS", Some("20")),
+            ],
+            || {
+                let base = load_versioned_config_bundle_from_env().expect("base bundle");
+                env::set_var("BOT_PREARM_LEAD_SECONDS", "21");
+                let changed = load_versioned_config_bundle_from_env().expect("changed bundle");
+                assert_ne!(base.config_hash(), changed.config_hash());
+                assert_ne!(base.config_version(), changed.config_version());
+            },
+        );
+    }
+
+    #[test]
+    fn secret_only_change_does_not_roll_config_version_or_persist_secret() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+            ],
+            || {
+                let left = load_versioned_config_bundle_from_env().expect("left bundle");
+                env::set_var("POLYMARKET_PRIVATE_KEY", "secret-b");
+                let right = load_versioned_config_bundle_from_env().expect("right bundle");
+                assert_eq!(left.config_version(), right.config_version());
+                let text = right.config_text().expect("config text");
+                assert!(!text.contains("secret-a"));
+                assert!(!text.contains("secret-b"));
+            },
+        );
     }
 }

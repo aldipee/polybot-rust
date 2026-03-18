@@ -1,10 +1,10 @@
-use crate::config::BotConfig;
+use crate::config::{BotConfig, ResolvedVersionedConfigBundle};
 use crate::env_utils::{env_bool, env_float, env_int};
 use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
 use crate::helpers::{
     canonical_pair_id_from_slug, clamp, cost_per_pair, iso_to_epoch, load_daily_liquidity_state,
     load_state, locked_profit, q_down, round_down, round_up, save_daily_liquidity_state,
-    save_state, segment_defaults, BotState, DailyLiquidityState, OpenOrderState,
+    save_state, BotState, DailyLiquidityState, OpenOrderState,
 };
 use crate::latency_log::LatencyLogService;
 use crate::logging::LogLike;
@@ -92,7 +92,7 @@ mod shared;
 use self::shared::*;
 
 mod runtime;
-use self::runtime::*;
+pub(crate) use self::runtime::*;
 
 mod core;
 pub use self::core::MakerHedgeCapBot;

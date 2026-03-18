@@ -133,8 +133,7 @@ impl MakerHedgeCapBot {
             if let (Some(y_o), Some(n_o)) = (s.open_orders.get(yes), s.open_orders.get(no)) {
                 let y_p = y_o.price.unwrap_or(0.0);
                 let n_p = n_o.price.unwrap_or(0.0);
-                let min_edge = env_int("MIN_ENTRY_EDGE_TICKS", self.cfg.entry_edge_ticks) as i64;
-                let edge_ticks = self.cfg.entry_edge_ticks.max(min_edge);
+                let edge_ticks = self.cfg.entry_edge_ticks.max(self.min_entry_edge_ticks);
                 let entry_edge = edge_ticks as f64 * self.cfg.tick.max(0.0001);
                 if (y_p + n_p) > (1.0 - entry_edge) {
                     reasons.push(format!(

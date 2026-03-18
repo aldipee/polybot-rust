@@ -10,6 +10,7 @@ mod taper;
 mod taper_helpers;
 mod taper_runtime;
 pub(in crate::bot) use self::config::*;
+pub(crate) use self::config::*;
 pub(in crate::bot) use self::metrics::*;
 pub(in crate::bot) use self::pair_build::*;
 pub(in crate::bot) use self::policy::*;

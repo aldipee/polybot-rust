@@ -1,4 +1,4 @@
-use crate::config::BotConfig;
+use crate::config::{BotConfig, ResolvedVersionedConfigBundle};
 use crate::helpers::canonical_pair_id_from_slug;
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, Duration, Utc};
@@ -71,6 +71,9 @@ pub struct BotRow {
 pub struct ConfigurationRow {
     pub configuration_id: String,
     pub config_hash: String,
+    pub config_version: String,
+    pub config_text: String,
+    pub loaded_at: String,
     pub clob_host: String,
     pub ws_base: String,
     pub chain_id: i64,
@@ -109,6 +112,7 @@ pub struct TradeRow {
     pub yes_asset_id: Option<String>,
     pub no_asset_id: Option<String>,
     pub configuration_id: String,
+    pub config_version: String,
     pub date: String,
     pub start_trade: String,
     pub end_trade: String,
@@ -162,6 +166,7 @@ pub struct TradePairMetadata {
 
 #[derive(Debug, Clone, Default)]
 pub struct TradeDecisionUpsert {
+    pub config_version: Option<String>,
     pub pair_id: Option<String>,
     pub market_slug: Option<String>,
     pub condition_id: Option<String>,
@@ -285,6 +290,11 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
     })
 }
 
+fn legacy_config_version_from_hash(config_hash: &str) -> String {
+    let suffix = config_hash.chars().take(12).collect::<String>();
+    format!("legacy_{suffix}")
+}
+
 fn normalized_trade_pair_metadata(pair: &TradePairMetadata) -> TradePairMetadata {
     let market_slug = pair.market_slug.trim().to_string();
     let pair_id = canonical_pair_id_from_slug(if pair.pair_id.trim().is_empty() {
@@ -324,6 +334,9 @@ CREATE TABLE IF NOT EXISTS bot (
 CREATE TABLE IF NOT EXISTS configuration (
   configuration_id TEXT PRIMARY KEY,
   config_hash TEXT NOT NULL UNIQUE,
+  config_version TEXT NOT NULL,
+  config_text TEXT NOT NULL,
+  loaded_at TEXT NOT NULL,
   clob_host TEXT NOT NULL,
   ws_base TEXT NOT NULL,
   chain_id BIGINT NOT NULL,
@@ -362,6 +375,7 @@ CREATE TABLE IF NOT EXISTS trade (
   yes_asset_id TEXT NULL,
   no_asset_id TEXT NULL,
   configuration_id TEXT NOT NULL,
+  config_version TEXT NOT NULL DEFAULT '',
   date TEXT NOT NULL,
   start_trade TEXT NOT NULL,
   end_trade TEXT NOT NULL,
@@ -389,6 +403,7 @@ CREATE TABLE IF NOT EXISTS trade (
 
 CREATE TABLE IF NOT EXISTS trade_decisions (
   trade_id TEXT PRIMARY KEY,
+  config_version TEXT NULL,
   pair_id TEXT NULL,
   market_slug TEXT NULL,
   condition_id TEXT NULL,
@@ -449,6 +464,8 @@ CREATE TABLE IF NOT EXISTS trade_decisions (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
   ON trade (bot_id, pair_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_configuration_config_version_unique
+  ON configuration (config_version);
 "#,
         )
         .context("failed creating schema")?;
@@ -466,6 +483,9 @@ ALTER TABLE configuration ALTER COLUMN hedge_buffer_ticks TYPE BIGINT USING hedg
 ALTER TABLE configuration ALTER COLUMN log_every TYPE BIGINT USING log_every::BIGINT;
 ALTER TABLE configuration ALTER COLUMN market_data_stale_seconds TYPE BIGINT USING market_data_stale_seconds::BIGINT;
 ALTER TABLE configuration ALTER COLUMN stop_buffer_seconds TYPE BIGINT USING stop_buffer_seconds::BIGINT;
+ALTER TABLE configuration ADD COLUMN IF NOT EXISTS config_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE configuration ADD COLUMN IF NOT EXISTS config_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE configuration ADD COLUMN IF NOT EXISTS loaded_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE configuration ALTER COLUMN cancel_all_on_start TYPE BOOLEAN USING
     CASE
         WHEN cancel_all_on_start::TEXT IN ('1', 't', 'true', 'TRUE') THEN TRUE
@@ -476,6 +496,10 @@ ALTER TABLE configuration ALTER COLUMN dry_run TYPE BOOLEAN USING
         WHEN dry_run::TEXT IN ('1', 't', 'true', 'TRUE') THEN TRUE
         ELSE FALSE
     END;
+UPDATE configuration
+SET loaded_at = COALESCE(NULLIF(trim(loaded_at), ''), created_at);
+UPDATE configuration
+SET config_version = COALESCE(NULLIF(trim(config_version), ''), 'legacy_' || LEFT(config_hash, 12));
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'PENDING';
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_checked_at TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS validation_validated_at TEXT NULL;
@@ -484,6 +508,7 @@ ALTER TABLE trade ADD COLUMN IF NOT EXISTS pair_id TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS condition_id TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS yes_asset_id TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS no_asset_id TEXT NULL;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS config_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS entry_time TEXT NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS holding_duration_seconds DOUBLE PRECISION NULL;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS entry_reason TEXT NULL;
@@ -527,6 +552,7 @@ WHERE (stop_loss_category IS NULL OR trim(stop_loss_category) = '')
   );
 ALTER TABLE trade ALTER COLUMN pair_id SET NOT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS t_left_seconds DOUBLE PRECISION NULL;
+ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS config_version TEXT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS pair_id TEXT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS market_slug TEXT NULL;
 ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS condition_id TEXT NULL;
@@ -637,8 +663,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         }))
     }
 
-    pub fn upsert_configuration(&self, cfg: &BotConfig) -> Result<String> {
-        let h = cfg_hash(cfg);
+    pub fn upsert_configuration(&self, bundle: &ResolvedVersionedConfigBundle) -> Result<String> {
+        let h = bundle.config_hash().to_string();
+        let cfg = &bundle.effective_bot_config;
+        let config_text = bundle.config_text()?;
         let mut conn = open_conn(&self.engine)?;
 
         if let Some(row) = conn.query_opt(
@@ -653,7 +681,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         let now = now_iso_jakarta();
         conn.execute(
             "INSERT INTO configuration (
-                configuration_id, config_hash,
+                configuration_id, config_hash, config_version, config_text, loaded_at,
                 clob_host, ws_base, chain_id, private_key, signature_type, funder,
                 tick, min_shares, lock_profit_target,
                 clip_shares, improve_bid_ticks, maker_buffer_ticks, replace_if_price_moves_ticks, stale_seconds,
@@ -662,22 +690,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
                 market_data_stale_seconds, ws_reconnect_min, ws_reconnect_max,
                 stop_buffer_seconds, created_at
             ) VALUES (
-                $1, $2,
-                $3, $4, $5, $6, $7, $8,
-                $9, $10, $11,
-                $12, $13, $14, $15, $16,
-                $17, $18, $19, $20,
-                $21, $22, $23,
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9, $10, $11,
+                $12, $13, $14,
+                $15, $16, $17, $18, $19,
+                $20, $21, $22, $23,
                 $24, $25, $26,
-                $27, $28
+                $27, $28, $29,
+                $30, $31
             )",
             &[
                 &cid,
                 &h,
+                &bundle.snapshot.config_version,
+                &config_text,
+                &bundle.snapshot.loaded_at,
                 &cfg.clob_host,
                 &cfg.ws_base,
                 &cfg.chain_id,
-                &cfg.private_key,
+                &bundle.snapshot.bot_config.private_key,
                 &cfg.signature_type,
                 &cfg.funder,
                 &cfg.tick,
@@ -709,7 +740,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         let mut conn = open_conn(&self.engine)?;
         let row = conn.query_opt(
             "SELECT
-                configuration_id, config_hash,
+                configuration_id, config_hash, config_version, config_text, loaded_at,
                 clob_host, ws_base, chain_id, private_key, signature_type, funder,
                 tick, min_shares, lock_profit_target,
                 clip_shares, improve_bid_ticks, maker_buffer_ticks, replace_if_price_moves_ticks, stale_seconds,
@@ -721,35 +752,52 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
             &[&configuration_id],
         )?;
 
-        Ok(row.map(|r| ConfigurationRow {
-            configuration_id: r.get(0),
-            config_hash: r.get(1),
-            clob_host: r.get(2),
-            ws_base: r.get(3),
-            chain_id: r.get(4),
-            private_key: r.get(5),
-            signature_type: r.get(6),
-            funder: r.get(7),
-            tick: r.get(8),
-            min_shares: r.get(9),
-            lock_profit_target: r.get(10),
-            clip_shares: r.get(11),
-            improve_bid_ticks: r.get(12),
-            maker_buffer_ticks: r.get(13),
-            replace_if_price_moves_ticks: r.get(14),
-            stale_seconds: r.get(15),
-            entry_edge_ticks: r.get(16),
-            hedge_buffer_ticks: r.get(17),
-            max_total_cost: r.get(18),
-            reserve_usd: r.get(19),
-            cancel_all_on_start: r.get(20),
-            dry_run: r.get(21),
-            log_every: r.get(22),
-            market_data_stale_seconds: r.get(23),
-            ws_reconnect_min: r.get(24),
-            ws_reconnect_max: r.get(25),
-            stop_buffer_seconds: r.get(26),
-            created_at: r.get(27),
+        Ok(row.map(|r| {
+            let config_hash: String = r.get(1);
+            let raw_config_version: String = r.get(2);
+            let created_at: String = r.get(30);
+            let loaded_at: String = r.get(4);
+            ConfigurationRow {
+                configuration_id: r.get(0),
+                config_hash: config_hash.clone(),
+                config_version: if raw_config_version.trim().is_empty() {
+                    legacy_config_version_from_hash(config_hash.as_str())
+                } else {
+                    raw_config_version
+                },
+                config_text: r.get(3),
+                loaded_at: if loaded_at.trim().is_empty() {
+                    created_at.clone()
+                } else {
+                    loaded_at
+                },
+                clob_host: r.get(5),
+                ws_base: r.get(6),
+                chain_id: r.get(7),
+                private_key: r.get(8),
+                signature_type: r.get(9),
+                funder: r.get(10),
+                tick: r.get(11),
+                min_shares: r.get(12),
+                lock_profit_target: r.get(13),
+                clip_shares: r.get(14),
+                improve_bid_ticks: r.get(15),
+                maker_buffer_ticks: r.get(16),
+                replace_if_price_moves_ticks: r.get(17),
+                stale_seconds: r.get(18),
+                entry_edge_ticks: r.get(19),
+                hedge_buffer_ticks: r.get(20),
+                max_total_cost: r.get(21),
+                reserve_usd: r.get(22),
+                cancel_all_on_start: r.get(23),
+                dry_run: r.get(24),
+                log_every: r.get(25),
+                market_data_stale_seconds: r.get(26),
+                ws_reconnect_min: r.get(27),
+                ws_reconnect_max: r.get(28),
+                stop_buffer_seconds: r.get(29),
+                created_at,
+            }
         }))
     }
 
@@ -1011,6 +1059,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         bot_id: &str,
         pair: &TradePairMetadata,
         configuration_id: &str,
+        config_version: &str,
         start_trade_iso: &str,
     ) -> Result<(String, String)> {
         let pair = normalized_trade_pair_metadata(pair);
@@ -1040,18 +1089,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         conn.execute(
             "INSERT INTO trade (
                 trade_id, exit_reason, bot_id, slug, pair_id, condition_id, yes_asset_id, no_asset_id,
-                configuration_id,
+                configuration_id, config_version,
                 date, start_trade, end_trade,
                 entry_time, holding_duration_seconds, entry_reason, exit_time, exit_reason_category,
                 stop_loss_category, entry_price, exit_price,
                 lp, total_cost, q_yes, q_no, cpp, status, claim_status, meta_data
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9,
-                $10, $11, $12,
-                $13, $14, $15, $16, $17,
-                $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28
+                $9, $10,
+                $11, $12, $13,
+                $14, $15, $16, $17, $18,
+                $19, $20, $21,
+                $22, $23, $24, $25, $26, $27, $28, $29
             )",
             &[
                 &tid,
@@ -1063,6 +1112,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
                 &pair.yes_asset_id,
                 &pair.no_asset_id,
                 &configuration_id,
+                &config_version,
                 &date_jakarta(),
                 &start_trade_iso,
                 &empty,
@@ -1387,6 +1437,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         conn.execute(
             "INSERT INTO trade_decisions (
                 trade_id,
+                config_version,
                 pair_id, market_slug, condition_id, yes_asset_id, no_asset_id,
                 t_left_seconds, tick_age_ms,
                 momentum_checks_passed, momentum_checks_required, momentum_trend_ok, momentum_slope_ok, momentum_candles_ok,
@@ -1404,23 +1455,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
                 created_at, updated_at
             ) VALUES (
                 $1,
-                $2, $3, $4, $5, $6,
-                $7, $8,
-                $9, $10, $11, $12, $13,
-                $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24,
-                $25, $26, $27,
-                $28, $29, $30,
-                $31, $32, $33, $34, $35,
-                $36, $37,
-                $38, $39, $40, $41, $42,
-                $43, $44,
-                $45, $46, $47,
-                $48, $49, $50, $51, $52,
-                $53, $54, $55,
-                $56, $57
+                $2,
+                $3, $4, $5, $6, $7,
+                $8, $9,
+                $10, $11, $12, $13, $14,
+                $15, $16, $17, $18,
+                $19, $20, $21, $22, $23, $24, $25,
+                $26, $27, $28,
+                $29, $30, $31,
+                $32, $33, $34, $35, $36,
+                $37, $38,
+                $39, $40, $41, $42, $43,
+                $44, $45,
+                $46, $47, $48,
+                $49, $50, $51, $52, $53,
+                $54, $55, $56,
+                $57, $58
             )
             ON CONFLICT (trade_id) DO UPDATE SET
+                config_version = EXCLUDED.config_version,
                 pair_id = EXCLUDED.pair_id,
                 market_slug = EXCLUDED.market_slug,
                 condition_id = EXCLUDED.condition_id,
@@ -1478,6 +1531,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
                 updated_at = EXCLUDED.updated_at",
             &[
                 &trade_id,
+                &row.config_version,
                 &pair_id,
                 &market_slug,
                 &condition_id,

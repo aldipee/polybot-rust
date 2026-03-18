@@ -59,6 +59,8 @@ impl MakerHedgeCapBot {
                 .or_insert_with(|| json!(identity.yes_asset_id));
             obj.entry("no_asset_id".to_string())
                 .or_insert_with(|| json!(identity.no_asset_id));
+            obj.entry("config_version".to_string())
+                .or_insert_with(|| json!(self.config_version));
         }
     }
 

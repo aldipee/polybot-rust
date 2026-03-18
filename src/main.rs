@@ -16,14 +16,19 @@ use anyhow::{anyhow, Context, Result};
 use bot::MakerHedgeCapBot;
 use chrono::{Duration as ChronoDuration, Utc};
 use chrono_tz::Asia::Jakarta;
-use config::BotConfig;
+use config::{
+    build_legacy_versioned_config_bundle, load_versioned_config_bundle_from_env,
+    resolve_versioned_config_bundle_from_snapshot, BotConfig, ResolvedVersionedConfigBundle,
+    VersionedConfigSnapshotV1,
+};
 use db::{
     date_jakarta, make_engine, make_session_factory, month_start_date_jakarta, now_iso_jakarta,
-    week_start_date_jakarta, BotRepository, BotTradeStats, ConfigurationRow, TradePairMetadata,
+    week_start_date_jakarta, BotRepository, BotRow, BotTradeStats, ConfigurationRow,
+    TradePairMetadata,
 };
 use env_utils::{env_bool, env_float, env_int};
 use gamma::fetch_market_by_slug;
-use helpers::{generate_market_slug_from_env_now, get_next_slug, segment, segment_defaults};
+use helpers::{generate_market_slug_from_env_now, get_next_slug_with_config};
 use logging::{setup_item_logger, LogLike};
 use r2_storage::upload_logs_before_rollover;
 use reqwest::blocking::Client;
@@ -39,6 +44,12 @@ use std::time::Duration;
 
 fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 fn build_version() -> String {
@@ -1028,7 +1039,13 @@ fn reconcile_unvalidated_trades_with_polymarket(
     Ok(())
 }
 
-fn cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
+#[derive(Debug, Clone)]
+struct ActiveConfigVersion {
+    configuration_id: String,
+    bundle: ResolvedVersionedConfigBundle,
+}
+
+fn legacy_cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
     BotConfig {
         clob_host: cfg_row.clob_host.clone(),
         ws_base: cfg_row.ws_base.clone(),
@@ -1059,6 +1076,86 @@ fn cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
     }
 }
 
+fn config_bundle_from_row(cfg_row: &ConfigurationRow) -> Result<ResolvedVersionedConfigBundle> {
+    if !cfg_row.config_text.trim().is_empty() {
+        let snapshot: VersionedConfigSnapshotV1 = serde_json::from_str(&cfg_row.config_text)
+            .with_context(|| {
+                format!(
+                    "failed deserializing config_text for configuration_id={} config_version={}",
+                    cfg_row.configuration_id, cfg_row.config_version
+                )
+            })?;
+        return resolve_versioned_config_bundle_from_snapshot(snapshot);
+    }
+
+    build_legacy_versioned_config_bundle(
+        legacy_cfg_from_row(cfg_row),
+        cfg_row.config_hash.clone(),
+        cfg_row.config_version.clone(),
+        cfg_row.loaded_at.clone(),
+    )
+}
+
+fn activate_next_config(
+    repo: &BotRepository,
+    bot_row: Option<&BotRow>,
+    previous: Option<&ActiveConfigVersion>,
+    logger: &Arc<dyn LogLike>,
+) -> Result<ActiveConfigVersion> {
+    match load_versioned_config_bundle_from_env() {
+        Ok(bundle) => {
+            let configuration_id = repo.upsert_configuration(&bundle)?;
+            let next = ActiveConfigVersion {
+                configuration_id,
+                bundle,
+            };
+            if previous
+                .map(|prior| prior.bundle.config_version() != next.bundle.config_version())
+                .unwrap_or(true)
+            {
+                logger.info(&format!(
+                    "[CONFIG] activated config_version={} configuration_id={} config_hash={}",
+                    next.bundle.config_version(),
+                    next.configuration_id,
+                    next.bundle.config_hash()
+                ));
+            }
+            Ok(next)
+        }
+        Err(err) => {
+            if let Some(prior) = previous {
+                logger.warning(&format!(
+                    "[CONFIG] reload_failed keeping_previous config_version={} configuration_id={} err={:#}",
+                    prior.bundle.config_version(),
+                    prior.configuration_id,
+                    err
+                ));
+                return Ok(prior.clone());
+            }
+
+            let fallback_id = bot_row
+                .and_then(|row| row.configuration_id.clone())
+                .unwrap_or_default();
+            if !fallback_id.trim().is_empty() {
+                if let Some(cfg_row) = repo.get_configuration(&fallback_id)? {
+                    let bundle = config_bundle_from_row(&cfg_row)?;
+                    logger.warning(&format!(
+                        "[CONFIG] env_load_failed falling_back_to_db config_version={} configuration_id={} err={:#}",
+                        bundle.config_version(),
+                        cfg_row.configuration_id,
+                        err
+                    ));
+                    return Ok(ActiveConfigVersion {
+                        configuration_id: cfg_row.configuration_id,
+                        bundle,
+                    });
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
 fn run() -> Result<()> {
     install_rustls_crypto_provider();
     let _ = dotenvy::dotenv();
@@ -1070,33 +1167,6 @@ fn run() -> Result<()> {
         return Ok(());
     }
     println!("polybot version: {}", build_version());
-
-    let mut cfg = BotConfig::from_env();
-
-    let seg = segment(&env::var("MARKET_SEGMENT").unwrap_or_else(|_| "15M".to_string()));
-    let d = segment_defaults(&seg);
-    cfg.market_segment = seg;
-    cfg.market_duration_seconds = env::var("MARKET_DURATION_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(d.duration);
-    cfg.market_step_seconds = env::var("MARKET_STEP_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(d.step);
-    env::set_var(
-        "MARKET_DURATION_SECONDS",
-        cfg.market_duration_seconds.to_string(),
-    );
-    env::set_var("MARKET_STEP_SECONDS", cfg.market_step_seconds.to_string());
-    cfg.stop_buffer_seconds = env::var("STOP_BUFFER_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(d.stop_buffer);
-
-    if cfg.private_key.trim().is_empty() {
-        return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
-    }
 
     let db_url = env::var("DB_URL")
         .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5432/polybot".to_string());
@@ -1135,18 +1205,12 @@ fn run() -> Result<()> {
         env_bool("TRADE_VALIDATION_AFTER_MARKET_ENABLED", false);
     let pnl_stats_at_end_enabled = env_bool("PNL_STATS_AT_END_ENABLED", false);
     let trade_realized_log_enabled = env_bool("TRADE_REALIZED_LOG_ENABLED", false);
-
-    let sig = env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "1".to_string());
-    let funder = env::var("POLYMARKET_FUNDER").unwrap_or_default();
-    if !sig.trim().is_empty() && !funder.trim().is_empty() {
-        cfg.signature_type = sig.trim().parse::<i64>().ok();
-        cfg.funder = Some(funder.trim().to_string());
-    }
-    if cfg.funder.clone().unwrap_or_default().trim().is_empty() {
-        return Err(anyhow!("Missing POLYMARKET_FUNDER"));
-    }
-
-    let exec_mode = require_bot_exec_mode()?;
+    let config_logger = setup_item_logger("config_loader");
+    let config_repo = session_factory.repository();
+    let initial_bot_row = config_repo.get_bot(&bot_id)?;
+    let mut active_config =
+        activate_next_config(&config_repo, initial_bot_row.as_ref(), None, &config_logger)?;
+    let exec_mode = active_config.bundle.execution_config.exec_mode.clone();
     if telegram_enabled() {
         let startup_logger = setup_item_logger("startup");
         let startup_msg = build_telegram_startup_message(&bot_id, &exec_mode);
@@ -1155,6 +1219,7 @@ fn run() -> Result<()> {
 
     let mut slug = env::var("MARKET_SLUG").unwrap_or_default();
     if slug.trim().is_empty() {
+        let cfg = &active_config.bundle.effective_bot_config;
         if let Some(auto_slug) =
             generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
         {
@@ -1172,8 +1237,6 @@ fn run() -> Result<()> {
             ));
         }
     }
-
-    cfg.apply_safe_defaults();
     let mut current_slug = slug;
     let mut startup_trade_validation_done = false;
     let mut last_daily_limit_telegram_key = String::new();
@@ -1182,10 +1245,17 @@ fn run() -> Result<()> {
         let bot_logger = setup_item_logger(&current_slug);
         bot_logger.info(&format!("\nSTARTING MARKET: {current_slug}"));
         let repo = session_factory.repository();
+        let mut bot_row = repo.get_bot(&bot_id)?;
+        active_config =
+            activate_next_config(&repo, bot_row.as_ref(), Some(&active_config), &bot_logger)?;
+        let current_cfg = active_config.bundle.effective_bot_config.clone();
         if trade_validation_enabled && !startup_trade_validation_done {
-            if let Err(e) =
-                reconcile_unvalidated_trades_with_polymarket(&repo, &bot_id, &cfg, &bot_logger)
-            {
+            if let Err(e) = reconcile_unvalidated_trades_with_polymarket(
+                &repo,
+                &bot_id,
+                &current_cfg,
+                &bot_logger,
+            ) {
                 bot_logger.warning(&format!("[TRADE_VALIDATE] poll error: {e:#}"));
             }
             startup_trade_validation_done = true;
@@ -1238,24 +1308,23 @@ fn run() -> Result<()> {
                     }
                 }
                 thread::sleep(Duration::from_secs(60));
-                if let Some(auto_slug) =
-                    generate_market_slug_from_env_now(&cfg.market_segment, cfg.market_step_seconds)
-                {
+                if let Some(auto_slug) = generate_market_slug_from_env_now(
+                    &current_cfg.market_segment,
+                    current_cfg.market_step_seconds,
+                ) {
                     current_slug = auto_slug;
                 }
                 continue;
             }
         }
 
-        let mut bot_row = repo.get_bot(&bot_id)?;
         if bot_row.is_none() {
-            let bootstrap_cfg_id = repo.upsert_configuration(&cfg)?;
             repo.upsert_bot(
                 &bot_id,
                 &bot_description,
                 &account_name,
                 "ACTIVE",
-                &bootstrap_cfg_id,
+                &active_config.configuration_id,
             )?;
             bot_row = repo.get_bot(&bot_id)?;
         }
@@ -1264,28 +1333,33 @@ fn run() -> Result<()> {
             if row.status != "ACTIVE" {
                 bot_logger.warning(&format!("Bot DISABLED in DB. Skipping {current_slug}."));
                 thread::sleep(Duration::from_secs(2));
-                current_slug = get_next_slug(&current_slug);
+                current_slug = get_next_slug_with_config(
+                    &current_slug,
+                    &current_cfg.market_segment,
+                    current_cfg.market_step_seconds,
+                );
                 continue;
             }
         }
 
-        let mut configuration_id = bot_row
+        let row_config_id = bot_row
             .as_ref()
-            .and_then(|b| b.configuration_id.clone())
+            .and_then(|row| row.configuration_id.clone())
             .unwrap_or_default();
-        if configuration_id.trim().is_empty() {
-            configuration_id = repo.upsert_configuration(&cfg)?;
+        if row_config_id != active_config.configuration_id {
+            repo.upsert_bot(
+                &bot_id,
+                &bot_description,
+                &account_name,
+                "ACTIVE",
+                &active_config.configuration_id,
+            )?;
         }
 
-        let run_cfg = match repo.get_configuration(&configuration_id)? {
-            Some(r) => cfg_from_row(&r),
-            None => {
-                configuration_id = repo.upsert_configuration(&cfg)?;
-                cfg.clone()
-            }
-        };
+        let run_bundle = active_config.bundle.clone();
+        let run_cfg = run_bundle.effective_bot_config.clone();
 
-        let bot = MakerHedgeCapBot::new(run_cfg.clone(), &current_slug, bot_logger.clone())
+        let bot = MakerHedgeCapBot::new(run_bundle.clone(), &current_slug, bot_logger.clone())
             .with_context(|| format!("failed to initialize bot for {current_slug}"))?;
         let pair = bot.pair_identity();
         let trade_pair = TradePairMetadata {
@@ -1299,19 +1373,25 @@ fn run() -> Result<()> {
         let (trade_id, status) = repo.create_pending_trade(
             &bot_id,
             &trade_pair,
-            &configuration_id,
+            &active_config.configuration_id,
+            run_bundle.config_version(),
             &bot.start_trade_iso,
         )?;
         bot_logger.info(&format!(
-            "Created pending trade record: {trade_id} status={status} pair_id={}",
-            trade_pair.pair_id
+            "Created pending trade record: {trade_id} status={status} pair_id={} config_version={}",
+            trade_pair.pair_id,
+            run_bundle.config_version()
         ));
         if status != "INITIALIZED" {
             bot_logger.info(&format!(
                 "Trade {trade_id} already exists with status={status}. Skipping {current_slug}."
             ));
             thread::sleep(Duration::from_secs(1));
-            current_slug = get_next_slug(&current_slug);
+            current_slug = get_next_slug_with_config(
+                &current_slug,
+                &current_cfg.market_segment,
+                current_cfg.market_step_seconds,
+            );
             continue;
         }
 
@@ -1341,7 +1421,7 @@ fn run() -> Result<()> {
         // as soon as the bot is done trading.
         let bg_slug = current_slug.clone();
         let bg_bot_id = bot_id.clone();
-        let bg_cfg = cfg.clone();
+        let bg_cfg = run_cfg.clone();
         let bg_logger = bot_logger.clone();
         let bg_session_factory = session_factory.clone();
         let bg_trade_validation_enabled = trade_validation_enabled;
@@ -1512,7 +1592,11 @@ fn run() -> Result<()> {
             ));
             ns
         } else {
-            get_next_slug(&current_slug)
+            get_next_slug_with_config(
+                &current_slug,
+                &run_cfg.market_segment,
+                run_cfg.market_step_seconds,
+            )
         };
 
         let is_ts = current_slug
@@ -1537,15 +1621,74 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_await_settlement_trade_snapshot, payout_from_resolution_diff,
+        build_await_settlement_trade_snapshot, config_bundle_from_row, payout_from_resolution_diff,
         realized_lp_from_resolution_record, require_bot_exec_mode, settlement_metadata_json,
     };
     use crate::bot::TradeMetrics;
+    use crate::config::load_versioned_config_bundle_from_env;
+    use crate::db::ConfigurationRow;
     use crate::logging::{setup_item_logger, LogLike};
     use crate::rtds::ResolutionSnapshot;
     use serde_json::Value;
     use std::env;
     use std::sync::Arc;
+
+    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let saved = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in vars {
+            match value {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+        f();
+        for (key, value) in saved {
+            match value {
+                Some(v) => env::set_var(&key, v),
+                None => env::remove_var(&key),
+            }
+        }
+    }
+
+    fn configuration_row_from_bundle(config_text: String) -> ConfigurationRow {
+        ConfigurationRow {
+            configuration_id: "cfg-row-1".to_string(),
+            config_hash: "hash1234567890".to_string(),
+            config_version: "cfgv1_test".to_string(),
+            config_text,
+            loaded_at: "2024-01-01T00:00:00Z".to_string(),
+            clob_host: "https://wrong.example".to_string(),
+            ws_base: "wss://wrong.example".to_string(),
+            chain_id: 137,
+            private_key: "legacy-private-key".to_string(),
+            signature_type: Some(1),
+            funder: Some("0xfunder".to_string()),
+            tick: 0.05,
+            min_shares: 7.0,
+            lock_profit_target: 0.5,
+            clip_shares: 7.0,
+            improve_bid_ticks: 1,
+            maker_buffer_ticks: 1,
+            replace_if_price_moves_ticks: 3,
+            stale_seconds: 5,
+            entry_edge_ticks: 6,
+            hedge_buffer_ticks: 2,
+            max_total_cost: 15.0,
+            reserve_usd: 2.0,
+            cancel_all_on_start: true,
+            dry_run: true,
+            log_every: 5,
+            market_data_stale_seconds: 8,
+            ws_reconnect_min: 0.5,
+            ws_reconnect_max: 5.0,
+            stop_buffer_seconds: 120,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
 
     #[test]
     fn tie_resolves_to_yes() {
@@ -1698,6 +1841,53 @@ mod tests {
         assert_eq!(snapshot.entry_price, Some(8.4 / 18.0));
         assert!(snapshot.holding_duration_seconds.unwrap_or_default() > 0.0);
         assert_eq!(snapshot.end_trade_iso, "2024-01-01T00:05:00Z");
+    }
+
+    #[test]
+    fn config_bundle_from_row_prefers_config_text_and_restores_secret_from_env() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-from-env")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+            ],
+            || {
+                let bundle = load_versioned_config_bundle_from_env().expect("env bundle");
+                let row = configuration_row_from_bundle(bundle.config_text().expect("config text"));
+                let hydrated = config_bundle_from_row(&row).expect("hydrated config bundle");
+                assert_eq!(hydrated.config_version(), bundle.config_version());
+                assert_eq!(
+                    hydrated.effective_bot_config.clob_host,
+                    bundle.effective_bot_config.clob_host
+                );
+                assert_eq!(
+                    hydrated.effective_bot_config.private_key,
+                    "secret-from-env".to_string()
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn config_bundle_from_row_falls_back_to_legacy_flat_columns() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-from-env")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+            ],
+            || {
+                let row = configuration_row_from_bundle(String::new());
+                let hydrated = config_bundle_from_row(&row).expect("legacy fallback bundle");
+                assert_eq!(hydrated.config_version(), "cfgv1_test");
+                assert_eq!(
+                    hydrated.effective_bot_config.clob_host,
+                    "https://wrong.example"
+                );
+                assert_eq!(
+                    hydrated.effective_bot_config.private_key,
+                    "legacy-private-key".to_string()
+                );
+            },
+        );
     }
 }
 

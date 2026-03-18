@@ -405,6 +405,31 @@ pub fn get_next_slug(current_slug: &str) -> String {
     increment_human_slug(current_slug, &seg).unwrap_or_else(|| current_slug.to_string())
 }
 
+pub fn get_next_slug_with_config(
+    current_slug: &str,
+    market_segment: &str,
+    market_step_seconds: i64,
+) -> String {
+    let seg = segment(market_segment);
+    let step = if market_step_seconds > 0 {
+        market_step_seconds
+    } else {
+        segment_defaults(&seg).step
+    };
+
+    let mut parts: Vec<String> = current_slug.split('-').map(|s| s.to_string()).collect();
+    if let Some(last) = parts.last().cloned() {
+        if let Ok(ts) = last.parse::<i64>() {
+            if let Some(slot) = parts.last_mut() {
+                *slot = (ts + step).to_string();
+            }
+            return parts.join("-");
+        }
+    }
+
+    increment_human_slug(current_slug, &seg).unwrap_or_else(|| current_slug.to_string())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenOrderState {
     pub order_id: Option<String>,

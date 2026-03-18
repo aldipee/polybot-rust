@@ -4,6 +4,7 @@ pub struct MakerHedgeCapBot {
     pub cfg: BotConfig,
     pub logger: Arc<dyn LogLike>,
     pub market_slug: String,
+    pub config_version: String,
     pub(super) pair_identity: PairIdentity,
     pub state_file: PathBuf,
     pub state: Arc<Mutex<BotState>>,
@@ -23,6 +24,7 @@ pub struct MakerHedgeCapBot {
     pub reconcile_sell_credit_mult: f64,
     pub first_clip_shares: f64,
     pub first_hedge_full: bool,
+    pub min_entry_edge_ticks: i64,
     pub start_ts: i64,
     pub expiry_ts: i64,
     pub warmup_seconds: i64,
@@ -39,6 +41,7 @@ pub struct MakerHedgeCapBot {
     pub exec_mode: String,
     pub loop_wait_seconds_maker: f64,
     pub loop_wait_seconds_taker: f64,
+    pub clob_order_meta_warmup: bool,
     pub condition_id: Option<String>,
     pub market_fees_enabled: Option<bool>,
     pub yes_asset: Option<String>,
@@ -182,27 +185,25 @@ impl MakerHedgeCapBot {
         Self::pending_taker_state_file_for_wallet(self.wallet_address.as_str())
     }
 
-    /// Builds a fully wired bot instance from env-backed config, persisted state,
+    /// Builds a fully wired bot instance from a resolved, pinned config bundle,
     /// derived market metadata, and optional latency/CLOB clients.
     ///
     /// This constructor is the main assembly point for runtime dependencies and
-    /// also applies the final env overrides that shape the live BOT behavior.
-    pub fn new(cfg: BotConfig, market_slug: &str, bot_logger: Arc<dyn LogLike>) -> Result<Self> {
+    /// keeps one immutable config_version active for the full market lifecycle.
+    pub fn new(
+        resolved_cfg: ResolvedVersionedConfigBundle,
+        market_slug: &str,
+        bot_logger: Arc<dyn LogLike>,
+    ) -> Result<Self> {
+        let cfg = resolved_cfg.effective_bot_config;
+        let bot_runtime_cfg = resolved_cfg.runtime_config;
+        let execution_cfg = resolved_cfg.execution_config;
+        let config_version = resolved_cfg.snapshot.config_version.clone();
         let state_file = PathBuf::from(format!("maker_hedgecap_state_{market_slug}.json"));
         let state = load_state(&state_file)?;
         let start_trade_iso = crate::db::now_iso_jakarta();
 
-        let mut wallet_address = std::env::var("WALLET_ADDRESS").unwrap_or_default();
-        if wallet_address.trim().is_empty() {
-            wallet_address = std::env::var("POLYMARKET_WALLET_ADDRESS").unwrap_or_default();
-        }
-        if wallet_address.trim().is_empty() {
-            wallet_address = std::env::var("POLYMARKET_FUNDER").unwrap_or_default();
-        }
-        if wallet_address.trim().is_empty() {
-            wallet_address = cfg.funder.clone().unwrap_or_default();
-        }
-        wallet_address = wallet_address.trim().to_ascii_lowercase();
+        let wallet_address = execution_cfg.wallet_address.trim().to_ascii_lowercase();
         let daily_liquidity_state_file =
             Self::daily_liquidity_state_file_for_wallet(wallet_address.as_str());
         if let Some(parent) = daily_liquidity_state_file.parent() {
@@ -222,55 +223,29 @@ impl MakerHedgeCapBot {
             start_ts = raw_ts;
             expiry_ts = raw_ts + cfg.market_duration_seconds;
         }
-
-        let seg_d = segment_defaults(&cfg.market_segment);
         let runtime_flags = HashMap::new();
-        let exec_latency_log_enabled = env_bool("EXEC_LATENCY_LOG_ENABLED", true);
-        let exec_latency_file_log_enabled = env_bool("EXEC_LATENCY_FILE_LOG_ENABLED", true);
-        let exec_latency_jsonl_enabled = env_bool("EXEC_LATENCY_JSONL_ENABLED", true);
-        let exec_latency_csv_enabled = env_bool("EXEC_LATENCY_CSV_ENABLED", true);
-        let exec_latency_log_dir = std::env::var("EXEC_LATENCY_LOG_DIR")
-            .unwrap_or_else(|_| "./logs".to_string())
-            .trim()
-            .to_string();
-        let exec_latency_jsonl_path = {
-            let p = std::env::var("EXEC_LATENCY_JSONL_PATH").unwrap_or_default();
-            if p.trim().is_empty() {
-                format!("{exec_latency_log_dir}/exec_latency.jsonl")
-            } else {
-                p
-            }
-        };
-        let exec_latency_csv_path = {
-            let p = std::env::var("EXEC_LATENCY_CSV_PATH").unwrap_or_default();
-            if p.trim().is_empty() {
-                format!("{exec_latency_log_dir}/exec_latency.csv")
-            } else {
-                p
-            }
-        };
-        let latency_log = if exec_latency_log_enabled && exec_latency_file_log_enabled {
+        let latency_log = if execution_cfg.exec_latency_log_enabled
+            && execution_cfg.exec_latency_file_log_enabled
+        {
             Some(Arc::new(LatencyLogService::new(
-                exec_latency_jsonl_path,
-                exec_latency_csv_path,
+                execution_cfg.exec_latency_jsonl_path.clone(),
+                execution_cfg.exec_latency_csv_path.clone(),
                 true,
-                exec_latency_jsonl_enabled,
-                exec_latency_csv_enabled,
+                execution_cfg.exec_latency_jsonl_enabled,
+                execution_cfg.exec_latency_csv_enabled,
                 None,
             )))
         } else {
             None
         };
-        let clob_gamma_host = std::env::var("CLOB_GAMMA_API_URL")
-            .or_else(|_| std::env::var("GAMMA_HOST"))
-            .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
         let (clob_rt, clob_client, clob_api_creds) =
-            Self::_init_native_clob_client(&cfg, &bot_logger, &clob_gamma_host)?;
+            Self::_init_native_clob_client(&cfg, &bot_logger, &execution_cfg.clob_gamma_host)?;
 
         let mut out = Self {
             cfg,
             logger: bot_logger,
             market_slug: market_slug.to_string(),
+            config_version,
             pair_identity: PairIdentity::from_slug(market_slug),
             state_file,
             state: Arc::new(Mutex::new(state)),
@@ -285,43 +260,30 @@ impl MakerHedgeCapBot {
             exit_reason: Arc::new(Mutex::new("RUNNING".to_string())),
             stop_flag: Arc::new(AtomicBool::new(false)),
             wallet_address,
-            min_maker_notional: env_float("MIN_MAKER_NOTIONAL", 1.0),
-            min_taker_notional: env_float("MIN_TAKER_NOTIONAL", 1.0),
-            reconcile_sell_credit_mult: clamp(
-                env_float("RECONCILE_SELL_CREDIT_MULT", 1.0),
-                0.0,
-                1.0,
-            ),
-            first_clip_shares: env_float("FIRST_CLIP_SHARES", 0.0),
-            first_hedge_full: matches!(
-                std::env::var("FIRST_HEDGE_FULL")
-                    .unwrap_or_else(|_| "false".to_string())
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "1" | "true" | "yes" | "y"
-            ),
+            min_maker_notional: execution_cfg.min_maker_notional,
+            min_taker_notional: execution_cfg.min_taker_notional,
+            reconcile_sell_credit_mult: execution_cfg.reconcile_sell_credit_mult,
+            first_clip_shares: execution_cfg.first_clip_shares,
+            first_hedge_full: execution_cfg.first_hedge_full,
+            min_entry_edge_ticks: execution_cfg.min_entry_edge_ticks,
             start_ts,
             expiry_ts,
-            warmup_seconds: env_int("WARMUP_SECONDS", seg_d.warmup) as i64,
-            max_spread_ticks: env_int("MAX_SPREAD_TICKS", 6) as i64,
-            parity_tolerance: env_float("PARITY_TOLERANCE", 0.025),
-            unhedged_timeout_seconds: env_float("UNHEDGED_TIMEOUT_SECONDS", 2.0),
-            hedge_slippage_ticks: env_int("HEDGE_SLIPPAGE_TICKS", 1) as i64,
-            hedge_taker_order_type: std::env::var("HEDGE_TAKER_ORDER_TYPE")
-                .unwrap_or_else(|_| "FAK".to_string())
-                .trim()
-                .to_ascii_uppercase(),
-            taker_order_ttl_seconds: env_int("TAKER_ORDER_TTL_SECONDS", 120) as i64,
-            taker_fill_fallback_from_order_events: env_bool(
-                "TAKER_FILL_FALLBACK_FROM_ORDER_EVENTS",
-                true,
-            ),
-            taker_strict_inflight: env_bool("TAKER_STRICT_INFLIGHT", true),
+            warmup_seconds: execution_cfg.warmup_seconds,
+            max_spread_ticks: execution_cfg.max_spread_ticks,
+            parity_tolerance: execution_cfg.parity_tolerance,
+            unhedged_timeout_seconds: execution_cfg.unhedged_timeout_seconds,
+            hedge_slippage_ticks: execution_cfg.hedge_slippage_ticks,
+            hedge_taker_order_type: execution_cfg.hedge_taker_order_type.clone(),
+            taker_order_ttl_seconds: execution_cfg.taker_order_ttl_seconds,
+            taker_fill_fallback_from_order_events: execution_cfg
+                .taker_fill_fallback_from_order_events,
+            taker_strict_inflight: execution_cfg.taker_strict_inflight,
             last_taker_hedge_ts: 0.0,
-            taker_hedge_min_interval: env_float("TAKER_HEDGE_MIN_INTERVAL", 1.0),
-            exec_mode: require_bot_exec_mode()?,
-            loop_wait_seconds_maker: env_float("LOOP_WAIT_SECONDS_MAKER", 1.0),
-            loop_wait_seconds_taker: env_float("LOOP_WAIT_SECONDS_TAKER", 0.2),
+            taker_hedge_min_interval: execution_cfg.taker_hedge_min_interval,
+            exec_mode: execution_cfg.exec_mode.clone(),
+            loop_wait_seconds_maker: execution_cfg.loop_wait_seconds_maker,
+            loop_wait_seconds_taker: execution_cfg.loop_wait_seconds_taker,
+            clob_order_meta_warmup: execution_cfg.clob_order_meta_warmup,
             condition_id: None,
             market_fees_enabled: None,
             yes_asset: None,
@@ -351,23 +313,22 @@ impl MakerHedgeCapBot {
             maker_order_index: Arc::new(Mutex::new(HashMap::new())),
             maker_exec_ledger: Arc::new(Mutex::new(MakerExecLedger::default())),
             bot_runtime_state: Arc::new(Mutex::new(BotRuntimeState::default())),
-            bot_runtime_cfg: bot_runtime_config_from_env(),
+            bot_runtime_cfg,
         };
 
         out._hydrate_runtime_liquidity_counters_from_state();
 
-        out._apply_cfg_overrides_from_env();
-        let min_entry_edge_ticks = env_int("MIN_ENTRY_EDGE_TICKS", out.cfg.entry_edge_ticks).max(0);
-        let effective_entry_edge_ticks = out.cfg.entry_edge_ticks.max(min_entry_edge_ticks);
+        let effective_entry_edge_ticks = out.cfg.entry_edge_ticks.max(out.min_entry_edge_ticks);
         out.logger.info(&format!(
-            "[CFG_EFFECTIVE] dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale={}s stop_buffer={}s",
+            "[CFG_EFFECTIVE] config_version={} dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale={}s stop_buffer={}s",
+            out.config_version,
             out.cfg.dry_run,
             out.cfg.max_total_cost,
             out.cfg.reserve_usd,
             out.cfg.min_shares,
             out.cfg.clip_shares,
             out.cfg.entry_edge_ticks,
-            min_entry_edge_ticks,
+            out.min_entry_edge_ticks,
             effective_entry_edge_ticks,
             out.cfg.log_every,
             out.cfg.market_data_stale_seconds,
@@ -426,7 +387,7 @@ impl MakerHedgeCapBot {
     /// This front-loads tick size, neg-risk, and fee lookups so the runtime loop
     /// does not pay the first-request latency while it is already trading.
     pub(super) fn _warm_clob_order_meta_cache(&self) {
-        if !env_bool("CLOB_ORDER_META_WARMUP", true) {
+        if !self.clob_order_meta_warmup {
             return;
         }
         let (rt, client) = match (&self.clob_rt, &self.clob_client) {
