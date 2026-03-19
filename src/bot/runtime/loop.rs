@@ -331,7 +331,7 @@ impl MakerHedgeCapBot {
 
     pub(in crate::bot) fn _run_bot_runtime_loop(&self) -> String {
         let mut last_log = 0.0;
-        let mut stale_logged = false;
+        let mut stale_stage_logged = BotRuntimeMarketDataStaleStage::Fresh;
         let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
             "[BOT] pair_id={} Phase 2 open-both active; runtime path is isolated from settlement-shaper target-gap planning and opening now posts neutral paired BUY seeds",
@@ -532,6 +532,33 @@ impl MakerHedgeCapBot {
                     total_cost,
                 );
             }
+            let stale_status = if matches!(
+                phase,
+                BotRuntimePhase::PreArm | BotRuntimePhase::AwaitSettlement
+            ) {
+                BotRuntimeMarketDataStaleStatus::default()
+            } else {
+                self._bot_runtime_market_data_stale_status()
+            };
+            if stale_status.requires_hard_pause() {
+                let preserve_existing_database_pause = self
+                    .bot_runtime_state
+                    .lock()
+                    .map(|st| {
+                        st.safety_gate == BotRuntimeSafetyGate::DependencyPaused
+                            && st
+                                .safety_gate_reason
+                                .starts_with("dependency_pause:database")
+                    })
+                    .unwrap_or(false);
+                if preserve_existing_database_pause {
+                    if let Ok(mut st) = self.bot_runtime_state.lock() {
+                        st.market_data_hard_pause_latched = true;
+                    }
+                } else {
+                    self._bot_runtime_enter_dependency_pause("market_data_stale", "", now);
+                }
+            }
             let mut safety_gate = self
                 .bot_runtime_state
                 .lock()
@@ -603,6 +630,11 @@ impl MakerHedgeCapBot {
             let block_new_risk = !safety_gate.allows_new_risk()
                 && !matches!(owner, BotRuntimeControlOwner::AwaitSettlement)
                 && !matches!(phase, BotRuntimePhase::PreArm);
+            let add_block_only = stale_status.blocks_new_risk()
+                && !stale_status.requires_hard_pause()
+                && safety_gate.allows_new_risk()
+                && !matches!(owner, BotRuntimeControlOwner::AwaitSettlement)
+                && !matches!(phase, BotRuntimePhase::PreArm);
             if block_new_risk {
                 let hold_reason = if safety_gate_reason.trim().is_empty() {
                     safety_gate.as_str().to_string()
@@ -623,17 +655,53 @@ impl MakerHedgeCapBot {
                         "owner": owner.as_str(),
                         "safety_gate": safety_gate.as_str(),
                         "safety_gate_reason": hold_reason,
-                        "reconcile_scope": if matches!(safety_gate, BotRuntimeSafetyGate::ReconnectReconPending) {
+                        "reconcile_scope": if hold_reason.starts_with("dependency_pause:market_data_stale") {
+                            "stale_hard_pause"
+                        } else if matches!(safety_gate, BotRuntimeSafetyGate::ReconnectReconPending) {
                             "reconnect"
                         } else {
                             "startup"
                         },
                         "reconcile_clean": false,
-                        "dependency_pause_kind": if matches!(safety_gate, BotRuntimeSafetyGate::DependencyPaused) {
+                        "dependency_pause_kind": if hold_reason.starts_with("dependency_pause:market_data_stale") {
+                            Some("market_data_stale")
+                        } else if matches!(safety_gate, BotRuntimeSafetyGate::DependencyPaused) {
                             Some("runtime_dependency")
                         } else {
                             None::<&str>
                         },
+                        "stale_stage": if stale_status.blocks_new_risk() {
+                            Some(stale_status.stage.as_str())
+                        } else {
+                            None::<&str>
+                        },
+                        "stale_age_seconds": if stale_status.blocks_new_risk() {
+                            Some(stale_status.age_seconds)
+                        } else {
+                            None::<f64>
+                        },
+                    }),
+                );
+            } else if add_block_only {
+                let hold_reason = "market_data_stale_add_block";
+                let _ = self._audit_insert_runtime_event(
+                    "risk_block",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(hold_reason),
+                    json!({
+                        "pair_id": pair_id,
+                        "phase": phase.as_str(),
+                        "owner": owner.as_str(),
+                        "safety_gate": safety_gate.as_str(),
+                        "safety_gate_reason": safety_gate_reason,
+                        "reconcile_scope": "stale_add_block",
+                        "reconcile_clean": false,
+                        "dependency_pause_kind": None::<&str>,
+                        "stale_stage": stale_status.stage.as_str(),
+                        "stale_age_seconds": stale_status.age_seconds,
                     }),
                 );
             } else if bot_runtime_should_run_open_both_handler(owner) {
@@ -662,22 +730,39 @@ impl MakerHedgeCapBot {
                 let _ =
                     self._bot_runtime_cancel_taper_orders(None, "bot_runtime_taper_owner_inactive");
             }
-            if matches!(phase, BotRuntimePhase::PreArm) {
-                stale_logged = false;
-            } else if !self._market_data_fresh() {
-                if !stale_logged {
+            if matches!(
+                phase,
+                BotRuntimePhase::PreArm | BotRuntimePhase::AwaitSettlement
+            ) {
+                stale_stage_logged = BotRuntimeMarketDataStaleStage::Fresh;
+            } else if stale_status.stage != stale_stage_logged {
+                if matches!(stale_status.stage, BotRuntimeMarketDataStaleStage::Fresh)
+                    && !matches!(stale_stage_logged, BotRuntimeMarketDataStaleStage::Fresh)
+                {
                     self.logger.info(&format!(
-                        "[BOT] pair_id={} hold reason=market_data_stale",
+                        "[BOT] pair_id={} market data fresh -> bot phase controller active",
                         pair_id
                     ));
-                    stale_logged = true;
+                } else if matches!(
+                    stale_status.stage,
+                    BotRuntimeMarketDataStaleStage::AddBlocked
+                ) {
+                    self.logger.info(&format!(
+                        "[BOT] pair_id={} hold reason=market_data_stale_add_block stale_age_seconds={:.3}",
+                        pair_id,
+                        stale_status.age_seconds
+                    ));
+                } else if matches!(
+                    stale_status.stage,
+                    BotRuntimeMarketDataStaleStage::HardPaused
+                ) {
+                    self.logger.info(&format!(
+                        "[BOT] pair_id={} hold reason=dependency_pause:market_data_stale stale_age_seconds={:.3}",
+                        pair_id,
+                        stale_status.age_seconds
+                    ));
                 }
-            } else if stale_logged {
-                self.logger.info(&format!(
-                    "[BOT] pair_id={} market data fresh -> bot phase controller active",
-                    pair_id
-                ));
-                stale_logged = false;
+                stale_stage_logged = stale_status.stage;
             }
             if now - last_log >= (self.cfg.log_every as f64).max(0.5) {
                 let late_fill_events_after_reduce_label = bot_runtime_late_metric_label(

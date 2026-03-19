@@ -325,8 +325,10 @@ impl MakerHedgeCapBot {
         out._hydrate_runtime_liquidity_counters_from_state();
 
         let effective_entry_edge_ticks = out.cfg.entry_edge_ticks.max(out.min_entry_edge_ticks);
+        let stale_policy_requirement_compliant =
+            crate::config::stale_data_policy_requirement_compliant(&out.cfg);
         out.logger.info(&format!(
-            "[CFG_EFFECTIVE] config_version={} dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale={}s stop_buffer={}s",
+            "[CFG_EFFECTIVE] config_version={} dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale_add_block={}s market_data_stale_hard_pause={}s stale_policy_requirement_compliant={} stop_buffer={}s",
             out.config_version,
             out.cfg.dry_run,
             out.cfg.max_total_cost,
@@ -337,9 +339,18 @@ impl MakerHedgeCapBot {
             out.min_entry_edge_ticks,
             effective_entry_edge_ticks,
             out.cfg.log_every,
-            out.cfg.market_data_stale_seconds,
+            out.cfg.market_data_stale_add_block_seconds,
+            out.cfg.market_data_stale_hard_pause_seconds,
+            stale_policy_requirement_compliant,
             out.cfg.stop_buffer_seconds
         ));
+        if !stale_policy_requirement_compliant {
+            out.logger.warning(&format!(
+                "[CFG_EFFECTIVE] stale_policy_noncompliant add_block={} hard_pause={} expected=2/5",
+                out.cfg.market_data_stale_add_block_seconds,
+                out.cfg.market_data_stale_hard_pause_seconds
+            ));
+        }
 
         if let Some(market) = fetch_market_by_slug(&out.market_slug, Some(&out.logger))? {
             out.market_fees_enabled = market

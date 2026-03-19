@@ -68,6 +68,8 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
     let mut cfg = BotConfig::default();
     cfg.dry_run = true;
     cfg.market_data_stale_seconds = 8;
+    cfg.market_data_stale_add_block_seconds = 2;
+    cfg.market_data_stale_hard_pause_seconds = 5;
     cfg.stale_seconds = 3;
     cfg.max_total_cost = 20.0;
     cfg.reserve_usd = 2.0;
@@ -394,6 +396,176 @@ fn dependency_pause_cancels_direct_bot_orders_without_single_inflight() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
+}
+
+#[test]
+fn stale_add_block_blocks_new_risk_without_entering_dependency_pause() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(
+        &bot,
+        0.42,
+        0.43,
+        0.41,
+        0.42,
+        now - (bot.cfg.market_data_stale_add_block_seconds as f64 + 0.25),
+    );
+
+    let stale = bot._bot_runtime_market_data_stale_status();
+    assert_eq!(stale.stage, BotRuntimeMarketDataStaleStage::AddBlocked);
+    assert!(stale.age_seconds >= bot.cfg.market_data_stale_add_block_seconds as f64);
+
+    bot._bot_runtime_dependency_healthy()
+        .expect("warning stale should not enter dependency pause on its own");
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+        .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new()));
+    assert_eq!(runtime_state.0, BotRuntimeSafetyGate::Healthy);
+    assert!(runtime_state.1.is_empty());
+}
+
+#[test]
+fn hard_stale_enters_dependency_pause_and_stays_latched_until_quotes_are_fresh() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(
+        &bot,
+        0.42,
+        0.43,
+        0.41,
+        0.42,
+        now - (bot.cfg.market_data_stale_hard_pause_seconds as f64 + 0.25),
+    );
+    let stale = bot._bot_runtime_market_data_stale_status();
+    assert_eq!(stale.stage, BotRuntimeMarketDataStaleStage::HardPaused);
+
+    bot._bot_runtime_enter_dependency_pause("market_data_stale", "", now);
+    let health_before = bot._bot_runtime_dependency_healthy();
+    assert!(health_before.is_err());
+    assert!(health_before
+        .err()
+        .unwrap_or_default()
+        .contains("dependency_pause:market_data_stale"));
+
+    set_pair_quotes(&bot, 0.42, 0.43, 0.41, 0.42, now_ts_f64());
+    bot._bot_runtime_dependency_healthy()
+        .expect("hard stale pause should clear only once quotes are fully fresh");
+}
+
+#[test]
+fn hard_stale_recovery_stays_latched_across_other_pause_reasons() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(
+        &bot,
+        0.42,
+        0.43,
+        0.41,
+        0.42,
+        now - (bot.cfg.market_data_stale_hard_pause_seconds as f64 + 0.25),
+    );
+    bot._bot_runtime_enter_dependency_pause("market_data_stale", "", now);
+
+    set_pair_quotes(
+        &bot,
+        0.42,
+        0.43,
+        0.41,
+        0.42,
+        now - (bot.cfg.market_data_stale_add_block_seconds as f64 + 0.25),
+    );
+    bot._bot_runtime_enter_dependency_pause("market_ws", "closed", now + 0.1);
+
+    let health = bot._bot_runtime_dependency_healthy();
+    assert!(health.is_err());
+    assert!(health
+        .err()
+        .unwrap_or_default()
+        .contains("dependency_pause:market_data_stale"));
+}
+
+#[test]
+fn hard_stale_does_not_overwrite_existing_database_pause() {
+    let mut bot = make_bot_runtime_test_bot();
+    let missing_dir = std::env::temp_dir()
+        .join(format!(
+            "bot_runtime_missing_state_dir_stale_precedence_{}",
+            uuid::Uuid::new_v4()
+        ))
+        .join("nested");
+    bot.state_file = missing_dir.join("state.json");
+    let now = now_ts_f64();
+
+    set_pair_quotes(
+        &bot,
+        0.42,
+        0.43,
+        0.41,
+        0.42,
+        now - (bot.cfg.market_data_stale_hard_pause_seconds as f64 + 0.25),
+    );
+    bot._bot_runtime_enter_dependency_pause("database", "test", now);
+
+    let preserve_existing_database_pause = bot
+        .bot_runtime_state
+        .lock()
+        .map(|st| {
+            st.safety_gate == BotRuntimeSafetyGate::DependencyPaused
+                && st
+                    .safety_gate_reason
+                    .starts_with("dependency_pause:database")
+        })
+        .unwrap_or(false);
+    if preserve_existing_database_pause {
+        if let Ok(mut st) = bot.bot_runtime_state.lock() {
+            st.market_data_hard_pause_latched = true;
+        }
+    } else {
+        bot._bot_runtime_enter_dependency_pause("market_data_stale", "", now);
+    }
+
+    let paused = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| {
+            (
+                state.safety_gate,
+                state.safety_gate_reason.clone(),
+                state.market_data_hard_pause_latched,
+            )
+        })
+        .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new(), false));
+    assert_eq!(paused.0, BotRuntimeSafetyGate::DependencyPaused);
+    assert!(paused.1.starts_with("dependency_pause:database"));
+    assert!(paused.2);
+
+    std::fs::create_dir_all(&missing_dir).expect("create recovered state dir");
+    set_pair_quotes(&bot, 0.42, 0.43, 0.41, 0.42, now - 3.25);
+    let health = bot._bot_runtime_dependency_healthy();
+    assert!(health.is_err());
+    assert!(health
+        .err()
+        .unwrap_or_default()
+        .contains("dependency_pause:market_data_stale"));
+}
+
+#[test]
+fn quote_input_status_uses_add_block_threshold_not_legacy_compat_field() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.market_data_stale_seconds = 8;
+    bot.cfg.market_data_stale_add_block_seconds = 10;
+    bot.cfg.market_data_stale_hard_pause_seconds = 20;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.42, 0.43, 0.41, 0.42, now - 9.0);
+
+    let (ready, reason) = bot._bot_runtime_quote_input_status();
+    assert!(
+        ready,
+        "quotes should remain usable until add-block threshold"
+    );
+    assert_eq!(reason, "ok");
 }
 
 #[test]

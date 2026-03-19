@@ -49,6 +49,44 @@ impl BotRuntimeSafetyGate {
         matches!(self, Self::Healthy)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::bot) enum BotRuntimeMarketDataStaleStage {
+    #[default]
+    Fresh,
+    AddBlocked,
+    HardPaused,
+}
+
+impl BotRuntimeMarketDataStaleStage {
+    pub(in crate::bot) fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::AddBlocked => "add_blocked",
+            Self::HardPaused => "hard_paused",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(in crate::bot) struct BotRuntimeMarketDataStaleStatus {
+    pub(in crate::bot) stage: BotRuntimeMarketDataStaleStage,
+    pub(in crate::bot) age_seconds: f64,
+}
+
+impl BotRuntimeMarketDataStaleStatus {
+    pub(in crate::bot) fn is_fresh(self) -> bool {
+        matches!(self.stage, BotRuntimeMarketDataStaleStage::Fresh)
+    }
+
+    pub(in crate::bot) fn blocks_new_risk(self) -> bool {
+        !self.is_fresh()
+    }
+
+    pub(in crate::bot) fn requires_hard_pause(self) -> bool {
+        matches!(self.stage, BotRuntimeMarketDataStaleStage::HardPaused)
+    }
+}
 /// Implements should stop for rollover for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
@@ -212,6 +250,7 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) last_reconnect_reconcile_ts: f64,
     pub(in crate::bot) last_validation_ts: f64,
     pub(in crate::bot) dependency_pause_started_ts: f64,
+    pub(in crate::bot) market_data_hard_pause_latched: bool,
     pub(in crate::bot) market_ws_ever_opened: bool,
     pub(in crate::bot) user_ws_ever_opened: bool,
     pub(in crate::bot) armed_once: bool,

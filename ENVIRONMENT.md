@@ -1,6 +1,6 @@
 # Environment Reference
 
-Date: 2026-03-17
+Date: 2026-03-19
 Scope: supported operator env for the `polybot` binary only.
 
 This repo now has one supported runtime:
@@ -9,7 +9,7 @@ This repo now has one supported runtime:
 - if `EXEC_MODE` is unset, startup defaults to `BOT`
 - any other `EXEC_MODE` value fails fast at startup
 
-This document intentionally covers the active `polybot` surface only. It does not document helper-binary-only env such as `COPYTRADE_*` or `COPY_COLLECT_*`, and it does not treat legacy compatibility aliases as part of the supported contract.
+This document intentionally covers the active `polybot` surface only. It does not document helper-binary-only env such as `COPYTRADE_*` or `COPY_COLLECT_*`, and it does not treat legacy compatibility aliases as part of the supported contract except where a migration alias is explicitly called out below.
 
 ## Runtime and Identity
 
@@ -38,17 +38,18 @@ This document intentionally covers the active `polybot` surface only. It does no
 - `DRY_RUN`: simulation vs live placement
 - `MIN_SHARES`, `CLIP_SHARES`, `MAX_TOTAL_COST`, `RESERVE_USD`: base sizing and budget caps
 - `LOG_EVERY_SECONDS`, `LOOP_WAIT_SECONDS_MAKER`, `LOOP_WAIT_SECONDS_TAKER`: loop cadence and heartbeat logging
-- `MARKET_DATA_STALE_SECONDS`, `STOP_BUFFER_SECONDS`, `WARMUP_SECONDS`: timing and stale-data guards
+- `MARKET_DATA_STALE_ADD_BLOCK_SECONDS`, `MARKET_DATA_STALE_HARD_PAUSE_SECONDS`, `STOP_BUFFER_SECONDS`, `WARMUP_SECONDS`: timing and stale-data guards
 - `ENTRY_EDGE_TICKS`, `MIN_ENTRY_EDGE_TICKS`, `MAX_SPREAD_TICKS`, `PARITY_TOLERANCE`: entry quality controls
 - `HEDGE_BUFFER_TICKS`, `HEDGE_SLIPPAGE_TICKS`, `HEDGE_TAKER_ORDER_TYPE`: hedge and taker execution settings
 - `MIN_MAKER_NOTIONAL`, `MIN_TAKER_NOTIONAL`, `FIRST_CLIP_SHARES`, `FIRST_HEDGE_FULL`, `UNHEDGED_TIMEOUT_SECONDS`: startup and exposure controls
 - `TAKER_ORDER_TTL_SECONDS`, `TAKER_FILL_FALLBACK_FROM_ORDER_EVENTS`, `TAKER_STRICT_INFLIGHT`, `TAKER_HEDGE_MIN_INTERVAL`: taker lifecycle controls
 - `IMPROVE_BID_TICKS`, `REPLACE_IF_PRICE_MOVES_TICKS`, `STALE_SECONDS`, `CLOB_ORDER_META_WARMUP`: order posting and repricing behavior
+- `STALE_SECONDS` remains the order-management stale-order control; it is not the market-data add-block or hard-pause policy
 
 ## BOT Runtime Controls
 
 - `BOT_PREARM_LEAD_SECONDS`: pre-arm lead before the market opens
-- `BOT_SEED_CLIP_SMALL`, `BOT_REPAIR_CLIP_SMALL`, `BOT_CLIP_LADDER_LARGE`: clip sizes for seeding, repair, and larger growth
+- `BOT_CLIP_LADDER`: authoritative four-rung clip ladder for seed, normal, and green-gated large clips
 - `BOT_REPAIR_RESERVE_BUFFER_USD`: reserve kept aside for lighter-side repair
 - `BOT_BUDGET_SEED_MIN_FRACTION`, `BOT_BUDGET_SEED_MAX_FRACTION`: seed-phase budget band
 - `BOT_BUDGET_EARLY_MIN_FRACTION`, `BOT_BUDGET_EARLY_MAX_FRACTION`: early pair-build budget band
@@ -56,7 +57,8 @@ This document intentionally covers the active `polybot` surface only. It does no
 - `BOT_BUDGET_LATE_MIN_FRACTION`, `BOT_BUDGET_LATE_MAX_FRACTION`: late pair-build budget band
 - `BOT_BUDGET_TAPER_MIN_FRACTION`, `BOT_BUDGET_TAPER_MAX_FRACTION`: taper budget band
 - `BOT_TARGET_BOTH_SIDES_BY_30S`, `BOT_TARGET_BOTH_SIDES_BY_60S`: two-sided progress canaries
-- `BOT_TAPER_START_SECONDS`, `BOT_FINAL_QUIET_SECONDS`: taper and rollover timing
+- `BOT_LATE_REDUCE_START_SECONDS`, `BOT_LATE_BALANCE_ONLY_START_SECONDS`, `BOT_LATE_STOP_NEW_ORDERS_START_SECONDS`: authoritative late-window timing
+- `BOT_TAPER_START_SECONDS`, `BOT_FINAL_QUIET_SECONDS`: accepted legacy compatibility aliases for late-window migration; `BOT_LATE_*` is preferred
 - `BOT_TAIL_CAP_MID_START_SECONDS`, `BOT_TAIL_CAP_LATE_START_SECONDS`: tail-cap phase boundaries
 - `BOT_TAIL_CAP_EARLY_FRACTION`, `BOT_TAIL_CAP_MID_FRACTION`, `BOT_TAIL_CAP_LATE_FRACTION`: tail inventory caps over time
 - `BOT_BAD_REGIME_WINDOW_SECONDS`, `BOT_BAD_REGIME_EXPENSIVE_FRACTION`: expensive-regime protection
@@ -138,4 +140,5 @@ This document intentionally covers the active `polybot` surface only. It does no
 - helper-binary-only env: `COPYTRADE_*`, `COPY_COLLECT_*`, `CLICKHOUSE_*_PATH`
 - removed legacy mode families: `SETTLEMENT_SHAPER_*`, `SIGNAL_*`, `SNIPER_*`, `PAIR_BASE_*`, `PAIR_RECOVERY_*`, `PAIR_ARB_*`, `MAKER_SKEW_*`
 - stale legacy control families removed from the contract: `FSM_*`, `MAX_LOSS_*`, `FORCE_FLATTEN_*`, `RISK_EXIT_*`, `RTDS_ENTRY_GATE_*`, `RTDS_GATE_*`
+- deprecated stale-data alias `MARKET_DATA_STALE_SECONDS` is intentionally unsupported and startup now fails fast if it is set
 - legacy compatibility aliases such as `API_KEY`, `API_SECRET`, `API_PASSPHRASE`, `CLOB_API_*`, `POLY_API_*`, and `GAMMA_HOST` are intentionally omitted from the supported contract

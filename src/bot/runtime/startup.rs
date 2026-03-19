@@ -58,7 +58,7 @@ impl MakerHedgeCapBot {
         let (Some(yes_asset), Some(no_asset)) = (&self.yes_asset, &self.no_asset) else {
             return (false, "asset_ids_missing".to_string());
         };
-        let stale_s = self.cfg.market_data_stale_seconds.max(1) as f64;
+        let stale_s = self.cfg.market_data_stale_add_block_seconds.max(1) as f64;
         let now = now_ts_f64();
         for (label, asset_id) in [("YES", yes_asset.as_str()), ("NO", no_asset.as_str())] {
             let (ready, reason) = bot_runtime_quote_snapshot_status(
@@ -81,7 +81,7 @@ impl MakerHedgeCapBot {
         let (Some(yes_asset), Some(no_asset)) = (&self.yes_asset, &self.no_asset) else {
             return (false, "asset_ids_missing".to_string());
         };
-        let stale_s = self.cfg.market_data_stale_seconds.max(1) as f64;
+        let stale_s = self.cfg.market_data_stale_add_block_seconds.max(1) as f64;
         bot_runtime_startup_pair_quote_status(
             self._best_bid_ask_with_ts(yes_asset),
             self._best_bid_ask_with_ts(no_asset),
@@ -106,7 +106,7 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|st| st.open_confirmed_ts)
             .unwrap_or(0.0);
-        let stale_s = self.cfg.market_data_stale_seconds.max(1) as f64;
+        let stale_s = self.cfg.market_data_stale_add_block_seconds.max(1) as f64;
         bot_runtime_post_open_pair_quote_status(
             self._best_bid_ask_with_ts(yes_asset),
             self._best_bid_ask_with_ts(no_asset),
@@ -1554,7 +1554,7 @@ impl MakerHedgeCapBot {
             OutcomeSide::Yes => "YES",
             OutcomeSide::No => "NO",
         };
-        let stale_s = self.cfg.market_data_stale_seconds.max(1) as f64;
+        let stale_s = self.cfg.market_data_stale_add_block_seconds.max(1) as f64;
         let deadline_elapsed =
             time_since_first_side_s >= bot_runtime_await_second_fill_deadline_seconds() - 1e-9;
         let missing_quote = self._best_bid_ask_with_ts(missing_asset);

@@ -18,8 +18,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use chrono_tz::Asia::Jakarta;
 use config::{
     build_legacy_versioned_config_bundle, load_versioned_config_bundle_from_env,
-    resolve_versioned_config_bundle_from_snapshot, BotConfig, ResolvedVersionedConfigBundle,
-    VersionedConfigSnapshotV1,
+    resolve_versioned_config_bundle_from_snapshot, stale_data_policy_from_legacy_threshold,
+    BotConfig, ResolvedVersionedConfigBundle, VersionedConfigSnapshotV1,
 };
 use db::{
     date_jakarta, make_engine, make_session_factory, month_start_date_jakarta, now_iso_jakarta,
@@ -1046,6 +1046,8 @@ struct ActiveConfigVersion {
 }
 
 fn legacy_cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
+    let (legacy_stale_add_block_seconds, legacy_stale_hard_pause_seconds) =
+        stale_data_policy_from_legacy_threshold(cfg_row.market_data_stale_seconds);
     BotConfig {
         clob_host: cfg_row.clob_host.clone(),
         ws_base: cfg_row.ws_base.clone(),
@@ -1069,6 +1071,8 @@ fn legacy_cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
         dry_run: cfg_row.dry_run,
         log_every: cfg_row.log_every,
         market_data_stale_seconds: cfg_row.market_data_stale_seconds,
+        market_data_stale_add_block_seconds: legacy_stale_add_block_seconds,
+        market_data_stale_hard_pause_seconds: legacy_stale_hard_pause_seconds,
         ws_reconnect_min: cfg_row.ws_reconnect_min,
         ws_reconnect_max: cfg_row.ws_reconnect_max,
         stop_buffer_seconds: cfg_row.stop_buffer_seconds,
@@ -1123,6 +1127,13 @@ fn activate_next_config(
             Ok(next)
         }
         Err(err) => {
+            let fatal_deprecated_stale_env = err
+                .to_string()
+                .contains("MARKET_DATA_STALE_SECONDS is unsupported");
+            if fatal_deprecated_stale_env {
+                logger.error(&format!("[CONFIG] reload_failed_fatal err={:#}", err));
+                return Err(err);
+            }
             if let Some(prior) = previous {
                 logger.warning(&format!(
                     "[CONFIG] reload_failed keeping_previous config_version={} configuration_id={} err={:#}",
@@ -1660,12 +1671,13 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_await_settlement_trade_snapshot, config_bundle_from_row, payout_from_resolution_diff,
-        realized_lp_from_resolution_record, require_bot_exec_mode, settlement_metadata_json,
+        activate_next_config, build_await_settlement_trade_snapshot, config_bundle_from_row,
+        payout_from_resolution_diff, realized_lp_from_resolution_record, require_bot_exec_mode,
+        settlement_metadata_json, ActiveConfigVersion,
     };
     use crate::bot::TradeMetrics;
     use crate::config::load_versioned_config_bundle_from_env;
-    use crate::db::ConfigurationRow;
+    use crate::db::{make_engine, make_session_factory, ConfigurationRow};
     use crate::logging::{setup_item_logger, LogLike};
     use crate::rtds::ResolutionSnapshot;
     use serde_json::Value;
@@ -1925,6 +1937,52 @@ mod tests {
                     hydrated.effective_bot_config.private_key,
                     "legacy-private-key".to_string()
                 );
+                assert_eq!(hydrated.effective_bot_config.market_data_stale_seconds, 8);
+                assert_eq!(
+                    hydrated
+                        .effective_bot_config
+                        .market_data_stale_add_block_seconds,
+                    5
+                );
+                assert_eq!(
+                    hydrated
+                        .effective_bot_config
+                        .market_data_stale_hard_pause_seconds,
+                    8
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn activate_next_config_rejects_deprecated_stale_env_without_fallback() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-from-env")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MARKET_DATA_STALE_SECONDS", Some("8")),
+            ],
+            || {
+                let logger: Arc<dyn LogLike> = setup_item_logger("config_reload_test");
+                let engine = make_engine("postgresql://invalid-test-host/polybot");
+                let repo = make_session_factory(engine).repository();
+                let env_err = load_versioned_config_bundle_from_env()
+                    .expect_err("deprecated env should fail");
+                assert!(env_err
+                    .to_string()
+                    .contains("MARKET_DATA_STALE_SECONDS is unsupported"));
+
+                let prior = ActiveConfigVersion {
+                    configuration_id: "cfg-prev".to_string(),
+                    bundle: config_bundle_from_row(&configuration_row_from_bundle(String::new()))
+                        .expect("prior bundle"),
+                };
+
+                let err = activate_next_config(&repo, None, Some(&prior), &logger)
+                    .expect_err("deprecated stale env should be fatal");
+                assert!(err
+                    .to_string()
+                    .contains("MARKET_DATA_STALE_SECONDS is unsupported"));
             },
         );
     }

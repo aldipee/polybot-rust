@@ -75,6 +75,9 @@ impl MakerHedgeCapBot {
                     if now.is_finite() && now > 0.0 && st.dependency_pause_started_ts <= 0.0 {
                         st.dependency_pause_started_ts = now;
                     }
+                    if reason.starts_with("dependency_pause:market_data_stale") {
+                        st.market_data_hard_pause_latched = true;
+                    }
                 }
                 _ => {}
             }
@@ -129,6 +132,54 @@ impl MakerHedgeCapBot {
                 }
             }
             st.dependency_pause_started_ts = 0.0;
+            st.market_data_hard_pause_latched = false;
+        }
+    }
+
+    pub(super) fn _bot_runtime_market_data_stale_status(&self) -> BotRuntimeMarketDataStaleStatus {
+        let add_block_s = self.cfg.market_data_stale_add_block_seconds.max(1) as f64;
+        let hard_pause_s = self.cfg.market_data_stale_hard_pause_seconds.max(1) as f64;
+        let yes = self.yes_asset.clone();
+        let no = self.no_asset.clone();
+        let now = now_ts_f64();
+        let quotes = match self.best_quotes.lock() {
+            Ok(m) => m,
+            Err(_) => {
+                return BotRuntimeMarketDataStaleStatus {
+                    stage: BotRuntimeMarketDataStaleStage::HardPaused,
+                    age_seconds: hard_pause_s,
+                };
+            }
+        };
+        let mut max_age_s: f64 = 0.0;
+        for aid in [yes, no].into_iter().flatten() {
+            let (_, _, ts) = match quotes.get(&aid).copied() {
+                Some(v) => v,
+                None => {
+                    return BotRuntimeMarketDataStaleStatus {
+                        stage: BotRuntimeMarketDataStaleStage::HardPaused,
+                        age_seconds: hard_pause_s,
+                    };
+                }
+            };
+            if ts <= 0.0 {
+                return BotRuntimeMarketDataStaleStatus {
+                    stage: BotRuntimeMarketDataStaleStage::HardPaused,
+                    age_seconds: hard_pause_s,
+                };
+            }
+            max_age_s = max_age_s.max((now - ts).max(0.0));
+        }
+        let stage = if max_age_s >= hard_pause_s {
+            BotRuntimeMarketDataStaleStage::HardPaused
+        } else if max_age_s >= add_block_s {
+            BotRuntimeMarketDataStaleStage::AddBlocked
+        } else {
+            BotRuntimeMarketDataStaleStage::Fresh
+        };
+        BotRuntimeMarketDataStaleStatus {
+            stage,
+            age_seconds: max_age_s,
         }
     }
 
@@ -191,10 +242,15 @@ impl MakerHedgeCapBot {
         {
             return Err("dependency_pause:user_ws".to_string());
         }
-        if !self._market_data_fresh() {
-            return Err("dependency_pause:market_ws".to_string());
-        }
         self._bot_runtime_persistence_healthy()?;
+        let stale_pause_active = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.market_data_hard_pause_latched)
+            .unwrap_or(false);
+        if stale_pause_active && !self._market_data_fresh() {
+            return Err("dependency_pause:market_data_stale".to_string());
+        }
         Ok(())
     }
 
@@ -844,25 +900,7 @@ impl MakerHedgeCapBot {
         {
             return false;
         }
-
-        let stale_s = self.cfg.market_data_stale_seconds.max(1) as f64;
-        let now = now_ts_f64();
-        let yes = self.yes_asset.clone();
-        let no = self.no_asset.clone();
-        let quotes = match self.best_quotes.lock() {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        for aid in [yes, no].into_iter().flatten() {
-            let (_, _, ts) = match quotes.get(&aid).copied() {
-                Some(v) => v,
-                None => return false,
-            };
-            if ts <= 0.0 || (now - ts) > stale_s {
-                return false;
-            }
-        }
-        true
+        self._bot_runtime_market_data_stale_status().is_fresh()
     }
 
     /// Returns the best bid ask available in cached market data.
@@ -1552,9 +1590,13 @@ impl MakerHedgeCapBot {
         self.cfg.reserve_usd = env_float("RESERVE_USD", self.cfg.reserve_usd);
         self.cfg.dry_run = env_bool("DRY_RUN", self.cfg.dry_run);
         self.cfg.log_every = env_int("LOG_EVERY_SECONDS", self.cfg.log_every) as i64;
-        self.cfg.market_data_stale_seconds = env_int(
-            "MARKET_DATA_STALE_SECONDS",
-            self.cfg.market_data_stale_seconds,
+        self.cfg.market_data_stale_add_block_seconds = env_int(
+            "MARKET_DATA_STALE_ADD_BLOCK_SECONDS",
+            self.cfg.market_data_stale_add_block_seconds,
+        ) as i64;
+        self.cfg.market_data_stale_hard_pause_seconds = env_int(
+            "MARKET_DATA_STALE_HARD_PAUSE_SECONDS",
+            self.cfg.market_data_stale_hard_pause_seconds,
         ) as i64;
         self.cfg.stop_buffer_seconds =
             env_int("STOP_BUFFER_SECONDS", self.cfg.stop_buffer_seconds) as i64;

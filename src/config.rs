@@ -11,6 +11,18 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 
+fn default_market_data_stale_seconds_compat() -> i64 {
+    8
+}
+
+fn default_market_data_stale_add_block_seconds() -> i64 {
+    2
+}
+
+fn default_market_data_stale_hard_pause_seconds() -> i64 {
+    5
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BotConfig {
     pub clob_host: String,
@@ -37,7 +49,12 @@ pub struct BotConfig {
     pub cancel_all_on_start: bool,
     pub dry_run: bool,
     pub log_every: i64,
+    #[serde(default = "default_market_data_stale_seconds_compat")]
     pub market_data_stale_seconds: i64,
+    #[serde(default = "default_market_data_stale_add_block_seconds")]
+    pub market_data_stale_add_block_seconds: i64,
+    #[serde(default = "default_market_data_stale_hard_pause_seconds")]
+    pub market_data_stale_hard_pause_seconds: i64,
     pub ws_reconnect_min: f64,
     pub ws_reconnect_max: f64,
     pub stop_buffer_seconds: i64,
@@ -71,6 +88,8 @@ impl Default for BotConfig {
             dry_run: false,
             log_every: 5,
             market_data_stale_seconds: 8,
+            market_data_stale_add_block_seconds: 2,
+            market_data_stale_hard_pause_seconds: 5,
             ws_reconnect_min: 0.5,
             ws_reconnect_max: 5.0,
             stop_buffer_seconds: 120,
@@ -137,9 +156,40 @@ impl BotConfig {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(2.0);
         self.market_data_stale_seconds = 8;
+        self.market_data_stale_add_block_seconds = 2;
+        self.market_data_stale_hard_pause_seconds = 5;
         self.cancel_all_on_start = true;
         self.log_every = 5;
     }
+}
+
+pub(crate) fn stale_data_policy_requirement_compliant(cfg: &BotConfig) -> bool {
+    cfg.market_data_stale_add_block_seconds == default_market_data_stale_add_block_seconds()
+        && cfg.market_data_stale_hard_pause_seconds
+            == default_market_data_stale_hard_pause_seconds()
+}
+
+pub(crate) fn stale_data_policy_from_legacy_threshold(
+    legacy_hard_pause_seconds: i64,
+) -> (i64, i64) {
+    let hard_pause_seconds = legacy_hard_pause_seconds.max(2);
+    let add_block_seconds = (hard_pause_seconds - 3).max(1);
+    (add_block_seconds, hard_pause_seconds)
+}
+
+fn validate_stale_data_policy(cfg: &BotConfig) -> Result<()> {
+    if cfg.market_data_stale_add_block_seconds <= 0 {
+        return Err(anyhow!("Invalid MARKET_DATA_STALE_ADD_BLOCK_SECONDS"));
+    }
+    if cfg.market_data_stale_hard_pause_seconds <= 0 {
+        return Err(anyhow!("Invalid MARKET_DATA_STALE_HARD_PAUSE_SECONDS"));
+    }
+    if cfg.market_data_stale_hard_pause_seconds <= cfg.market_data_stale_add_block_seconds {
+        return Err(anyhow!(
+            "Invalid stale-data policy: MARKET_DATA_STALE_HARD_PAUSE_SECONDS must be greater than MARKET_DATA_STALE_ADD_BLOCK_SECONDS"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -385,6 +435,13 @@ fn exec_latency_csv_path_from_env(log_dir: &str) -> String {
 
 pub fn build_effective_bot_config_from_env() -> Result<BotConfig> {
     let mut cfg = BotConfig::from_env();
+    let legacy_market_data_stale_seconds =
+        env::var("MARKET_DATA_STALE_SECONDS").unwrap_or_default();
+    if !legacy_market_data_stale_seconds.trim().is_empty() {
+        return Err(anyhow!(
+            "MARKET_DATA_STALE_SECONDS is unsupported; use MARKET_DATA_STALE_ADD_BLOCK_SECONDS and MARKET_DATA_STALE_HARD_PAUSE_SECONDS"
+        ));
+    }
 
     let seg = segment(&env::var("MARKET_SEGMENT").unwrap_or_else(|_| "15M".to_string()));
     let defaults = segment_defaults(&seg);
@@ -416,8 +473,14 @@ pub fn build_effective_bot_config_from_env() -> Result<BotConfig> {
     cfg.reserve_usd = env_float("RESERVE_USD", cfg.reserve_usd);
     cfg.dry_run = env_bool("DRY_RUN", cfg.dry_run);
     cfg.log_every = env_int("LOG_EVERY_SECONDS", cfg.log_every) as i64;
-    cfg.market_data_stale_seconds =
-        env_int("MARKET_DATA_STALE_SECONDS", cfg.market_data_stale_seconds) as i64;
+    cfg.market_data_stale_add_block_seconds = env_int(
+        "MARKET_DATA_STALE_ADD_BLOCK_SECONDS",
+        cfg.market_data_stale_add_block_seconds,
+    ) as i64;
+    cfg.market_data_stale_hard_pause_seconds = env_int(
+        "MARKET_DATA_STALE_HARD_PAUSE_SECONDS",
+        cfg.market_data_stale_hard_pause_seconds,
+    ) as i64;
     cfg.stop_buffer_seconds = env_int("STOP_BUFFER_SECONDS", cfg.stop_buffer_seconds) as i64;
     cfg.entry_edge_ticks = env_int("ENTRY_EDGE_TICKS", cfg.entry_edge_ticks) as i64;
     cfg.hedge_buffer_ticks = env_int("HEDGE_BUFFER_TICKS", cfg.hedge_buffer_ticks) as i64;
@@ -435,6 +498,7 @@ pub fn build_effective_bot_config_from_env() -> Result<BotConfig> {
     if cfg.funder.clone().unwrap_or_default().trim().is_empty() {
         return Err(anyhow!("Missing POLYMARKET_FUNDER"));
     }
+    validate_stale_data_policy(&cfg)?;
 
     Ok(cfg)
 }
@@ -568,6 +632,7 @@ pub fn resolve_versioned_config_bundle_from_snapshot(
     let runtime_config = snapshot.runtime_config.to_runtime_config();
     bot_runtime_validate_config(&runtime_config).map_err(|err| anyhow!(err))?;
     let mut effective_bot_config = snapshot.bot_config.clone();
+    validate_stale_data_policy(&effective_bot_config)?;
     if effective_bot_config.private_key.trim().is_empty() {
         effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
             .unwrap_or_default()
@@ -600,6 +665,7 @@ pub fn build_legacy_versioned_config_bundle(
     config_version: String,
     loaded_at: String,
 ) -> Result<ResolvedVersionedConfigBundle> {
+    validate_stale_data_policy(&effective_bot_config)?;
     if effective_bot_config.private_key.trim().is_empty() {
         effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
             .unwrap_or_default()
@@ -715,6 +781,129 @@ mod tests {
                 let text = right.config_text().expect("config text");
                 assert!(!text.contains("secret-a"));
                 assert!(!text.contains("secret-b"));
+            },
+        );
+    }
+
+    #[test]
+    fn stale_data_policy_defaults_to_requirement_thresholds() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MARKET_DATA_STALE_ADD_BLOCK_SECONDS", None),
+                ("MARKET_DATA_STALE_HARD_PAUSE_SECONDS", None),
+                ("MARKET_DATA_STALE_SECONDS", None),
+            ],
+            || {
+                let cfg = build_effective_bot_config_from_env().expect("effective config");
+                assert_eq!(cfg.market_data_stale_add_block_seconds, 2);
+                assert_eq!(cfg.market_data_stale_hard_pause_seconds, 5);
+                assert!(stale_data_policy_requirement_compliant(&cfg));
+            },
+        );
+    }
+
+    #[test]
+    fn stale_data_policy_rejects_legacy_single_threshold_env() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MARKET_DATA_STALE_SECONDS", Some("8")),
+            ],
+            || {
+                let err = build_effective_bot_config_from_env()
+                    .expect_err("legacy stale env should fail");
+                assert!(err
+                    .to_string()
+                    .contains("MARKET_DATA_STALE_SECONDS is unsupported"));
+            },
+        );
+    }
+
+    #[test]
+    fn relaxed_stale_data_policy_is_allowed_but_noncompliant() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MARKET_DATA_STALE_ADD_BLOCK_SECONDS", Some("3")),
+                ("MARKET_DATA_STALE_HARD_PAUSE_SECONDS", Some("6")),
+                ("MARKET_DATA_STALE_SECONDS", None),
+            ],
+            || {
+                let cfg = build_effective_bot_config_from_env().expect("effective config");
+                assert_eq!(cfg.market_data_stale_add_block_seconds, 3);
+                assert_eq!(cfg.market_data_stale_hard_pause_seconds, 6);
+                assert!(!stale_data_policy_requirement_compliant(&cfg));
+            },
+        );
+    }
+
+    #[test]
+    fn stale_data_policy_rejects_non_ascending_thresholds() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MARKET_DATA_STALE_ADD_BLOCK_SECONDS", Some("6")),
+                ("MARKET_DATA_STALE_HARD_PAUSE_SECONDS", Some("6")),
+                ("MARKET_DATA_STALE_SECONDS", None),
+            ],
+            || {
+                let err = build_effective_bot_config_from_env()
+                    .expect_err("non-ascending stale policy should fail");
+                assert!(err
+                    .to_string()
+                    .contains("MARKET_DATA_STALE_HARD_PAUSE_SECONDS"));
+            },
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_new_stale_fields_uses_requirement_defaults() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MARKET_DATA_STALE_SECONDS", None),
+            ],
+            || {
+                let bundle = load_versioned_config_bundle_from_env().expect("bundle");
+                let mut value: Value =
+                    serde_json::from_str(&bundle.config_text().expect("config text"))
+                        .expect("snapshot json");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("market_data_stale_add_block_seconds");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("market_data_stale_hard_pause_seconds");
+
+                let snapshot: VersionedConfigSnapshotV1 =
+                    serde_json::from_value(value).expect("legacy-like snapshot");
+                let resolved =
+                    resolve_versioned_config_bundle_from_snapshot(snapshot).expect("resolved");
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .market_data_stale_add_block_seconds,
+                    2
+                );
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .market_data_stale_hard_pause_seconds,
+                    5
+                );
+                assert!(stale_data_policy_requirement_compliant(
+                    &resolved.effective_bot_config
+                ));
             },
         );
     }
