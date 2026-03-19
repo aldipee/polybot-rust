@@ -23,6 +23,32 @@ impl BotRuntimePhase {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::bot) enum BotRuntimeSafetyGate {
+    #[default]
+    Healthy,
+    StartupReconPending,
+    ReconnectReconPending,
+    ValidationFailed,
+    DependencyPaused,
+}
+
+impl BotRuntimeSafetyGate {
+    pub(in crate::bot) fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::StartupReconPending => "startup_reconciliation_pending",
+            Self::ReconnectReconPending => "reconnect_reconciliation_pending",
+            Self::ValidationFailed => "validation_failed",
+            Self::DependencyPaused => "dependency_paused",
+        }
+    }
+
+    pub(in crate::bot) fn allows_new_risk(self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+}
 /// Implements should stop for rollover for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
@@ -180,6 +206,14 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) owner: BotRuntimeControlOwner,
     pub(in crate::bot) owner_enter_ts: f64,
     pub(in crate::bot) owner_reason: &'static str,
+    pub(in crate::bot) safety_gate: BotRuntimeSafetyGate,
+    pub(in crate::bot) safety_gate_reason: String,
+    pub(in crate::bot) last_clean_reconcile_ts: f64,
+    pub(in crate::bot) last_reconnect_reconcile_ts: f64,
+    pub(in crate::bot) last_validation_ts: f64,
+    pub(in crate::bot) dependency_pause_started_ts: f64,
+    pub(in crate::bot) market_ws_ever_opened: bool,
+    pub(in crate::bot) user_ws_ever_opened: bool,
     pub(in crate::bot) armed_once: bool,
     pub(in crate::bot) prearm_ready_once: bool,
     pub(in crate::bot) prearm_ready_ts: f64,
@@ -551,6 +585,7 @@ pub(in crate::bot) struct BotRuntimeMetricsSnapshot {
     pub(in crate::bot) unmatched_fraction: f64,
     pub(in crate::bot) match_ratio: f64,
     pub(in crate::bot) imbalance_state: BotRuntimeImbalanceState,
+    pub(in crate::bot) safety_gate: BotRuntimeSafetyGate,
     pub(in crate::bot) pair_coverage: f64,
     pub(in crate::bot) share_skew_ratio: f64,
     pub(in crate::bot) inventory_vwap_sum: f64,

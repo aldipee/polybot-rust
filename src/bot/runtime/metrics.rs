@@ -381,6 +381,7 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
         unmatched_fraction: unmatched_fraction(q_yes, q_no),
         match_ratio: match_ratio(q_yes, q_no),
         imbalance_state: state.imbalance_state,
+        safety_gate: state.safety_gate,
         pair_coverage: pair_coverage(q_yes, q_no),
         share_skew_ratio: share_skew_ratio(q_yes, q_no),
         inventory_vwap_sum: inventory_vwap_sum(q_yes, q_no, cost_yes, cost_no),

@@ -154,25 +154,32 @@ impl MakerHedgeCapBot {
         let decision_event_id = new_uuid();
         let (pair_id, market_slug, condition_id, yes_asset_id, no_asset_id) =
             self._audit_pair_identity_fields();
-        let (phase, owner, pair_taker_share, daily_taker_share) = self
-            .bot_runtime_state
-            .lock()
-            .map(|st| {
-                (
-                    st.phase.as_str().to_string(),
-                    st.owner.as_str().to_string(),
-                    bot_runtime_taker_share(st.maker_fill_shares, st.taker_fill_shares),
-                    bot_runtime_taker_share(st.daily_maker_fill_shares, st.daily_taker_fill_shares),
-                )
-            })
-            .unwrap_or_else(|_| {
-                (
-                    BotRuntimePhase::PreArm.as_str().to_string(),
-                    BotRuntimeControlOwner::PreArm.as_str().to_string(),
-                    0.0,
-                    0.0,
-                )
-            });
+        let (phase, owner, pair_taker_share, daily_taker_share, safety_gate, safety_gate_reason) =
+            self.bot_runtime_state
+                .lock()
+                .map(|st| {
+                    (
+                        st.phase.as_str().to_string(),
+                        st.owner.as_str().to_string(),
+                        bot_runtime_taker_share(st.maker_fill_shares, st.taker_fill_shares),
+                        bot_runtime_taker_share(
+                            st.daily_maker_fill_shares,
+                            st.daily_taker_fill_shares,
+                        ),
+                        st.safety_gate.as_str().to_string(),
+                        st.safety_gate_reason.clone(),
+                    )
+                })
+                .unwrap_or_else(|_| {
+                    (
+                        BotRuntimePhase::PreArm.as_str().to_string(),
+                        BotRuntimeControlOwner::PreArm.as_str().to_string(),
+                        0.0,
+                        0.0,
+                        BotRuntimeSafetyGate::Healthy.as_str().to_string(),
+                        String::new(),
+                    )
+                });
         let t_left_seconds = (self.expiry_ts as f64 - now_ts_f64()).max(0.0);
         let unmatched_fraction_now = unmatched_fraction(q_yes, q_no);
         let match_ratio_now = match_ratio(q_yes, q_no);
@@ -205,6 +212,8 @@ impl MakerHedgeCapBot {
             "reason_code": reason_code,
             "phase": phase.clone(),
             "owner": owner.clone(),
+            "safety_gate": safety_gate,
+            "safety_gate_reason": safety_gate_reason,
             "submit_origin": order_origin,
             "submit_side": order_side,
             "t_into_seconds": t_into_s.max(0.0),
@@ -508,8 +517,16 @@ impl MakerHedgeCapBot {
     pub(in crate::bot) fn _audit_record_reconciliation_event(
         &self,
         reason_code: &str,
-        payload: Value,
+        mut payload: Value,
     ) {
+        if let Some(obj) = payload.as_object_mut() {
+            if let Ok(st) = self.bot_runtime_state.lock() {
+                obj.entry("safety_gate".to_string())
+                    .or_insert(json!(st.safety_gate.as_str()));
+                obj.entry("safety_gate_reason".to_string())
+                    .or_insert(json!(st.safety_gate_reason));
+            }
+        }
         let _ = self._audit_insert_runtime_event(
             "reconciliation",
             None,

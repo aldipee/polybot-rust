@@ -51,6 +51,293 @@ impl MakerHedgeCapBot {
             .and_then(|mut pending| pending.take())
     }
 
+    pub(super) fn _bot_runtime_set_safety_gate(
+        &self,
+        gate: BotRuntimeSafetyGate,
+        reason: &str,
+        now: f64,
+    ) {
+        if let Ok(mut st) = self.bot_runtime_state.lock() {
+            st.safety_gate = gate;
+            st.safety_gate_reason = reason.trim().to_string();
+            match gate {
+                BotRuntimeSafetyGate::Healthy => {
+                    if now.is_finite() && now > 0.0 {
+                        st.last_validation_ts = now;
+                    }
+                }
+                BotRuntimeSafetyGate::ReconnectReconPending => {
+                    if now.is_finite() && now > 0.0 {
+                        st.last_reconnect_reconcile_ts = 0.0;
+                    }
+                }
+                BotRuntimeSafetyGate::DependencyPaused => {
+                    if now.is_finite() && now > 0.0 && st.dependency_pause_started_ts <= 0.0 {
+                        st.dependency_pause_started_ts = now;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(super) fn _bot_runtime_mark_startup_reconciliation_pending(&self, now: f64) {
+        self._bot_runtime_set_safety_gate(
+            BotRuntimeSafetyGate::StartupReconPending,
+            "startup_reconciliation_pending",
+            now,
+        );
+    }
+
+    pub(super) fn _bot_runtime_mark_reconnect_reconciliation_pending(
+        &self,
+        channel: &str,
+        now: f64,
+    ) {
+        self._bot_runtime_set_safety_gate(
+            BotRuntimeSafetyGate::ReconnectReconPending,
+            &format!(
+                "reconnect_reconciliation_pending:{}",
+                channel.trim().to_ascii_lowercase()
+            ),
+            now,
+        );
+    }
+
+    pub(super) fn _bot_runtime_enter_dependency_pause(&self, kind: &str, detail: &str, now: f64) {
+        let mut reason = format!("dependency_pause:{}", kind.trim().to_ascii_lowercase());
+        if !detail.trim().is_empty() {
+            reason.push(':');
+            reason.push_str(detail.trim());
+        }
+        self._bot_runtime_set_safety_gate(BotRuntimeSafetyGate::DependencyPaused, &reason, now);
+    }
+
+    pub(super) fn _bot_runtime_mark_validation_failed(&self, reason: &str, now: f64) {
+        self._bot_runtime_set_safety_gate(BotRuntimeSafetyGate::ValidationFailed, reason, now);
+    }
+
+    pub(super) fn _bot_runtime_mark_reconciliation_clean(&self, scope: &str, now: f64) {
+        if let Ok(mut st) = self.bot_runtime_state.lock() {
+            st.safety_gate = BotRuntimeSafetyGate::Healthy;
+            st.safety_gate_reason = format!("reconciliation_clean:{}", scope.trim());
+            if now.is_finite() && now > 0.0 {
+                st.last_clean_reconcile_ts = now;
+                st.last_validation_ts = now;
+                if scope.eq_ignore_ascii_case("reconnect") {
+                    st.last_reconnect_reconcile_ts = now;
+                }
+            }
+            st.dependency_pause_started_ts = 0.0;
+        }
+    }
+
+    fn _bot_runtime_persistence_healthy(&self) -> Result<(), String> {
+        let (gate, reason) = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| (st.safety_gate, st.safety_gate_reason.clone()))
+            .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new()));
+        if !matches!(gate, BotRuntimeSafetyGate::DependencyPaused)
+            || !reason.starts_with("dependency_pause:database")
+        {
+            return Ok(());
+        }
+        let mut snapshot = self.state.lock().map(|state| state.clone()).map_err(|_| {
+            if reason.trim().is_empty() {
+                "dependency_pause:database".to_string()
+            } else {
+                reason.clone()
+            }
+        })?;
+        save_state(&self.state_file, &mut snapshot).map_err(|_| {
+            if reason.trim().is_empty() {
+                "dependency_pause:database".to_string()
+            } else {
+                reason.clone()
+            }
+        })?;
+        if reason.starts_with("dependency_pause:database:daily_liquidity") {
+            let mut snapshot = self
+                .daily_liquidity_state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| {
+                    if reason.trim().is_empty() {
+                        "dependency_pause:database:daily_liquidity".to_string()
+                    } else {
+                        reason.clone()
+                    }
+                })?;
+            save_daily_liquidity_state(&self.daily_liquidity_state_file, &mut snapshot).map_err(
+                |_| {
+                    if reason.trim().is_empty() {
+                        "dependency_pause:database:daily_liquidity".to_string()
+                    } else {
+                        reason
+                    }
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn _bot_runtime_dependency_healthy(&self) -> Result<(), String> {
+        if !self.market_connected.load(Ordering::SeqCst) {
+            return Err("dependency_pause:market_ws".to_string());
+        }
+        if env_bool("REQUIRE_USER_WS_CONNECTED", true)
+            && !self.user_connected.load(Ordering::SeqCst)
+        {
+            return Err("dependency_pause:user_ws".to_string());
+        }
+        if !self._market_data_fresh() {
+            return Err("dependency_pause:market_ws".to_string());
+        }
+        self._bot_runtime_persistence_healthy()?;
+        Ok(())
+    }
+
+    pub(super) fn _bot_runtime_save_state_or_dependency_pause(
+        &self,
+        state: &mut BotState,
+        context: &str,
+    ) -> bool {
+        match save_state(&self.state_file, state) {
+            Ok(()) => true,
+            Err(err) => {
+                let now = now_ts_f64();
+                self.logger.warning(&format!(
+                    "[BOT][SAFE_PAUSE] state_persist_failed context={} err={:#}",
+                    context, err
+                ));
+                self._bot_runtime_enter_dependency_pause("database", context, now);
+                self._audit_record_reconciliation_event(
+                    "dependency_pause:database",
+                    json!({
+                        "context": context,
+                        "reconcile_scope": context,
+                        "reconcile_clean": false,
+                        "dependency_pause_kind": "database",
+                        "error": format!("{:#}", err),
+                    }),
+                );
+                false
+            }
+        }
+    }
+
+    fn _bot_runtime_position_truth_snapshot(
+        &self,
+    ) -> Result<Option<(f64, f64, &'static str)>, String> {
+        let (yes, no) = match (&self.yes_asset, &self.no_asset) {
+            (Some(y), Some(n)) if !y.trim().is_empty() && !n.trim().is_empty() => {
+                (y.as_str(), n.as_str())
+            }
+            _ => return Ok(None),
+        };
+        let use_data_api = env_bool("RECONCILE_USE_DATA_API", false);
+        let use_legacy_balance = env_bool("MISMATCH_RECONCILE_FROM_BALANCE", false);
+        if !use_data_api && !use_legacy_balance {
+            return Ok(None);
+        }
+        if use_data_api {
+            let yes_pos = self
+                ._get_position_size_data_api(yes)
+                .ok_or_else(|| "dependency_pause:reconciliation".to_string())?;
+            let no_pos = self
+                ._get_position_size_data_api(no)
+                .ok_or_else(|| "dependency_pause:reconciliation".to_string())?;
+            return Ok(Some((yes_pos.max(0.0), no_pos.max(0.0), "data_api")));
+        }
+        let (yes_bal, _) = self
+            ._get_balance_allowance_conditional_cached(yes, 0.0)
+            .ok_or_else(|| "dependency_pause:reconciliation".to_string())?;
+        let (no_bal, _) = self
+            ._get_balance_allowance_conditional_cached(no, 0.0)
+            .ok_or_else(|| "dependency_pause:reconciliation".to_string())?;
+        Ok(Some((yes_bal.max(0.0), no_bal.max(0.0), "legacy_balance")))
+    }
+
+    pub(super) fn _bot_runtime_run_reconciliation_gate(
+        &self,
+        scope: &str,
+        now: f64,
+    ) -> Result<(), String> {
+        let pair = self.pair_identity();
+        if let Some(yes) = pair.yes_asset_id.as_deref() {
+            self._reconcile_exchange_orders_for_asset(yes, None, true);
+        }
+        if let Some(no) = pair.no_asset_id.as_deref() {
+            self._reconcile_exchange_orders_for_asset(no, None, true);
+        }
+        let local = self
+            .state
+            .lock()
+            .map(|state| (state.q_yes.max(0.0), state.q_no.max(0.0)))
+            .map_err(|_| "dependency_pause:database".to_string())?;
+        let external = self._bot_runtime_position_truth_snapshot()?;
+        let threshold = self.cfg.min_shares.max(1e-6);
+        if let Some((ext_yes, ext_no, source)) = external {
+            let yes_delta = (local.0 - ext_yes).abs();
+            let no_delta = (local.1 - ext_no).abs();
+            if yes_delta > threshold || no_delta > threshold {
+                let reason = "reconciliation_mismatch";
+                self._audit_record_reconciliation_event(
+                    reason,
+                    json!({
+                        "pair_id": pair.pair_id,
+                        "reconcile_scope": scope,
+                        "reconcile_clean": false,
+                        "dependency_pause_kind": "reconciliation",
+                        "source": source,
+                        "local_q_yes": local.0,
+                        "local_q_no": local.1,
+                        "external_q_yes": ext_yes,
+                        "external_q_no": ext_no,
+                        "threshold": threshold,
+                    }),
+                );
+                self._bot_runtime_mark_validation_failed(reason, now);
+                return Err(reason.to_string());
+            }
+            self._audit_record_reconciliation_event(
+                &format!("{}_clean", scope.trim()),
+                json!({
+                    "pair_id": pair.pair_id,
+                    "reconcile_scope": scope,
+                    "reconcile_clean": true,
+                    "source": source,
+                    "local_q_yes": local.0,
+                    "local_q_no": local.1,
+                    "external_q_yes": ext_yes,
+                    "external_q_no": ext_no,
+                }),
+            );
+        } else {
+            self._audit_record_reconciliation_event(
+                &format!("{}_clean", scope.trim()),
+                json!({
+                    "pair_id": pair.pair_id,
+                    "reconcile_scope": scope,
+                    "reconcile_clean": true,
+                    "source": "local_only",
+                    "local_q_yes": local.0,
+                    "local_q_no": local.1,
+                }),
+            );
+        }
+        self._bot_runtime_mark_reconciliation_clean(scope, now);
+        Ok(())
+    }
+
+    pub(super) fn _bot_runtime_cancel_new_risk_orders(&self, reason: &str) {
+        let _ = self._bot_runtime_cancel_order_family("BOT_OPEN_BOTH", None, reason);
+        let _ = self._bot_runtime_cancel_await_second_fill_orders(None, reason);
+        let _ = self._bot_runtime_cancel_pair_build_orders(None, reason);
+        let _ = self._bot_runtime_cancel_taper_orders(None, reason);
+    }
+
     /// Computes env first for the BOT runtime.
     /// This is a helper used by the BOT runtime for normalization, state labels, or
     /// calculations.
@@ -211,10 +498,33 @@ impl MakerHedgeCapBot {
     /// runtime.
 
     pub fn _on_open(&self, channel: &str) {
+        let now = now_ts_f64();
         if channel.eq_ignore_ascii_case("market") {
+            let reopened = self
+                .bot_runtime_state
+                .lock()
+                .map(|state| state.market_ws_ever_opened)
+                .unwrap_or(false);
             self.market_connected.store(true, Ordering::SeqCst);
+            if let Ok(mut state) = self.bot_runtime_state.lock() {
+                state.market_ws_ever_opened = true;
+            }
+            if reopened {
+                self._bot_runtime_mark_reconnect_reconciliation_pending("market_ws", now);
+            }
         } else if channel.eq_ignore_ascii_case("user") {
+            let reopened = self
+                .bot_runtime_state
+                .lock()
+                .map(|state| state.user_ws_ever_opened)
+                .unwrap_or(false);
             self.user_connected.store(true, Ordering::SeqCst);
+            if let Ok(mut state) = self.bot_runtime_state.lock() {
+                state.user_ws_ever_opened = true;
+            }
+            if reopened {
+                self._bot_runtime_mark_reconnect_reconciliation_pending("user_ws", now);
+            }
         }
         self.logger.info(&format!("[{channel}] open"));
     }
@@ -224,10 +534,27 @@ impl MakerHedgeCapBot {
     /// runtime.
 
     pub fn _on_error(&self, channel: &str, err: &str) {
+        let now = now_ts_f64();
         if channel.eq_ignore_ascii_case("market") {
             self.market_connected.store(false, Ordering::SeqCst);
+            let was_live = self
+                .bot_runtime_state
+                .lock()
+                .map(|state| state.market_ws_ever_opened)
+                .unwrap_or(false);
+            if was_live {
+                self._bot_runtime_enter_dependency_pause("market_ws", "error", now);
+            }
         } else if channel.eq_ignore_ascii_case("user") {
             self.user_connected.store(false, Ordering::SeqCst);
+            let was_live = self
+                .bot_runtime_state
+                .lock()
+                .map(|state| state.user_ws_ever_opened)
+                .unwrap_or(false);
+            if was_live {
+                self._bot_runtime_enter_dependency_pause("user_ws", "error", now);
+            }
         }
         self.logger.error(&format!("[{channel}] error: {err}"));
     }
@@ -237,10 +564,27 @@ impl MakerHedgeCapBot {
     /// runtime.
 
     pub fn _on_close(&self, channel: &str, code: i64, msg: &str) {
+        let now = now_ts_f64();
         if channel.eq_ignore_ascii_case("market") {
             self.market_connected.store(false, Ordering::SeqCst);
+            let was_live = self
+                .bot_runtime_state
+                .lock()
+                .map(|state| state.market_ws_ever_opened)
+                .unwrap_or(false);
+            if was_live {
+                self._bot_runtime_enter_dependency_pause("market_ws", "closed", now);
+            }
         } else if channel.eq_ignore_ascii_case("user") {
             self.user_connected.store(false, Ordering::SeqCst);
+            let was_live = self
+                .bot_runtime_state
+                .lock()
+                .map(|state| state.user_ws_ever_opened)
+                .unwrap_or(false);
+            if was_live {
+                self._bot_runtime_enter_dependency_pause("user_ws", "closed", now);
+            }
         }
         self.logger
             .warning(&format!("[{channel}] closed: {code} {msg}"));
@@ -1022,7 +1366,10 @@ impl MakerHedgeCapBot {
             s.q_no = new_q_no;
             s.c_yes = new_c_yes;
             s.c_no = new_c_no;
-            let _ = save_state(&self.state_file, &mut s);
+            let _ = self._bot_runtime_save_state_or_dependency_pause(
+                &mut s,
+                "reconcile_state_from_positions",
+            );
         }
         let tag = if reason.trim().is_empty() {
             String::new()

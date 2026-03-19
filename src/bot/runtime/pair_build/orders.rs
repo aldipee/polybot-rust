@@ -10,6 +10,143 @@ use super::decision::{
 use super::state::BotRuntimePairBuildMarketContext;
 
 impl MakerHedgeCapBot {
+    fn _bot_runtime_side_for_asset_id(&self, asset_id: &str) -> Option<OutcomeSide> {
+        let trimmed = asset_id.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if self.yes_asset.as_deref() == Some(trimmed) {
+            return Some(OutcomeSide::Yes);
+        }
+        if self.no_asset.as_deref() == Some(trimmed) {
+            return Some(OutcomeSide::No);
+        }
+        None
+    }
+
+    fn _bot_runtime_cancel_direct_order_family(
+        &self,
+        family_prefix: &str,
+        exclude_prefix: Option<&str>,
+        active_side: Option<OutcomeSide>,
+        reason: &str,
+    ) -> bool {
+        let tracked_order_ids: HashSet<String> = self
+            .maker_order_slots
+            .lock()
+            .map(|slots| {
+                slots
+                    .values()
+                    .filter_map(|slot| slot.order_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let targets: Vec<(String, String)> = self
+            .order_exec_context
+            .lock()
+            .map(|ctx_map| {
+                ctx_map
+                    .iter()
+                    .filter_map(|(order_id, ctx)| {
+                        let origin = ctx.get("origin").and_then(|value| value.as_str())?.trim();
+                        if !origin.starts_with(family_prefix) {
+                            return None;
+                        }
+                        if exclude_prefix
+                            .map(|prefix| origin.starts_with(prefix))
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        if ctx
+                            .get("direct_cancel_requested")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        if tracked_order_ids.contains(order_id) {
+                            return None;
+                        }
+                        let asset_id = ctx
+                            .get("asset_id")
+                            .or_else(|| ctx.get("token_id"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let side = ctx
+                            .get("side")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_ascii_uppercase();
+                        if side != "BUY" {
+                            return None;
+                        }
+                        if active_side == self._bot_runtime_side_for_asset_id(asset_id.as_str()) {
+                            return None;
+                        }
+                        if asset_id.is_empty() {
+                            return None;
+                        }
+                        Some((order_id.clone(), asset_id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if targets.is_empty() {
+            return false;
+        }
+        let mut cancelled: Vec<(String, String)> = Vec::new();
+        for (order_id, asset_id) in &targets {
+            if self._cancel(order_id) {
+                cancelled.push((order_id.clone(), asset_id.clone()));
+            }
+        }
+        if cancelled.is_empty() {
+            return true;
+        }
+        let cancel_ts = now_ts_f64();
+        if let Ok(mut ctx_map) = self.order_exec_context.lock() {
+            for (order_id, _) in &cancelled {
+                if let Some(existing) = ctx_map
+                    .get_mut(order_id)
+                    .and_then(|value| value.as_object_mut())
+                {
+                    existing.insert("direct_cancel_requested".to_string(), json!(true));
+                    existing.insert("direct_cancel_reason".to_string(), json!(reason));
+                    existing.insert("direct_cancel_ts".to_string(), json!(cancel_ts));
+                }
+            }
+        }
+        let cancelled_ids: HashSet<String> = cancelled
+            .iter()
+            .map(|(order_id, _)| order_id.clone())
+            .collect();
+        if let Ok(mut state) = self.state.lock() {
+            let mut removed_any = false;
+            state.open_orders.retain(|_, row| {
+                let keep = row
+                    .order_id
+                    .as_ref()
+                    .map(|order_id| !cancelled_ids.contains(order_id))
+                    .unwrap_or(true);
+                if !keep {
+                    removed_any = true;
+                }
+                keep
+            });
+            if removed_any {
+                let _ = self._bot_runtime_save_state_or_dependency_pause(
+                    &mut state,
+                    "cancel_direct_order_family",
+                );
+            }
+        }
+        true
+    }
+
     /// Implements pair build note side cancel for the BOT runtime.
     /// This helper supports pair-build planning, repair, pacing, or hold-state handling in the
     /// BOT runtime.
@@ -154,7 +291,9 @@ impl MakerHedgeCapBot {
                 }
             }
         }
-        touched
+        let cancelled_direct =
+            self._bot_runtime_cancel_direct_order_family(family_prefix, None, active_side, reason);
+        touched || cancelled_direct
     }
 
     /// Implements cancel order family on a single side for the BOT runtime.
@@ -212,7 +351,13 @@ impl MakerHedgeCapBot {
                 }
             }
         }
-        touched
+        let cancelled_direct = self._bot_runtime_cancel_direct_order_family(
+            family_prefix,
+            Some(exclude_prefix),
+            active_side,
+            reason,
+        );
+        touched || cancelled_direct
     }
 
     /// Implements cancel pair build orders for the BOT runtime.

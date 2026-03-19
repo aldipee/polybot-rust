@@ -446,6 +446,9 @@ pub struct BotState {
     pub c_yes: f64,
     pub c_no: f64,
     pub seen_trade_keys: Vec<String>,
+    pub seen_trade_key_times: HashMap<String, f64>,
+    pub bot_order_intent_attempts: HashMap<String, u64>,
+    pub bot_order_intent_signatures: HashMap<String, String>,
     pub open_orders: HashMap<String, OpenOrderState>,
     pub pair_total_fill_events: u32,
     pub pair_total_fill_shares: f64,
@@ -463,6 +466,9 @@ impl Default for BotState {
             c_yes: 0.0,
             c_no: 0.0,
             seen_trade_keys: Vec::new(),
+            seen_trade_key_times: HashMap::new(),
+            bot_order_intent_attempts: HashMap::new(),
+            bot_order_intent_signatures: HashMap::new(),
             open_orders: HashMap::new(),
             pair_total_fill_events: 0,
             pair_total_fill_shares: 0.0,
@@ -479,6 +485,33 @@ impl BotState {
         if self.open_orders.is_empty() {
             self.open_orders = HashMap::new();
         }
+        if self.seen_trade_key_times.is_empty() && !self.seen_trade_keys.is_empty() {
+            for (idx, key) in self.seen_trade_keys.iter().enumerate() {
+                if !key.trim().is_empty() {
+                    // Preserve the legacy vector's append order so trim behavior keeps the most
+                    // recently seen keys after migration.
+                    self.seen_trade_key_times.insert(key.clone(), idx as f64);
+                }
+            }
+        }
+        if self.seen_trade_keys.is_empty() && !self.seen_trade_key_times.is_empty() {
+            self.seen_trade_keys = self.seen_trade_key_times.keys().cloned().collect();
+            self.seen_trade_keys.sort();
+        } else if !self.seen_trade_key_times.is_empty() {
+            self.seen_trade_keys.retain(|key| {
+                !key.trim().is_empty() && self.seen_trade_key_times.contains_key(key)
+            });
+            for key in self.seen_trade_key_times.keys() {
+                if !self.seen_trade_keys.iter().any(|seen| seen == key) {
+                    self.seen_trade_keys.push(key.clone());
+                }
+            }
+        }
+        self.trim_seen_trade_keys();
+        self.bot_order_intent_attempts
+            .retain(|key, value| !key.trim().is_empty() && *value < u64::MAX);
+        self.bot_order_intent_signatures
+            .retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
         if !self.pair_total_fill_shares.is_finite() || self.pair_total_fill_shares < 0.0 {
             self.pair_total_fill_shares = 0.0;
         }
@@ -504,6 +537,79 @@ impl BotState {
             self.pair_taker_fill_events = self.pair_taker_fill_events.saturating_add(1);
             self.pair_taker_fill_shares += qty;
         }
+    }
+
+    pub fn has_seen_trade_key(&self, trade_key: &str) -> bool {
+        let trimmed = trade_key.trim();
+        !trimmed.is_empty()
+            && (self.seen_trade_key_times.contains_key(trimmed)
+                || self.seen_trade_keys.iter().any(|seen| seen == trimmed))
+    }
+
+    pub fn record_seen_trade_key(&mut self, trade_key: &str, ts: f64) {
+        let trimmed = trade_key.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let normalized_ts = if ts.is_finite() && ts > 0.0 { ts } else { 0.0 };
+        self.seen_trade_key_times
+            .insert(trimmed.to_string(), normalized_ts);
+        if !self.seen_trade_keys.iter().any(|seen| seen == trimmed) {
+            self.seen_trade_keys.push(trimmed.to_string());
+        }
+        self.trim_seen_trade_keys();
+    }
+
+    pub fn note_bot_order_intent_attempt(&mut self, family_key: &str, signature: &str) -> u64 {
+        let trimmed_key = family_key.trim();
+        let trimmed_sig = signature.trim();
+        if trimmed_key.is_empty() || trimmed_sig.is_empty() {
+            return 0;
+        }
+        let prev_sig = self.bot_order_intent_signatures.get(trimmed_key).cloned();
+        let entry = self
+            .bot_order_intent_attempts
+            .entry(trimmed_key.to_string())
+            .or_insert(0);
+        if prev_sig.as_deref() != Some(trimmed_sig) {
+            *entry = entry.saturating_add(1);
+        }
+        self.bot_order_intent_signatures
+            .insert(trimmed_key.to_string(), trimmed_sig.to_string());
+        *entry
+    }
+
+    fn trim_seen_trade_keys(&mut self) {
+        if self.seen_trade_key_times.len() <= 5000 {
+            if self.seen_trade_keys.len() > 5000 {
+                let start = self.seen_trade_keys.len().saturating_sub(2000);
+                self.seen_trade_keys = self.seen_trade_keys[start..].to_vec();
+            }
+            self.seen_trade_keys
+                .retain(|key| self.seen_trade_key_times.contains_key(key));
+            return;
+        }
+        let mut ranked: Vec<(String, f64)> = self
+            .seen_trade_key_times
+            .iter()
+            .map(|(key, ts)| (key.clone(), *ts))
+            .collect();
+        ranked.sort_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let keep_from = ranked.len().saturating_sub(2000);
+        let keep_keys: HashMap<String, f64> = ranked[keep_from..]
+            .iter()
+            .map(|(key, ts)| (key.clone(), *ts))
+            .collect();
+        self.seen_trade_key_times = keep_keys;
+        self.seen_trade_keys = ranked[keep_from..]
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
     }
 }
 
@@ -949,10 +1055,7 @@ pub fn load_state(state_file: &Path) -> Result<BotState> {
 }
 
 pub fn save_state(state_file: &Path, state: &mut BotState) -> Result<()> {
-    if state.seen_trade_keys.len() > 5000 {
-        let start = state.seen_trade_keys.len().saturating_sub(2000);
-        state.seen_trade_keys = state.seen_trade_keys[start..].to_vec();
-    }
+    state.normalize();
     let raw = serde_json::to_string_pretty(state)?;
     fs::write(state_file, raw)
         .with_context(|| format!("failed writing state file {}", state_file.display()))?;
@@ -1159,5 +1262,53 @@ mod tests {
         assert!(lock_path.exists());
         drop(lock);
         assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn bot_state_reuses_attempt_for_identical_order_intent_signature() {
+        let mut state = BotState::default();
+        let attempt_1 = state.note_bot_order_intent_attempt("family", "sig-a");
+        let attempt_2 = state.note_bot_order_intent_attempt("family", "sig-a");
+        let attempt_3 = state.note_bot_order_intent_attempt("family", "sig-b");
+        assert_eq!(attempt_1, 1);
+        assert_eq!(attempt_2, 1);
+        assert_eq!(attempt_3, 2);
+    }
+
+    #[test]
+    fn bot_state_seen_trade_key_times_restore_legacy_vector_entries() {
+        let raw = json!({
+            "q_yes": 0.0,
+            "q_no": 0.0,
+            "c_yes": 0.0,
+            "c_no": 0.0,
+            "seen_trade_keys": ["legacy_fill_key"]
+        });
+        let mut state: BotState = serde_json::from_value(raw).expect("legacy bot state");
+        state.normalize();
+        assert!(state.has_seen_trade_key("legacy_fill_key"));
+        assert!(state.seen_trade_key_times.contains_key("legacy_fill_key"));
+    }
+
+    #[test]
+    fn bot_state_legacy_trade_key_backfill_preserves_recent_entries_when_trimmed() {
+        let seen_trade_keys: Vec<String> = (0..5005)
+            .rev()
+            .map(|idx| format!("legacy_fill_key_{idx:04}"))
+            .collect();
+        let raw = json!({
+            "q_yes": 0.0,
+            "q_no": 0.0,
+            "c_yes": 0.0,
+            "c_no": 0.0,
+            "seen_trade_keys": seen_trade_keys,
+        });
+        let mut state: BotState = serde_json::from_value(raw).expect("legacy bot state");
+        state.normalize();
+        assert_eq!(state.seen_trade_key_times.len(), 2000);
+        assert!(state.has_seen_trade_key("legacy_fill_key_0000"));
+        assert!(state.has_seen_trade_key("legacy_fill_key_1999"));
+        assert!(!state.has_seen_trade_key("legacy_fill_key_2000"));
+        assert!(!state.has_seen_trade_key("legacy_fill_key_5004"));
     }
 }

@@ -62,7 +62,8 @@ impl MakerHedgeCapBot {
         }
         if let Ok(mut s) = self.state.lock() {
             s.open_orders.remove(asset_id);
-            let _ = save_state(&self.state_file, &mut s);
+            let _ =
+                self._bot_runtime_save_state_or_dependency_pause(&mut s, "cancel_open_order_local");
         }
     }
     /// Cancels all open orders local for the active BOT flow.
@@ -89,7 +90,10 @@ impl MakerHedgeCapBot {
         }
         if let Ok(mut s) = self.state.lock() {
             s.open_orders.clear();
-            let _ = save_state(&self.state_file, &mut s);
+            let _ = self._bot_runtime_save_state_or_dependency_pause(
+                &mut s,
+                "cancel_all_open_orders_local",
+            );
         }
     }
     /// Cancels all open orders local except for the active BOT flow.
@@ -143,7 +147,10 @@ impl MakerHedgeCapBot {
             if let Some(v) = kept {
                 s.open_orders.insert(keep_asset_id.to_string(), v);
             }
-            let _ = save_state(&self.state_file, &mut s);
+            let _ = self._bot_runtime_save_state_or_dependency_pause(
+                &mut s,
+                "cancel_all_open_orders_local_except",
+            );
         }
     }
     /// Extracts order id from the provided payload or state.
@@ -363,7 +370,10 @@ impl MakerHedgeCapBot {
         if mine.is_empty() {
             if let Ok(mut s) = self.state.lock() {
                 if s.open_orders.remove(asset_id).is_some() {
-                    let _ = save_state(&self.state_file, &mut s);
+                    let _ = self._bot_runtime_save_state_or_dependency_pause(
+                        &mut s,
+                        "reconcile_exchange_orders_remove_local",
+                    );
                 }
             }
             return;
@@ -385,7 +395,10 @@ impl MakerHedgeCapBot {
                                 ts: Some(now),
                             },
                         );
-                        let _ = save_state(&self.state_file, &mut s);
+                        let _ = self._bot_runtime_save_state_or_dependency_pause(
+                            &mut s,
+                            "reconcile_exchange_orders_single",
+                        );
                     }
                 }
             }
@@ -462,7 +475,10 @@ impl MakerHedgeCapBot {
                         ts: Some(now),
                     },
                 );
-                let _ = save_state(&self.state_file, &mut s);
+                let _ = self._bot_runtime_save_state_or_dependency_pause(
+                    &mut s,
+                    "reconcile_exchange_orders_multi",
+                );
             }
         }
     }

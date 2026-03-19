@@ -1,5 +1,80 @@
 use super::*;
+use sha2::{Digest, Sha256};
 impl MakerHedgeCapBot {
+    fn _bot_order_intent_family_key(
+        &self,
+        asset_id: &str,
+        side: &str,
+        origin: &str,
+        order_type: &str,
+        post_only: Option<bool>,
+    ) -> String {
+        format!(
+            "trade={}|pair={}|asset={}|side={}|origin={}|order_type={}|post_only={}",
+            self.active_trade_id.as_deref().unwrap_or("pending_trade"),
+            self.pair_identity().pair_id,
+            asset_id.trim(),
+            side.trim().to_ascii_uppercase(),
+            origin.trim(),
+            order_type.trim().to_ascii_uppercase(),
+            post_only.unwrap_or(false),
+        )
+    }
+
+    fn _bot_order_intent_signature(
+        &self,
+        asset_id: &str,
+        side: &str,
+        origin: &str,
+        order_type: &str,
+        post_only: Option<bool>,
+        price: f64,
+        size: f64,
+    ) -> String {
+        format!(
+            "{}|price={:.8}|size={:.8}",
+            self._bot_order_intent_family_key(asset_id, side, origin, order_type, post_only),
+            price.max(0.0),
+            size.max(0.0)
+        )
+    }
+
+    fn _bot_order_intent_nonce(
+        &self,
+        asset_id: &str,
+        side: &str,
+        origin: &str,
+        order_type: &str,
+        post_only: Option<bool>,
+        price: f64,
+        size: f64,
+    ) -> Option<(u64, u64, String, String)> {
+        let family_key =
+            self._bot_order_intent_family_key(asset_id, side, origin, order_type, post_only);
+        let signature = self._bot_order_intent_signature(
+            asset_id, side, origin, order_type, post_only, price, size,
+        );
+        let attempt = if let Ok(mut state) = self.state.lock() {
+            let attempt = state.note_bot_order_intent_attempt(&family_key, &signature);
+            if !self._bot_runtime_save_state_or_dependency_pause(&mut state, "submit_intent_nonce")
+            {
+                return None;
+            }
+            attempt
+        } else {
+            return None;
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(family_key.as_bytes());
+        hasher.update(signature.as_bytes());
+        hasher.update(attempt.to_le_bytes());
+        let digest = hasher.finalize();
+        let mut nonce_bytes = [0_u8; 8];
+        nonce_bytes.copy_from_slice(&digest[..8]);
+        let nonce = u64::from_le_bytes(nonce_bytes);
+        Some((nonce, attempt, family_key, signature))
+    }
+
     /// Submits order compat through the compatibility execution path.
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
@@ -73,8 +148,17 @@ impl MakerHedgeCapBot {
                 }
             }
         }
+        let intent = self._bot_order_intent_nonce(
+            asset_id.as_str(),
+            side_u.as_str(),
+            origin.as_str(),
+            order_type,
+            post_only,
+            price,
+            size,
+        )?;
         let local_fallback = || {
-            let oid = crate::db::new_uuid();
+            let oid = format!("LOCAL_INTENT_{}", intent.0);
             let row = json!({
                 "id": oid,
                 "order_id": oid,
@@ -82,6 +166,10 @@ impl MakerHedgeCapBot {
                 "side": side_u,
                 "price": price,
                 "size": size,
+                "nonce": intent.0,
+                "intent_attempt": intent.1,
+                "intent_family_key": intent.2,
+                "intent_signature": intent.3,
                 "order_type": order_type.to_ascii_uppercase(),
                 "post_only": post_only,
                 "ts": now_ts_f64(),
@@ -152,7 +240,7 @@ impl MakerHedgeCapBot {
             size,
             side,
             fee_rate_bps,
-            nonce: None,
+            nonce: Some(intent.0),
             expiration: None,
             taker: None,
         };
@@ -217,6 +305,10 @@ impl MakerHedgeCapBot {
             "side": side_u,
             "price": price,
             "size": size,
+            "nonce": intent.0,
+            "intent_attempt": intent.1,
+            "intent_family_key": intent.2,
+            "intent_signature": intent.3,
             "order_type": order_type.to_ascii_uppercase(),
             "post_only": post_only,
             "ts": now_ts_f64(),
@@ -242,6 +334,10 @@ impl MakerHedgeCapBot {
                 "fee_rate_bps": fee_rate_bps,
                 "tick_size": tick_size.as_f64(),
                 "neg_risk": neg_risk,
+                "nonce": intent.0,
+                "intent_attempt": intent.1,
+                "intent_family_key": intent.2,
+                "intent_signature": intent.3,
             });
             self._merge_pair_metadata_into_value(&mut submit_timing);
             m.insert(oid.clone(), submit_timing);
@@ -418,7 +514,8 @@ impl MakerHedgeCapBot {
                         ts: Some(now_ts_f64()),
                     },
                 );
-                let _ = save_state(&self.state_file, &mut s);
+                let _ = self
+                    ._bot_runtime_save_state_or_dependency_pause(&mut s, "place_limit_bid_gtc_dry");
             }
             self.logger.info(&format!(
                 "[DRY] limit bid GTC asset={} px={px:.3} size={size:.2} post_only={post_only:?}",
@@ -453,7 +550,7 @@ impl MakerHedgeCapBot {
                     ts: Some(now_ts_f64()),
                 },
             );
-            let _ = save_state(&self.state_file, &mut s);
+            let _ = self._bot_runtime_save_state_or_dependency_pause(&mut s, "place_limit_bid_gtc");
         }
         self._track_order_execution_context(
             &oid,
@@ -512,7 +609,10 @@ impl MakerHedgeCapBot {
                         ts: Some(now_ts_f64()),
                     },
                 );
-                let _ = save_state(&self.state_file, &mut s);
+                let _ = self._bot_runtime_save_state_or_dependency_pause(
+                    &mut s,
+                    "place_limit_bid_gtc_exact_dry",
+                );
             }
             self.logger.info(&format!(
                 "[DRY] limit bid GTC exact asset={} px={px:.3} size={size:.2} post_only={post_only:?}",
@@ -547,7 +647,8 @@ impl MakerHedgeCapBot {
                     ts: Some(now_ts_f64()),
                 },
             );
-            let _ = save_state(&self.state_file, &mut s);
+            let _ = self
+                ._bot_runtime_save_state_or_dependency_pause(&mut s, "place_limit_bid_gtc_exact");
         }
         self._track_order_execution_context(
             &oid,

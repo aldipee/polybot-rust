@@ -46,6 +46,21 @@ fn with_exec_mode<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     }
     out
 }
+
+fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _guard = env_lock().lock().expect("env lock");
+    let prior = std::env::var(key).ok();
+    match value {
+        Some(v) => std::env::set_var(key, v),
+        None => std::env::remove_var(key),
+    }
+    let out = f();
+    match prior {
+        Some(v) => std::env::set_var(key, v),
+        None => std::env::remove_var(key),
+    }
+    out
+}
 /// Exercises the make BOT runtime test BOT scenario and checks the expected BOT behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
@@ -174,6 +189,286 @@ fn set_daily_liquidity_state(
         let _ =
             crate::helpers::save_daily_liquidity_state(&bot.daily_liquidity_state_file, &mut state);
     }
+}
+
+#[test]
+fn startup_reconciliation_gate_clears_to_healthy_when_local_validation_is_clean() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.42, 0.43, 0.41, 0.42, now);
+    bot._bot_runtime_mark_startup_reconciliation_pending(now);
+    bot._bot_runtime_run_reconciliation_gate("startup", now + 1.0)
+        .expect("startup reconciliation should pass in local-only mode");
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.safety_gate, BotRuntimeSafetyGate::Healthy);
+    assert!(runtime_state.last_clean_reconcile_ts > 0.0);
+    assert!(runtime_state
+        .safety_gate_reason
+        .contains("reconciliation_clean"));
+}
+
+#[test]
+fn websocket_disconnect_and_reopen_moves_runtime_through_pause_and_reconnect_gate() {
+    let bot = make_bot_runtime_test_bot();
+    bot._on_open("market");
+    bot._on_close("market", 1006, "test_disconnect");
+    let paused = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+        .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new()));
+    assert_eq!(paused.0, BotRuntimeSafetyGate::DependencyPaused);
+    assert!(paused.1.contains("dependency_pause:market_ws"));
+
+    bot._on_open("market");
+    let reconnected = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+        .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new()));
+    assert_eq!(reconnected.0, BotRuntimeSafetyGate::ReconnectReconPending);
+    assert!(reconnected
+        .1
+        .contains("reconnect_reconciliation_pending:market_ws"));
+}
+
+#[test]
+fn database_dependency_pause_stays_latched_until_state_save_recovers() {
+    let mut bot = make_bot_runtime_test_bot();
+    let missing_dir = std::env::temp_dir()
+        .join(format!(
+            "bot_runtime_missing_state_dir_{}",
+            uuid::Uuid::new_v4()
+        ))
+        .join("nested");
+    bot.state_file = missing_dir.join("state.json");
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.42, 0.43, 0.41, 0.42, now);
+    bot._bot_runtime_enter_dependency_pause("database", "test", now);
+
+    let health_before = bot._bot_runtime_dependency_healthy();
+    assert!(health_before.is_err());
+    let paused = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+        .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new()));
+    assert_eq!(paused.0, BotRuntimeSafetyGate::DependencyPaused);
+    assert!(paused.1.starts_with("dependency_pause:database"));
+
+    std::fs::create_dir_all(&missing_dir).expect("create recovered state dir");
+    bot._bot_runtime_dependency_healthy()
+        .expect("database pause should clear only after state writes recover");
+    bot._bot_runtime_run_reconciliation_gate("recovery", now + 1.0)
+        .expect("recovery reconciliation should pass once persistence recovers");
+
+    let recovered = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+        .unwrap_or((BotRuntimeSafetyGate::DependencyPaused, String::new()));
+    assert_eq!(recovered.0, BotRuntimeSafetyGate::Healthy);
+    assert!(recovered.1.contains("reconciliation_clean:recovery"));
+}
+
+#[test]
+fn daily_liquidity_database_pause_stays_latched_until_daily_file_recovers() {
+    let mut bot = make_bot_runtime_test_bot();
+    let state_dir =
+        std::env::temp_dir().join(format!("bot_runtime_state_ok_dir_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+    bot.state_file = state_dir.join("state.json");
+
+    let blocker_path = std::env::temp_dir().join(format!(
+        "bot_runtime_daily_blocker_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&blocker_path, "block daily liquidity dir").expect("write blocker");
+    bot.daily_liquidity_state_file = blocker_path.join("daily_liquidity.json");
+
+    if let Ok(mut daily_state) = bot.daily_liquidity_state.lock() {
+        daily_state.day_key_utc = crate::helpers::current_utc_day_key();
+        daily_state.maker_fill_shares = 4.0;
+        daily_state.taker_fill_shares = 1.0;
+    }
+
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.42, 0.43, 0.41, 0.42, now);
+    bot._bot_runtime_enter_dependency_pause("database", "daily_liquidity", now);
+
+    let health_before = bot._bot_runtime_dependency_healthy();
+    assert!(health_before.is_err());
+    let paused = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+        .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new()));
+    assert_eq!(paused.0, BotRuntimeSafetyGate::DependencyPaused);
+    assert!(paused
+        .1
+        .starts_with("dependency_pause:database:daily_liquidity"));
+
+    let recovered_file = std::env::temp_dir()
+        .join(format!("bot_runtime_daily_ok_dir_{}", uuid::Uuid::new_v4()))
+        .join("daily_liquidity.json");
+    bot.daily_liquidity_state_file = recovered_file;
+    bot._bot_runtime_dependency_healthy()
+        .expect("daily liquidity pause should clear only after daily file writes recover");
+    bot._bot_runtime_run_reconciliation_gate("recovery", now + 1.0)
+        .expect("recovery reconciliation should pass once daily liquidity persistence recovers");
+
+    let recovered = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+        .unwrap_or((BotRuntimeSafetyGate::DependencyPaused, String::new()));
+    assert_eq!(recovered.0, BotRuntimeSafetyGate::Healthy);
+    assert!(recovered.1.contains("reconciliation_clean:recovery"));
+}
+
+#[test]
+fn dependency_pause_cancels_direct_bot_orders_without_single_inflight() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+
+    let yes_oid = bot
+        ._place_limit_bid_gtc_with_origin(
+            "yes_asset_id",
+            0.40,
+            12.0,
+            Some(true),
+            "BOT_PAIR_BUILD_YES",
+        )
+        .expect("direct yes bot order");
+    let no_oid = bot
+        ._place_limit_bid_gtc_with_origin("no_asset_id", 0.41, 12.0, Some(true), "BOT_TAPER_NO")
+        .expect("direct no bot order");
+
+    assert_eq!(
+        bot.state
+            .lock()
+            .map(|state| state.open_orders.len())
+            .unwrap_or_default(),
+        2
+    );
+    assert_eq!(
+        bot.exchange_orders_cache
+            .lock()
+            .map(|orders| orders.len())
+            .unwrap_or_default(),
+        2
+    );
+
+    bot._bot_runtime_cancel_new_risk_orders("dependency_pause:test");
+
+    assert!(bot
+        .state
+        .lock()
+        .map(|state| state.open_orders.is_empty())
+        .unwrap_or(false));
+    assert!(bot
+        .exchange_orders_cache
+        .lock()
+        .map(|orders| orders.is_empty())
+        .unwrap_or(false));
+    let yes_ctx = bot
+        ._get_order_execution_context(&yes_oid)
+        .expect("yes order context");
+    let no_ctx = bot
+        ._get_order_execution_context(&no_oid)
+        .expect("no order context");
+    assert_eq!(
+        yes_ctx
+            .get("direct_cancel_requested")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        no_ctx
+            .get("direct_cancel_requested")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn direct_bot_order_cancel_still_works_when_latency_logging_is_disabled() {
+    with_env_var("EXEC_LATENCY_LOG_ENABLED", Some("false"), || {
+        let mut bot = make_bot_runtime_test_bot();
+        bot.cfg.dry_run = false;
+
+        let order_id = bot
+            ._place_limit_bid_gtc_with_origin(
+                "yes_asset_id",
+                0.40,
+                12.0,
+                Some(true),
+                "BOT_PAIR_BUILD_YES",
+            )
+            .expect("bot direct order");
+        assert!(
+            bot._get_order_execution_context(&order_id).is_some(),
+            "order execution context should still be stored when latency logging is disabled"
+        );
+
+        bot._bot_runtime_cancel_new_risk_orders("dependency_pause:test");
+
+        assert!(bot
+            .state
+            .lock()
+            .map(|state| state.open_orders.is_empty())
+            .unwrap_or(false));
+        let ctx = bot
+            ._get_order_execution_context(&order_id)
+            .expect("order context after cancellation");
+        assert_eq!(
+            ctx.get("direct_cancel_requested")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    });
+}
+
+#[test]
+fn identical_local_order_retry_reuses_deterministic_intent_oid() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+
+    let oid_a = bot
+        ._place_limit_bid_gtc_exact_with_origin(
+            "yes_asset_id",
+            0.40,
+            12.0,
+            Some(false),
+            "BOT_PAIR_BUILD_YES",
+        )
+        .expect("first local fallback order id");
+    let oid_b = bot
+        ._place_limit_bid_gtc_exact_with_origin(
+            "yes_asset_id",
+            0.40,
+            12.0,
+            Some(false),
+            "BOT_PAIR_BUILD_YES",
+        )
+        .expect("retry local fallback order id");
+    let oid_c = bot
+        ._place_limit_bid_gtc_exact_with_origin(
+            "yes_asset_id",
+            0.40,
+            20.0,
+            Some(false),
+            "BOT_PAIR_BUILD_YES",
+        )
+        .expect("replacement local fallback order id");
+
+    assert_eq!(oid_a, oid_b);
+    assert_ne!(oid_a, oid_c);
 }
 /// Exercises the exec mode defaults to BOT runtime scenario and checks the expected BOT
 /// behavior.

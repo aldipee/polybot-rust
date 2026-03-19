@@ -86,9 +86,7 @@ impl MakerHedgeCapBot {
         if order_id.trim().is_empty() {
             return;
         }
-        if !env_bool("EXEC_LATENCY_LOG_ENABLED", true) {
-            return;
-        }
+        let latency_logging_enabled = env_bool("EXEC_LATENCY_LOG_ENABLED", true);
         let now = now_ts_f64();
         let mut rec2 = rec.clone();
         if !rec2.is_object() {
@@ -315,7 +313,7 @@ impl MakerHedgeCapBot {
                 obj.insert("ts".to_string(), json!(now));
             }
         }
-        if env_bool("EXEC_LATENCY_LOG_SUBMIT_BREAKDOWN_CONSOLE", true) {
+        if latency_logging_enabled && env_bool("EXEC_LATENCY_LOG_SUBMIT_BREAKDOWN_CONSOLE", true) {
             let em = self.exec_mode.trim().to_ascii_uppercase();
             let allow_maker = env_bool("EXEC_LATENCY_LOG_SUBMIT_BREAKDOWN_CONSOLE_MAKER", false);
             let allow = !(em == "MAKER"
@@ -365,7 +363,7 @@ impl MakerHedgeCapBot {
                 ));
             }
         }
-        if self._should_file_log_submit_event(decide_ts) {
+        if latency_logging_enabled && self._should_file_log_submit_event(decide_ts) {
             let row = json!({
                 "event": "SUBMIT",
                 "ts": submit_ts,

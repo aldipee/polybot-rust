@@ -397,6 +397,8 @@ impl MakerHedgeCapBot {
                     st.owner = owner;
                     st.owner_enter_ts = now;
                     st.owner_reason = owner_reason;
+                    st.safety_gate = BotRuntimeSafetyGate::StartupReconPending;
+                    st.safety_gate_reason = "startup_reconciliation_pending".to_string();
                     self.logger.info(&format!(
                         "[BOT] pair_id={} armed phase={} owner={} reason={} t_into={:.1}s t_left={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
                         pair_id,
@@ -530,12 +532,111 @@ impl MakerHedgeCapBot {
                     total_cost,
                 );
             }
+            let mut safety_gate = self
+                .bot_runtime_state
+                .lock()
+                .map(|st| st.safety_gate)
+                .unwrap_or_default();
+            let mut safety_gate_reason = self
+                .bot_runtime_state
+                .lock()
+                .map(|st| st.safety_gate_reason.clone())
+                .unwrap_or_default();
+            if !matches!(
+                phase,
+                BotRuntimePhase::PreArm | BotRuntimePhase::AwaitSettlement
+            ) {
+                match self._bot_runtime_dependency_healthy() {
+                    Ok(()) => {
+                        if matches!(
+                            safety_gate,
+                            BotRuntimeSafetyGate::StartupReconPending
+                                | BotRuntimeSafetyGate::ReconnectReconPending
+                                | BotRuntimeSafetyGate::ValidationFailed
+                                | BotRuntimeSafetyGate::DependencyPaused
+                        ) {
+                            let scope = match safety_gate {
+                                BotRuntimeSafetyGate::StartupReconPending => "startup",
+                                BotRuntimeSafetyGate::ReconnectReconPending => "reconnect",
+                                BotRuntimeSafetyGate::ValidationFailed => "validation_retry",
+                                BotRuntimeSafetyGate::DependencyPaused => "recovery",
+                                BotRuntimeSafetyGate::Healthy => "healthy",
+                            };
+                            match self._bot_runtime_run_reconciliation_gate(scope, now) {
+                                Ok(()) => {}
+                                Err(reason) if reason.starts_with("dependency_pause:") => {
+                                    self._bot_runtime_enter_dependency_pause(
+                                        "reconciliation",
+                                        scope,
+                                        now,
+                                    );
+                                }
+                                Err(reason) => {
+                                    self._bot_runtime_mark_validation_failed(&reason, now);
+                                }
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        let kind = reason
+                            .strip_prefix("dependency_pause:")
+                            .unwrap_or("market_ws");
+                        self._bot_runtime_enter_dependency_pause(kind, "", now);
+                    }
+                }
+                safety_gate = self
+                    .bot_runtime_state
+                    .lock()
+                    .map(|st| st.safety_gate)
+                    .unwrap_or_default();
+                safety_gate_reason = self
+                    .bot_runtime_state
+                    .lock()
+                    .map(|st| st.safety_gate_reason.clone())
+                    .unwrap_or_default();
+            }
             self._bot_runtime_note_first_fill(now, qy, qn, cost_yes, cost_no);
             self._bot_runtime_note_await_second_fill_progress(
                 now, t_into_s, qy, qn, cost_yes, cost_no,
             );
             self._bot_runtime_note_imbalance_state(now, qy, qn, &cfg);
-            if bot_runtime_should_run_open_both_handler(owner) {
+            let block_new_risk = !safety_gate.allows_new_risk()
+                && !matches!(owner, BotRuntimeControlOwner::AwaitSettlement)
+                && !matches!(phase, BotRuntimePhase::PreArm);
+            if block_new_risk {
+                let hold_reason = if safety_gate_reason.trim().is_empty() {
+                    safety_gate.as_str().to_string()
+                } else {
+                    safety_gate_reason.clone()
+                };
+                self._bot_runtime_cancel_new_risk_orders(hold_reason.as_str());
+                let _ = self._audit_insert_runtime_event(
+                    "risk_block",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(hold_reason.as_str()),
+                    json!({
+                        "pair_id": pair_id,
+                        "phase": phase.as_str(),
+                        "owner": owner.as_str(),
+                        "safety_gate": safety_gate.as_str(),
+                        "safety_gate_reason": hold_reason,
+                        "reconcile_scope": if matches!(safety_gate, BotRuntimeSafetyGate::ReconnectReconPending) {
+                            "reconnect"
+                        } else {
+                            "startup"
+                        },
+                        "reconcile_clean": false,
+                        "dependency_pause_kind": if matches!(safety_gate, BotRuntimeSafetyGate::DependencyPaused) {
+                            Some("runtime_dependency")
+                        } else {
+                            None::<&str>
+                        },
+                    }),
+                );
+            } else if bot_runtime_should_run_open_both_handler(owner) {
                 self._bot_runtime_open_both_handler(now, t_into_s, total_cost, qy, qn, &cfg);
             } else if matches!(owner, BotRuntimeControlOwner::AwaitSecondFill) {
                 self._bot_runtime_await_second_fill_handler(

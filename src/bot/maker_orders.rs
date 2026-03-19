@@ -240,7 +240,10 @@ impl MakerHedgeCapBot {
                         ts: Some(now),
                     },
                 );
-                let _ = save_state(&self.state_file, &mut s);
+                let _ = self._bot_runtime_save_state_or_dependency_pause(
+                    &mut s,
+                    "maker_order_track_submit",
+                );
             }
         }
     }
@@ -523,7 +526,8 @@ impl MakerHedgeCapBot {
                 .is_some();
             if should_remove {
                 s.open_orders.remove(&aid);
-                let _ = save_state(&self.state_file, &mut s);
+                let _ = self
+                    ._bot_runtime_save_state_or_dependency_pause(&mut s, "maker_order_clear_slot");
             }
         }
     }
@@ -640,7 +644,10 @@ impl MakerHedgeCapBot {
                     .unwrap_or(false);
                 if should_remove {
                     s.open_orders.remove(&asset_id);
-                    let _ = save_state(&self.state_file, &mut s);
+                    let _ = self._bot_runtime_save_state_or_dependency_pause(
+                        &mut s,
+                        "maker_order_cancel_ack",
+                    );
                 }
             }
             return;
@@ -695,7 +702,10 @@ impl MakerHedgeCapBot {
                         ts: Some(now_ts_f64()),
                     },
                 );
-                let _ = save_state(&self.state_file, &mut s);
+                let _ = self._bot_runtime_save_state_or_dependency_pause(
+                    &mut s,
+                    "maker_order_reconcile_local",
+                );
             }
         }
     }

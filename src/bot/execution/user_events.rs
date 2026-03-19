@@ -539,7 +539,10 @@ impl MakerHedgeCapBot {
                     .unwrap_or(false);
                 if should_remove {
                     s.open_orders.remove(&asset_id);
-                    let _ = save_state(&self.state_file, &mut s);
+                    let _ = self._bot_runtime_save_state_or_dependency_pause(
+                        &mut s,
+                        "user_event_remove_open_order",
+                    );
                 }
             }
             return;
@@ -554,7 +557,10 @@ impl MakerHedgeCapBot {
                     ts: Some(now_ts_f64()),
                 },
             );
-            let _ = save_state(&self.state_file, &mut s);
+            let _ = self._bot_runtime_save_state_or_dependency_pause(
+                &mut s,
+                "user_event_upsert_open_order",
+            );
         }
     }
     /// Handles user event for the active BOT flow.

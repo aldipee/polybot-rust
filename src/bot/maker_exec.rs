@@ -326,7 +326,7 @@ impl MakerHedgeCapBot {
         if canonical_id.is_none() {
             canonical_id = aliases
                 .iter()
-                .find(|alias| state.seen_trade_keys.iter().any(|seen| seen == *alias))
+                .find(|alias| state.has_seen_trade_key(alias))
                 .cloned();
         }
         let canonical_id = canonical_id.unwrap_or_else(|| aliases[0].clone());
@@ -347,13 +347,8 @@ impl MakerHedgeCapBot {
             };
         }
 
-        if state
-            .seen_trade_keys
-            .iter()
-            .any(|seen| seen == &canonical_id)
-            || aliases
-                .iter()
-                .any(|alias| state.seen_trade_keys.iter().any(|seen| seen == alias))
+        if state.has_seen_trade_key(&canonical_id)
+            || aliases.iter().any(|alias| state.has_seen_trade_key(alias))
         {
             return MakerExecApplyResult::Duplicate { canonical_id };
         }
@@ -390,9 +385,9 @@ impl MakerHedgeCapBot {
             };
         };
 
-        state.seen_trade_keys.push(canonical_id.clone());
+        state.record_seen_trade_key(&canonical_id, now);
         state.record_pair_liquidity_fill(candidate.qty, true);
-        let _ = save_state(&self.state_file, &mut state);
+        let _ = self._bot_runtime_save_state_or_dependency_pause(&mut state, "maker_exec_fill");
         drop(state);
         let fill_ts = candidate.match_time.as_deref().and_then(|value| {
             self._fill_event_ts_from_value(Some(&Value::String(value.to_string())))

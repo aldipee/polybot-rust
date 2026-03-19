@@ -68,7 +68,19 @@ impl MakerHedgeCapBot {
                         .unwrap_or_default()
                 });
             state.record_fill(qty, is_maker, day_key.as_str());
-            let _ = save_daily_liquidity_state(&self.daily_liquidity_state_file, &mut state);
+            if let Err(err) =
+                save_daily_liquidity_state(&self.daily_liquidity_state_file, &mut state)
+            {
+                self.logger.warning(&format!(
+                    "[BOT][SAFE_PAUSE] daily_liquidity_persist_failed err={:#}",
+                    err
+                ));
+                self._bot_runtime_enter_dependency_pause(
+                    "database",
+                    "daily_liquidity",
+                    now_ts_f64(),
+                );
+            }
             state
         } else {
             let mut state = self
@@ -211,10 +223,10 @@ impl MakerHedgeCapBot {
             Ok(g) => g,
             Err(_) => return false,
         };
-        if guard.seen_trade_keys.iter().any(|k| k == trade_key) {
+        if guard.has_seen_trade_key(trade_key) {
             return false;
         }
-        guard.seen_trade_keys.push(trade_key.to_string());
+        guard.record_seen_trade_key(trade_key, fill_ts.unwrap_or_else(now_ts_f64));
         let yes_asset = self.yes_asset.as_deref().unwrap_or_default();
         let sign = if side_u == "BUY" { 1.0 } else { -1.0 };
         let qty = sign * filled;
@@ -233,7 +245,7 @@ impl MakerHedgeCapBot {
         let closed_position = qty_after <= 1e-12;
         let mark_first_entry_fill = side_u == "BUY" && qty_after > qty_before + 1e-12;
         guard.record_pair_liquidity_fill(filled, false);
-        let _ = save_state(&self.state_file, &mut guard);
+        let _ = self._bot_runtime_save_state_or_dependency_pause(&mut guard, "apply_fill");
         drop(guard);
         self._record_daily_liquidity_fill_global(filled, false, fill_ts);
         // Clear seed in-flight cooldown on any fill ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â allows immediate re-seeding

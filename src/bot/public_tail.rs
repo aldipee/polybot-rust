@@ -161,7 +161,10 @@ impl MakerHedgeCapBot {
 
     pub fn persist_state(&self) {
         if let Ok(mut state) = self.state.lock() {
-            let _ = save_state(&self.state_file, &mut state);
+            let _ = self._bot_runtime_save_state_or_dependency_pause(
+                &mut state,
+                "public_tail_apply_position",
+            );
         }
     }
 
@@ -183,7 +186,10 @@ impl MakerHedgeCapBot {
         }
         if let Ok(mut s) = self.state.lock() {
             s.open_orders.clear();
-            let _ = save_state(&self.state_file, &mut s);
+            let _ = self._bot_runtime_save_state_or_dependency_pause(
+                &mut s,
+                "public_tail_clear_open_orders",
+            );
         }
     }
 }
