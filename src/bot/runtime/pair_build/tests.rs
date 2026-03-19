@@ -21,6 +21,8 @@ impl LogLike for BotRuntimeNoopLogger {
     /// BOT runtime.
 
     fn error(&self, _msg: &str) {}
+
+    fn event(&self, _level: &str, _record: &serde_json::Value) {}
 }
 
 /// Exercises the make pair build test BOT scenario and checks the expected BOT behavior.
@@ -46,6 +48,9 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
         logger: Arc::new(BotRuntimeNoopLogger),
         market_slug: "pair-build-test".to_string(),
         config_version: "cfgv1_test".to_string(),
+        audit_repo: None,
+        active_trade_id: None,
+        audit_runtime_tx: None,
         pair_identity: PairIdentity {
             pair_id: canonical_pair_id_from_slug("pair-build-test"),
             market_slug: "pair-build-test".to_string(),

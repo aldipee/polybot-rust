@@ -54,7 +54,16 @@ impl MakerHedgeCapBot {
                     .or_else(|| msg.get("timestamp"))
                     .or_else(|| msg.get("ts")),
             );
-            let applied = self._apply_fill_with_fill_ts(asset, price, inc, &key, side, fill_ts);
+            let applied = self._apply_fill_with_fill_ts(
+                asset,
+                price,
+                inc,
+                &key,
+                side,
+                fill_ts,
+                Some(order_id),
+                rec0.taker_exception_reason.map(|reason| reason.as_str()),
+            );
             if applied {
                 self._log_execution_latency_on_fill(order_id, now_ts_f64());
             }
@@ -286,7 +295,18 @@ impl MakerHedgeCapBot {
                     .or_else(|| msg.get("timestamp"))
                     .or_else(|| msg.get("ts")),
             );
-            let applied = self._apply_fill_with_fill_ts(&asset, price, size, &key, &side, fill_ts);
+            let applied = self._apply_fill_with_fill_ts(
+                &asset,
+                price,
+                size,
+                &key,
+                &side,
+                fill_ts,
+                Some(&taker_oid),
+                taker_ctx
+                    .as_ref()
+                    .and_then(|ctx| ctx.get("origin").and_then(|value| value.as_str())),
+            );
             if applied {
                 self._log_execution_latency_on_fill(&taker_oid, now_ts_f64());
                 let mut remove_oid = false;

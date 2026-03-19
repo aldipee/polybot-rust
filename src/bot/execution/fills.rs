@@ -186,7 +186,7 @@ impl MakerHedgeCapBot {
         trade_key: &str,
         side: &str,
     ) -> bool {
-        self._apply_fill_with_fill_ts(asset_id, price, filled, trade_key, side, None)
+        self._apply_fill_with_fill_ts(asset_id, price, filled, trade_key, side, None, None, None)
     }
 
     pub(in crate::bot) fn _apply_fill_with_fill_ts(
@@ -197,6 +197,8 @@ impl MakerHedgeCapBot {
         trade_key: &str,
         side: &str,
         fill_ts: Option<f64>,
+        order_id: Option<&str>,
+        origin: Option<&str>,
     ) -> bool {
         let side_u = side.trim().to_ascii_uppercase();
         if !matches!(side_u.as_str(), "BUY" | "SELL") {
@@ -268,7 +270,10 @@ impl MakerHedgeCapBot {
                 }
             }
         }
-        self._bot_runtime_note_observed_fill(asset_id, filled, false, side, None, None);
+        self._bot_runtime_note_observed_fill(asset_id, filled, false, side, order_id, origin);
+        self._audit_record_fill_event(
+            order_id, asset_id, side, price, filled, false, fill_ts, origin,
+        );
         true
     }
     /// Applies fill locked nodedupe to the current BOT state.

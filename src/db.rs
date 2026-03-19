@@ -223,6 +223,47 @@ pub struct TradeDecisionUpsert {
     pub maker_clip_bucket: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TradeDecisionEventInsert {
+    pub decision_event_id: String,
+    pub trade_id: String,
+    pub pair_id: String,
+    pub market_slug: String,
+    pub condition_id: Option<String>,
+    pub yes_asset_id: Option<String>,
+    pub no_asset_id: Option<String>,
+    pub config_version: String,
+    pub decision_scope: String,
+    pub decision_ts: String,
+    pub phase: Option<String>,
+    pub owner: Option<String>,
+    pub approved: bool,
+    pub reason_code: String,
+    pub submit_origin: Option<String>,
+    pub submit_side: Option<String>,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeRuntimeEventInsert {
+    pub event_id: String,
+    pub trade_id: String,
+    pub pair_id: String,
+    pub market_slug: String,
+    pub condition_id: Option<String>,
+    pub yes_asset_id: Option<String>,
+    pub no_asset_id: Option<String>,
+    pub config_version: String,
+    pub event_kind: String,
+    pub event_ts: String,
+    pub decision_event_id: Option<String>,
+    pub order_id: Option<String>,
+    pub asset_id: Option<String>,
+    pub side: Option<String>,
+    pub reason_code: Option<String>,
+    pub payload_json: String,
+}
+
 pub fn now_iso_jakarta() -> String {
     Utc::now()
         .with_timezone(&Jakarta)
@@ -462,10 +503,57 @@ CREATE TABLE IF NOT EXISTS trade_decisions (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS trade_decision_events (
+  decision_event_id TEXT PRIMARY KEY,
+  trade_id TEXT NOT NULL,
+  pair_id TEXT NOT NULL,
+  market_slug TEXT NOT NULL,
+  condition_id TEXT NULL,
+  yes_asset_id TEXT NULL,
+  no_asset_id TEXT NULL,
+  config_version TEXT NOT NULL,
+  decision_scope TEXT NOT NULL,
+  decision_ts TEXT NOT NULL,
+  phase TEXT NULL,
+  owner TEXT NULL,
+  approved BOOLEAN NOT NULL,
+  reason_code TEXT NOT NULL,
+  submit_origin TEXT NULL,
+  submit_side TEXT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trade_runtime_events (
+  event_id TEXT PRIMARY KEY,
+  trade_id TEXT NOT NULL,
+  pair_id TEXT NOT NULL,
+  market_slug TEXT NOT NULL,
+  condition_id TEXT NULL,
+  yes_asset_id TEXT NULL,
+  no_asset_id TEXT NULL,
+  config_version TEXT NOT NULL,
+  event_kind TEXT NOT NULL,
+  event_ts TEXT NOT NULL,
+  decision_event_id TEXT NULL,
+  order_id TEXT NULL,
+  asset_id TEXT NULL,
+  side TEXT NULL,
+  reason_code TEXT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
   ON trade (bot_id, pair_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_configuration_config_version_unique
   ON configuration (config_version);
+CREATE INDEX IF NOT EXISTS idx_trade_decision_events_trade_ts
+  ON trade_decision_events (trade_id, decision_ts);
+CREATE INDEX IF NOT EXISTS idx_trade_runtime_events_trade_ts
+  ON trade_runtime_events (trade_id, event_ts);
+CREATE INDEX IF NOT EXISTS idx_trade_runtime_events_decision
+  ON trade_runtime_events (decision_event_id);
 "#,
         )
         .context("failed creating schema")?;
@@ -1588,6 +1676,104 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
                 &row.maker_clip_bucket,
                 &now,
                 &now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_trade_decision_event(&self, row: &TradeDecisionEventInsert) -> Result<()> {
+        let mut conn = open_conn(&self.engine)?;
+        conn.execute(
+            "INSERT INTO trade_decision_events (
+                decision_event_id,
+                trade_id,
+                pair_id,
+                market_slug,
+                condition_id,
+                yes_asset_id,
+                no_asset_id,
+                config_version,
+                decision_scope,
+                decision_ts,
+                phase,
+                owner,
+                approved,
+                reason_code,
+                submit_origin,
+                submit_side,
+                payload_json,
+                created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, $18
+            )",
+            &[
+                &row.decision_event_id,
+                &row.trade_id,
+                &row.pair_id,
+                &row.market_slug,
+                &row.condition_id,
+                &row.yes_asset_id,
+                &row.no_asset_id,
+                &row.config_version,
+                &row.decision_scope,
+                &row.decision_ts,
+                &row.phase,
+                &row.owner,
+                &row.approved,
+                &row.reason_code,
+                &row.submit_origin,
+                &row.submit_side,
+                &row.payload_json,
+                &now_iso_jakarta(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_trade_runtime_event(&self, row: &TradeRuntimeEventInsert) -> Result<()> {
+        let mut conn = open_conn(&self.engine)?;
+        conn.execute(
+            "INSERT INTO trade_runtime_events (
+                event_id,
+                trade_id,
+                pair_id,
+                market_slug,
+                condition_id,
+                yes_asset_id,
+                no_asset_id,
+                config_version,
+                event_kind,
+                event_ts,
+                decision_event_id,
+                order_id,
+                asset_id,
+                side,
+                reason_code,
+                payload_json,
+                created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17
+            )",
+            &[
+                &row.event_id,
+                &row.trade_id,
+                &row.pair_id,
+                &row.market_slug,
+                &row.condition_id,
+                &row.yes_asset_id,
+                &row.no_asset_id,
+                &row.config_version,
+                &row.event_kind,
+                &row.event_ts,
+                &row.decision_event_id,
+                &row.order_id,
+                &row.asset_id,
+                &row.side,
+                &row.reason_code,
+                &row.payload_json,
+                &now_iso_jakarta(),
             ],
         )?;
         Ok(())

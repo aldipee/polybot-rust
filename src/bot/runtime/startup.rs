@@ -523,6 +523,23 @@ impl MakerHedgeCapBot {
             return;
         }
         let pair_id = self.pair_identity().pair_id;
+        let _ = self._audit_insert_runtime_event(
+            "risk_block",
+            None,
+            None,
+            None,
+            None,
+            Some(reason),
+            json!({
+                "scope": "open_both",
+                "pair_id": pair_id,
+                "reason_code": reason,
+                "t_into_seconds": t_into_s.max(0.0),
+                "q_yes": q_yes.max(0.0),
+                "q_no": q_no.max(0.0),
+                "total_cost": total_cost.max(0.0),
+            }),
+        );
         self.logger.info(&format!(
             "[BOT][OPEN_BOTH] pair_id={} hold reason={} t_into={:.1}s qYES={:.2} qNO={:.2} total_cost={:.2}",
             pair_id,
@@ -875,6 +892,42 @@ impl MakerHedgeCapBot {
         let yes_new = maker_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
         let no_new = maker_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
         if yes_new || no_new {
+            let decision_event_id = self._audit_insert_decision_event(
+                "open_both",
+                None,
+                true,
+                "open_both_submit",
+                Some("BOT_OPEN_BOTH"),
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            for (is_new, live_oid, side) in [
+                (yes_new, yes_live.as_deref(), OutcomeSide::Yes),
+                (no_new, no_live.as_deref(), OutcomeSide::No),
+            ] {
+                if !is_new {
+                    continue;
+                }
+                if let (Some(order_id), Some(decision_event_id)) =
+                    (live_oid, decision_event_id.as_deref())
+                {
+                    self._audit_attach_decision_context(
+                        order_id,
+                        decision_event_id,
+                        "open_both_submit",
+                    );
+                    self._merge_order_execution_context_fields(
+                        order_id,
+                        &json!({
+                            "submit_origin": "BOT_OPEN_BOTH",
+                            "submit_side": side.as_str(),
+                        }),
+                    );
+                }
+            }
             let (attempt_count, first_submit) = self._bot_runtime_note_open_both_submit(
                 submit_started,
                 yes_new,
@@ -1067,6 +1120,25 @@ impl MakerHedgeCapBot {
         }
         self._bot_runtime_note_startup_completion_blocked();
         let pair_id = self.pair_identity().pair_id;
+        let _ = self._audit_insert_runtime_event(
+            "risk_block",
+            None,
+            None,
+            None,
+            missing_side.map(|side| side.as_str()),
+            Some(reason),
+            json!({
+                "scope": "await_second_fill",
+                "pair_id": pair_id,
+                "reason_code": reason,
+                "missing_side": missing_side.map(|side| side.as_str()),
+                "t_into_seconds": t_into_s.max(0.0),
+                "time_since_first_side_seconds": time_since_first_side_s.max(0.0),
+                "q_yes": q_yes.max(0.0),
+                "q_no": q_no.max(0.0),
+                "total_cost": total_cost.max(0.0),
+            }),
+        );
         let yes_bid = self
             .yes_asset
             .as_deref()
@@ -1826,11 +1898,30 @@ impl MakerHedgeCapBot {
                 TakerCapPolicy::EnforceCap,
             );
             if let Some(order_id) = oid.as_deref() {
+                let decision_event_id = self._audit_insert_decision_event(
+                    "await_second_fill",
+                    None,
+                    true,
+                    "await_second_fill_rescue_submit",
+                    Some("BOT_AWAIT_SECOND_FILL_RESCUE"),
+                    Some(missing_side.as_str()),
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
                 if let Ok(mut st) = self.bot_runtime_state.lock() {
                     st.await_second_fill_rescue_used = true;
                     st.await_second_fill_rescue_attempted_ts = now;
                     st.second_side_by_30s = false;
                     st.await_second_fill_last_hold_reason.clear();
+                }
+                if let Some(decision_event_id) = decision_event_id.as_deref() {
+                    self._audit_attach_decision_context(
+                        order_id,
+                        decision_event_id,
+                        "await_second_fill_rescue_submit",
+                    );
                 }
                 self._merge_order_execution_context_fields(
                     order_id,
@@ -1971,6 +2062,31 @@ impl MakerHedgeCapBot {
             let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
                 || prev_slot.state != MakerOrderLifecycle::Working;
             if is_new_submit {
+                if let Some(decision_event_id) = self._audit_insert_decision_event(
+                    "await_second_fill",
+                    None,
+                    true,
+                    "await_second_fill_submit",
+                    Some("BOT_AWAIT_SECOND_FILL"),
+                    Some(missing_side.as_str()),
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                ) {
+                    self._audit_attach_decision_context(
+                        order_id,
+                        decision_event_id.as_str(),
+                        "await_second_fill_submit",
+                    );
+                    self._merge_order_execution_context_fields(
+                        order_id,
+                        &json!({
+                            "submit_origin": "BOT_AWAIT_SECOND_FILL",
+                            "submit_side": missing_side.as_str(),
+                        }),
+                    );
+                }
                 self._bot_runtime_clear_await_second_fill_hold();
                 self.logger.info(&format!(
                     "[BOT][AWAIT_SECOND_FILL] pair_id={} submit missing_side={} bid={:.3} clip={} favorite_side={} underdog_side={} residual_side={} residual_kind={} one_side_exception_kind={} t_into={:.1}s since_first_side={:.1}s budget_scope=whole_window maker_first=true",

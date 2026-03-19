@@ -19,6 +19,8 @@ impl LogLike for BotRuntimeNoopLogger {
     /// active market.
 
     fn error(&self, _msg: &str) {}
+
+    fn event(&self, _level: &str, _record: &serde_json::Value) {}
 }
 /// Exercises the env lock scenario and checks the expected BOT behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -67,6 +69,9 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
         logger: Arc::new(BotRuntimeNoopLogger),
         market_slug: "bot-test".to_string(),
         config_version: "cfgv1_test".to_string(),
+        audit_repo: None,
+        active_trade_id: None,
+        audit_runtime_tx: None,
         pair_identity: PairIdentity {
             pair_id: canonical_pair_id_from_slug("bot-test"),
             market_slug: "bot-test".to_string(),
@@ -1105,6 +1110,8 @@ fn apply_fill_with_fill_ts_attributes_daily_liquidity_to_fill_day() {
         "fill-with-ts",
         "BUY",
         Some(fill_ts),
+        None,
+        None,
     ));
 
     let state = bot.state.lock().expect("state lock");

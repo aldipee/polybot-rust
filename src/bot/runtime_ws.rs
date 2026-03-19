@@ -1029,6 +1029,24 @@ impl MakerHedgeCapBot {
         } else {
             format!(" ({reason})")
         };
+        self._audit_record_reconciliation_event(
+            if reason.trim().is_empty() {
+                "reconcile_state_from_positions"
+            } else {
+                reason
+            },
+            json!({
+                "pair_id": pair_id,
+                "reason_code": reason,
+                "use_data_api": use_data_api,
+                "use_legacy_balance": use_legacy_balance,
+                "q_yes": new_q_yes.max(0.0),
+                "q_no": new_q_no.max(0.0),
+                "total_cost": (new_c_yes + new_c_no).max(0.0),
+                "yes_balance": yes_bal.max(0.0),
+                "no_balance": no_bal.max(0.0),
+            }),
+        );
         self.logger.warning(&format!(
             "Reconciled state from positions pair_id={}{} qYES={new_q_yes:.6} qNO={new_q_no:.6} total_cost={:.4}",
             pair_id,

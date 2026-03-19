@@ -1,5 +1,6 @@
 use chrono::Local;
 use serde_json::json;
+use serde_json::Value;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -10,6 +11,7 @@ pub trait LogLike: Send + Sync {
     fn info(&self, msg: &str);
     fn warning(&self, msg: &str);
     fn error(&self, msg: &str);
+    fn event(&self, level: &str, record: &Value);
 }
 
 #[derive(Debug)]
@@ -64,6 +66,40 @@ impl ItemLogger {
         }
     }
 
+    fn write_json_event(&self, level: &str, record: &Value) {
+        let mut rec = if record.is_object() {
+            record.clone()
+        } else {
+            json!({ "payload": record })
+        };
+        if let Some(obj) = rec.as_object_mut() {
+            obj.insert(
+                "time".to_string(),
+                json!({
+                    "repr": Local::now().to_rfc3339(),
+                    "timestamp": Local::now().timestamp_millis() as f64 / 1000.0
+                }),
+            );
+            obj.insert("level".to_string(), json!({ "name": level }));
+            let extra = obj.entry("extra".to_string()).or_insert_with(|| json!({}));
+            if let Some(extra_obj) = extra.as_object_mut() {
+                extra_obj.insert("item_id".to_string(), json!(self.item_id));
+                extra_obj.insert(
+                    "item_dir".to_string(),
+                    json!(self.item_dir.to_string_lossy().to_string()),
+                );
+            }
+        }
+        let line = format!(
+            "{}\n",
+            serde_json::to_string(&rec).unwrap_or_else(|_| "{}".to_string())
+        );
+        let path = self.item_dir.join("app.json");
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
     fn emit(&self, level: &str, msg: &str) {
         let stderr_line = format!(
             "{}|{}| {}",
@@ -91,8 +127,35 @@ impl LogLike for ItemLogger {
     fn error(&self, msg: &str) {
         self.emit("ERROR", msg);
     }
+
+    fn event(&self, level: &str, record: &Value) {
+        let message = record
+            .get("message")
+            .and_then(|value| value.as_str())
+            .or_else(|| record.get("event_kind").and_then(|value| value.as_str()))
+            .unwrap_or("structured_event");
+        let stderr_line = format!(
+            "{}|{}| {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            level,
+            message
+        );
+        eprintln!("{stderr_line}");
+        if self.write_lock.lock().is_ok() {
+            self.write_text_log(level, message);
+            self.write_json_event(level, record);
+        }
+    }
 }
 
 pub fn setup_item_logger(name: &str) -> Arc<dyn LogLike> {
     Arc::new(ItemLogger::new(name.to_string()))
+}
+
+pub fn structured_event_record(event_kind: &str, message: &str, payload: Value) -> Value {
+    json!({
+        "event_kind": event_kind,
+        "message": message,
+        "payload": payload,
+    })
 }

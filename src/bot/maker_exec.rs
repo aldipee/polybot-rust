@@ -450,6 +450,16 @@ impl MakerHedgeCapBot {
             Some(&candidate.order_id),
             fill_origin.as_deref(),
         );
+        self._audit_record_fill_event(
+            Some(&candidate.order_id),
+            &candidate.asset_id,
+            &candidate.side,
+            candidate.price,
+            candidate.qty,
+            true,
+            fill_ts.or(Some(now)),
+            fill_origin.as_deref(),
+        );
         MakerExecApplyResult::Applied { canonical_id }
     }
 }

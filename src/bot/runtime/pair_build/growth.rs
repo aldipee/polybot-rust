@@ -365,6 +365,42 @@ impl MakerHedgeCapBot {
         let yes_new = maker_pair_submit_leg_is_new(yes_live_oid.as_deref(), &context.yes_slot);
         let no_new = maker_pair_submit_leg_is_new(no_live_oid.as_deref(), &context.no_slot);
         if yes_new || no_new {
+            let decision_event_id = self._audit_insert_decision_event(
+                "pair_build",
+                Some(&decision),
+                true,
+                "pair_build_submit",
+                Some("BOT_PAIR_BUILD"),
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            for (is_new, live_oid, side) in [
+                (yes_new, yes_live_oid.as_deref(), OutcomeSide::Yes),
+                (no_new, no_live_oid.as_deref(), OutcomeSide::No),
+            ] {
+                if !is_new {
+                    continue;
+                }
+                if let (Some(order_id), Some(decision_event_id)) =
+                    (live_oid, decision_event_id.as_deref())
+                {
+                    self._audit_attach_decision_context(
+                        order_id,
+                        decision_event_id,
+                        "pair_build_submit",
+                    );
+                    self._merge_order_execution_context_fields(
+                        order_id,
+                        &json!({
+                            "submit_origin": "BOT_PAIR_BUILD",
+                            "submit_side": side.as_str(),
+                        }),
+                    );
+                }
+            }
             let projected_paired_cost = plan
                 .paired_cost_observation
                 .map(|(projected_paired_cost, _)| projected_paired_cost)

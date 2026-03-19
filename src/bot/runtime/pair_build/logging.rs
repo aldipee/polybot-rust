@@ -18,6 +18,40 @@ impl MakerHedgeCapBot {
         if !self._bot_runtime_pair_build_hold_changed(state_kind, reason) {
             return;
         }
+        let decision_event_id = self._audit_insert_decision_event(
+            "pair_build",
+            decision.as_ref(),
+            false,
+            reason,
+            None,
+            decision.and_then(|value| value.side.map(|side| side.as_str())),
+            t_into_s,
+            total_cost,
+            q_yes,
+            q_no,
+        );
+        let _ = self._audit_insert_runtime_event(
+            "risk_block",
+            decision_event_id.as_deref(),
+            None,
+            None,
+            decision.and_then(|value| value.side.map(|side| side.as_str())),
+            Some(reason),
+            json!({
+                "scope": "pair_build",
+                "state_kind": state_kind,
+                "reason_code": reason,
+                "mode": decision.map(|value| value.mode.as_str()),
+                "side": decision.and_then(|value| value.side.map(|side| side.as_str())),
+                "clip": decision.map(|value| value.clip),
+                "price_zone": decision.map(|value| value.price_zone.as_str()),
+                "imbalance_state": decision.map(|value| value.imbalance_state.as_str()),
+                "t_into_seconds": t_into_s.max(0.0),
+                "q_yes": q_yes.max(0.0),
+                "q_no": q_no.max(0.0),
+                "total_cost": total_cost.max(0.0),
+            }),
+        );
         if state_kind == "hold" {
             self._bot_runtime_note_optional_add_skipped();
             if reason.starts_with("repair_reserve_block:") {

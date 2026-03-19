@@ -44,18 +44,17 @@ Work status legend:
 
 ### Overall Estimate
 
-- Estimated requirement coverage in current scope: `70%`
-- Estimated remaining gap in current scope: `26%`
-- Estimated requirement coverage in current scope: `74%`
+- Estimated requirement coverage in current scope: `78%`
+- Estimated remaining gap in current scope: `22%`
 
 ### Work Status Snapshot
 
 - Requirement analysis: `Done`
 - Requirement-only backlog definition: `Done`
 - `REQ-001` scope override recorded: `Done`
-- Active implementation tasks completed: `11 / 24`
+- Active implementation tasks completed: `12 / 24`
 - Tasks ready to start now: `4 / 24`
-- Tasks queued behind earlier work: `3 / 24`
+- Tasks queued behind earlier work: `2 / 24`
 - Tasks blocked by prerequisites: `6 / 24`
 - Tasks marked not applicable: `1`
 
@@ -66,7 +65,7 @@ Work status legend:
 | Market scope and paired lifecycle | `REQ-002` to `REQ-008` with `REQ-001` excluded | 82% | 18% | Pair identity, pair snapshots, pair-level runtime decisions, `AwaitSettlement`, buy-only hold-to-settlement flow, exact open-time seeding, and `AwaitSecondFill` with one-shot missing-side rescue are now in place. The remaining gap in this area is mostly the still-partial settlement-owned lifecycle polish under `REQ-003`. |
 | Inventory, pricing, and residual discipline | `REQ-009` to `REQ-013`, `REQ-018` to `REQ-021` | 91% | 9% | Exact unmatched-fraction controls, exact marginal pair-cost zones, explicit residual-direction blocks, and strict late-window controls are now in place, including `7% / 12% / 20%` imbalance thresholds, `0.94 / 0.97 / 1.00 / 1.03` price bands, projected hard-disable blocks, repair-only routing, hard cutoff into `AwaitSettlement` at the late stop-new-orders window, and dynamic late-window observability keyed to configured thresholds. The remaining gap in this area is mostly the optional model-edge overlay. |
 | Execution controls and clip policy | `REQ-014` to `REQ-017`, `REQ-034` | 80% | 20% | Maker-first execution, explicit taker exception reasons, wallet-aware market and daily taker-share caps, shared pending-taker accounting, crash-tolerant shared-state enforcement, and the exact env-configurable `12 / 20 / 40 / 80` clip ladder with green-gated `40 / 80` escalation are now in place. The remaining gap in this area is mostly refresh-rate controls under `REQ-034`. |
-| Config, observability, and auditability | `REQ-023` to `REQ-025` | 46% | 54% | Versioned env snapshots, persisted `config_text` plus `config_version`, next-market-only activation, rollback-safe reload fallback, and pinned trade or execution metadata now exist. The remaining gap in this area is mostly append-only decision audit persistence and fuller requirement-grade metrics or logs. |
+| Config, observability, and auditability | `REQ-023` to `REQ-025` | 84% | 16% | Versioned env snapshots, persisted `config_text` plus `config_version`, next-market-only activation, rollback-safe reload fallback, append-only decision-event persistence, structured runtime-event persistence, linked `decision_event_id` audit trails, and pinned trade or execution metadata now exist. The remaining gap in this area is mostly operational hardening and richer downstream reporting on top of the new audit stream. |
 | Replay, paper, and live safety modes | `REQ-026` to `REQ-029` | 10% | 90% | No true replay engine, importer parity, paper adapter, or shadow-first guarded live flow is present. |
 | Reliability, stale data, and reconciliation | `REQ-030` to `REQ-033` | 24% | 76% | There are partial dedupe and reconcile pieces. Current direction keeps startup, reconnect, and post-settlement validation in scope, but excludes active-market 5-second position reconciliation from the target behavior. |
 | Validation and launch gates | Section 10 | 8% | 92% | A small unit-test set exists, but replay, simulation, paper KPI, and shadow KPI gates are mostly absent. |
@@ -89,7 +88,7 @@ Work status legend:
 | IMP-10 | `REQ-018`, `REQ-019` | Done | Done | Hard-block intentional single-side speculative adds and forbid any order that increases residual inventory on the underdog side. | Implemented: pair-build, taper, and `AwaitSecondFill` now classify favorite/underdog and residual direction explicitly, emit stable residual-direction hold reasons, cancel only blocked-side BOT orders when underdog residual would increase, and expose the new residual telemetry in runtime logs. | `src/bot/runtime/pair_build/decision.rs`, `src/bot/runtime/metrics.rs`, `src/bot/runtime/pair_build/orders.rs`, `src/bot/runtime/startup.rs`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/tests.rs` |
 | IMP-11 | `REQ-021` | Done | Done | Add exact late-window controls: smaller clips after 180 seconds, balance-only at 225 seconds, and zero new orders after 240 seconds. | Implemented: the runtime now uses env-configurable `180 / 225 / 240` late-window defaults, downshifts paired growth to maintenance sizing after late reduce starts, enforces balance-only repair routing after the configured balance-only threshold, hands off into `AwaitSettlement` at the configured stop-new-orders cutoff, preserves legacy late-window env compatibility, and emits dynamic late-window metrics keyed to the active thresholds. | `src/bot/runtime/config.rs`, `src/bot/runtime/state.rs`, `src/bot/runtime/taper.rs`, `src/bot/runtime/taper_runtime.rs`, `src/bot/runtime/metrics.rs`, `src/bot/runtime/loop.rs`, `src/env_contract.rs`, `src/bot/runtime/tests.rs` |
 | IMP-12 | `REQ-023` | Done | Done | Introduce versioned config with persisted snapshots, explicit `config_version` on decisions, orders, and fills, and rollback-safe reload behavior. | Implemented: env now resolves into one versioned snapshot bundle, sanitized `config_text` and deterministic `config_version` are persisted, reload activates only on the next market and keeps the last good version on failure, and trades plus execution metadata now carry the pinned `config_version`. | `src/config.rs`, `src/db.rs`, `src/main.rs`, `src/bot/core.rs`, `src/bot/execution/*` |
-| IMP-13 | `REQ-024`, `REQ-025` | Missing | Queued | Build append-only decision logging and structured metrics for state transitions, risk blocks, intents, acks, fills, reconciliation, and settlement. | Current decision persistence is incomplete, legacy-shaped, and not append-only or fully wired into order flow. | `src/db.rs`, `src/logging.rs`, `src/main.rs`, `src/bot/runtime/*` |
+| IMP-13 | `REQ-024`, `REQ-025` | Done | Done | Build append-only decision logging and structured metrics for state transitions, risk blocks, intents, acks, fills, reconciliation, and settlement. | Implemented: append-only `trade_decision_events` and `trade_runtime_events` are now the audit source of truth, `trade_decisions` remains only as a latest-summary mirror, decision and runtime events are linked through `decision_event_id`, structured audit payloads are persisted for state transitions, risk holds, order intents, acks, fills, reconciliation, and settlement, and audit DB writes are now off the live trading path. | `src/db.rs`, `src/logging.rs`, `src/main.rs`, `src/bot/runtime/*`, `src/bot/audit.rs` |
 | IMP-14 | `REQ-028`, `REQ-029` | Missing | Blocked | Add a true paper adapter and make `paper` or `shadow` the default startup mode until clean reconciliation and explicit live enablement pass. | `dry_run` exists, but it is not a real paper adapter, and live-start safeguards are not requirement-complete. | `src/main.rs`, `src/bot.rs`, `src/bot/execution/*`, new paper adapter module |
 | IMP-15 | `REQ-030`, adjusted `REQ-031` scope | Partial | Ready | Enforce idempotent client order IDs, fill dedupe, dependency-failure pause, startup reconciliation, reconnect reconciliation, and post-settlement validation without active-market Data API position reconciliation. Use `TRADE_VALIDATE` for startup and post-settlement validation flows. | Some dedupe and reconciliation helpers exist, but the repo still lacks a requirement-complete safe-mode and startup or post-settlement validation policy under the new product direction. | `src/bot/execution/*`, `src/bot/runtime_ws.rs`, `src/db.rs`, `src/main.rs` |
 
@@ -117,12 +116,11 @@ Work status legend:
 
 This sequence stays tied to the requirement instead of a refactor roadmap:
 
-1. `IMP-13` append-only decision audit trail
-2. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
-3. `IMP-14` true paper plus shadow-first startup safety
-4. `IMP-17` analytics importer parity
-5. `IMP-18` deterministic replay
-6. `IMP-22` to `IMP-25` validation and launch gates
+1. `IMP-15` startup/reconnect/post-settlement reconciliation and dependency-failure pause
+2. `IMP-14` true paper plus shadow-first startup safety
+3. `IMP-17` analytics importer parity
+4. `IMP-18` deterministic replay
+5. `IMP-22` to `IMP-25` validation and launch gates
 
 ## Short Summary
 
@@ -141,10 +139,10 @@ Recent completed work:
 - `IMP-10` / `REQ-018` and `REQ-019` implementation work is now `Done`: pair-build, taper, and `AwaitSecondFill` now classify favorite and underdog sides from live bids, hard-block speculative one-sided adds, block orders that would increase underdog residual, and cancel only the offending BOT side when that residual-direction guard trips.
 - `IMP-11` / `REQ-021` implementation work is now `Done`: the runtime now enforces exact late-window timing with env-configurable `180 / 225 / 240` defaults, shifts into reduced-clip late trading, flips to balance-only repair after the configured balance-only threshold, stops new orders by handing off into `AwaitSettlement` at the configured cutoff, preserves legacy late-window env compatibility, and emits late-window metrics against the active thresholds rather than hard-coded bucket names.
 - `IMP-12` / `REQ-023` implementation work is now `Done`: env now resolves into one authoritative versioned snapshot, sanitized `config_text` and deterministic `config_version` are persisted in `configuration`, invalid reloads keep the previous active version, new valid snapshots activate only on the next market, and the pinned `config_version` now follows each trade and execution context through the market lifecycle.
+- `IMP-13` / `REQ-024` and `REQ-025` implementation work is now `Done`: the bot now persists append-only decision and runtime audit events, links later intents, acks, fills, reconciliation, and settlement records back to a single `decision_event_id`, preserves skipped-market audit rows, uses exchange match time for maker fill audit events, and keeps audit DB writes off the live trading path.
 
 The biggest remaining requirement gaps are:
 
-- append-only decision and audit persistence
 - true paper, replay, and shadow modes
 - startup and post-settlement validation discipline plus strict stale-data behavior
 - validation gates before any guarded live rollout
@@ -156,5 +154,5 @@ Intentional scope exception:
 
 Current estimate:
 
-- Requirement coverage in current scope: `74%`
-- Remaining requirement gap in current scope: `26%`
+- Requirement coverage in current scope: `78%`
+- Remaining requirement gap in current scope: `22%`

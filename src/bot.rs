@@ -1,4 +1,5 @@
 use crate::config::{BotConfig, ResolvedVersionedConfigBundle};
+use crate::db::BotRepository;
 use crate::env_utils::{env_bool, env_float, env_int};
 use crate::gamma::{fetch_market_by_slug, parse_tokens_and_condition};
 use crate::helpers::{
@@ -27,6 +28,7 @@ use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -97,6 +99,8 @@ pub(crate) use self::runtime::*;
 mod core;
 pub use self::core::MakerHedgeCapBot;
 
+mod audit;
+pub(super) use self::audit::AuditWriteTask;
 mod execution;
 mod maker_exec;
 mod maker_orders;

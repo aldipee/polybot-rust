@@ -890,6 +890,42 @@ impl MakerHedgeCapBot {
         let no_new = maker_pair_submit_leg_is_new(no_live_oid.as_deref(), &prev_no_slot);
         self._bot_runtime_clear_taper_hold();
         if yes_new || no_new {
+            let decision_event_id = self._audit_insert_decision_event(
+                "taper",
+                Some(&decision),
+                true,
+                "taper_submit",
+                Some("BOT_TAPER"),
+                None,
+                t_into_s,
+                total_cost,
+                q_yes,
+                q_no,
+            );
+            for (is_new, live_oid, side) in [
+                (yes_new, yes_live_oid.as_deref(), OutcomeSide::Yes),
+                (no_new, no_live_oid.as_deref(), OutcomeSide::No),
+            ] {
+                if !is_new {
+                    continue;
+                }
+                if let (Some(order_id), Some(decision_event_id)) =
+                    (live_oid, decision_event_id.as_deref())
+                {
+                    self._audit_attach_decision_context(
+                        order_id,
+                        decision_event_id,
+                        "taper_submit",
+                    );
+                    self._merge_order_execution_context_fields(
+                        order_id,
+                        &json!({
+                            "submit_origin": "BOT_TAPER",
+                            "submit_side": side.as_str(),
+                        }),
+                    );
+                }
+            }
             self._bot_runtime_note_taper_submit(t_into_s, cfg);
             self.logger.info(&format!(
                 "[BOT][TAPER] submit taper_mode={} mode={} clip={} clip_bucket={} selected_rung={} requested_rung={} requested_large_clip={} cpp_hint={} price_zone={} marginal_cost_mode={} effective_marginal_pair_cost={:.3} yes_quote={:.3} no_quote={:.3} marginal_pair_sum={:.3} residual_unit_cost={} lagging_side_quote={} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} current_base={:.2} current_tail={:.2} projected_tail={:.2} current_floor={:+.2} projected_floor={:+.2} green_conditions_met={} green_both_sides_filled={} green_price_ok={} green_imbalance_ok={} green_time_ok={} green_budget_ok={} t_into={:.1}s elapsed_ms={:.0} qYES={:.2} qNO={:.2} total_cost={:.2} unmatched_fraction={:.3} projected_unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} reduces_imbalance={}",

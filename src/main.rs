@@ -1394,6 +1394,7 @@ fn run() -> Result<()> {
             );
             continue;
         }
+        let bot = bot.with_trade_audit(repo.clone(), &trade_id);
 
         let rtds_service =
             match RtdsService::for_market(&current_slug, &run_cfg, bot_logger.clone()) {
@@ -1482,6 +1483,19 @@ fn run() -> Result<()> {
                     "Trade row {trade_id} handed off to settlement. reason={}",
                     await_snapshot.raw_exit_reason
                 ));
+                bot._audit_record_settlement_event(
+                    "await_settlement_handoff",
+                    json!({
+                        "trade_id": trade_id,
+                        "reason_code": "await_settlement_handoff",
+                        "raw_exit_reason": await_snapshot.raw_exit_reason,
+                        "end_trade_iso": await_snapshot.end_trade_iso,
+                        "q_yes": await_snapshot.q_yes,
+                        "q_no": await_snapshot.q_no,
+                        "total_cost": await_snapshot.total_cost,
+                        "cpp": await_snapshot.cpp,
+                    }),
+                );
 
                 // Close RTDS (waits for resolution price) in background.
                 if let Some(svc) = rtds_service {
@@ -1535,12 +1549,37 @@ fn run() -> Result<()> {
                         metrics.q_yes,
                         metrics.q_no
                     ));
+                    bot._audit_record_settlement_event(
+                        "settled",
+                        json!({
+                            "trade_id": trade_id,
+                            "reason_code": "settled",
+                            "resolved_lp": metrics.lp,
+                            "total_cost": metrics.total_cost,
+                            "cpp": metrics.cpp,
+                            "q_yes": metrics.q_yes,
+                            "q_no": metrics.q_no,
+                            "snapshot_market_slug": snapshot.market_slug,
+                            "snapshot_resolution_price": snapshot.resolution_price,
+                        }),
+                    );
                 } else {
                     bot.persist_state();
                     bg_logger.info(&format!(
                         "Trade row {trade_id} remains AWAIT_SETTLEMENT. reason=resolution_snapshot_unavailable pair_id={}",
                         metrics.pair_id
                     ));
+                    bot._audit_record_settlement_event(
+                        "resolution_snapshot_unavailable",
+                        json!({
+                            "trade_id": trade_id,
+                            "reason_code": "resolution_snapshot_unavailable",
+                            "pair_id": metrics.pair_id,
+                            "q_yes": metrics.q_yes,
+                            "q_no": metrics.q_no,
+                            "total_cost": metrics.total_cost,
+                        }),
+                    );
                 }
             }
 

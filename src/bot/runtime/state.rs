@@ -252,6 +252,8 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) below_snapshot_optional_submit_shares: f64,
     pub(in crate::bot) below_snapshot_optional_fill_count: u32,
     pub(in crate::bot) below_snapshot_optional_fill_shares: f64,
+    pub(in crate::bot) audit_decision_event_count: u32,
+    pub(in crate::bot) audit_runtime_event_count: u32,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::bot) struct BotRuntimePreArmStatus {
@@ -581,6 +583,8 @@ pub(in crate::bot) struct BotRuntimeMetricsSnapshot {
     pub(in crate::bot) below_snapshot_optional_fill_count: u32,
     pub(in crate::bot) below_snapshot_optional_fill_shares: f64,
     pub(in crate::bot) below_snapshot_optional_fill_rate: f64,
+    pub(in crate::bot) audit_decision_event_count: u32,
+    pub(in crate::bot) audit_runtime_event_count: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::bot) struct BotRuntimeBudgetSnapshot {

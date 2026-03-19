@@ -422,6 +422,7 @@ impl MakerHedgeCapBot {
             map.insert(order_id.to_string(), rec2);
         }
         self._prune_order_exec_context_locked(now);
+        self._audit_record_order_context_events(order_id);
     }
     /// Merges order execution context fields into the current BOT record.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -452,6 +453,7 @@ impl MakerHedgeCapBot {
             map.insert(trimmed.to_string(), merged);
         }
         self._prune_order_exec_context_locked(now);
+        self._audit_record_order_context_events(trimmed);
     }
     /// Returns order execution context from the current BOT context.
     /// This reads execution state, exchange payloads, or cached order context for the active

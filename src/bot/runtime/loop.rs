@@ -118,7 +118,7 @@ impl MakerHedgeCapBot {
         let new_orders_after_stop_label =
             bot_runtime_late_metric_label("new_orders", cfg.late_stop_new_orders_start_seconds);
         self.logger.info(&format!(
-            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} taker_fill_events={} taker_fill_shares={:.2} pair_taker_share={:.3} daily_maker_fill_shares={:.2} daily_taker_fill_shares={:.2} daily_taker_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} {}={} {}={} {}={} {}={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
+            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} taker_fill_events={} taker_fill_shares={:.2} pair_taker_share={:.3} daily_maker_fill_shares={:.2} daily_taker_fill_shares={:.2} daily_taker_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} audit_decision_events={} audit_runtime_events={} {}={} {}={} {}={} {}={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
             pair_id,
             exit_reason,
             metrics.market_participated,
@@ -156,6 +156,8 @@ impl MakerHedgeCapBot {
             metrics.bad_regime_shutdown,
             canary_success,
             canary_failure_summary,
+            metrics.audit_decision_event_count,
+            metrics.audit_runtime_event_count,
             fills_after_late_reduce_label,
             metrics.late_fill_events_after_180,
             fills_after_balance_only_label,
@@ -375,6 +377,18 @@ impl MakerHedgeCapBot {
                 bot_runtime_owner_for_snapshot(phase, qy, qn, await_second_fill_hard_paused);
             let prearm_status = matches!(phase, BotRuntimePhase::PreArm)
                 .then(|| self._bot_runtime_prearm_status(t_into_s));
+            let mut phase_transition: Option<(
+                BotRuntimePhase,
+                BotRuntimePhase,
+                BotRuntimeControlOwner,
+                BotRuntimeControlOwner,
+                &'static str,
+            )> = None;
+            let mut owner_transition: Option<(
+                BotRuntimeControlOwner,
+                BotRuntimeControlOwner,
+                &'static str,
+            )> = None;
             if let Ok(mut st) = self.bot_runtime_state.lock() {
                 if !st.armed_once {
                     st.armed_once = true;
@@ -424,20 +438,23 @@ impl MakerHedgeCapBot {
                             total_cost,
                             prearm_summary
                         ));
+                        phase_transition = Some((st.phase, phase, st.owner, owner, owner_reason));
                         st.phase = phase;
                         st.state_enter_ts = now;
                     }
                     if st.owner != owner || st.owner_reason != owner_reason {
+                        let prev_owner = st.owner;
                         self.logger.info(&format!(
                             "[BOT] pair_id={} owner {} -> {} reason={} phase={} t_into={:.1}s t_left={:.1}s",
                             pair_id,
-                            st.owner.as_str(),
+                            prev_owner.as_str(),
                             owner.as_str(),
                             owner_reason,
                             phase.as_str(),
                             t_into_s.max(0.0),
                             seconds_left.max(0.0)
                         ));
+                        owner_transition = Some((prev_owner, owner, owner_reason));
                         st.owner = owner;
                         st.owner_enter_ts = now;
                         st.owner_reason = owner_reason;
@@ -484,6 +501,34 @@ impl MakerHedgeCapBot {
                         ));
                     }
                 }
+            }
+            if let Some((prev_phase, next_phase, prev_owner, next_owner, transition_reason)) =
+                phase_transition
+            {
+                self._audit_record_state_transition(
+                    prev_phase,
+                    next_phase,
+                    prev_owner,
+                    next_owner,
+                    transition_reason,
+                    t_into_s,
+                    qy,
+                    qn,
+                    total_cost,
+                );
+            }
+            if let Some((prev_owner, next_owner, transition_reason)) = owner_transition {
+                self._audit_record_state_transition(
+                    phase,
+                    phase,
+                    prev_owner,
+                    next_owner,
+                    transition_reason,
+                    t_into_s,
+                    qy,
+                    qn,
+                    total_cost,
+                );
             }
             self._bot_runtime_note_first_fill(now, qy, qn, cost_yes, cost_no);
             self._bot_runtime_note_await_second_fill_progress(

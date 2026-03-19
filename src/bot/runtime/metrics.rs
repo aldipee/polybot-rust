@@ -415,6 +415,8 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
         below_snapshot_optional_fill_count: state.below_snapshot_optional_fill_count,
         below_snapshot_optional_fill_shares: state.below_snapshot_optional_fill_shares,
         below_snapshot_optional_fill_rate,
+        audit_decision_event_count: state.audit_decision_event_count,
+        audit_runtime_event_count: state.audit_runtime_event_count,
     }
 }
 /// Implements canary success for the BOT runtime.

@@ -71,6 +71,41 @@ impl MakerHedgeCapBot {
         if !self._bot_runtime_taper_hold_changed(state_kind, reason) {
             return;
         }
+        let decision_event_id = self._audit_insert_decision_event(
+            "taper",
+            decision.as_ref(),
+            false,
+            reason,
+            None,
+            decision.and_then(|value| value.side.map(|side| side.as_str())),
+            t_into_s,
+            total_cost,
+            q_yes,
+            q_no,
+        );
+        let _ = self._audit_insert_runtime_event(
+            "risk_block",
+            decision_event_id.as_deref(),
+            None,
+            None,
+            decision.and_then(|value| value.side.map(|side| side.as_str())),
+            Some(reason),
+            json!({
+                "scope": "taper",
+                "state_kind": state_kind,
+                "taper_mode": taper_mode.as_str(),
+                "reason_code": reason,
+                "mode": decision.map(|value| value.mode.as_str()),
+                "side": decision.and_then(|value| value.side.map(|side| side.as_str())),
+                "clip": decision.map(|value| value.clip),
+                "price_zone": decision.map(|value| value.price_zone.as_str()),
+                "imbalance_state": decision.map(|value| value.imbalance_state.as_str()),
+                "t_into_seconds": t_into_s.max(0.0),
+                "q_yes": q_yes.max(0.0),
+                "q_no": q_no.max(0.0),
+                "total_cost": total_cost.max(0.0),
+            }),
+        );
         if state_kind == "hold"
             || reason.starts_with("late_reduce_clips_repair_first_suppress:")
             || reason.starts_with("late_balance_only_suppress:")

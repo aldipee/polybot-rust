@@ -730,6 +730,31 @@ impl MakerHedgeCapBot {
             let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
                 || prev_slot.state != MakerOrderLifecycle::Working;
             if is_new_submit {
+                if let Some(decision_event_id) = self._audit_insert_decision_event(
+                    "pair_build",
+                    Some(&decision),
+                    true,
+                    "pair_build_lighter_submit",
+                    Some("BOT_PAIR_BUILD_LIGHTER"),
+                    Some(active_side.as_str()),
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                ) {
+                    self._audit_attach_decision_context(
+                        order_id,
+                        decision_event_id.as_str(),
+                        "pair_build_lighter_submit",
+                    );
+                    self._merge_order_execution_context_fields(
+                        order_id,
+                        &json!({
+                            "submit_origin": "BOT_PAIR_BUILD_LIGHTER",
+                            "submit_side": active_side.as_str(),
+                        }),
+                    );
+                }
                 self._bot_runtime_pair_build_note_side_submit(active_side, repair_bid_capped, now);
                 self._bot_runtime_clear_pair_build_hold();
                 let exact_gap_clip = plan

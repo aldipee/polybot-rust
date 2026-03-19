@@ -5,6 +5,9 @@ pub struct MakerHedgeCapBot {
     pub logger: Arc<dyn LogLike>,
     pub market_slug: String,
     pub config_version: String,
+    pub(super) audit_repo: Option<BotRepository>,
+    pub(super) active_trade_id: Option<String>,
+    pub(super) audit_runtime_tx: Option<SyncSender<AuditWriteTask>>,
     pub(super) pair_identity: PairIdentity,
     pub state_file: PathBuf,
     pub state: Arc<Mutex<BotState>>,
@@ -246,6 +249,9 @@ impl MakerHedgeCapBot {
             logger: bot_logger,
             market_slug: market_slug.to_string(),
             config_version,
+            audit_repo: None,
+            active_trade_id: None,
+            audit_runtime_tx: None,
             pair_identity: PairIdentity::from_slug(market_slug),
             state_file,
             state: Arc::new(Mutex::new(state)),
@@ -380,6 +386,54 @@ impl MakerHedgeCapBot {
         out._warm_clob_order_meta_cache();
 
         Ok(out)
+    }
+
+    pub fn with_trade_audit(mut self, repo: BotRepository, trade_id: &str) -> Self {
+        let trimmed = trade_id.trim();
+        if !trimmed.is_empty() {
+            let (tx, rx) = mpsc::sync_channel::<AuditWriteTask>(1024);
+            let worker_repo = repo.clone();
+            let worker_logger = self.logger.clone();
+            thread::spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    match task {
+                        AuditWriteTask::Runtime(row) => {
+                            if let Err(err) = worker_repo.insert_trade_runtime_event(&row) {
+                                worker_logger.warning(&format!(
+                                    "[AUDIT] runtime_event_insert_failed event_id={} event_kind={} trade_id={} err={:#}",
+                                    row.event_id, row.event_kind, row.trade_id, err
+                                ));
+                            }
+                        }
+                        AuditWriteTask::Decision {
+                            row,
+                            trade_id,
+                            latest_summary,
+                        } => {
+                            if let Err(err) = worker_repo.insert_trade_decision_event(&row) {
+                                worker_logger.warning(&format!(
+                                    "[AUDIT] decision_event_insert_failed decision_event_id={} decision_scope={} trade_id={} err={:#}",
+                                    row.decision_event_id, row.decision_scope, row.trade_id, err
+                                ));
+                                continue;
+                            }
+                            if let Err(err) = worker_repo
+                                .upsert_trade_decision(trade_id.as_str(), &latest_summary)
+                            {
+                                worker_logger.warning(&format!(
+                                    "[AUDIT] decision_summary_upsert_failed decision_event_id={} trade_id={} err={:#}",
+                                    row.decision_event_id, trade_id, err
+                                ));
+                            }
+                        }
+                    }
+                }
+            });
+            self.audit_repo = Some(repo);
+            self.active_trade_id = Some(trimmed.to_string());
+            self.audit_runtime_tx = Some(tx);
+        }
+        self
     }
 
     /// Warms the native CLOB metadata cache for the active YES/NO assets.
