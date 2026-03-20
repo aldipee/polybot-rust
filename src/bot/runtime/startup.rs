@@ -788,14 +788,19 @@ impl MakerHedgeCapBot {
             if asymmetry.state != MakerOrderLifecycle::CancelPending
                 && asymmetry.age_s >= asymmetry_timeout_s
             {
-                let _ = self._maker_order_request_cancel(
-                    &live_key,
-                    &format!(
-                        "BOT open-both asymmetric submit stale live_side={} age_s={:.1}",
-                        asymmetry.live_side.as_str(),
-                        asymmetry.age_s
-                    ),
+                let cancel_reason = format!(
+                    "BOT open-both asymmetric submit stale live_side={} age_s={:.1}",
+                    asymmetry.live_side.as_str(),
+                    asymmetry.age_s
                 );
+                if let Err(reason) =
+                    self._maker_order_request_refresh_cancel(&live_key, cancel_reason.as_str())
+                {
+                    self._bot_runtime_log_open_both_hold(
+                        &reason, t_into_s, total_cost, q_yes, q_no,
+                    );
+                    return;
+                }
                 self._bot_runtime_log_open_both_hold(
                     &format!(
                         "asymmetric_submit_stale_cancel:{}:{:.1}",
@@ -889,8 +894,17 @@ impl MakerHedgeCapBot {
             ._maker_order_slot_get(&no_key)
             .order_id
             .or(n_oid.clone());
-        let yes_new = maker_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
-        let no_new = maker_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
+        let yes_noop = yes_live
+            .as_deref()
+            .map(|order_id| self._consume_refresh_cadence_noop_marker(order_id))
+            .unwrap_or(false);
+        let no_noop = no_live
+            .as_deref()
+            .map(|order_id| self._consume_refresh_cadence_noop_marker(order_id))
+            .unwrap_or(false);
+        let yes_new =
+            !yes_noop && maker_pair_submit_leg_is_new(yes_live.as_deref(), &prev_yes_slot);
+        let no_new = !no_noop && maker_pair_submit_leg_is_new(no_live.as_deref(), &prev_no_slot);
         if yes_new || no_new {
             let decision_event_id = self._audit_insert_decision_event(
                 "open_both",
@@ -1633,7 +1647,7 @@ impl MakerHedgeCapBot {
             if maker_slot_family_live(&prev_slot, "BOT_AWAIT_SECOND_FILL")
                 && prev_slot.state != MakerOrderLifecycle::CancelPending
             {
-                let _ = self._maker_order_request_cancel(
+                let _ = self._maker_order_request_cancel_unthrottled(
                     &key,
                     "bot_runtime_await_second_fill_deadline_cancel",
                 );
@@ -1657,7 +1671,7 @@ impl MakerHedgeCapBot {
                 )
             {
                 if prev_slot.state != MakerOrderLifecycle::CancelPending {
-                    let _ = self._maker_order_request_cancel(
+                    let _ = self._maker_order_request_cancel_unthrottled(
                         &key,
                         "bot_runtime_await_second_fill_deadline_handoff",
                     );
@@ -1986,8 +2000,21 @@ impl MakerHedgeCapBot {
             if age_s >= live_order_timeout_s
                 && prev_slot.state != MakerOrderLifecycle::CancelPending
             {
-                let _ =
-                    self._maker_order_request_cancel(&key, "bot_runtime_await_second_fill_stale");
+                if let Err(reason) = self._maker_order_request_refresh_cancel(
+                    &key,
+                    "bot_runtime_await_second_fill_stale",
+                ) {
+                    self._bot_runtime_log_await_second_fill_hold(
+                        &reason,
+                        Some(missing_side),
+                        t_into_s,
+                        time_since_first_side_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return;
+                }
                 self._bot_runtime_log_await_second_fill_hold(
                     "missing_side_live_order_stale_cancel",
                     Some(missing_side),
@@ -2022,8 +2049,10 @@ impl MakerHedgeCapBot {
             )
         {
             if prev_slot.state != MakerOrderLifecycle::CancelPending {
-                let _ =
-                    self._maker_order_request_cancel(&key, "bot_runtime_await_second_fill_handoff");
+                let _ = self._maker_order_request_cancel_unthrottled(
+                    &key,
+                    "bot_runtime_await_second_fill_handoff",
+                );
             }
             self._bot_runtime_log_await_second_fill_hold(
                 &format!(
@@ -2059,8 +2088,10 @@ impl MakerHedgeCapBot {
             "BOT_AWAIT_SECOND_FILL",
         );
         if let Some(order_id) = oid.as_deref() {
-            let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
-                || prev_slot.state != MakerOrderLifecycle::Working;
+            let refresh_noop = self._consume_refresh_cadence_noop_marker(order_id);
+            let is_new_submit = !refresh_noop
+                && (prev_slot.order_id.as_deref() != Some(order_id)
+                    || prev_slot.state != MakerOrderLifecycle::Working);
             if is_new_submit {
                 if let Some(decision_event_id) = self._audit_insert_decision_event(
                     "await_second_fill",

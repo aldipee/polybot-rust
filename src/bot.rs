@@ -104,5 +104,6 @@ pub(super) use self::audit::AuditWriteTask;
 mod execution;
 mod maker_exec;
 mod maker_orders;
+use self::maker_orders::MakerDirectRefreshDecision;
 mod public_tail;
 mod runtime_ws;

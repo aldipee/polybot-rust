@@ -548,6 +548,21 @@ impl MakerHedgeCapBot {
             return;
         }
         if let Ok(mut s) = self.state.lock() {
+            let existing = s.open_orders.get(&asset_id).cloned();
+            let submit_ts = existing
+                .as_ref()
+                .filter(|entry| entry.order_id.as_deref() == Some(oid.as_str()))
+                .and_then(|entry| entry.submit_ts.or(entry.ts))
+                .or_else(|| {
+                    self._get_order_execution_context(oid.as_str())
+                        .as_ref()
+                        .and_then(|ctx| {
+                            ctx.get("order_submit_ts")
+                                .and_then(|value| value.as_f64())
+                                .or_else(|| ctx.get("decision_ts").and_then(|value| value.as_f64()))
+                        })
+                })
+                .or(Some(now_ts_f64()));
             s.open_orders.insert(
                 asset_id,
                 OpenOrderState {
@@ -555,6 +570,7 @@ impl MakerHedgeCapBot {
                     price: Some(price),
                     size: Some(remaining),
                     ts: Some(now_ts_f64()),
+                    submit_ts,
                 },
             );
             let _ = self._bot_runtime_save_state_or_dependency_pause(

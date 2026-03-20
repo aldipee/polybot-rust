@@ -436,6 +436,7 @@ pub struct OpenOrderState {
     pub price: Option<f64>,
     pub size: Option<f64>,
     pub ts: Option<f64>,
+    pub submit_ts: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +485,19 @@ impl BotState {
     pub fn normalize(&mut self) {
         if self.open_orders.is_empty() {
             self.open_orders = HashMap::new();
+        } else {
+            self.open_orders.retain(|asset_id, order| {
+                let keep = !asset_id.trim().is_empty();
+                if keep {
+                    if !matches!(order.ts, Some(ts) if ts.is_finite() && ts > 0.0) {
+                        order.ts = None;
+                    }
+                    if !matches!(order.submit_ts, Some(ts) if ts.is_finite() && ts > 0.0) {
+                        order.submit_ts = order.ts;
+                    }
+                }
+                keep
+            });
         }
         if self.seen_trade_key_times.is_empty() && !self.seen_trade_keys.is_empty() {
             for (idx, key) in self.seen_trade_keys.iter().enumerate() {

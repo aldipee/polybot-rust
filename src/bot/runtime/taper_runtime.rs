@@ -235,7 +235,10 @@ impl MakerHedgeCapBot {
                 continue;
             }
             if slot.state != MakerOrderLifecycle::CancelPending {
-                let _ = self._maker_order_request_cancel(key, "bot_runtime_taper_order_handoff");
+                let _ = self._maker_order_request_cancel_unthrottled(
+                    key,
+                    "bot_runtime_taper_order_handoff",
+                );
             }
             self._bot_runtime_log_taper_state(
                 "rest",
@@ -538,7 +541,7 @@ impl MakerHedgeCapBot {
                         );
                     }
                     if inactive_slot.state != MakerOrderLifecycle::CancelPending {
-                        let _ = self._maker_order_request_cancel(
+                        let _ = self._maker_order_request_cancel_unthrottled(
                             &inactive_key,
                             "bot_runtime_taper_lighter_side_owner",
                         );
@@ -586,8 +589,22 @@ impl MakerHedgeCapBot {
                 if age_s >= asymmetry_timeout_s
                     && prev_slot.state != MakerOrderLifecycle::CancelPending
                 {
-                    let _ = self
-                        ._maker_order_request_cancel(&key, "bot_runtime_taper_lighter_side_stale");
+                    if let Err(reason) = self._maker_order_request_refresh_cancel(
+                        &key,
+                        "bot_runtime_taper_lighter_side_stale",
+                    ) {
+                        self._bot_runtime_log_taper_state(
+                            "hold",
+                            &reason,
+                            taper_mode,
+                            Some(decision),
+                            t_into_s,
+                            total_cost,
+                            q_yes,
+                            q_no,
+                        );
+                        return;
+                    }
                     self._bot_runtime_log_taper_state(
                         "rest",
                         &format!("lighter_side_live_order_stale_cancel:{:.1}", age_s),
@@ -636,9 +653,13 @@ impl MakerHedgeCapBot {
                 "BOT_TAPER_LIGHTER",
             );
             if let Some(order_id) = oid.as_deref() {
-                let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
-                    || prev_slot.state != MakerOrderLifecycle::Working;
-                self._bot_runtime_clear_taper_hold();
+                let refresh_noop = self._consume_refresh_cadence_noop_marker(order_id);
+                let is_new_submit = !refresh_noop
+                    && (prev_slot.order_id.as_deref() != Some(order_id)
+                        || prev_slot.state != MakerOrderLifecycle::Working);
+                if !refresh_noop {
+                    self._bot_runtime_clear_taper_hold();
+                }
                 if is_new_submit {
                     self._bot_runtime_note_taper_submit(t_into_s, cfg);
                     self.logger.info(&format!(
@@ -729,10 +750,38 @@ impl MakerHedgeCapBot {
                 && yes_slot.state != MakerOrderLifecycle::CancelPending
                 && no_slot.state != MakerOrderLifecycle::CancelPending
             {
-                let _ =
-                    self._maker_order_request_cancel(&yes_key, "bot_runtime_taper_stale_both_live");
-                let _ =
-                    self._maker_order_request_cancel(&no_key, "bot_runtime_taper_stale_both_live");
+                if let Err(reason) = self._maker_order_request_refresh_cancel(
+                    &yes_key,
+                    "bot_runtime_taper_stale_both_live",
+                ) {
+                    self._bot_runtime_log_taper_state(
+                        "hold",
+                        &reason,
+                        taper_mode,
+                        Some(decision),
+                        t_into_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return;
+                }
+                if let Err(reason) = self._maker_order_request_refresh_cancel(
+                    &no_key,
+                    "bot_runtime_taper_stale_both_live",
+                ) {
+                    self._bot_runtime_log_taper_state(
+                        "hold",
+                        &reason,
+                        taper_mode,
+                        Some(decision),
+                        t_into_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return;
+                }
                 self._bot_runtime_log_taper_state(
                     "rest",
                     &format!("maintenance_live_orders_stale_cancel:{yes_age_s:.1}:{no_age_s:.1}"),
@@ -772,10 +821,22 @@ impl MakerHedgeCapBot {
             if asymmetry.state != MakerOrderLifecycle::CancelPending
                 && asymmetry.age_s >= asymmetry_timeout_s
             {
-                let _ = self._maker_order_request_cancel(
+                if let Err(reason) = self._maker_order_request_refresh_cancel(
                     &live_key,
                     "bot_runtime_taper_asymmetric_submit_stale",
-                );
+                ) {
+                    self._bot_runtime_log_taper_state(
+                        "hold",
+                        &reason,
+                        taper_mode,
+                        Some(decision),
+                        t_into_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return;
+                }
                 self._bot_runtime_log_taper_state(
                     "rest",
                     &format!(
@@ -873,6 +934,14 @@ impl MakerHedgeCapBot {
         }
         let yes_live_oid = self._maker_order_slot_get(&yes_key).order_id.or(y_oid);
         let no_live_oid = self._maker_order_slot_get(&no_key).order_id.or(n_oid);
+        let yes_noop = yes_live_oid
+            .as_deref()
+            .map(|order_id| self._consume_refresh_cadence_noop_marker(order_id))
+            .unwrap_or(false);
+        let no_noop = no_live_oid
+            .as_deref()
+            .map(|order_id| self._consume_refresh_cadence_noop_marker(order_id))
+            .unwrap_or(false);
         if yes_live_oid.is_none() && no_live_oid.is_none() {
             self._bot_runtime_log_taper_state(
                 "hold",
@@ -886,8 +955,10 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        let yes_new = maker_pair_submit_leg_is_new(yes_live_oid.as_deref(), &prev_yes_slot);
-        let no_new = maker_pair_submit_leg_is_new(no_live_oid.as_deref(), &prev_no_slot);
+        let yes_new =
+            !yes_noop && maker_pair_submit_leg_is_new(yes_live_oid.as_deref(), &prev_yes_slot);
+        let no_new =
+            !no_noop && maker_pair_submit_leg_is_new(no_live_oid.as_deref(), &prev_no_slot);
         self._bot_runtime_clear_taper_hold();
         if yes_new || no_new {
             let decision_event_id = self._audit_insert_decision_event(

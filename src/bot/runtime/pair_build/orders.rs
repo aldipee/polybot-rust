@@ -287,7 +287,7 @@ impl MakerHedgeCapBot {
             ) {
                 touched = true;
                 if slot.state != MakerOrderLifecycle::CancelPending {
-                    let _ = self._maker_order_request_cancel(&key, reason);
+                    let _ = self._maker_order_request_cancel_unthrottled(&key, reason);
                 }
             }
         }
@@ -347,7 +347,7 @@ impl MakerHedgeCapBot {
             ) {
                 touched = true;
                 if slot.state != MakerOrderLifecycle::CancelPending {
-                    let _ = self._maker_order_request_cancel(&key, reason);
+                    let _ = self._maker_order_request_cancel_unthrottled(&key, reason);
                 }
             }
         }
@@ -496,8 +496,10 @@ impl MakerHedgeCapBot {
                 continue;
             }
             if slot.state != MakerOrderLifecycle::CancelPending {
-                let _ =
-                    self._maker_order_request_cancel(key, "bot_runtime_pair_build_order_handoff");
+                let _ = self._maker_order_request_cancel_unthrottled(
+                    key,
+                    "bot_runtime_pair_build_order_handoff",
+                );
             }
             self._bot_runtime_log_pair_build_state(
                 "rest",
@@ -559,24 +561,52 @@ impl MakerHedgeCapBot {
             && context.yes_slot.state != MakerOrderLifecycle::CancelPending
             && context.no_slot.state != MakerOrderLifecycle::CancelPending
         {
-            let _ = self._maker_order_request_cancel(
+            match self._maker_order_request_refresh_cancel(
                 &context.yes_key,
                 "bot_runtime_pair_build_invalid_both_live",
-            );
-            self._bot_runtime_pair_build_note_side_cancel(
-                OutcomeSide::Yes,
-                context.yes_slot.price,
-                now,
-            );
-            let _ = self._maker_order_request_cancel(
+            ) {
+                Ok(true) => self._bot_runtime_pair_build_note_side_cancel(
+                    OutcomeSide::Yes,
+                    context.yes_slot.price,
+                    now,
+                ),
+                Err(reason) => {
+                    self._bot_runtime_log_pair_build_state(
+                        "hold",
+                        &reason,
+                        Some(decision),
+                        t_into_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return true;
+                }
+                Ok(false) => {}
+            }
+            match self._maker_order_request_refresh_cancel(
                 &context.no_key,
                 "bot_runtime_pair_build_invalid_both_live",
-            );
-            self._bot_runtime_pair_build_note_side_cancel(
-                OutcomeSide::No,
-                context.no_slot.price,
-                now,
-            );
+            ) {
+                Ok(true) => self._bot_runtime_pair_build_note_side_cancel(
+                    OutcomeSide::No,
+                    context.no_slot.price,
+                    now,
+                ),
+                Err(reason) => {
+                    self._bot_runtime_log_pair_build_state(
+                        "hold",
+                        &reason,
+                        Some(decision),
+                        t_into_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return true;
+                }
+                Ok(false) => {}
+            }
             self._bot_runtime_log_pair_build_state(
                 "rest",
                 &format!("paired_growth_live_orders_invalid_cancel:{yes_age_s:.1}:{no_age_s:.1}"),
@@ -657,15 +687,35 @@ impl MakerHedgeCapBot {
             && (economically_invalid || broken_submit)
             && asymmetry.age_s >= asymmetry_timeout_s
         {
-            let _ = self._maker_order_request_cancel(
+            match self._maker_order_request_refresh_cancel(
                 live_key,
                 if broken_submit {
                     "bot_runtime_pair_build_asymmetric_submit_broken"
                 } else {
                     "bot_runtime_pair_build_asymmetric_submit_invalid"
                 },
-            );
-            self._bot_runtime_pair_build_note_side_cancel(asymmetry.live_side, live_price, now);
+            ) {
+                Ok(true) => {
+                    self._bot_runtime_pair_build_note_side_cancel(
+                        asymmetry.live_side,
+                        live_price,
+                        now,
+                    );
+                }
+                Err(reason) => {
+                    self._bot_runtime_log_pair_build_state(
+                        "hold",
+                        &reason,
+                        Some(decision),
+                        t_into_s,
+                        total_cost,
+                        q_yes,
+                        q_no,
+                    );
+                    return true;
+                }
+                Ok(false) => {}
+            }
             self._bot_runtime_log_pair_build_state(
                 "rest",
                 &format!(

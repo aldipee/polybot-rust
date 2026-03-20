@@ -237,6 +237,14 @@ pub(in crate::bot) struct BotRuntimePairBuildSideRepostState {
     pub(in crate::bot) last_submit_ts: f64,
     pub(in crate::bot) last_submit_price: f64,
 }
+
+#[derive(Debug, Clone, Default)]
+pub(in crate::bot) struct BotRuntimeSideRefreshCycleState {
+    pub(in crate::bot) last_cycle_started_ts: f64,
+    pub(in crate::bot) awaiting_repost: bool,
+    pub(in crate::bot) last_origin: String,
+    pub(in crate::bot) last_reason: String,
+}
 #[derive(Debug, Clone, Default)]
 pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) phase: BotRuntimePhase,
@@ -291,6 +299,8 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) pair_build_last_optional_growth_submit_ts: f64,
     pub(in crate::bot) pair_build_yes_repost: BotRuntimePairBuildSideRepostState,
     pub(in crate::bot) pair_build_no_repost: BotRuntimePairBuildSideRepostState,
+    pub(in crate::bot) yes_refresh_cycle: BotRuntimeSideRefreshCycleState,
+    pub(in crate::bot) no_refresh_cycle: BotRuntimeSideRefreshCycleState,
     pub(in crate::bot) pair_build_last_paired_growth_yes_bid: f64,
     pub(in crate::bot) pair_build_last_paired_growth_no_bid: f64,
     pub(in crate::bot) taper_last_hold_reason: String,
@@ -325,6 +335,10 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) below_snapshot_optional_submit_shares: f64,
     pub(in crate::bot) below_snapshot_optional_fill_count: u32,
     pub(in crate::bot) below_snapshot_optional_fill_shares: f64,
+    pub(in crate::bot) yes_refresh_cycles_started: u32,
+    pub(in crate::bot) no_refresh_cycles_started: u32,
+    pub(in crate::bot) yes_refresh_cap_block_count: u32,
+    pub(in crate::bot) no_refresh_cap_block_count: u32,
     pub(in crate::bot) audit_decision_event_count: u32,
     pub(in crate::bot) audit_runtime_event_count: u32,
 }
@@ -657,6 +671,10 @@ pub(in crate::bot) struct BotRuntimeMetricsSnapshot {
     pub(in crate::bot) below_snapshot_optional_fill_count: u32,
     pub(in crate::bot) below_snapshot_optional_fill_shares: f64,
     pub(in crate::bot) below_snapshot_optional_fill_rate: f64,
+    pub(in crate::bot) yes_refresh_cycles_started: u32,
+    pub(in crate::bot) no_refresh_cycles_started: u32,
+    pub(in crate::bot) yes_refresh_cap_block_count: u32,
+    pub(in crate::bot) no_refresh_cap_block_count: u32,
     pub(in crate::bot) audit_decision_event_count: u32,
     pub(in crate::bot) audit_runtime_event_count: u32,
 }

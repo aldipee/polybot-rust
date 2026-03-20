@@ -384,8 +384,26 @@ impl MakerHedgeCapBot {
                 let p = self._extract_order_price(o);
                 let sz = self._extract_order_remaining_size(o);
                 if let Ok(mut s) = self.state.lock() {
-                    let local = s.open_orders.get(asset_id).and_then(|x| x.order_id.clone());
+                    let existing = s.open_orders.get(asset_id).cloned();
+                    let local = existing.as_ref().and_then(|x| x.order_id.clone());
                     if local.as_deref() != Some(oid.as_str()) {
+                        let submit_ts = existing
+                            .as_ref()
+                            .filter(|entry| entry.order_id.as_deref() == Some(oid.as_str()))
+                            .and_then(|entry| entry.submit_ts.or(entry.ts))
+                            .or_else(|| {
+                                self._get_order_execution_context(oid.as_str())
+                                    .as_ref()
+                                    .and_then(|ctx| {
+                                        ctx.get("order_submit_ts")
+                                            .and_then(|value| value.as_f64())
+                                            .or_else(|| {
+                                                ctx.get("decision_ts")
+                                                    .and_then(|value| value.as_f64())
+                                            })
+                                    })
+                            })
+                            .or(Some(now));
                         s.open_orders.insert(
                             asset_id.to_string(),
                             OpenOrderState {
@@ -393,6 +411,7 @@ impl MakerHedgeCapBot {
                                 price: Some(p),
                                 size: Some(sz),
                                 ts: Some(now),
+                                submit_ts,
                             },
                         );
                         let _ = self._bot_runtime_save_state_or_dependency_pause(
@@ -466,6 +485,23 @@ impl MakerHedgeCapBot {
             let p = self._extract_order_price(&keep);
             let sz = self._extract_order_remaining_size(&keep);
             if let Ok(mut s) = self.state.lock() {
+                let existing = s.open_orders.get(asset_id).cloned();
+                let submit_ts = existing
+                    .as_ref()
+                    .filter(|entry| entry.order_id.as_deref() == Some(keep_id.as_str()))
+                    .and_then(|entry| entry.submit_ts.or(entry.ts))
+                    .or_else(|| {
+                        self._get_order_execution_context(keep_id.as_str())
+                            .as_ref()
+                            .and_then(|ctx| {
+                                ctx.get("order_submit_ts")
+                                    .and_then(|value| value.as_f64())
+                                    .or_else(|| {
+                                        ctx.get("decision_ts").and_then(|value| value.as_f64())
+                                    })
+                            })
+                    })
+                    .or(Some(now));
                 s.open_orders.insert(
                     asset_id.to_string(),
                     OpenOrderState {
@@ -473,6 +509,7 @@ impl MakerHedgeCapBot {
                         price: Some(p),
                         size: Some(sz),
                         ts: Some(now),
+                        submit_ts,
                     },
                 );
                 let _ = self._bot_runtime_save_state_or_dependency_pause(

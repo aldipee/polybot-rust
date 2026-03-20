@@ -23,6 +23,10 @@ fn default_market_data_stale_hard_pause_seconds() -> i64 {
     5
 }
 
+fn default_maker_replace_min_interval_seconds() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BotConfig {
     pub clob_host: String,
@@ -42,6 +46,8 @@ pub struct BotConfig {
     pub maker_buffer_ticks: i64,
     pub replace_if_price_moves_ticks: i64,
     pub stale_seconds: i64,
+    #[serde(default = "default_maker_replace_min_interval_seconds")]
+    pub maker_replace_min_interval_seconds: f64,
     pub entry_edge_ticks: i64,
     pub hedge_buffer_ticks: i64,
     pub max_total_cost: f64,
@@ -80,6 +86,7 @@ impl Default for BotConfig {
             maker_buffer_ticks: 1,
             replace_if_price_moves_ticks: 3,
             stale_seconds: 20,
+            maker_replace_min_interval_seconds: 1.0,
             entry_edge_ticks: 2,
             hedge_buffer_ticks: 1,
             max_total_cost: 20.0,
@@ -147,6 +154,7 @@ impl BotConfig {
         self.improve_bid_ticks = 0;
         self.stale_seconds = 5;
         self.replace_if_price_moves_ticks = 3;
+        self.maker_replace_min_interval_seconds = 1.0;
         self.max_total_cost = env::var("MAX_TOTAL_COST")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -491,6 +499,11 @@ pub fn build_effective_bot_config_from_env() -> Result<BotConfig> {
         cfg.replace_if_price_moves_ticks,
     ) as i64;
     cfg.stale_seconds = env_int("STALE_SECONDS", cfg.stale_seconds) as i64;
+    cfg.maker_replace_min_interval_seconds = env_float(
+        "MAKER_REPLACE_MIN_INTERVAL_SECONDS",
+        cfg.maker_replace_min_interval_seconds,
+    )
+    .max(0.0);
 
     if cfg.private_key.trim().is_empty() {
         return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
@@ -805,6 +818,36 @@ mod tests {
     }
 
     #[test]
+    fn maker_replace_min_interval_defaults_to_one_second() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MAKER_REPLACE_MIN_INTERVAL_SECONDS", None),
+            ],
+            || {
+                let cfg = build_effective_bot_config_from_env().expect("effective config");
+                assert!((cfg.maker_replace_min_interval_seconds - 1.0).abs() < 1e-9);
+            },
+        );
+    }
+
+    #[test]
+    fn maker_replace_min_interval_respects_operator_override() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MAKER_REPLACE_MIN_INTERVAL_SECONDS", Some("1.5")),
+            ],
+            || {
+                let cfg = build_effective_bot_config_from_env().expect("effective config");
+                assert!((cfg.maker_replace_min_interval_seconds - 1.5).abs() < 1e-9);
+            },
+        );
+    }
+
+    #[test]
     fn stale_data_policy_rejects_legacy_single_threshold_env() {
         with_env(
             &[
@@ -900,6 +943,14 @@ mod tests {
                         .effective_bot_config
                         .market_data_stale_hard_pause_seconds,
                     5
+                );
+                assert!(
+                    (resolved
+                        .effective_bot_config
+                        .maker_replace_min_interval_seconds
+                        - 1.0)
+                        .abs()
+                        < 1e-9
                 );
                 assert!(stale_data_policy_requirement_compliant(
                     &resolved.effective_bot_config

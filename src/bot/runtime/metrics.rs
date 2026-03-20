@@ -416,6 +416,10 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
         below_snapshot_optional_fill_count: state.below_snapshot_optional_fill_count,
         below_snapshot_optional_fill_shares: state.below_snapshot_optional_fill_shares,
         below_snapshot_optional_fill_rate,
+        yes_refresh_cycles_started: state.yes_refresh_cycles_started,
+        no_refresh_cycles_started: state.no_refresh_cycles_started,
+        yes_refresh_cap_block_count: state.yes_refresh_cap_block_count,
+        no_refresh_cap_block_count: state.no_refresh_cap_block_count,
         audit_decision_event_count: state.audit_decision_event_count,
         audit_runtime_event_count: state.audit_runtime_event_count,
     }

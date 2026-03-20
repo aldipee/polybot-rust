@@ -6,6 +6,13 @@ impl MakerHedgeCapBot {
     /// runtime.
 
     pub(super) fn _maker_single_inflight_enabled(&self) -> bool {
+        if let Some(enabled) = self
+            .runtime_flags
+            .get("maker_single_inflight_per_side")
+            .and_then(|value| value.as_bool())
+        {
+            return enabled;
+        }
         env_bool("MAKER_SINGLE_INFLIGHT_PER_SIDE", true)
     }
 
@@ -38,7 +45,7 @@ impl MakerHedgeCapBot {
     /// runtime.
 
     pub(super) fn _maker_replace_min_interval_seconds(&self) -> f64 {
-        env_float("MAKER_REPLACE_MIN_INTERVAL_SECONDS", 0.5).max(0.0)
+        self.cfg.maker_replace_min_interval_seconds.max(0.0)
     }
 
     /// Implements submit reject cooldown seconds for the maker-side BOT workflow.

@@ -561,7 +561,7 @@ impl MakerHedgeCapBot {
                     );
                 }
                 if inactive_slot.state != MakerOrderLifecycle::CancelPending {
-                    let _ = self._maker_order_request_cancel(
+                    let _ = self._maker_order_request_cancel_unthrottled(
                         inactive_key,
                         "bot_runtime_pair_build_lighter_side_owner",
                     );
@@ -603,11 +603,31 @@ impl MakerHedgeCapBot {
                 && economically_invalid
                 && prev_slot.state != MakerOrderLifecycle::CancelPending
             {
-                let _ = self._maker_order_request_cancel(
+                match self._maker_order_request_refresh_cancel(
                     key,
                     "bot_runtime_pair_build_lighter_side_invalid",
-                );
-                self._bot_runtime_pair_build_note_side_cancel(active_side, prev_slot.price, now);
+                ) {
+                    Ok(true) => {
+                        self._bot_runtime_pair_build_note_side_cancel(
+                            active_side,
+                            prev_slot.price,
+                            now,
+                        );
+                    }
+                    Err(reason) => {
+                        self._bot_runtime_log_pair_build_state(
+                            "hold",
+                            &reason,
+                            Some(decision),
+                            t_into_s,
+                            total_cost,
+                            q_yes,
+                            q_no,
+                        );
+                        return;
+                    }
+                    Ok(false) => {}
+                }
                 self._bot_runtime_log_pair_build_state(
                     "rest",
                     &format!("lighter_side_live_order_invalid_cancel:{age_s:.1}"),
@@ -727,8 +747,10 @@ impl MakerHedgeCapBot {
             "BOT_PAIR_BUILD_LIGHTER",
         );
         if let Some(order_id) = oid.as_deref() {
-            let is_new_submit = prev_slot.order_id.as_deref() != Some(order_id)
-                || prev_slot.state != MakerOrderLifecycle::Working;
+            let refresh_noop = self._consume_refresh_cadence_noop_marker(order_id);
+            let is_new_submit = !refresh_noop
+                && (prev_slot.order_id.as_deref() != Some(order_id)
+                    || prev_slot.state != MakerOrderLifecycle::Working);
             if is_new_submit {
                 if let Some(decision_event_id) = self._audit_insert_decision_event(
                     "pair_build",

@@ -1,6 +1,6 @@
 # Environment Reference
 
-Date: 2026-03-19
+Date: 2026-03-20
 Scope: supported operator env for the `polybot` binary only.
 
 This repo now has one supported runtime:
@@ -79,7 +79,7 @@ This document intentionally covers the active `polybot` surface only. It does no
 
 - `MAKER_SINGLE_INFLIGHT_PER_SIDE`: enable single-slot maker order ownership
 - `MAKER_SUBMIT_PENDING_TTL_SECONDS`, `MAKER_CANCEL_PENDING_TTL_SECONDS`, `MAKER_WORKING_MISSING_TTL_SECONDS`: local maker slot TTLs
-- `MAKER_REPLACE_MIN_INTERVAL_SECONDS`: minimum replace spacing
+- `MAKER_REPLACE_MIN_INTERVAL_SECONDS`: authoritative per-side maker refresh-cycle cap; default `1.0` second in the supported BOT runtime
 - `MAKER_SUBMIT_REJECT_COOLDOWN_SECONDS`, `MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS`: submit reject backoff
 - `MAKER_MAX_ACTIVE_BUY_ORDERS_PER_ASSET`: exchange-order cap enforced during reconciliation
 

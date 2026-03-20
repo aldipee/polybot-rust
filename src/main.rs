@@ -1950,6 +1950,14 @@ mod tests {
                         .market_data_stale_hard_pause_seconds,
                     8
                 );
+                assert!(
+                    (hydrated
+                        .effective_bot_config
+                        .maker_replace_min_interval_seconds
+                        - 1.0)
+                        .abs()
+                        < 1e-9
+                );
             },
         );
     }

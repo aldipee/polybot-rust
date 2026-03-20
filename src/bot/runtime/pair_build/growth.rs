@@ -287,6 +287,20 @@ impl MakerHedgeCapBot {
         }
 
         self._set_pending_entry_reason("BOT_PAIR_BUILD");
+        let prev_yes_live_oid = context.yes_slot.order_id.clone().or_else(|| {
+            self.state
+                .lock()
+                .ok()
+                .and_then(|state| state.open_orders.get(context.yes_asset.as_str()).cloned())
+                .and_then(|row| row.order_id)
+        });
+        let prev_no_live_oid = context.no_slot.order_id.clone().or_else(|| {
+            self.state
+                .lock()
+                .ok()
+                .and_then(|state| state.open_orders.get(context.no_asset.as_str()).cloned())
+                .and_then(|row| row.order_id)
+        });
         let submit_started = now_ts_f64();
         let (y_oid, n_oid) = self._maker_submit_pair_orders(
             decision.clip,
@@ -296,13 +310,29 @@ impl MakerHedgeCapBot {
             Some(true),
             "BOT_PAIR_BUILD",
         );
-        if y_oid.is_some() {
+        let yes_live_oid = self
+            ._maker_order_slot_get(&context.yes_key)
+            .order_id
+            .or(y_oid.clone());
+        let no_live_oid = self
+            ._maker_order_slot_get(&context.no_key)
+            .order_id
+            .or(n_oid.clone());
+        let y_noop = yes_live_oid
+            .as_deref()
+            .map(|order_id| self._consume_refresh_cadence_noop_marker(order_id))
+            .unwrap_or(false);
+        let n_noop = no_live_oid
+            .as_deref()
+            .map(|order_id| self._consume_refresh_cadence_noop_marker(order_id))
+            .unwrap_or(false);
+        if y_oid.is_some() && !y_noop {
             self._bot_runtime_pair_build_note_side_submit(OutcomeSide::Yes, context.y_bid, now);
         }
-        if n_oid.is_some() {
+        if n_oid.is_some() && !n_noop {
             self._bot_runtime_pair_build_note_side_submit(OutcomeSide::No, context.n_bid, now);
         }
-        if y_oid.is_some() || n_oid.is_some() {
+        if (y_oid.is_some() && !y_noop) || (n_oid.is_some() && !n_noop) {
             if let Ok(mut st) = self.bot_runtime_state.lock() {
                 st.pair_build_last_paired_growth_yes_bid = context.y_bid;
                 st.pair_build_last_paired_growth_no_bid = context.n_bid;
@@ -336,14 +366,6 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        let yes_live_oid = self
-            ._maker_order_slot_get(&context.yes_key)
-            .order_id
-            .or(y_oid);
-        let no_live_oid = self
-            ._maker_order_slot_get(&context.no_key)
-            .order_id
-            .or(n_oid);
         if yes_live_oid.is_none() && no_live_oid.is_none() {
             self._bot_runtime_log_pair_build_state(
                 "hold",
@@ -357,14 +379,24 @@ impl MakerHedgeCapBot {
             return;
         }
 
-        self._bot_runtime_note_pair_build_submit(
-            submit_started,
-            &decision,
-            plan.paired_cost_observation.map(|(_, band)| band),
-        );
-        let yes_new = maker_pair_submit_leg_is_new(yes_live_oid.as_deref(), &context.yes_slot);
-        let no_new = maker_pair_submit_leg_is_new(no_live_oid.as_deref(), &context.no_slot);
+        let yes_new = !y_noop
+            && if context.yes_slot.order_id.is_some() {
+                maker_pair_submit_leg_is_new(yes_live_oid.as_deref(), &context.yes_slot)
+            } else {
+                prev_yes_live_oid.as_deref() != yes_live_oid.as_deref()
+            };
+        let no_new = !n_noop
+            && if context.no_slot.order_id.is_some() {
+                maker_pair_submit_leg_is_new(no_live_oid.as_deref(), &context.no_slot)
+            } else {
+                prev_no_live_oid.as_deref() != no_live_oid.as_deref()
+            };
         if yes_new || no_new {
+            self._bot_runtime_note_pair_build_submit(
+                submit_started,
+                &decision,
+                plan.paired_cost_observation.map(|(_, band)| band),
+            );
             let decision_event_id = self._audit_insert_decision_event(
                 "pair_build",
                 Some(&decision),

@@ -61,6 +61,7 @@ fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
     }
     out
 }
+
 /// Exercises the make BOT runtime test BOT scenario and checks the expected BOT behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
@@ -396,6 +397,485 @@ fn dependency_pause_cancels_direct_bot_orders_without_single_inflight() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
+}
+
+#[test]
+fn maker_refresh_cycle_cap_blocks_second_yes_cycle_within_interval() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    let key = MakerOrderKey::buy("yes_asset_id");
+
+    let oid = bot
+        ._maker_order_upsert_gtc(&key, 0.40, 12.0, "BOT_PAIR_BUILD_YES")
+        .expect("initial yes order");
+    assert!(!oid.is_empty());
+
+    let first_cycle = bot
+        ._maker_order_request_refresh_cancel(&key, "test_refresh_cycle")
+        .expect("first refresh cycle should start");
+    assert!(first_cycle);
+
+    let blocked = bot
+        ._maker_order_request_refresh_cancel(&key, "test_refresh_cycle")
+        .expect_err("second refresh cycle should be blocked");
+    assert!(blocked.starts_with("refresh_cadence_cap:YES:"));
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.yes_refresh_cycles_started, 1);
+    assert_eq!(runtime_state.yes_refresh_cap_block_count, 1);
+    assert_eq!(runtime_state.no_refresh_cycles_started, 0);
+    assert_eq!(runtime_state.no_refresh_cap_block_count, 0);
+}
+
+#[test]
+fn direct_refresh_cycle_cap_blocks_same_side_without_latency_logging() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+    let first_oid = bot
+        ._place_limit_bid_gtc_with_origin("yes_asset_id", 0.40, 12.0, Some(true), "BOT_TAPER_YES")
+        .expect("initial direct yes order");
+    let second_oid = bot
+        ._place_limit_bid_gtc_with_origin("yes_asset_id", 0.41, 12.0, Some(true), "BOT_TAPER_YES")
+        .expect("first direct refresh cycle");
+    let third_oid = bot._place_limit_bid_gtc_with_origin(
+        "yes_asset_id",
+        0.42,
+        12.0,
+        Some(true),
+        "BOT_TAPER_YES",
+    );
+
+    assert_ne!(second_oid, first_oid);
+    assert_eq!(third_oid.as_deref(), Some(second_oid.as_str()));
+    let open_order_id = bot
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+        .and_then(|row| row.order_id)
+        .expect("live open order after capped no-op");
+    assert_eq!(open_order_id, second_oid);
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.yes_refresh_cycles_started, 1);
+    assert_eq!(runtime_state.yes_refresh_cap_block_count, 1);
+}
+
+#[test]
+fn direct_refresh_decision_does_not_start_cycle_before_submit_succeeds() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+    let first_oid = bot
+        ._place_limit_bid_gtc_with_origin("yes_asset_id", 0.40, 12.0, Some(true), "BOT_TAPER_YES")
+        .expect("initial direct yes order");
+    assert!(!first_oid.is_empty());
+
+    let decision =
+        bot._bot_runtime_direct_refresh_decision("yes_asset_id", "BOT_TAPER_YES", now_ts_f64());
+    match decision {
+        MakerDirectRefreshDecision::Started(OutcomeSide::Yes) => {}
+        other => panic!("expected started direct refresh decision, got {other:?}"),
+    }
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.yes_refresh_cycles_started, 0);
+    assert_eq!(runtime_state.yes_refresh_cycle.last_cycle_started_ts, 0.0);
+}
+
+#[test]
+fn protective_refresh_cancel_bypasses_cadence_cap() {
+    let bot = make_bot_runtime_test_bot();
+    let key = MakerOrderKey::buy("yes_asset_id");
+
+    let oid = bot
+        ._maker_order_upsert_gtc(&key, 0.40, 12.0, "BOT_PAIR_BUILD_YES")
+        .expect("initial yes order");
+    assert!(!oid.is_empty());
+
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.yes_refresh_cycle.last_cycle_started_ts = now_ts_f64();
+        runtime_state.yes_refresh_cycle.last_origin = "BOT_PAIR_BUILD_YES".to_string();
+        runtime_state.yes_refresh_cycle.last_reason = "test_recent_cycle".to_string();
+    }
+
+    let canceled = bot
+        ._maker_order_request_refresh_cancel(
+            &key,
+            "bot_runtime_pair_build_asymmetric_submit_invalid",
+        )
+        .expect("protective cancel should bypass cadence cap");
+    assert!(canceled);
+
+    let slot = bot._maker_order_slot_get(&key);
+    assert_eq!(slot.state, MakerOrderLifecycle::CancelPending);
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.yes_refresh_cap_block_count, 0);
+}
+
+#[test]
+fn direct_refresh_missing_context_uses_live_order_timestamp_for_cap() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+    let first_oid = bot
+        ._place_limit_bid_gtc_with_origin("yes_asset_id", 0.40, 12.0, Some(true), "BOT_TAPER_YES")
+        .expect("initial direct yes order");
+    if let Ok(mut map) = bot.order_exec_context.lock() {
+        map.clear();
+    }
+
+    let decision =
+        bot._bot_runtime_direct_refresh_decision("yes_asset_id", "BOT_TAPER_YES", now_ts_f64());
+    match decision {
+        MakerDirectRefreshDecision::Blocked {
+            existing_order_id,
+            reason,
+        } => {
+            assert_eq!(existing_order_id, first_oid);
+            assert!(reason.starts_with("refresh_cadence_cap:YES:"));
+        }
+        other => panic!("expected blocked direct refresh decision, got {other:?}"),
+    }
+}
+
+#[test]
+fn direct_refresh_missing_context_uses_stable_submit_ts_not_last_update_ts() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+    let first_oid = bot
+        ._place_limit_bid_gtc_with_origin("yes_asset_id", 0.40, 12.0, Some(true), "BOT_TAPER_YES")
+        .expect("initial direct yes order");
+    if let Ok(mut state) = bot.state.lock() {
+        if let Some(order) = state.open_orders.get_mut("yes_asset_id") {
+            order.submit_ts = Some(now_ts_f64() - 5.0);
+            order.ts = Some(now_ts_f64());
+        }
+    }
+    if let Ok(mut map) = bot.order_exec_context.lock() {
+        map.clear();
+    }
+
+    let decision =
+        bot._bot_runtime_direct_refresh_decision("yes_asset_id", "BOT_TAPER_YES", now_ts_f64());
+    match decision {
+        MakerDirectRefreshDecision::Started(OutcomeSide::Yes) => {}
+        other => panic!("expected started direct refresh decision, got {other:?}"),
+    }
+
+    let live_order_id = bot
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+        .and_then(|row| row.order_id)
+        .expect("live order after stable-submit-ts check");
+    assert_eq!(live_order_id, first_oid);
+}
+
+#[test]
+fn user_event_replacement_does_not_inherit_previous_order_submit_ts() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+    let old_submit_ts = now_ts_f64() - 5.0;
+    if let Ok(mut state) = bot.state.lock() {
+        state.open_orders.insert(
+            "yes_asset_id".to_string(),
+            OpenOrderState {
+                order_id: Some("old_yes_oid".to_string()),
+                price: Some(0.40),
+                size: Some(12.0),
+                ts: Some(now_ts_f64()),
+                submit_ts: Some(old_submit_ts),
+            },
+        );
+    }
+    if let Ok(mut map) = bot.order_exec_context.lock() {
+        map.clear();
+    }
+
+    bot._handle_user_order_event(&json!({
+        "event_type": "order",
+        "asset_id": "yes_asset_id",
+        "order_id": "replacement_yes_oid",
+        "side": "BUY",
+        "type": "PLACEMENT",
+        "price": 0.41,
+        "original_size": 12.0,
+        "size_matched": 0.0,
+        "status": "LIVE",
+    }));
+
+    let replacement = bot
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+        .expect("replacement order in state");
+    assert_eq!(replacement.order_id.as_deref(), Some("replacement_yes_oid"));
+    assert!(replacement.submit_ts.unwrap_or(0.0) > old_submit_ts + 1.0);
+
+    let decision =
+        bot._bot_runtime_direct_refresh_decision("yes_asset_id", "BOT_TAPER_YES", now_ts_f64());
+    match decision {
+        MakerDirectRefreshDecision::Blocked { .. } => {}
+        other => panic!("expected blocked direct refresh decision, got {other:?}"),
+    }
+}
+
+#[test]
+fn direct_refresh_cycle_cap_blocks_family_handoff_without_single_inflight() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+    let first_oid = bot
+        ._place_limit_bid_gtc_with_origin(
+            "yes_asset_id",
+            0.40,
+            12.0,
+            Some(true),
+            "BOT_PAIR_BUILD_YES",
+        )
+        .expect("initial direct yes order");
+    let second_oid = bot
+        ._place_limit_bid_gtc_with_origin("yes_asset_id", 0.41, 12.0, Some(true), "BOT_TAPER_YES")
+        .expect("direct family handoff should be cadence-capped");
+
+    assert_eq!(second_oid, first_oid);
+    let open_order_id = bot
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+        .and_then(|row| row.order_id)
+        .expect("live open order after capped handoff");
+    assert_eq!(open_order_id, first_oid);
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.yes_refresh_cycles_started, 0);
+    assert_eq!(runtime_state.yes_refresh_cap_block_count, 1);
+}
+
+#[test]
+fn maker_refresh_cycle_cap_blocks_family_handoff_within_interval() {
+    let bot = make_bot_runtime_test_bot();
+    let key = MakerOrderKey::buy("yes_asset_id");
+
+    let live_oid = bot
+        ._maker_order_upsert_gtc(&key, 0.40, 12.0, "BOT_PAIR_BUILD_YES")
+        .expect("initial pair-build order");
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.yes_refresh_cycle.last_cycle_started_ts = now_ts_f64();
+        runtime_state.yes_refresh_cycle.last_origin = "BOT_PAIR_BUILD_YES".to_string();
+        runtime_state.yes_refresh_cycle.last_reason = "test_recent_handoff".to_string();
+    }
+    let third_oid = bot
+        ._maker_order_upsert_gtc(&key, 0.45, 12.0, "BOT_TAPER_YES")
+        .expect("capped family handoff reuses live order");
+
+    assert_eq!(third_oid, live_oid);
+
+    let slot = bot._maker_order_slot_get(&key);
+    assert_eq!(slot.state, MakerOrderLifecycle::Working);
+    assert_eq!(slot.order_id.as_deref(), Some(live_oid.as_str()));
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.yes_refresh_cycles_started, 0);
+    assert_eq!(runtime_state.yes_refresh_cap_block_count, 1);
+}
+
+#[test]
+fn pair_build_submit_bookkeeping_skips_when_both_legs_are_refresh_noops() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+    let cfg = bot_runtime_config_defaults();
+    let submit_started = now_ts_f64();
+
+    let first_yes_oid = bot
+        ._place_limit_bid_gtc_with_origin(
+            "yes_asset_id",
+            0.40,
+            12.0,
+            Some(true),
+            "BOT_PAIR_BUILD_YES",
+        )
+        .expect("initial yes direct order");
+    let second_yes_oid = bot
+        ._place_limit_bid_gtc_with_origin(
+            "yes_asset_id",
+            0.41,
+            12.0,
+            Some(true),
+            "BOT_PAIR_BUILD_YES",
+        )
+        .expect("first yes refresh cycle");
+    let first_no_oid = bot
+        ._place_limit_bid_gtc_with_origin(
+            "no_asset_id",
+            0.40,
+            12.0,
+            Some(true),
+            "BOT_PAIR_BUILD_NO",
+        )
+        .expect("initial no direct order");
+    let second_no_oid = bot
+        ._place_limit_bid_gtc_with_origin(
+            "no_asset_id",
+            0.41,
+            12.0,
+            Some(true),
+            "BOT_PAIR_BUILD_NO",
+        )
+        .expect("first no refresh cycle");
+    assert_ne!(first_yes_oid, second_yes_oid);
+    assert_ne!(first_no_oid, second_no_oid);
+
+    let decision = bot_runtime_pair_build_decision(
+        60.0, 12.0, 12.0, 12.0, 12.0, 0.40, 0.42, 0.40, 0.42, 20.0, 10.0, 1.0, 1.0, 0.01, &cfg,
+        false,
+    )
+    .expect("paired-growth decision");
+    assert_eq!(decision.mode, BotRuntimePairBuildMode::PairedGrowth);
+    let optional_growth_policy = bot_runtime_pair_build_optional_growth_policy(
+        &decision, 12.0, 12.0, 12.0, 12.0, 0.40, 0.40, 1.0, &cfg,
+    );
+    let optional_buy_policy = bot_runtime_pair_build_optional_buy_policy(
+        &decision,
+        0.40,
+        0.42,
+        0.40,
+        0.42,
+        BotRuntimePairedCostBand::Acceptable,
+        1.0,
+        &cfg,
+    );
+    let plan = BotRuntimePairBuildPlan {
+        decision,
+        budget_snapshot: BotRuntimeBudgetSnapshot {
+            cumulative_min_fraction: 0.0,
+            cumulative_max_fraction: 1.0,
+            cumulative_min_cost: 0.0,
+            cumulative_max_cost: 100.0,
+            remaining_to_max_cost: 100.0,
+            under_min_target: false,
+        },
+        lighter_repair_policy: None,
+        repair_reserve_policy: None,
+        optional_growth_policy,
+        optional_buy_policy,
+        paired_cost_observation: Some((0.82, BotRuntimePairedCostBand::Acceptable)),
+        bad_regime_shutdown: (false, 0.0, 0, 0),
+    };
+    let context = BotRuntimePairBuildMarketContext {
+        yes_asset: "yes_asset_id".to_string(),
+        no_asset: "no_asset_id".to_string(),
+        yes_key: MakerOrderKey::buy("yes_asset_id"),
+        no_key: MakerOrderKey::buy("no_asset_id"),
+        yes_slot: bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id")),
+        no_slot: bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id")),
+        y_bid: 0.40,
+        y_ask: 0.42,
+        n_bid: 0.40,
+        n_ask: 0.42,
+    };
+
+    bot._bot_runtime_pair_build_handle_paired_growth(
+        submit_started,
+        60.0,
+        10.0,
+        12.0,
+        12.0,
+        &context,
+        &plan,
+        &cfg,
+    );
+
+    let runtime_state = bot
+        .bot_runtime_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert_eq!(runtime_state.pair_build_last_optional_growth_submit_ts, 0.0);
+    assert_eq!(runtime_state.paired_size_delta_by_state, [0.0; 5]);
+    assert_eq!(runtime_state.yes_refresh_cap_block_count, 1);
+    assert_eq!(runtime_state.no_refresh_cap_block_count, 1);
+}
+
+#[test]
+fn maker_submit_pair_orders_preserves_refresh_noop_markers_for_direct_capped_legs() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.cfg.dry_run = false;
+    bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+    let (first_yes_oid, first_no_oid) =
+        bot._maker_submit_pair_orders(12, 0.40, 0.40, "GTC", Some(true), "BOT_PAIR_BUILD");
+    let first_yes_oid = first_yes_oid.expect("initial yes pair order");
+    let first_no_oid = first_no_oid.expect("initial no pair order");
+
+    let (second_yes_oid, second_no_oid) =
+        bot._maker_submit_pair_orders(12, 0.41, 0.41, "GTC", Some(true), "BOT_PAIR_BUILD");
+    let second_yes_oid = second_yes_oid.expect("first yes refresh cycle");
+    let second_no_oid = second_no_oid.expect("first no refresh cycle");
+
+    let (third_yes_oid, third_no_oid) =
+        bot._maker_submit_pair_orders(12, 0.42, 0.42, "GTC", Some(true), "BOT_PAIR_BUILD");
+    let third_yes_oid = third_yes_oid.expect("capped yes pair leg");
+    let third_no_oid = third_no_oid.expect("capped no pair leg");
+
+    assert_ne!(second_yes_oid, first_yes_oid);
+    assert_ne!(second_no_oid, first_no_oid);
+    assert_eq!(third_yes_oid, second_yes_oid);
+    assert_eq!(third_no_oid, second_no_oid);
+    assert!(bot._consume_refresh_cadence_noop_marker(&third_yes_oid));
+    assert!(bot._consume_refresh_cadence_noop_marker(&third_no_oid));
 }
 
 #[test]
@@ -2326,6 +2806,10 @@ fn runtime_metrics_snapshot_exposes_pair_and_daily_taker_share() {
     state.taker_fill_shares = 5.0;
     state.daily_maker_fill_shares = 190.0;
     state.daily_taker_fill_shares = 10.0;
+    state.yes_refresh_cycles_started = 2;
+    state.no_refresh_cycles_started = 1;
+    state.yes_refresh_cap_block_count = 3;
+    state.no_refresh_cap_block_count = 4;
 
     let metrics = bot_runtime_metrics_snapshot(&state, 10.0, 10.0, 4.0, 4.0, 8.0);
 
@@ -2333,6 +2817,10 @@ fn runtime_metrics_snapshot_exposes_pair_and_daily_taker_share() {
     assert!((metrics.daily_taker_share - 0.05).abs() < 1e-9);
     assert_eq!(metrics.taker_fill_events, 1);
     assert!((metrics.taker_fill_shares - 5.0).abs() < 1e-9);
+    assert_eq!(metrics.yes_refresh_cycles_started, 2);
+    assert_eq!(metrics.no_refresh_cycles_started, 1);
+    assert_eq!(metrics.yes_refresh_cap_block_count, 3);
+    assert_eq!(metrics.no_refresh_cap_block_count, 4);
 }
 
 #[test]

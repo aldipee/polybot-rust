@@ -463,6 +463,37 @@ impl MakerHedgeCapBot {
             .ok()
             .and_then(|m| m.get(order_id).cloned())
     }
+
+    pub fn _refresh_cadence_noop_marker_active(&self, order_id: &str) -> bool {
+        self._get_order_execution_context(order_id)
+            .and_then(|ctx| {
+                ctx.get("refresh_cadence_noop")
+                    .and_then(|value| value.as_bool())
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn _consume_refresh_cadence_noop_marker(&self, order_id: &str) -> bool {
+        let trimmed = order_id.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if let Ok(mut map) = self.order_exec_context.lock() {
+            if let Some(Value::Object(obj)) = map.get_mut(trimmed) {
+                let flagged = obj
+                    .get("refresh_cadence_noop")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                if flagged {
+                    obj.remove("refresh_cadence_noop");
+                    obj.remove("refresh_cadence_noop_origin");
+                    obj.remove("refresh_cadence_noop_ts");
+                    return true;
+                }
+            }
+        }
+        false
+    }
     /// Logs execution latency on fill for diagnostics and operator visibility.
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.

@@ -502,6 +502,29 @@ impl MakerHedgeCapBot {
         if size + 1e-9 < min_int as f64 {
             return None;
         }
+        let direct_refresh_decision =
+            self._bot_runtime_direct_refresh_decision(asset_id, origin, now_ts_f64());
+        if let MakerDirectRefreshDecision::Blocked {
+            existing_order_id,
+            reason,
+        } = &direct_refresh_decision
+        {
+            self.logger.info(&format!(
+                "[BOT][REFRESH_CAP] direct_refresh_blocked asset={} origin={} hold_reason={}",
+                asset_id,
+                origin.trim(),
+                reason
+            ));
+            self._merge_order_execution_context_fields(
+                existing_order_id,
+                &json!({
+                    "refresh_cadence_noop": true,
+                    "refresh_cadence_noop_origin": origin,
+                    "refresh_cadence_noop_ts": now_ts_f64(),
+                }),
+            );
+            return Some(existing_order_id.clone());
+        }
         if self.cfg.dry_run {
             let oid = format!("DRY_LIMIT_GTC_{}", (now_ts_f64() * 1000.0) as i64);
             if let Ok(mut s) = self.state.lock() {
@@ -512,6 +535,7 @@ impl MakerHedgeCapBot {
                         price: Some(px),
                         size: Some(size),
                         ts: Some(now_ts_f64()),
+                        submit_ts: Some(now_ts_f64()),
                     },
                 );
                 let _ = self
@@ -528,6 +552,15 @@ impl MakerHedgeCapBot {
                     .rev()
                     .collect::<String>()
             ));
+            if let MakerDirectRefreshDecision::Started(side) = direct_refresh_decision {
+                self._bot_runtime_note_refresh_cycle_started(
+                    side,
+                    origin,
+                    "direct_refresh_submit",
+                    now_ts_f64(),
+                );
+                self._bot_runtime_note_refresh_cycle_submit(side, origin, "direct_submit_dry");
+            }
             return Some(oid);
         }
         let decide_ts = now_ts_f64();
@@ -548,6 +581,7 @@ impl MakerHedgeCapBot {
                     price: Some(px),
                     size: Some(size),
                     ts: Some(now_ts_f64()),
+                    submit_ts: Some(now_ts_f64()),
                 },
             );
             let _ = self._bot_runtime_save_state_or_dependency_pause(&mut s, "place_limit_bid_gtc");
@@ -570,6 +604,15 @@ impl MakerHedgeCapBot {
                 "taker_cap_policy": null,
             }),
         );
+        if let MakerDirectRefreshDecision::Started(side) = direct_refresh_decision {
+            self._bot_runtime_note_refresh_cycle_started(
+                side,
+                origin,
+                "direct_refresh_submit",
+                decide_ts,
+            );
+            self._bot_runtime_note_refresh_cycle_submit(side, origin, "direct_submit");
+        }
         Some(oid)
     }
     /// Places limit bid GTC exact with origin through the bot''s execution layer.
@@ -597,6 +640,29 @@ impl MakerHedgeCapBot {
         if size < 0.01 {
             return None;
         }
+        let direct_refresh_decision =
+            self._bot_runtime_direct_refresh_decision(asset_id, origin, now_ts_f64());
+        if let MakerDirectRefreshDecision::Blocked {
+            existing_order_id,
+            reason,
+        } = &direct_refresh_decision
+        {
+            self.logger.info(&format!(
+                "[BOT][REFRESH_CAP] direct_refresh_blocked asset={} origin={} hold_reason={}",
+                asset_id,
+                origin.trim(),
+                reason
+            ));
+            self._merge_order_execution_context_fields(
+                existing_order_id,
+                &json!({
+                    "refresh_cadence_noop": true,
+                    "refresh_cadence_noop_origin": origin,
+                    "refresh_cadence_noop_ts": now_ts_f64(),
+                }),
+            );
+            return Some(existing_order_id.clone());
+        }
         if self.cfg.dry_run {
             let oid = format!("DRY_LIMIT_GTC_EXACT_{}", (now_ts_f64() * 1000.0) as i64);
             if let Ok(mut s) = self.state.lock() {
@@ -607,6 +673,7 @@ impl MakerHedgeCapBot {
                         price: Some(px),
                         size: Some(size),
                         ts: Some(now_ts_f64()),
+                        submit_ts: Some(now_ts_f64()),
                     },
                 );
                 let _ = self._bot_runtime_save_state_or_dependency_pause(
@@ -625,6 +692,15 @@ impl MakerHedgeCapBot {
                     .rev()
                     .collect::<String>()
             ));
+            if let MakerDirectRefreshDecision::Started(side) = direct_refresh_decision {
+                self._bot_runtime_note_refresh_cycle_started(
+                    side,
+                    origin,
+                    "direct_refresh_submit",
+                    now_ts_f64(),
+                );
+                self._bot_runtime_note_refresh_cycle_submit(side, origin, "direct_submit_dry");
+            }
             return Some(oid);
         }
         let decide_ts = now_ts_f64();
@@ -645,6 +721,7 @@ impl MakerHedgeCapBot {
                     price: Some(px),
                     size: Some(size),
                     ts: Some(now_ts_f64()),
+                    submit_ts: Some(now_ts_f64()),
                 },
             );
             let _ = self
@@ -668,6 +745,15 @@ impl MakerHedgeCapBot {
                 "taker_cap_policy": null,
             }),
         );
+        if let MakerDirectRefreshDecision::Started(side) = direct_refresh_decision {
+            self._bot_runtime_note_refresh_cycle_started(
+                side,
+                origin,
+                "direct_refresh_submit",
+                decide_ts,
+            );
+            self._bot_runtime_note_refresh_cycle_submit(side, origin, "direct_submit");
+        }
         Some(oid)
     }
 
