@@ -5,7 +5,9 @@ This document records post-implementation findings that were raised, validated, 
 Scope covered here:
 
 - `IMP-13` (`REQ-024`, `REQ-025`)
+- `IMP-14` (`REQ-028`, `REQ-029`)
 - `IMP-15` (`REQ-030`, adjusted `REQ-031`)
+- `IMP-18` (`REQ-026`)
 - `IMP-19` (`REQ-032`)
 - `IMP-20` (`REQ-033`)
 - `IMP-21` (`REQ-034`)
@@ -21,11 +23,13 @@ Status legend:
 | IMP | Requirement mapping | Total findings | Runtime findings | Test-only findings | Status |
 |---|---|---:|---:|---:|---|
 | `IMP-13` | `REQ-024`, `REQ-025` | 5 | 5 | 0 | Fixed |
+| `IMP-14` | `REQ-028`, `REQ-029` | 6 | 6 | 0 | Fixed |
 | `IMP-15` | `REQ-030`, adjusted `REQ-031` | 5 | 5 | 0 | Fixed |
+| `IMP-18` | `REQ-026` | 12 | 12 | 0 | Fixed |
 | `IMP-19` | `REQ-032` | 35 | 34 | 1 | Fixed |
 | `IMP-20` | `REQ-033` | 5 | 5 | 0 | Fixed |
 | `IMP-21` | `REQ-034` | 12 | 12 | 0 | Fixed |
-| **Total** |  | **62** | **61** | **1** | **Fixed** |
+| **Total** |  | **80** | **79** | **1** | **Fixed** |
 
 ## IMP-13
 
@@ -37,6 +41,17 @@ Requirement mapping: `REQ-024`, `REQ-025`
 4. `P1` Decision-event writes still ran synchronously on the trading path. `Runtime`, `Fixed`
 5. `P2` Phase-transition audit rows stamped the new owner into both `prev_owner` and `next_owner`. `Runtime`, `Fixed`
 
+## IMP-14
+
+Requirement mapping: `REQ-028`, `REQ-029`
+
+1. `P1` Legacy flat-row `dry_run=true` configs could fail migration by validating shadow-mode credentials before the legacy paper mapping was restored. `Runtime`, `Fixed`
+2. `P1` Paper `FAK` or `FOK` taker exits could leave phantom shared gross reservations behind after immediate local resolution. `Runtime`, `Fixed`
+3. `P2` Local non-live cancels could leave stale taker tracking and pending-taker state behind for synthetic orders. `Runtime`, `Fixed`
+4. `P1` Shadow intents could disappear during open-order reconciliation when venue reads overwrote the hypothetical working set. `Runtime`, `Fixed`
+5. `P1` Guarded-live fallback sessions could try venue cancels for synthetic `SHADOW_INTENT_*` orders after live had been armed once. `Runtime`, `Fixed`
+6. `P1` Shadow `FAK` or `FOK` takers could remain pending until TTL expiry even though shadow mode can never fill them. `Runtime`, `Fixed`
+
 ## IMP-15
 
 Requirement mapping: `REQ-030`, adjusted `REQ-031`
@@ -46,6 +61,23 @@ Requirement mapping: `REQ-030`, adjusted `REQ-031`
 3. `P2` Legacy seen-trade-key migration lost recency ordering and could shrink the dedupe window. `Runtime`, `Fixed`
 4. `P1` Daily-liquidity persistence pauses were cleared by main-state recovery even if the daily-liquidity file was still failing. `Runtime`, `Fixed`
 5. `P1` Direct BOT order cleanup depended on execution-latency logging being enabled. `Runtime`, `Fixed`
+
+## IMP-18
+
+Requirement mapping: `REQ-026`
+
+1. `P1` Replay could lose the captured market schedule and reinterpret mid-market tapes as if they had just opened. `Runtime`, `Fixed`
+2. `P1` Replay ticks could skip phase and owner transition runtime events that live capture emitted. `Runtime`, `Fixed`
+3. `P1` Replay finalized before regenerating the post-run settlement events that live capture wrote after the main loop returned. `Runtime`, `Fixed`
+4. `P2` Replay ticks could suppress `risk_block` runtime events during startup, reconnect, or stale-data holds. `Runtime`, `Fixed`
+5. `P1` Replay settlement consulted the local machine RTDS state instead of a captured resolution snapshot. `Runtime`, `Fixed`
+6. `P2` Replayed order acknowledgements could miss captured submit-timing metadata in `order_ack` payloads. `Runtime`, `Fixed`
+7. `P2` Replay bundles persisted only the snapshot and recomputed a fresh resolved config bundle at load time. `Runtime`, `Fixed`
+8. `P2` Event-only replay scenarios could lose real exchange order IDs when `oracle_runtime_events.jsonl` was absent. `Runtime`, `Fixed`
+9. `P2` Event-only replay could swap paired maker YES and NO order IDs by consuming fallback acks in arrival order instead of submit order. `Runtime`, `Fixed`
+10. `P2` Event-only replay scenarios could lose `active_trade_id` and undercount their own portfolio exposure against gross caps. `Runtime`, `Fixed`
+11. `P2` Replay loader treated missing `events.jsonl` as an empty scenario instead of rejecting a corrupted bundle. `Runtime`, `Fixed`
+12. `P2` Replay bundles could still depend on ambient machine env overrides for behavior-critical runtime branches. `Runtime`, `Fixed`
 
 ## IMP-19
 
@@ -118,4 +150,5 @@ Requirement mapping: `REQ-034`
 
 - This document records findings that were actually raised during implementation hardening, not hypothetical future risks.
 - `IMP-19` generated the largest follow-up volume because it introduced wallet-global shared state, multi-instance coordination, restart recovery, TTL cleanup, maker and taker reservation accounting, and local-to-shared state republish logic all at once.
+- `IMP-18` generated a second cluster of follow-up parity fixes because deterministic replay had to become self-contained across schedule metadata, settlement inputs, captured order IDs, trade identity, and machine-local env differences.
 - The only finding in this document that was not a runtime requirement gap was the shared-state test-isolation issue under `IMP-19`.

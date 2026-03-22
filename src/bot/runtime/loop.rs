@@ -347,6 +347,316 @@ impl MakerHedgeCapBot {
         }
     }
 
+    pub(crate) fn _run_bot_runtime_tick(
+        &self,
+        now: f64,
+        last_gross_reservation_refresh: &mut f64,
+        stale_stage_logged: &mut BotRuntimeMarketDataStaleStage,
+    ) -> Option<String> {
+        self._bot_runtime_refresh_daily_liquidity_counters();
+        self._paper_runtime_simulate_fills(now);
+        self._bot_runtime_refresh_shared_gross_state(now, last_gross_reservation_refresh);
+
+        let t_into_s = now - self.start_ts as f64;
+        let seconds_left = self.expiry_ts as f64 - now;
+        let (total_cost, qy, qn, cost_yes, cost_no) = self
+            .state
+            .lock()
+            .map(|s| (s.c_yes + s.c_no, s.q_yes, s.q_no, s.c_yes, s.c_no))
+            .unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
+        let cfg = *self._bot_runtime_cfg();
+
+        if let Err(reason) = bot_runtime_validate_config(&cfg) {
+            self._set_exit_reason(&format!("BOT_INVALID_CONFIG:{reason}"));
+            return Some(self._get_exit_reason());
+        }
+
+        let mut phase = bot_runtime_phase_from_t_into_s(t_into_s, &cfg);
+        if bot_runtime_should_stop_for_rollover(seconds_left, self.cfg.stop_buffer_seconds) {
+            phase = BotRuntimePhase::AwaitSettlement;
+        }
+        if matches!(phase, BotRuntimePhase::OpenBoth) {
+            self._bot_runtime_note_open_confirmed(now);
+        }
+        let await_second_fill_hard_paused = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.await_second_fill_hard_paused)
+            .unwrap_or(false);
+        let (owner, owner_reason) =
+            bot_runtime_owner_for_snapshot(phase, qy, qn, await_second_fill_hard_paused);
+        let pair_id = self.pair_identity().pair_id;
+        let mut phase_transition: Option<(
+            BotRuntimePhase,
+            BotRuntimePhase,
+            BotRuntimeControlOwner,
+            BotRuntimeControlOwner,
+            &'static str,
+        )> = None;
+        let mut owner_transition: Option<(
+            BotRuntimeControlOwner,
+            BotRuntimeControlOwner,
+            &'static str,
+        )> = None;
+
+        if let Ok(mut st) = self.bot_runtime_state.lock() {
+            if !st.armed_once {
+                st.armed_once = true;
+                st.safety_gate = BotRuntimeSafetyGate::StartupReconPending;
+                st.safety_gate_reason = "startup_reconciliation_pending".to_string();
+                st.phase = phase;
+                st.state_enter_ts = now;
+                st.owner = owner;
+                st.owner_enter_ts = now;
+                st.owner_reason = owner_reason;
+            } else {
+                if st.phase != phase {
+                    phase_transition = Some((st.phase, phase, st.owner, owner, owner_reason));
+                    st.phase = phase;
+                    st.state_enter_ts = now;
+                }
+                if st.owner != owner || st.owner_reason != owner_reason {
+                    let prev_owner = st.owner;
+                    owner_transition = Some((prev_owner, owner, owner_reason));
+                    st.owner = owner;
+                    st.owner_enter_ts = now;
+                    st.owner_reason = owner_reason;
+                }
+            }
+        }
+        if let Some((prev_phase, next_phase, prev_owner, next_owner, transition_reason)) =
+            phase_transition
+        {
+            self._audit_record_state_transition(
+                prev_phase,
+                next_phase,
+                prev_owner,
+                next_owner,
+                transition_reason,
+                t_into_s,
+                qy,
+                qn,
+                total_cost,
+            );
+        }
+        if let Some((prev_owner, next_owner, transition_reason)) = owner_transition {
+            self._audit_record_state_transition(
+                phase,
+                phase,
+                prev_owner,
+                next_owner,
+                transition_reason,
+                t_into_s,
+                qy,
+                qn,
+                total_cost,
+            );
+        }
+
+        let stale_status = if matches!(
+            phase,
+            BotRuntimePhase::PreArm | BotRuntimePhase::AwaitSettlement
+        ) {
+            BotRuntimeMarketDataStaleStatus::default()
+        } else {
+            self._bot_runtime_market_data_stale_status()
+        };
+        if stale_status.requires_hard_pause() {
+            self._bot_runtime_enter_dependency_pause("market_data_stale", "", now);
+        }
+
+        let mut safety_gate = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.safety_gate)
+            .unwrap_or_default();
+        let mut safety_gate_reason = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| st.safety_gate_reason.clone())
+            .unwrap_or_default();
+
+        if !matches!(
+            phase,
+            BotRuntimePhase::PreArm | BotRuntimePhase::AwaitSettlement
+        ) {
+            match self._bot_runtime_dependency_healthy() {
+                Ok(()) => {
+                    if matches!(
+                        safety_gate,
+                        BotRuntimeSafetyGate::StartupReconPending
+                            | BotRuntimeSafetyGate::ReconnectReconPending
+                            | BotRuntimeSafetyGate::ValidationFailed
+                            | BotRuntimeSafetyGate::DependencyPaused
+                    ) {
+                        let scope = match safety_gate {
+                            BotRuntimeSafetyGate::StartupReconPending => "startup",
+                            BotRuntimeSafetyGate::ReconnectReconPending => "reconnect",
+                            BotRuntimeSafetyGate::ValidationFailed => "validation_retry",
+                            BotRuntimeSafetyGate::DependencyPaused => "recovery",
+                            BotRuntimeSafetyGate::Healthy => "healthy",
+                        };
+                        match self._bot_runtime_run_reconciliation_gate(scope, now) {
+                            Ok(()) => {}
+                            Err(reason) if reason.starts_with("dependency_pause:") => {
+                                self._bot_runtime_enter_dependency_pause(
+                                    "reconciliation",
+                                    scope,
+                                    now,
+                                );
+                            }
+                            Err(reason) => self._bot_runtime_mark_validation_failed(&reason, now),
+                        }
+                    }
+                }
+                Err(reason) => {
+                    let kind = reason
+                        .strip_prefix("dependency_pause:")
+                        .unwrap_or("market_ws");
+                    self._bot_runtime_enter_dependency_pause(kind, "", now);
+                }
+            }
+            safety_gate = self
+                .bot_runtime_state
+                .lock()
+                .map(|st| st.safety_gate)
+                .unwrap_or_default();
+            safety_gate_reason = self
+                .bot_runtime_state
+                .lock()
+                .map(|st| st.safety_gate_reason.clone())
+                .unwrap_or_default();
+        }
+
+        if matches!(self._bot_runtime_effective_order_mode(), BotOrderMode::Live) {
+            if let Ok(mut st) = self.bot_runtime_state.lock() {
+                st.live_order_write_armed_once = true;
+            }
+        }
+
+        self._bot_runtime_note_first_fill(now, qy, qn, cost_yes, cost_no);
+        self._bot_runtime_note_await_second_fill_progress(now, t_into_s, qy, qn, cost_yes, cost_no);
+        self._bot_runtime_note_imbalance_state(now, qy, qn, &cfg);
+
+        let block_new_risk = !safety_gate.allows_new_risk()
+            && !matches!(owner, BotRuntimeControlOwner::AwaitSettlement)
+            && !matches!(phase, BotRuntimePhase::PreArm);
+        let add_block_only = stale_status.blocks_new_risk()
+            && !stale_status.requires_hard_pause()
+            && safety_gate.allows_new_risk()
+            && !matches!(owner, BotRuntimeControlOwner::AwaitSettlement)
+            && !matches!(phase, BotRuntimePhase::PreArm);
+
+        if block_new_risk {
+            let hold_reason = if safety_gate_reason.trim().is_empty() {
+                safety_gate.as_str().to_string()
+            } else {
+                safety_gate_reason.clone()
+            };
+            self._bot_runtime_cancel_new_risk_orders(hold_reason.as_str());
+            let _ = self._audit_insert_runtime_event(
+                "risk_block",
+                None,
+                None,
+                None,
+                None,
+                Some(hold_reason.as_str()),
+                json!({
+                    "pair_id": pair_id.clone(),
+                    "phase": phase.as_str(),
+                    "owner": owner.as_str(),
+                    "safety_gate": safety_gate.as_str(),
+                    "safety_gate_reason": hold_reason,
+                    "reconcile_scope": if hold_reason.starts_with("dependency_pause:market_data_stale") {
+                        "stale_hard_pause"
+                    } else if matches!(safety_gate, BotRuntimeSafetyGate::ReconnectReconPending) {
+                        "reconnect"
+                    } else {
+                        "startup"
+                    },
+                    "reconcile_clean": false,
+                    "dependency_pause_kind": if hold_reason.starts_with("dependency_pause:market_data_stale") {
+                        Some("market_data_stale")
+                    } else if matches!(safety_gate, BotRuntimeSafetyGate::DependencyPaused) {
+                        Some("runtime_dependency")
+                    } else {
+                        None::<&str>
+                    },
+                    "stale_stage": if stale_status.blocks_new_risk() {
+                        Some(stale_status.stage.as_str())
+                    } else {
+                        None::<&str>
+                    },
+                    "stale_age_seconds": if stale_status.blocks_new_risk() {
+                        Some(stale_status.age_seconds)
+                    } else {
+                        None::<f64>
+                    },
+                }),
+            );
+        } else if !add_block_only {
+            if bot_runtime_should_run_open_both_handler(owner) {
+                self._bot_runtime_open_both_handler(now, t_into_s, total_cost, qy, qn, &cfg);
+            } else if matches!(owner, BotRuntimeControlOwner::AwaitSecondFill) {
+                self._bot_runtime_await_second_fill_handler(
+                    now, t_into_s, total_cost, qy, qn, cost_yes, cost_no, &cfg,
+                );
+            } else if matches!(owner, BotRuntimeControlOwner::PairBuild) {
+                self._bot_runtime_pair_build_handler(
+                    now, t_into_s, total_cost, qy, qn, cost_yes, cost_no, &cfg,
+                );
+            } else if matches!(owner, BotRuntimeControlOwner::Taper) {
+                self._bot_runtime_taper_handler(
+                    now, t_into_s, total_cost, qy, qn, cost_yes, cost_no, &cfg,
+                );
+            } else if matches!(owner, BotRuntimeControlOwner::AwaitSettlement) {
+                if self._bot_runtime_await_settlement_handler(now, seconds_left) {
+                    return Some(self._get_exit_reason());
+                }
+            } else {
+                let _ = self._bot_runtime_cancel_pair_build_orders(
+                    None,
+                    "bot_runtime_pair_build_owner_inactive",
+                );
+                let _ =
+                    self._bot_runtime_cancel_taper_orders(None, "bot_runtime_taper_owner_inactive");
+            }
+        } else {
+            let hold_reason = "market_data_stale_add_block";
+            let _ = self._audit_insert_runtime_event(
+                "risk_block",
+                None,
+                None,
+                None,
+                None,
+                Some(hold_reason),
+                json!({
+                    "pair_id": pair_id.clone(),
+                    "phase": phase.as_str(),
+                    "owner": owner.as_str(),
+                    "safety_gate": safety_gate.as_str(),
+                    "safety_gate_reason": safety_gate_reason,
+                    "reconcile_scope": "stale_add_block",
+                    "reconcile_clean": false,
+                    "dependency_pause_kind": None::<&str>,
+                    "stale_stage": stale_status.stage.as_str(),
+                    "stale_age_seconds": stale_status.age_seconds,
+                }),
+            );
+        }
+
+        if matches!(
+            phase,
+            BotRuntimePhase::PreArm | BotRuntimePhase::AwaitSettlement
+        ) {
+            *stale_stage_logged = BotRuntimeMarketDataStaleStage::Fresh;
+        } else {
+            *stale_stage_logged = stale_status.stage;
+        }
+
+        None
+    }
+
     /// Returns or derives run BOT runtime loop for the active BOT execution path.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.

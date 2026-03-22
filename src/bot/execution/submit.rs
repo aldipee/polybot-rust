@@ -269,6 +269,44 @@ impl MakerHedgeCapBot {
                 &intent,
             )
         };
+        if self._replay_mode_active() {
+            if let Some(ack) = self._replay_next_order_ack(asset_id.as_str(), side_u.as_str()) {
+                let oid = ack.order_id;
+                if let Some(submit_timing) = ack.submit_timing.filter(|value| value.is_object()) {
+                    if let Ok(mut timings) = self.submit_timing_cache.lock() {
+                        timings.insert(oid.clone(), submit_timing);
+                    }
+                }
+                let row = json!({
+                    "id": oid.clone(),
+                    "order_id": oid.clone(),
+                    "asset_id": asset_id,
+                    "token_id": asset_id,
+                    "side": side_u,
+                    "price": price,
+                    "size": size,
+                    "remaining_size": size,
+                    "original_size": size,
+                    "size_matched": 0.0,
+                    "nonce": intent.0,
+                    "intent_attempt": intent.1,
+                    "intent_family_key": intent.2,
+                    "intent_signature": intent.3,
+                    "order_type": order_type.to_ascii_uppercase(),
+                    "post_only": post_only,
+                    "origin": origin,
+                    "configured_order_mode": self.configured_order_mode.as_str(),
+                    "effective_order_mode": self._bot_runtime_effective_order_mode().as_str(),
+                    "status": "OPEN",
+                    "ts": now_ts_f64(),
+                });
+                if let Ok(mut ex) = self.exchange_orders_cache.lock() {
+                    ex.push(row);
+                }
+                return Some(oid);
+            }
+            return local_fallback();
+        }
         if !matches!(effective_order_mode, BotOrderMode::Live) {
             return local_fallback();
         }

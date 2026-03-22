@@ -41,6 +41,12 @@ This document intentionally covers the active `polybot` surface only. It does no
 - `DRY_RUN`: deprecated compatibility alias only; if `BOT_ORDER_MODE` is unset, `true` maps to `paper` and `false` maps to `shadow`, while inconsistent `DRY_RUN` and `BOT_ORDER_MODE` settings fail fast
 - `shadow` and `paper` use mode-scoped local or shared state so hypothetical or simulated exposure does not contaminate live companion files
 
+## Replay Capture
+
+- `REPLAY_CAPTURE_ENABLED`: when `true`, writes a replay scenario bundle for the current BOT run; defaults to `false`
+- `REPLAY_CAPTURE_DIR`: base directory for replay capture output; if unset or empty, capture stays disabled
+- replay capture is sidecar-only: it writes normalized event tapes, copied initial state, exact resolved config, captured behavior-critical env overrides, and optional oracle outputs, but it does not change live trading decisions
+
 ## Core Trading Controls
 
 - `MIN_SHARES`, `CLIP_SHARES`, `MAX_TOTAL_COST`, `RESERVE_USD`: base sizing and budget caps
@@ -85,7 +91,7 @@ This document intentionally covers the active `polybot` surface only. It does no
 - `REQUIRE_USER_WS_CONNECTED`, `WS_PING_INTERVAL`, `WS_IO_TIMEOUT_SECONDS`, `DEBUG_THROTTLE_SECONDS`: websocket health and debug throttling
 - `ORDERBOOK_HTTP_TIMEOUT`, `BOOK_CACHE_TTL_SECONDS`: orderbook snapshot fetch/cache behavior
 - `RECONCILE_EXCHANGE_ORDERS`, `RECONCILE_INTERVAL_SECONDS`: exchange-order reconciliation cadence
-- `RECONCILE_USE_DATA_API`, `MISMATCH_RECONCILE_FROM_BALANCE`: state-reconciliation source selection
+- `RECONCILE_USE_DATA_API`, `MISMATCH_RECONCILE_FROM_BALANCE`: explicit non-default state-reconciliation source selection; both default to `false`, and `MISMATCH_RECONCILE_FROM_BALANCE` is legacy compatibility only
 - `RECONCILE_MIN_INTERVAL_SECONDS`, `RECONCILE_CONFIRM_DELAY_SECONDS`, `RECONCILE_NEVER_ZERO_WITHOUT_CONFIRM`, `RECONCILE_SELL_CREDIT_MULT`: reconciliation safety controls
 - `UNWIND_CHUNK_SHARES`, `UNWIND_MAX_PASSES`, `UNWIND_WAIT_AFTER_ORDER_SECONDS`: chunked unwind behavior
 - `UNWIND_DEPTH_GATE_ENABLED`, `DEPTH_GATE_LEVELS`, `DEPTH_GATE_MAX_AGE_SECONDS`: depth gating for unwind orders

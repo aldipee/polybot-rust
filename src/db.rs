@@ -6,6 +6,7 @@ use chrono_tz::Asia::Jakarta;
 use native_tls::TlsConnector;
 use postgres::Client;
 use postgres_native_tls::MakeTlsConnector;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -223,7 +224,7 @@ pub struct TradeDecisionUpsert {
     pub maker_clip_bucket: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeDecisionEventInsert {
     pub decision_event_id: String,
     pub trade_id: String,
@@ -244,7 +245,7 @@ pub struct TradeDecisionEventInsert {
     pub payload_json: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRuntimeEventInsert {
     pub event_id: String,
     pub trade_id: String,
@@ -265,9 +266,7 @@ pub struct TradeRuntimeEventInsert {
 }
 
 pub fn now_iso_jakarta() -> String {
-    Utc::now()
-        .with_timezone(&Jakarta)
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    crate::replay::runtime_now_iso_jakarta()
 }
 
 pub fn date_jakarta() -> String {
@@ -317,7 +316,7 @@ pub fn cfg_hash(cfg: &BotConfig) -> String {
 }
 
 pub fn new_uuid() -> String {
-    Uuid::new_v4().to_string()
+    crate::replay::replay_runtime_new_uuid().unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
 fn normalize_optional_text(value: Option<&str>) -> Option<String> {

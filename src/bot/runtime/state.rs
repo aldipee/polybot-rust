@@ -25,7 +25,7 @@ impl BotRuntimePhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(in crate::bot) enum BotRuntimeSafetyGate {
+pub(crate) enum BotRuntimeSafetyGate {
     #[default]
     Healthy,
     StartupReconPending,
@@ -51,7 +51,7 @@ impl BotRuntimeSafetyGate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(in crate::bot) enum BotRuntimeMarketDataStaleStage {
+pub(crate) enum BotRuntimeMarketDataStaleStage {
     #[default]
     Fresh,
     AddBlocked,

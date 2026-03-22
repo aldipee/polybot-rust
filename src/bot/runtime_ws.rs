@@ -5,7 +5,7 @@ impl MakerHedgeCapBot {
     /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
     /// runtime.
 
-    pub(super) fn _set_exit_reason(&self, reason: &str) {
+    pub(crate) fn _set_exit_reason(&self, reason: &str) {
         if let Ok(mut r) = self.exit_reason.lock() {
             *r = reason.to_string();
         }
@@ -15,7 +15,7 @@ impl MakerHedgeCapBot {
     /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
     /// runtime.
 
-    pub(super) fn _get_exit_reason(&self) -> String {
+    pub(crate) fn _get_exit_reason(&self) -> String {
         self.exit_reason
             .lock()
             .map(|s| s.clone())
@@ -84,7 +84,7 @@ impl MakerHedgeCapBot {
         }
     }
 
-    pub(super) fn _bot_runtime_mark_startup_reconciliation_pending(&self, now: f64) {
+    pub(crate) fn _bot_runtime_mark_startup_reconciliation_pending(&self, now: f64) {
         self._bot_runtime_set_safety_gate(
             BotRuntimeSafetyGate::StartupReconPending,
             "startup_reconciliation_pending",
@@ -591,6 +591,13 @@ impl MakerHedgeCapBot {
 
     pub fn _on_open(&self, channel: &str) {
         let now = now_ts_f64();
+        self._replay_capture_event(
+            "ws_open",
+            json!({
+                "channel": channel.trim().to_ascii_lowercase(),
+                "ts": now,
+            }),
+        );
         if channel.eq_ignore_ascii_case("market") {
             let reopened = self
                 .bot_runtime_state
@@ -657,6 +664,15 @@ impl MakerHedgeCapBot {
 
     pub fn _on_close(&self, channel: &str, code: i64, msg: &str) {
         let now = now_ts_f64();
+        self._replay_capture_event(
+            "ws_close",
+            json!({
+                "channel": channel.trim().to_ascii_lowercase(),
+                "code": code,
+                "message": msg,
+                "ts": now,
+            }),
+        );
         if channel.eq_ignore_ascii_case("market") {
             self.market_connected.store(false, Ordering::SeqCst);
             let was_live = self
@@ -865,6 +881,13 @@ impl MakerHedgeCapBot {
             ) {
                 self.logger
                     .info(&format!("tick_size change signal detected: {v:.6}"));
+                self._replay_capture_event(
+                    "market_tick_size",
+                    json!({
+                        "event_type": "tick_size",
+                        "tick_size": v,
+                    }),
+                );
             }
             self.cancel_all_open_orders_local("tick size change");
             if let (Some(y), Some(n)) = (&self.yes_asset, &self.no_asset) {
@@ -897,6 +920,16 @@ impl MakerHedgeCapBot {
             ._extract_float_any(msg, &["best_ask", "ask", "a"])
             .unwrap_or(0.0);
         let ts = now_ts_f64();
+        self._replay_capture_event(
+            "market_best_bid_ask",
+            json!({
+                "event_type": "best_bid_ask",
+                "asset_id": asset_id.clone(),
+                "best_bid": bid,
+                "best_ask": ask,
+                "ts": ts,
+            }),
+        );
         if let Ok(mut quotes) = self.best_quotes.lock() {
             quotes.insert(asset_id, (bid, ask, ts));
         }

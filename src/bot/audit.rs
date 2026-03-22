@@ -119,8 +119,11 @@ impl MakerHedgeCapBot {
         reason_code: Option<&str>,
         payload: Value,
     ) -> Option<String> {
-        let trade_id = self.active_trade_id.clone()?;
-        let tx = self.audit_runtime_tx.clone()?;
+        let trade_id = self
+            .active_trade_id
+            .clone()
+            .unwrap_or_else(|| "replay".to_string());
+        let tx = self.audit_runtime_tx.clone();
         let (pair_id, market_slug, condition_id, yes_asset_id, no_asset_id) =
             self._audit_pair_identity_fields();
         let event_id = new_uuid();
@@ -145,6 +148,13 @@ impl MakerHedgeCapBot {
             payload_json: payload_text,
         };
         self._audit_emit_structured_event(event_kind, event_kind, payload);
+        if let Some(recorder) = self.replay_recorder.as_ref() {
+            recorder.record_runtime_event(&row);
+        }
+        let Some(tx) = tx else {
+            self._audit_note_runtime_event_inserted();
+            return Some(event_id);
+        };
         match tx.try_send(AuditWriteTask::Runtime(row)) {
             Ok(()) => {
                 self._audit_note_runtime_event_inserted();
@@ -180,8 +190,11 @@ impl MakerHedgeCapBot {
         q_yes: f64,
         q_no: f64,
     ) -> Option<String> {
-        let trade_id = self.active_trade_id.clone()?;
-        let tx = self.audit_runtime_tx.clone()?;
+        let trade_id = self
+            .active_trade_id
+            .clone()
+            .unwrap_or_else(|| "replay".to_string());
+        let tx = self.audit_runtime_tx.clone();
         let decision_event_id = new_uuid();
         let (pair_id, market_slug, condition_id, yes_asset_id, no_asset_id) =
             self._audit_pair_identity_fields();
@@ -331,6 +344,13 @@ impl MakerHedgeCapBot {
             reason_code,
             payload,
         );
+        if let Some(recorder) = self.replay_recorder.as_ref() {
+            recorder.record_decision_event(&row);
+        }
+        let Some(tx) = tx else {
+            self._audit_note_decision_event_inserted();
+            return Some(decision_event_id);
+        };
         match tx.try_send(AuditWriteTask::Decision {
             row,
             trade_id: trade_id.clone(),

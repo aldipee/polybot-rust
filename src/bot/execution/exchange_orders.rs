@@ -423,6 +423,14 @@ impl MakerHedgeCapBot {
     /// BOT runtime.
 
     pub fn _list_open_orders_exchange(&self) -> Vec<Value> {
+        let capture = |orders: &Vec<Value>| {
+            self._replay_capture_event(
+                "reconcile_snapshot",
+                json!({
+                    "orders": orders,
+                }),
+            );
+        };
         let fallback = || {
             let cached = self
                 .exchange_orders_cache
@@ -433,6 +441,7 @@ impl MakerHedgeCapBot {
             if let Ok(mut cache) = self.exchange_orders_cache.lock() {
                 *cache = merged.clone();
             }
+            capture(&merged);
             merged
         };
         if !self._bot_runtime_venue_reads_allowed() {
@@ -445,6 +454,7 @@ impl MakerHedgeCapBot {
             if let Ok(mut cache) = self.exchange_orders_cache.lock() {
                 *cache = merged.clone();
             }
+            capture(&merged);
             return merged;
         }
         let (rt, client) = match (&self.clob_rt, &self.clob_client) {
@@ -490,6 +500,7 @@ impl MakerHedgeCapBot {
                 if let Ok(mut cache) = self.exchange_orders_cache.lock() {
                     *cache = merged.clone();
                 }
+                capture(&merged);
                 merged
             }
             Err(e) => {

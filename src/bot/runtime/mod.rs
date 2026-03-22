@@ -14,7 +14,7 @@ pub(crate) use self::config::*;
 pub(in crate::bot) use self::metrics::*;
 pub(in crate::bot) use self::pair_build::*;
 pub(in crate::bot) use self::policy::*;
-pub(in crate::bot) use self::state::*;
+pub(crate) use self::state::*;
 pub(in crate::bot) use self::taper::*;
 #[cfg(test)]
 mod tests;

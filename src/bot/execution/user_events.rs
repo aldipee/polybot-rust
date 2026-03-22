@@ -666,8 +666,10 @@ impl MakerHedgeCapBot {
             .unwrap_or("")
             .to_ascii_lowercase();
         if t.contains("trade") {
+            self._replay_capture_event("user_trade", msg.clone());
             self._handle_user_trade_event(msg);
         } else if t.contains("order") {
+            self._replay_capture_event("user_order", msg.clone());
             self._handle_user_order_event(msg);
         }
     }

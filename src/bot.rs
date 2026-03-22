@@ -21,9 +21,10 @@ use rs_clob_client::{
     CreateOrderOptions, OpenOrderParams, OrderType as ClobOrderType, Side as ClobSide, TickSize,
     UserLimitOrder,
 };
+use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -31,30 +32,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
 fn now_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::replay::runtime_now_ts()
 }
 
 fn now_ts_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    crate::replay::runtime_now_ts_f64()
 }
 
 fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+    crate::replay::runtime_now_ns()
 }
 
 pub fn require_bot_exec_mode() -> Result<String> {
@@ -97,7 +89,7 @@ impl BotOrderMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TradeMetrics {
     pub pair_id: String,
     pub market_slug: String,

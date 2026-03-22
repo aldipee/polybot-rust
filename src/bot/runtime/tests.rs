@@ -1,7 +1,7 @@
 use super::*;
 use proptest::prelude::*;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::sync_channel;
 use std::sync::OnceLock;
@@ -178,6 +178,8 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
         maker_order_slots: Arc::new(Mutex::new(HashMap::new())),
         maker_order_index: Arc::new(Mutex::new(HashMap::new())),
         maker_exec_ledger: Arc::new(Mutex::new(MakerExecLedger::default())),
+        replay_recorder: None,
+        replay_order_acks: Arc::new(Mutex::new(VecDeque::new())),
         bot_runtime_state: Arc::new(Mutex::new(BotRuntimeState::default())),
         bot_runtime_cfg: bot_runtime_config_defaults(),
     }

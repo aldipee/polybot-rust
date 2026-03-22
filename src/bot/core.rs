@@ -8,6 +8,8 @@ pub struct MakerHedgeCapBot {
     pub(super) audit_repo: Option<BotRepository>,
     pub(super) active_trade_id: Option<String>,
     pub(super) audit_runtime_tx: Option<SyncSender<AuditWriteTask>>,
+    pub(crate) replay_recorder: Option<Arc<crate::replay::ReplayRecorder>>,
+    pub(crate) replay_order_acks: Arc<Mutex<VecDeque<crate::replay::ReplayOrderAck>>>,
     pub(super) pair_identity: PairIdentity,
     pub state_file: PathBuf,
     pub state: Arc<Mutex<BotState>>,
@@ -75,7 +77,7 @@ pub struct MakerHedgeCapBot {
     pub(super) maker_order_slots: Arc<Mutex<HashMap<MakerOrderKey, MakerOrderSlot>>>,
     pub(super) maker_order_index: Arc<Mutex<HashMap<String, MakerOrderKey>>>,
     pub(super) maker_exec_ledger: Arc<Mutex<MakerExecLedger>>,
-    pub(super) bot_runtime_state: Arc<Mutex<BotRuntimeState>>,
+    pub(crate) bot_runtime_state: Arc<Mutex<BotRuntimeState>>,
     pub(super) bot_runtime_cfg: BotRuntimeConfigSnapshot,
 }
 
@@ -167,7 +169,7 @@ impl MakerHedgeCapBot {
         ))
     }
 
-    pub(in crate::bot) fn pending_taker_state_file_for_wallet(
+    pub(crate) fn pending_taker_state_file_for_wallet(
         wallet_address: &str,
         configured_order_mode: &str,
     ) -> PathBuf {
@@ -178,7 +180,7 @@ impl MakerHedgeCapBot {
         ))
     }
 
-    pub(in crate::bot) fn gross_exposure_state_file_for_wallet(
+    pub(crate) fn gross_exposure_state_file_for_wallet(
         wallet_address: &str,
         configured_order_mode: &str,
     ) -> PathBuf {
@@ -352,10 +354,16 @@ impl MakerHedgeCapBot {
     }
 
     pub(in crate::bot) fn _bot_runtime_live_write_allowed(&self) -> bool {
+        if self._replay_mode_active() {
+            return false;
+        }
         matches!(self._bot_runtime_effective_order_mode(), BotOrderMode::Live)
     }
 
     pub(in crate::bot) fn _bot_runtime_live_cancel_allowed(&self) -> bool {
+        if self._replay_mode_active() {
+            return false;
+        }
         if matches!(self._bot_runtime_effective_order_mode(), BotOrderMode::Live) {
             return true;
         }
@@ -369,6 +377,81 @@ impl MakerHedgeCapBot {
 
     pub(in crate::bot) fn _bot_runtime_venue_reads_allowed(&self) -> bool {
         !matches!(self._configured_bot_order_mode(), BotOrderMode::Paper)
+    }
+
+    pub(crate) fn _replay_mode_active(&self) -> bool {
+        self.runtime_flags
+            .get("__replay_mode")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || crate::replay::replay_runtime_active()
+    }
+
+    pub(in crate::bot) fn _replay_next_order_ack(
+        &self,
+        asset_id: &str,
+        side: &str,
+    ) -> Option<crate::replay::ReplayOrderAck> {
+        let mut queue = self.replay_order_acks.lock().ok()?;
+        crate::replay::replay_take_order_ack(&mut queue, asset_id, side)
+    }
+
+    pub(crate) fn _replay_trade_id(&self) -> String {
+        self.active_trade_id
+            .clone()
+            .unwrap_or_else(|| "replay".to_string())
+    }
+
+    pub(crate) fn _active_trade_id_opt(&self) -> Option<String> {
+        self.active_trade_id
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    pub(crate) fn _replay_seed_active_trade_id(&mut self, trade_id: Option<String>) {
+        self.active_trade_id = trade_id.filter(|value| !value.trim().is_empty());
+    }
+
+    pub(crate) fn _replay_runtime_state_snapshot_json(&self) -> Value {
+        self.bot_runtime_state
+            .lock()
+            .map(|state| {
+                json!({
+                    "phase": state.phase.as_str(),
+                    "owner": state.owner.as_str(),
+                    "safety_gate": state.safety_gate.as_str(),
+                    "safety_gate_reason": state.safety_gate_reason,
+                    "live_order_write_armed_once": state.live_order_write_armed_once,
+                    "audit_decision_event_count": state.audit_decision_event_count,
+                    "audit_runtime_event_count": state.audit_runtime_event_count,
+                })
+            })
+            .unwrap_or(Value::Null)
+    }
+
+    pub(crate) fn _replay_seed_market_metadata(
+        &mut self,
+        condition_id: Option<String>,
+        yes_asset_id: Option<String>,
+        no_asset_id: Option<String>,
+        market_start_ts: Option<i64>,
+        market_expiry_ts: Option<i64>,
+    ) {
+        self.condition_id = condition_id.filter(|value| !value.trim().is_empty());
+        self.yes_asset = yes_asset_id.filter(|value| !value.trim().is_empty());
+        self.no_asset = no_asset_id.filter(|value| !value.trim().is_empty());
+        if let Some(start_ts) = market_start_ts.filter(|value| *value > 0) {
+            self.start_ts = start_ts;
+        }
+        if let Some(expiry_ts) = market_expiry_ts.filter(|value| *value > 0) {
+            self.expiry_ts = expiry_ts;
+        }
+        self.pair_identity.update_market_metadata(
+            self.condition_id.clone(),
+            self.yes_asset.clone(),
+            self.no_asset.clone(),
+        );
     }
 
     /// Builds a fully wired bot instance from a resolved, pinned config bundle,
@@ -431,12 +514,14 @@ impl MakerHedgeCapBot {
         } else {
             None
         };
-        let (clob_rt, clob_client, clob_api_creds) =
-            if configured_order_mode.eq_ignore_ascii_case("paper") {
-                (None, None, None)
-            } else {
-                Self::_init_native_clob_client(&cfg, &bot_logger, &execution_cfg.clob_gamma_host)?
-            };
+        let (clob_rt, clob_client, clob_api_creds) = if configured_order_mode
+            .eq_ignore_ascii_case("paper")
+            || crate::replay::replay_runtime_active()
+        {
+            (None, None, None)
+        } else {
+            Self::_init_native_clob_client(&cfg, &bot_logger, &execution_cfg.clob_gamma_host)?
+        };
 
         let mut out = Self {
             cfg,
@@ -446,6 +531,8 @@ impl MakerHedgeCapBot {
             audit_repo: None,
             active_trade_id: None,
             audit_runtime_tx: None,
+            replay_recorder: None,
+            replay_order_acks: Arc::new(Mutex::new(VecDeque::new())),
             pair_identity: PairIdentity::from_slug(market_slug),
             state_file,
             state: Arc::new(Mutex::new(state)),
@@ -559,45 +646,47 @@ impl MakerHedgeCapBot {
             ));
         }
 
-        if let Some(market) = fetch_market_by_slug(&out.market_slug, Some(&out.logger))? {
-            out.market_fees_enabled = market
-                .get("feesEnabled")
-                .or_else(|| market.get("fees_enabled"))
-                .and_then(|v| v.as_bool());
-            if let Ok((yes, no, condition)) = parse_tokens_and_condition(&market) {
-                out.condition_id = Some(condition.clone());
-                out.yes_asset = Some(yes.clone());
-                out.no_asset = Some(no.clone());
-                out.pair_identity.update_market_metadata(
-                    Some(condition.clone()),
-                    Some(yes.clone()),
-                    Some(no.clone()),
-                );
-                if slug_window_start_ts.is_none() {
-                    if let Some(st) = market
-                        .get("startDate")
+        if !crate::replay::replay_runtime_active() {
+            if let Some(market) = fetch_market_by_slug(&out.market_slug, Some(&out.logger))? {
+                out.market_fees_enabled = market
+                    .get("feesEnabled")
+                    .or_else(|| market.get("fees_enabled"))
+                    .and_then(|v| v.as_bool());
+                if let Ok((yes, no, condition)) = parse_tokens_and_condition(&market) {
+                    out.condition_id = Some(condition.clone());
+                    out.yes_asset = Some(yes.clone());
+                    out.no_asset = Some(no.clone());
+                    out.pair_identity.update_market_metadata(
+                        Some(condition.clone()),
+                        Some(yes.clone()),
+                        Some(no.clone()),
+                    );
+                    if slug_window_start_ts.is_none() {
+                        if let Some(st) = market
+                            .get("startDate")
+                            .and_then(|v| v.as_str())
+                            .and_then(iso_to_epoch)
+                        {
+                            out.start_ts = st;
+                        }
+                    }
+                    if let Some(et) = market
+                        .get("endDate")
                         .and_then(|v| v.as_str())
                         .and_then(iso_to_epoch)
                     {
-                        out.start_ts = st;
+                        out.expiry_ts = et;
                     }
+                    out.logger
+                        .info(&format!("Market Found: {}", out.market_slug));
+                    out.logger.info(&format!("Condition ID: {condition}"));
+                    out.logger.info(&format!("YES asset: {yes}"));
+                    out.logger.info(&format!("NO  asset: {no}"));
+                    out.logger.info(&format!(
+                        "Start ts: {} | Expiry ts: {}",
+                        out.start_ts, out.expiry_ts
+                    ));
                 }
-                if let Some(et) = market
-                    .get("endDate")
-                    .and_then(|v| v.as_str())
-                    .and_then(iso_to_epoch)
-                {
-                    out.expiry_ts = et;
-                }
-                out.logger
-                    .info(&format!("Market Found: {}", out.market_slug));
-                out.logger.info(&format!("Condition ID: {condition}"));
-                out.logger.info(&format!("YES asset: {yes}"));
-                out.logger.info(&format!("NO  asset: {no}"));
-                out.logger.info(&format!(
-                    "Start ts: {} | Expiry ts: {}",
-                    out.start_ts, out.expiry_ts
-                ));
             }
         }
         out._log_bot_runtime_cfg();

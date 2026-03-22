@@ -10,6 +10,7 @@ mod helpers;
 mod latency_log;
 mod logging;
 mod r2_storage;
+mod replay;
 mod rtds;
 
 use anyhow::{anyhow, Context, Result};
@@ -1412,7 +1413,8 @@ fn run() -> Result<()> {
             );
             continue;
         }
-        let bot = bot.with_trade_audit(repo.clone(), &trade_id);
+        let mut bot = bot.with_trade_audit(repo.clone(), &trade_id);
+        bot._init_replay_capture(&run_bundle)?;
 
         let rtds_service =
             match RtdsService::for_market(&current_slug, &run_cfg, bot_logger.clone()) {
@@ -1625,6 +1627,7 @@ fn run() -> Result<()> {
                     send_telegram_stats_if_enabled(&telegram_summary, &bg_logger);
                 }
             }
+            bot.finalize_replay_capture(run_reason.as_str());
         });
 
         // Wait for the bot to signal it's done trading (stop_flag set).

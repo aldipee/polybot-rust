@@ -7,6 +7,8 @@ pub const ENV_CONTRACT_KEYS: &[&str] = &[
     "EXEC_MODE",
     "LOG_DIR",
     "POLYBOT_PRINT_ENV_CONTRACT",
+    "REPLAY_CAPTURE_DIR",
+    "REPLAY_CAPTURE_ENABLED",
     // Auth, wallet, and connectivity
     "CHAIN_ID",
     "CLOB_GAMMA_API_URL",

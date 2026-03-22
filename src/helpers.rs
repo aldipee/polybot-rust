@@ -10,7 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentDefaults {
@@ -952,10 +952,7 @@ impl SharedPendingTakerState {
 }
 
 fn helper_now_ts_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    crate::replay::runtime_now_ts_f64()
 }
 
 pub fn utc_day_key_from_ts(ts: f64) -> String {
@@ -968,7 +965,7 @@ pub fn utc_day_key_from_ts(ts: f64) -> String {
 }
 
 pub fn current_utc_day_key() -> String {
-    Utc::now().format("%Y-%m-%d").to_string()
+    crate::replay::runtime_utc_day_key()
 }
 
 pub fn load_daily_liquidity_state(state_file: &Path) -> Result<DailyLiquidityState> {

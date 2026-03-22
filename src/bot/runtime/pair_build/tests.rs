@@ -1,7 +1,7 @@
 use super::super::*;
 use super::*;
 use proptest::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 struct BotRuntimeNoopLogger;
@@ -125,6 +125,8 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
         maker_order_slots: Arc::new(Mutex::new(HashMap::new())),
         maker_order_index: Arc::new(Mutex::new(HashMap::new())),
         maker_exec_ledger: Arc::new(Mutex::new(MakerExecLedger::default())),
+        replay_recorder: None,
+        replay_order_acks: Arc::new(Mutex::new(VecDeque::new())),
         bot_runtime_state: Arc::new(Mutex::new(BotRuntimeState::default())),
         bot_runtime_cfg: bot_runtime_config_defaults(),
     }
