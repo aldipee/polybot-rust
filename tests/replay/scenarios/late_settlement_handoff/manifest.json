@@ -1,0 +1,15 @@
+{
+  "schema_version": "replay_v1",
+  "market_slug": "late_settlement_handoff",
+  "configured_order_mode": "paper",
+  "state_file_name": "maker_hedgecap_state_late_settlement_handoff_paper.json",
+  "trade_id": "trade_late_settlement_handoff",
+  "env_overrides": {},
+  "condition_id": "cond_late_settlement_handoff",
+  "yes_asset_id": "yes_asset_id",
+  "no_asset_id": "no_asset_id",
+  "market_start_ts": 0,
+  "market_expiry_ts": 100,
+  "start_ts_ns": 95000000000,
+  "end_ts_ns": 101000000000
+}

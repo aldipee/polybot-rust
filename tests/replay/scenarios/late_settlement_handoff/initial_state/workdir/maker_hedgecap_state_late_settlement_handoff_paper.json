@@ -1,0 +1,17 @@
+{
+  "q_yes": 5.0,
+  "q_no": 5.0,
+  "c_yes": 2.3,
+  "c_no": 2.25,
+  "seen_trade_keys": [],
+  "seen_trade_key_times": {},
+  "bot_order_intent_attempts": {},
+  "bot_order_intent_signatures": {},
+  "open_orders": {},
+  "pair_total_fill_events": 0,
+  "pair_total_fill_shares": 0.0,
+  "pair_maker_fill_events": 0,
+  "pair_maker_fill_shares": 0.0,
+  "pair_taker_fill_events": 0,
+  "pair_taker_fill_shares": 0.0
+}

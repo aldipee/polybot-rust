@@ -1,0 +1,74 @@
+{
+  "daily_liquidity_state": {
+    "day_key_utc": "1970-01-01",
+    "maker_fill_shares": 0.0,
+    "taker_fill_shares": 0.0
+  },
+  "exit_reason": "REPLAY_COMPLETE",
+  "runtime_state": {
+    "audit_decision_event_count": 2,
+    "audit_runtime_event_count": 20,
+    "live_order_write_armed_once": false,
+    "owner": "OpenBoth",
+    "phase": "OpenBoth",
+    "safety_gate": "healthy",
+    "safety_gate_reason": "reconciliation_clean:reconnect"
+  },
+  "state": {
+    "bot_order_intent_attempts": {
+      "trade=trade_reconnect_reconciliation_mismatch|pair=reconnect_reconciliation_mismatch|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true": 1,
+      "trade=trade_reconnect_reconciliation_mismatch|pair=reconnect_reconciliation_mismatch|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true": 1
+    },
+    "bot_order_intent_signatures": {
+      "trade=trade_reconnect_reconciliation_mismatch|pair=reconnect_reconciliation_mismatch|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true": "trade=trade_reconnect_reconciliation_mismatch|pair=reconnect_reconciliation_mismatch|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true|price=0.42000000|size=3.00000000",
+      "trade=trade_reconnect_reconciliation_mismatch|pair=reconnect_reconciliation_mismatch|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true": "trade=trade_reconnect_reconciliation_mismatch|pair=reconnect_reconciliation_mismatch|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true|price=0.42000000|size=3.00000000"
+    },
+    "c_no": 0.0,
+    "c_yes": 0.0,
+    "open_orders": {
+      "no_asset_id": {
+        "kind": "maker",
+        "order_id": "SHADOW_INTENT_103000168229320209",
+        "price": 0.42,
+        "size": 3.0,
+        "submit_ts": 4.1,
+        "ts": 4.1
+      },
+      "yes_asset_id": {
+        "kind": "maker",
+        "order_id": "SHADOW_INTENT_13360663055018693052",
+        "price": 0.42,
+        "size": 3.0,
+        "submit_ts": 4.1,
+        "ts": 4.1
+      }
+    },
+    "pair_maker_fill_events": 0,
+    "pair_maker_fill_shares": 0.0,
+    "pair_taker_fill_events": 0,
+    "pair_taker_fill_shares": 0.0,
+    "pair_total_fill_events": 0,
+    "pair_total_fill_shares": 0.0,
+    "q_no": 0.0,
+    "q_yes": 0.0,
+    "seen_trade_key_times": {},
+    "seen_trade_keys": []
+  },
+  "trade_metrics": {
+    "condition_id": "cond_reconnect_reconciliation_mismatch",
+    "cpp": null,
+    "entry_reason": null,
+    "entry_time_iso": null,
+    "exit_reason": "REPLAY_COMPLETE",
+    "fill_count": 0,
+    "lp": 0.0,
+    "market_slug": "reconnect_reconciliation_mismatch",
+    "no_asset_id": "no_asset_id",
+    "pair_id": "reconnect_reconciliation_mismatch",
+    "q_no": 0.0,
+    "q_yes": 0.0,
+    "stop_loss_category": null,
+    "total_cost": 0.0,
+    "yes_asset_id": "yes_asset_id"
+  }
+}

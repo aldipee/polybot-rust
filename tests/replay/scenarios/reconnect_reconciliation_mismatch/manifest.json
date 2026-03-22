@@ -1,0 +1,15 @@
+{
+  "schema_version": "replay_v1",
+  "market_slug": "reconnect_reconciliation_mismatch",
+  "configured_order_mode": "shadow",
+  "state_file_name": "maker_hedgecap_state_reconnect_reconciliation_mismatch_shadow.json",
+  "trade_id": "trade_reconnect_reconciliation_mismatch",
+  "env_overrides": {},
+  "condition_id": "cond_reconnect_reconciliation_mismatch",
+  "yes_asset_id": "yes_asset_id",
+  "no_asset_id": "no_asset_id",
+  "market_start_ts": 2,
+  "market_expiry_ts": 302,
+  "start_ts_ns": 1000000000,
+  "end_ts_ns": 4800000000
+}

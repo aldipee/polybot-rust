@@ -1,0 +1,51 @@
+{
+  "daily_liquidity_state": {
+    "day_key_utc": "1970-01-01",
+    "maker_fill_shares": 0.0,
+    "taker_fill_shares": 0.0
+  },
+  "exit_reason": "AWAIT_SETTLEMENT",
+  "runtime_state": {
+    "audit_decision_event_count": 0,
+    "audit_runtime_event_count": 2,
+    "live_order_write_armed_once": false,
+    "owner": "AwaitSettlement",
+    "phase": "AwaitSettlement",
+    "safety_gate": "startup_reconciliation_pending",
+    "safety_gate_reason": "startup_reconciliation_pending"
+  },
+  "state": {
+    "bot_order_intent_attempts": {},
+    "bot_order_intent_signatures": {},
+    "c_no": 2.25,
+    "c_yes": 2.3,
+    "open_orders": {},
+    "pair_maker_fill_events": 0,
+    "pair_maker_fill_shares": 0.0,
+    "pair_taker_fill_events": 0,
+    "pair_taker_fill_shares": 0.0,
+    "pair_total_fill_events": 0,
+    "pair_total_fill_shares": 0.0,
+    "q_no": 5.0,
+    "q_yes": 5.0,
+    "seen_trade_key_times": {},
+    "seen_trade_keys": []
+  },
+  "trade_metrics": {
+    "condition_id": "cond_late_settlement_handoff",
+    "cpp": 0.9099999999999999,
+    "entry_reason": null,
+    "entry_time_iso": null,
+    "exit_reason": "AWAIT_SETTLEMENT",
+    "fill_count": 0,
+    "lp": 0.4500000000000002,
+    "market_slug": "late_settlement_handoff",
+    "no_asset_id": "no_asset_id",
+    "pair_id": "late_settlement_handoff",
+    "q_no": 5.0,
+    "q_yes": 5.0,
+    "stop_loss_category": null,
+    "total_cost": 4.55,
+    "yes_asset_id": "yes_asset_id"
+  }
+}

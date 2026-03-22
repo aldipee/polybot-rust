@@ -1,0 +1,72 @@
+{
+  "daily_liquidity_state": {
+    "day_key_utc": "1970-01-01",
+    "maker_fill_shares": 1.0,
+    "taker_fill_shares": 0.0
+  },
+  "exit_reason": "REPLAY_COMPLETE",
+  "runtime_state": {
+    "audit_decision_event_count": 2,
+    "audit_runtime_event_count": 17,
+    "live_order_write_armed_once": false,
+    "owner": "AwaitSecondFill",
+    "phase": "OpenBoth",
+    "safety_gate": "healthy",
+    "safety_gate_reason": "reconciliation_clean:recovery"
+  },
+  "state": {
+    "bot_order_intent_attempts": {
+      "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=no_asset_id|side=BUY|origin=BOT_AWAIT_SECOND_FILL|order_type=GTC|post_only=true": 1,
+      "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true": 1,
+      "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true": 1
+    },
+    "bot_order_intent_signatures": {
+      "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=no_asset_id|side=BUY|origin=BOT_AWAIT_SECOND_FILL|order_type=GTC|post_only=true": "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=no_asset_id|side=BUY|origin=BOT_AWAIT_SECOND_FILL|order_type=GTC|post_only=true|price=0.42000000|size=12.00000000",
+      "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true": "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true|price=0.42000000|size=3.00000000",
+      "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true": "trade=trade_one_side_lag_await_second_fill|pair=one_side_lag_await_second_fill|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true|price=0.42000000|size=3.00000000"
+    },
+    "c_no": 0.0,
+    "c_yes": 0.42,
+    "open_orders": {
+      "no_asset_id": {
+        "kind": "maker",
+        "order_id": "PAPER_INTENT_13653515372609028072",
+        "price": 0.42,
+        "size": 12.0,
+        "submit_ts": 2.61,
+        "ts": 2.61
+      }
+    },
+    "pair_maker_fill_events": 1,
+    "pair_maker_fill_shares": 1.0,
+    "pair_taker_fill_events": 0,
+    "pair_taker_fill_shares": 0.0,
+    "pair_total_fill_events": 1,
+    "pair_total_fill_shares": 1.0,
+    "q_no": 0.0,
+    "q_yes": 1.0,
+    "seen_trade_key_times": {
+      "paper:PAPER_INTENT_3148061185471920658:2600000000": 2.6
+    },
+    "seen_trade_keys": [
+      "paper:PAPER_INTENT_3148061185471920658:2600000000"
+    ]
+  },
+  "trade_metrics": {
+    "condition_id": "cond_one_side_lag_await_second_fill",
+    "cpp": null,
+    "entry_reason": "BOT_OPEN_BOTH",
+    "entry_time_iso": "1970-01-01T07:00:02+07:00",
+    "exit_reason": "REPLAY_COMPLETE",
+    "fill_count": 1,
+    "lp": -0.42,
+    "market_slug": "one_side_lag_await_second_fill",
+    "no_asset_id": "no_asset_id",
+    "pair_id": "one_side_lag_await_second_fill",
+    "q_no": 0.0,
+    "q_yes": 1.0,
+    "stop_loss_category": null,
+    "total_cost": 0.42,
+    "yes_asset_id": "yes_asset_id"
+  }
+}

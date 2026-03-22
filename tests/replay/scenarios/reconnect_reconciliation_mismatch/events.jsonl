@@ -1,0 +1,10 @@
+{"ts_ns":1000000000,"seq":0,"kind":"ws_open","payload":{"channel":"market"}}
+{"ts_ns":1050000000,"seq":1,"kind":"ws_open","payload":{"channel":"user"}}
+{"ts_ns":2100000000,"seq":2,"kind":"market_best_bid_ask","payload":{"asset_id":"yes_asset_id","best_ask":0.45,"best_bid":0.42,"event_type":"best_bid_ask"}}
+{"ts_ns":2110000000,"seq":3,"kind":"market_best_bid_ask","payload":{"asset_id":"no_asset_id","best_ask":0.45,"best_bid":0.42,"event_type":"best_bid_ask"}}
+{"ts_ns":2300000000,"seq":4,"kind":"user_order","payload":{"asset_id":"yes_asset_id","event_type":"order","id":"LIVE_ORDER_YES","order_id":"LIVE_ORDER_YES","original_size":5.0,"price":0.45,"remaining_size":5.0,"side":"BUY","size_matched":0.0,"status":"OPEN"}}
+{"ts_ns":3000000000,"seq":5,"kind":"ws_close","payload":{"channel":"market","code":1006,"message":"reconnect"}}
+{"ts_ns":4000000000,"seq":6,"kind":"reconcile_snapshot","payload":{"orders":[]}}
+{"ts_ns":4100000000,"seq":7,"kind":"ws_open","payload":{"channel":"market"}}
+{"ts_ns":4200000000,"seq":8,"kind":"market_best_bid_ask","payload":{"asset_id":"yes_asset_id","best_ask":0.45,"best_bid":0.42,"event_type":"best_bid_ask"}}
+{"ts_ns":4210000000,"seq":9,"kind":"market_best_bid_ask","payload":{"asset_id":"no_asset_id","best_ask":0.45,"best_bid":0.42,"event_type":"best_bid_ask"}}

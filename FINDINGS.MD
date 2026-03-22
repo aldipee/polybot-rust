@@ -11,6 +11,7 @@ Scope covered here:
 - `IMP-19` (`REQ-032`)
 - `IMP-20` (`REQ-033`)
 - `IMP-21` (`REQ-034`)
+- `IMP-23` (Section 10 replay certification)
 
 Status legend:
 
@@ -29,7 +30,8 @@ Status legend:
 | `IMP-19` | `REQ-032` | 35 | 34 | 1 | Fixed |
 | `IMP-20` | `REQ-033` | 5 | 5 | 0 | Fixed |
 | `IMP-21` | `REQ-034` | 12 | 12 | 0 | Fixed |
-| **Total** |  | **80** | **79** | **1** | **Fixed** |
+| `IMP-23` | Section 10 replay certification | 2 | 0 | 2 | Fixed |
+| **Total** |  | **82** | **79** | **3** | **Fixed** |
 
 ## IMP-13
 
@@ -146,9 +148,16 @@ Requirement mapping: `REQ-034`
 11. `P2` Pair-submit helper re-tracked refresh-capped no-op legs and erased their no-op marker. `Runtime`, `Fixed`
 12. `P2` Replacement user-order events could inherit `submit_ts` from a different order and weaken direct refresh throttling. `Runtime`, `Fixed`
 
+## IMP-23
+
+Requirement mapping: Section 10 replay certification
+
+1. `P1` Empty `initial_state/` replay fixture directories were not preserved on a clean clone because git does not track empty directories. `Test-only`, `Fixed`
+2. `P1` Replay certification fixture JSON files were still swallowed by the repo-wide `*.json` ignore rule, so required scenario bundles would disappear from normal commits and fresh clones. `Test-only`, `Fixed`
+
 ## Notes
 
 - This document records findings that were actually raised during implementation hardening, not hypothetical future risks.
 - `IMP-19` generated the largest follow-up volume because it introduced wallet-global shared state, multi-instance coordination, restart recovery, TTL cleanup, maker and taker reservation accounting, and local-to-shared state republish logic all at once.
 - `IMP-18` generated a second cluster of follow-up parity fixes because deterministic replay had to become self-contained across schedule metadata, settlement inputs, captured order IDs, trade identity, and machine-local env differences.
-- The only finding in this document that was not a runtime requirement gap was the shared-state test-isolation issue under `IMP-19`.
+- The non-runtime findings in this document are the shared-state test-isolation issue under `IMP-19` plus the replay certification fixture-portability issues under `IMP-23`.

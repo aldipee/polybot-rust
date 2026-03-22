@@ -1,0 +1,65 @@
+{
+  "daily_liquidity_state": {
+    "day_key_utc": "1970-01-01",
+    "maker_fill_shares": 2.0,
+    "taker_fill_shares": 0.0
+  },
+  "exit_reason": "REPLAY_COMPLETE",
+  "runtime_state": {
+    "audit_decision_event_count": 3,
+    "audit_runtime_event_count": 19,
+    "live_order_write_armed_once": false,
+    "owner": "PairBuild",
+    "phase": "OpenBoth",
+    "safety_gate": "healthy",
+    "safety_gate_reason": "reconciliation_clean:recovery"
+  },
+  "state": {
+    "bot_order_intent_attempts": {
+      "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=no_asset_id|side=BUY|origin=BOT_AWAIT_SECOND_FILL|order_type=GTC|post_only=true": 1,
+      "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true": 1,
+      "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true": 1
+    },
+    "bot_order_intent_signatures": {
+      "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=no_asset_id|side=BUY|origin=BOT_AWAIT_SECOND_FILL|order_type=GTC|post_only=true": "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=no_asset_id|side=BUY|origin=BOT_AWAIT_SECOND_FILL|order_type=GTC|post_only=true|price=0.34000000|size=12.00000000",
+      "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true": "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=no_asset_id|side=BUY|origin=BOT_OPEN_BOTH_NO|order_type=GTC|post_only=true|price=0.42000000|size=3.00000000",
+      "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true": "trade=trade_good_open_paired_seed|pair=good_open_paired_seed|asset=yes_asset_id|side=BUY|origin=BOT_OPEN_BOTH_YES|order_type=GTC|post_only=true|price=0.42000000|size=3.00000000"
+    },
+    "c_no": 0.34,
+    "c_yes": 0.42,
+    "open_orders": {},
+    "pair_maker_fill_events": 2,
+    "pair_maker_fill_shares": 2.0,
+    "pair_taker_fill_events": 0,
+    "pair_taker_fill_shares": 0.0,
+    "pair_total_fill_events": 2,
+    "pair_total_fill_shares": 2.0,
+    "q_no": 1.0,
+    "q_yes": 1.0,
+    "seen_trade_key_times": {
+      "paper:PAPER_INTENT_5663297198042367108:2600000000": 2.6,
+      "paper:PAPER_INTENT_9200746833896246091:3100000000": 3.1
+    },
+    "seen_trade_keys": [
+      "paper:PAPER_INTENT_5663297198042367108:2600000000",
+      "paper:PAPER_INTENT_9200746833896246091:3100000000"
+    ]
+  },
+  "trade_metrics": {
+    "condition_id": "cond_good_open_paired_seed",
+    "cpp": 0.76,
+    "entry_reason": "BOT_OPEN_BOTH",
+    "entry_time_iso": "1970-01-01T07:00:02+07:00",
+    "exit_reason": "REPLAY_COMPLETE",
+    "fill_count": 2,
+    "lp": 0.24,
+    "market_slug": "good_open_paired_seed",
+    "no_asset_id": "no_asset_id",
+    "pair_id": "good_open_paired_seed",
+    "q_no": 1.0,
+    "q_yes": 1.0,
+    "stop_loss_category": null,
+    "total_cost": 0.76,
+    "yes_asset_id": "yes_asset_id"
+  }
+}

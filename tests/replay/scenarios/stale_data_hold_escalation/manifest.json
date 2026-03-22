@@ -1,0 +1,15 @@
+{
+  "schema_version": "replay_v1",
+  "market_slug": "stale_data_hold_escalation",
+  "configured_order_mode": "paper",
+  "state_file_name": "maker_hedgecap_state_stale_data_hold_escalation_paper.json",
+  "trade_id": "trade_stale_data_hold_escalation",
+  "env_overrides": {},
+  "condition_id": "cond_stale_data_hold_escalation",
+  "yes_asset_id": "yes_asset_id",
+  "no_asset_id": "no_asset_id",
+  "market_start_ts": 2,
+  "market_expiry_ts": 302,
+  "start_ts_ns": 1000000000,
+  "end_ts_ns": 8000000000
+}

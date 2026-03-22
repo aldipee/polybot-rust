@@ -1,0 +1,14 @@
+{
+  "market_slug": "late_settlement_handoff",
+  "symbol": "yes_asset_id/usd",
+  "asset_id": "yes_asset_id",
+  "resolution_ts_ms": 101000,
+  "source_ts_ms": 101000,
+  "resolution_price": 1.0,
+  "resolution_value": 1.0,
+  "capture_mode": "replay_fixture",
+  "price_to_beat": 0.5,
+  "diff_vs_price_to_beat": 0.5,
+  "diff_vs_price_to_beat_percentage": 100.0,
+  "captured_at_ms": 101500
+}

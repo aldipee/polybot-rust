@@ -1,0 +1,15 @@
+{
+  "schema_version": "replay_v1",
+  "market_slug": "one_side_lag_await_second_fill",
+  "configured_order_mode": "paper",
+  "state_file_name": "maker_hedgecap_state_one_side_lag_await_second_fill_paper.json",
+  "trade_id": "trade_one_side_lag_await_second_fill",
+  "env_overrides": {},
+  "condition_id": "cond_one_side_lag_await_second_fill",
+  "yes_asset_id": "yes_asset_id",
+  "no_asset_id": "no_asset_id",
+  "market_start_ts": 2,
+  "market_expiry_ts": 302,
+  "start_ts_ns": 1000000000,
+  "end_ts_ns": 4000000000
+}
