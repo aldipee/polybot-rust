@@ -329,12 +329,31 @@ impl MakerHedgeCapBot {
         false
     }
 
+    fn _bot_runtime_gross_reservation_refresh_interval_seconds(&self) -> f64 {
+        (self.cfg.gross_cap_shared_state_ttl_seconds / 3.0).clamp(0.5, 5.0)
+    }
+
+    pub(in crate::bot) fn _bot_runtime_refresh_shared_gross_state(
+        &self,
+        now: f64,
+        last_reservation_refresh_ts: &mut f64,
+    ) {
+        let _ = self._refresh_shared_gross_trade_snapshot();
+        let refresh_interval = self._bot_runtime_gross_reservation_refresh_interval_seconds();
+        let refresh_due = *last_reservation_refresh_ts <= 0.0
+            || now - *last_reservation_refresh_ts >= refresh_interval;
+        if refresh_due && self._republish_shared_gross_reservations_from_local_state() {
+            *last_reservation_refresh_ts = now;
+        }
+    }
+
     /// Returns or derives run BOT runtime loop for the active BOT execution path.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
     /// active market.
 
     pub(in crate::bot) fn _run_bot_runtime_loop(&self) -> String {
         let mut last_log = 0.0;
+        let mut last_gross_reservation_refresh = 0.0;
         let mut stale_stage_logged = BotRuntimeMarketDataStaleStage::Fresh;
         let pair_id = self.pair_identity().pair_id;
         self.logger.info(&format!(
@@ -346,6 +365,7 @@ impl MakerHedgeCapBot {
             thread::sleep(Duration::from_secs_f64(wait_s.min(0.5)));
             let now = now_ts_f64();
             self._bot_runtime_refresh_daily_liquidity_counters();
+            self._bot_runtime_refresh_shared_gross_state(now, &mut last_gross_reservation_refresh);
             let t_into_s = now - self.start_ts as f64;
             let seconds_left = self.expiry_ts as f64 - now;
             let (total_cost, qy, qn, cost_yes, cost_no) = self

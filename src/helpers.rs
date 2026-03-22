@@ -437,6 +437,7 @@ pub struct OpenOrderState {
     pub size: Option<f64>,
     pub ts: Option<f64>,
     pub submit_ts: Option<f64>,
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +496,11 @@ impl BotState {
                     if !matches!(order.submit_ts, Some(ts) if ts.is_finite() && ts > 0.0) {
                         order.submit_ts = order.ts;
                     }
+                    order.kind = order
+                        .kind
+                        .as_ref()
+                        .map(|value| value.trim().to_ascii_lowercase())
+                        .filter(|value| matches!(value.as_str(), "maker" | "taker"));
                 }
                 keep
             });
@@ -1050,6 +1056,261 @@ pub fn save_shared_pending_taker_state(
     fs::write(state_file, raw).with_context(|| {
         format!(
             "failed writing shared pending taker state {}",
+            state_file.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SharedGrossTradeSnapshot {
+    pub trade_id: String,
+    pub pair_id: String,
+    pub instance_key: String,
+    pub gross_filled_cost: f64,
+    pub updated_ts: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SharedGrossOrderReservation {
+    pub order_id: String,
+    pub trade_id: String,
+    pub pair_id: String,
+    pub asset_id: String,
+    pub origin: String,
+    pub side: String,
+    pub price: f64,
+    pub size: f64,
+    pub applied_size: f64,
+    pub kind: String,
+    pub updated_ts: f64,
+}
+
+impl SharedGrossOrderReservation {
+    pub fn remaining_size(&self) -> f64 {
+        (self.size.max(0.0) - self.applied_size.max(0.0)).max(0.0)
+    }
+
+    pub fn remaining_gross(&self) -> f64 {
+        if self.side.eq_ignore_ascii_case("BUY") {
+            self.price.max(0.0) * self.remaining_size()
+        } else {
+            0.0
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SharedGrossExposureState {
+    pub live_trades: HashMap<String, SharedGrossTradeSnapshot>,
+    pub pending_orders: HashMap<String, SharedGrossOrderReservation>,
+}
+
+impl SharedGrossExposureState {
+    pub fn normalize(&mut self, ttl_seconds: f64) -> bool {
+        let ttl = ttl_seconds.max(0.1);
+        let now = helper_now_ts_f64();
+        let mut changed = false;
+        let before_trades = self.live_trades.len();
+        self.live_trades.retain(|trade_id, snapshot| {
+            let valid = !trade_id.trim().is_empty()
+                && !snapshot.trade_id.trim().is_empty()
+                && !snapshot.pair_id.trim().is_empty()
+                && snapshot.gross_filled_cost.is_finite()
+                && snapshot.gross_filled_cost >= 0.0
+                && snapshot.updated_ts.is_finite()
+                && snapshot.updated_ts > 0.0
+                && now - snapshot.updated_ts <= ttl;
+            changed |= !valid;
+            valid
+        });
+        changed |= before_trades != self.live_trades.len();
+
+        let before_orders = self.pending_orders.len();
+        self.pending_orders.retain(|order_id, reservation| {
+            let valid = !order_id.trim().is_empty()
+                && !reservation.order_id.trim().is_empty()
+                && !reservation.trade_id.trim().is_empty()
+                && !reservation.pair_id.trim().is_empty()
+                && !reservation.asset_id.trim().is_empty()
+                && reservation.price.is_finite()
+                && reservation.price >= 0.0
+                && reservation.size.is_finite()
+                && reservation.size >= 0.0
+                && reservation.applied_size.is_finite()
+                && reservation.applied_size >= 0.0
+                && reservation.updated_ts.is_finite()
+                && reservation.updated_ts > 0.0
+                && now - reservation.updated_ts <= ttl
+                && reservation.remaining_size() > 1e-9
+                && reservation.remaining_gross().is_finite();
+            changed |= !valid;
+            valid
+        });
+        changed |= before_orders != self.pending_orders.len();
+        changed
+    }
+
+    pub fn upsert_trade_snapshot(
+        &mut self,
+        trade_id: &str,
+        pair_id: &str,
+        instance_key: &str,
+        gross_filled_cost: f64,
+        updated_ts: f64,
+    ) {
+        let trade_id = trade_id.trim();
+        let pair_id = pair_id.trim();
+        if trade_id.is_empty()
+            || pair_id.is_empty()
+            || !gross_filled_cost.is_finite()
+            || gross_filled_cost < 0.0
+            || !updated_ts.is_finite()
+            || updated_ts <= 0.0
+        {
+            return;
+        }
+        self.live_trades.insert(
+            trade_id.to_string(),
+            SharedGrossTradeSnapshot {
+                trade_id: trade_id.to_string(),
+                pair_id: pair_id.to_string(),
+                instance_key: instance_key.trim().to_string(),
+                gross_filled_cost,
+                updated_ts,
+            },
+        );
+    }
+
+    pub fn forget_trade_snapshot(&mut self, trade_id: &str) {
+        self.live_trades.remove(trade_id.trim());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn remember_order(
+        &mut self,
+        order_id: &str,
+        trade_id: &str,
+        pair_id: &str,
+        asset_id: &str,
+        origin: &str,
+        side: &str,
+        price: f64,
+        size: f64,
+        applied_size: f64,
+        kind: &str,
+        updated_ts: f64,
+    ) {
+        let order_id = order_id.trim();
+        let trade_id = trade_id.trim();
+        let pair_id = pair_id.trim();
+        let asset_id = asset_id.trim();
+        if order_id.is_empty()
+            || trade_id.is_empty()
+            || pair_id.is_empty()
+            || asset_id.is_empty()
+            || !price.is_finite()
+            || price < 0.0
+            || !size.is_finite()
+            || size <= 0.0
+            || !applied_size.is_finite()
+            || applied_size < 0.0
+            || !updated_ts.is_finite()
+            || updated_ts <= 0.0
+        {
+            return;
+        }
+        self.pending_orders.insert(
+            order_id.to_string(),
+            SharedGrossOrderReservation {
+                order_id: order_id.to_string(),
+                trade_id: trade_id.to_string(),
+                pair_id: pair_id.to_string(),
+                asset_id: asset_id.to_string(),
+                origin: origin.trim().to_string(),
+                side: side.trim().to_ascii_uppercase(),
+                price,
+                size,
+                applied_size: applied_size.min(size).max(0.0),
+                kind: kind.trim().to_ascii_lowercase(),
+                updated_ts,
+            },
+        );
+    }
+
+    pub fn set_order_applied(&mut self, order_id: &str, applied_size: f64, updated_ts: f64) {
+        if let Some(order) = self.pending_orders.get_mut(order_id.trim()) {
+            if applied_size.is_finite()
+                && applied_size >= 0.0
+                && updated_ts.is_finite()
+                && updated_ts > 0.0
+            {
+                order.applied_size = applied_size.min(order.size).max(order.applied_size);
+                order.updated_ts = updated_ts;
+            }
+        }
+    }
+
+    pub fn add_order_applied(&mut self, order_id: &str, delta: f64, updated_ts: f64) {
+        if let Some(order) = self.pending_orders.get_mut(order_id.trim()) {
+            if delta.is_finite() && delta > 0.0 && updated_ts.is_finite() && updated_ts > 0.0 {
+                order.applied_size = (order.applied_size + delta).min(order.size).max(0.0);
+                order.updated_ts = updated_ts;
+            }
+        }
+    }
+
+    pub fn forget_order(&mut self, order_id: &str) {
+        self.pending_orders.remove(order_id.trim());
+    }
+}
+
+pub fn load_shared_gross_exposure_state(
+    state_file: &Path,
+    ttl_seconds: f64,
+) -> Result<SharedGrossExposureState> {
+    if state_file.exists() {
+        let raw = fs::read_to_string(state_file).with_context(|| {
+            format!(
+                "failed reading shared gross exposure state {}",
+                state_file.display()
+            )
+        })?;
+        let mut state: SharedGrossExposureState =
+            serde_json::from_str(&raw).with_context(|| {
+                format!(
+                    "failed parsing shared gross exposure state {}",
+                    state_file.display()
+                )
+            })?;
+        state.normalize(ttl_seconds);
+        return Ok(state);
+    }
+    Ok(SharedGrossExposureState::default())
+}
+
+pub fn save_shared_gross_exposure_state(
+    state_file: &Path,
+    state: &mut SharedGrossExposureState,
+) -> Result<()> {
+    if let Some(parent) = state_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed creating shared gross exposure state dir {}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    state.normalize(f64::INFINITY);
+    let raw = serde_json::to_string_pretty(state)?;
+    fs::write(state_file, raw).with_context(|| {
+        format!(
+            "failed writing shared gross exposure state {}",
             state_file.display()
         )
     })?;

@@ -10,6 +10,12 @@ pub(in crate::bot) enum MakerDirectRefreshDecision {
     },
 }
 
+#[derive(Debug, Clone, Default)]
+struct MakerPairGrossPreview {
+    requested_gross_usd: f64,
+    replace_order_ids: Vec<String>,
+}
+
 fn maker_refresh_family(origin: &str) -> Option<&'static str> {
     let trimmed = origin.trim();
     if trimmed.starts_with("BOT_OPEN_BOTH") {
@@ -33,6 +39,153 @@ fn maker_refresh_families_match(left: &str, right: &str) -> bool {
 }
 
 impl MakerHedgeCapBot {
+    fn _order_is_known_taker_buy(&self, order_id: &str, asset_id: &str) -> bool {
+        let order_id = order_id.trim();
+        let asset_id = asset_id.trim();
+        if order_id.is_empty() || asset_id.is_empty() {
+            return false;
+        }
+        self._get_order_execution_context(order_id)
+            .as_ref()
+            .and_then(|ctx| ctx.get("liquidity_intent").and_then(|value| value.as_str()))
+            .map(|value| value.eq_ignore_ascii_case("taker_exception"))
+            .unwrap_or(false)
+            || self
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| state.open_orders.get(asset_id).cloned())
+                .filter(|entry| entry.order_id.as_deref() == Some(order_id))
+                .and_then(|entry| entry.kind)
+                .map(|kind| kind.eq_ignore_ascii_case("taker"))
+                .unwrap_or(false)
+            || self._shared_pending_taker_order_exists(order_id)
+            || self
+                ._shared_gross_order_reservation_snapshot(order_id)
+                .map(|reservation| reservation.kind.eq_ignore_ascii_case("taker"))
+                .unwrap_or(false)
+    }
+
+    fn _maker_pair_gross_preview_gtc_leg(
+        &self,
+        asset_id: &str,
+        price: f64,
+        size: f64,
+        origin: &str,
+        now: f64,
+    ) -> MakerPairGrossPreview {
+        if asset_id.trim().is_empty()
+            || !price.is_finite()
+            || price <= 0.0
+            || !size.is_finite()
+            || size <= 0.0
+        {
+            return MakerPairGrossPreview::default();
+        }
+
+        if !self._maker_single_inflight_enabled() {
+            let direct_refresh_decision =
+                self._bot_runtime_direct_refresh_preview(asset_id, origin, now);
+            return match direct_refresh_decision {
+                MakerDirectRefreshDecision::Blocked { .. } => MakerPairGrossPreview::default(),
+                MakerDirectRefreshDecision::Started(_) => MakerPairGrossPreview {
+                    requested_gross_usd: price * size,
+                    replace_order_ids: Vec::new(),
+                },
+                MakerDirectRefreshDecision::Initial => MakerPairGrossPreview {
+                    requested_gross_usd: price * size,
+                    replace_order_ids: Vec::new(),
+                },
+            };
+        }
+
+        self._maker_order_reconcile_asset(asset_id, Some(price));
+        let key = MakerOrderKey::buy(asset_id);
+        let mut slot = self._maker_order_slot_get(&key);
+        let submit_ttl = self._maker_submit_pending_ttl_seconds();
+        let cancel_ttl = self._maker_cancel_pending_ttl_seconds();
+        let reject_cooldown = self._maker_submit_reject_cooldown_seconds();
+        let replace_min = self._maker_replace_min_interval_seconds();
+        let stale = env_int("STALE_SECONDS", self.cfg.stale_seconds).max(1) as f64;
+        let replace_ticks = env_int(
+            "REPLACE_IF_PRICE_MOVES_TICKS",
+            self.cfg.replace_if_price_moves_ticks,
+        ) as f64;
+
+        if slot.state == MakerOrderLifecycle::SubmitPending
+            && now - slot.last_submit_ts < submit_ttl
+        {
+            return MakerPairGrossPreview::default();
+        }
+        if slot.state == MakerOrderLifecycle::CancelPending
+            && now - slot.last_cancel_ts < cancel_ttl
+        {
+            return MakerPairGrossPreview::default();
+        }
+        if slot.order_id.is_none()
+            && slot.state == MakerOrderLifecycle::Idle
+            && reject_cooldown > 0.0
+            && slot.last_reject_ts > 0.0
+        {
+            let max_reject_cooldown =
+                env_float("MAKER_SUBMIT_REJECT_MAX_COOLDOWN_SECONDS", 60.0).max(reject_cooldown);
+            let effective_cooldown = maker_order_effective_reject_cooldown_seconds(
+                origin,
+                &slot,
+                reject_cooldown,
+                max_reject_cooldown,
+            );
+            if now - slot.last_reject_ts < effective_cooldown {
+                return MakerPairGrossPreview::default();
+            }
+        }
+        if slot.state != MakerOrderLifecycle::Working
+            && slot.state != MakerOrderLifecycle::Idle
+            && now - slot.last_submit_ts >= submit_ttl
+            && now - slot.last_cancel_ts >= cancel_ttl
+        {
+            slot.state = MakerOrderLifecycle::Idle;
+            slot.order_id = None;
+            slot.replace_target = None;
+        }
+
+        if slot.state == MakerOrderLifecycle::Working {
+            let Some(_) = slot.order_id.clone() else {
+                return MakerPairGrossPreview::default();
+            };
+            let old_price = slot.price.max(0.0);
+            let old_size = slot.remaining.max(slot.size).max(0.0);
+            let age = (now - slot.last_submit_ts).max(0.0);
+            let moved_ticks = (price - old_price).abs() / self.cfg.tick.max(0.0001);
+            let size_changed = old_size <= 0.0
+                || (size - old_size).abs() >= (0.25 * old_size).max(self.cfg.min_shares);
+            if age < stale && moved_ticks < replace_ticks && !size_changed {
+                return MakerPairGrossPreview::default();
+            }
+            let same_refresh_family = maker_refresh_families_match(slot.origin.as_str(), origin);
+            let refresh_capped_handoff = self._bot_runtime_origin_is_refresh_capped(&slot.origin)
+                && self._bot_runtime_origin_is_refresh_capped(origin);
+            if refresh_capped_handoff {
+                if let Some(side) = self._maker_side_for_asset_id(asset_id) {
+                    if self
+                        ._bot_runtime_refresh_cycle_block_reason_peek(side, origin, now)
+                        .is_some()
+                    {
+                        return MakerPairGrossPreview::default();
+                    }
+                }
+            } else if !same_refresh_family && now - slot.last_cancel_ts < replace_min {
+                return MakerPairGrossPreview::default();
+            }
+            return MakerPairGrossPreview::default();
+        }
+
+        MakerPairGrossPreview {
+            requested_gross_usd: price * size,
+            replace_order_ids: Vec::new(),
+        }
+    }
+
     fn _bot_runtime_refresh_cancel_is_protective(reason: &str) -> bool {
         let lower = reason.trim().to_ascii_lowercase();
         lower.contains("stale") || lower.contains("invalid") || lower.contains("broken")
@@ -118,11 +271,10 @@ impl MakerHedgeCapBot {
         maker_refresh_family(origin).is_some()
     }
 
-    fn _bot_runtime_refresh_cycle_block_reason(
+    fn _bot_runtime_refresh_cycle_block_reason_peek(
         &self,
         side: OutcomeSide,
         origin: &str,
-        reason: &str,
         now: f64,
     ) -> Option<String> {
         let cap_seconds = self._maker_replace_min_interval_seconds();
@@ -143,21 +295,28 @@ impl MakerHedgeCapBot {
                 )
             })
             .unwrap_or((0.0, String::new()));
-        if last_cycle_started_ts <= 0.0 {
-            return None;
-        }
-        if last_cycle_origin.trim().is_empty() {
+        if last_cycle_started_ts <= 0.0 || last_cycle_origin.trim().is_empty() {
             return None;
         }
         let elapsed = (now - last_cycle_started_ts).max(0.0);
         if elapsed + 1e-9 >= cap_seconds {
             return None;
         }
-        let block_reason = format!(
+        Some(format!(
             "refresh_cadence_cap:{}:{:.2}",
             side.as_str(),
             (cap_seconds - elapsed).max(0.0)
-        );
+        ))
+    }
+
+    fn _bot_runtime_refresh_cycle_block_reason(
+        &self,
+        side: OutcomeSide,
+        origin: &str,
+        reason: &str,
+        now: f64,
+    ) -> Option<String> {
+        let block_reason = self._bot_runtime_refresh_cycle_block_reason_peek(side, origin, now)?;
         if let Ok(mut state) = self.bot_runtime_state.lock() {
             let refresh_state = Self::_bot_runtime_refresh_cycle_state_mut(&mut state, side);
             refresh_state.last_origin = origin.trim().to_string();
@@ -470,6 +629,117 @@ impl MakerHedgeCapBot {
         MakerDirectRefreshDecision::Started(side)
     }
 
+    fn _bot_runtime_direct_refresh_preview(
+        &self,
+        asset_id: &str,
+        origin: &str,
+        now: f64,
+    ) -> MakerDirectRefreshDecision {
+        if self._maker_single_inflight_enabled()
+            || !self._bot_runtime_origin_is_refresh_capped(origin)
+        {
+            return MakerDirectRefreshDecision::Initial;
+        }
+        let Some(side) = self._maker_side_for_asset_id(asset_id) else {
+            return MakerDirectRefreshDecision::Initial;
+        };
+        let current = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.open_orders.get(asset_id).cloned());
+        let Some(current_order) = current else {
+            return MakerDirectRefreshDecision::Initial;
+        };
+        let Some(existing_order_id) = current_order.order_id.clone() else {
+            return MakerDirectRefreshDecision::Initial;
+        };
+        let Some(existing_ctx) = self._get_order_execution_context(existing_order_id.as_str())
+        else {
+            let recent_submit_ts = current_order.submit_ts.unwrap_or(0.0);
+            let cap_seconds = self._maker_replace_min_interval_seconds();
+            if recent_submit_ts > 0.0 && cap_seconds > 0.0 {
+                let elapsed = (now - recent_submit_ts).max(0.0);
+                if elapsed + 1e-9 < cap_seconds {
+                    return MakerDirectRefreshDecision::Blocked {
+                        existing_order_id,
+                        reason: format!(
+                            "refresh_cadence_cap:{}:{:.2}",
+                            side.as_str(),
+                            (cap_seconds - elapsed).max(0.0)
+                        ),
+                    };
+                }
+                return MakerDirectRefreshDecision::Started(side);
+            }
+            return MakerDirectRefreshDecision::Initial;
+        };
+        if existing_ctx
+            .get("direct_cancel_requested")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return MakerDirectRefreshDecision::Initial;
+        }
+        let existing_origin = existing_ctx
+            .get("origin")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let existing_side = existing_ctx
+            .get("side")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        if existing_side != "BUY"
+            || !self._bot_runtime_origin_is_refresh_capped(existing_origin.as_str())
+        {
+            return MakerDirectRefreshDecision::Initial;
+        }
+        if !maker_refresh_families_match(existing_origin.as_str(), origin) {
+            let recent_submit_ts = existing_ctx
+                .get("order_submit_ts")
+                .and_then(|value| value.as_f64())
+                .or_else(|| {
+                    existing_ctx
+                        .get("decision_ts")
+                        .and_then(|value| value.as_f64())
+                })
+                .or_else(|| {
+                    existing_ctx
+                        .get("post_start_ts")
+                        .and_then(|value| value.as_f64())
+                })
+                .unwrap_or(0.0);
+            let cap_seconds = self._maker_replace_min_interval_seconds();
+            if recent_submit_ts > 0.0 && cap_seconds > 0.0 {
+                let elapsed = (now - recent_submit_ts).max(0.0);
+                if elapsed + 1e-9 < cap_seconds {
+                    return MakerDirectRefreshDecision::Blocked {
+                        existing_order_id,
+                        reason: format!(
+                            "refresh_cadence_cap:{}:{:.2}",
+                            side.as_str(),
+                            (cap_seconds - elapsed).max(0.0)
+                        ),
+                    };
+                }
+            }
+            return MakerDirectRefreshDecision::Initial;
+        }
+        if let Some(block_reason) =
+            self._bot_runtime_refresh_cycle_block_reason_peek(side, origin, now)
+        {
+            return MakerDirectRefreshDecision::Blocked {
+                existing_order_id,
+                reason: block_reason,
+            };
+        }
+        MakerDirectRefreshDecision::Started(side)
+    }
+
     /// Implements reconcile inferred origin for the maker-side BOT workflow.
     /// This reads bot-owned state, cached data, or exchange metadata for the active BOT
     /// runtime.
@@ -589,6 +859,7 @@ impl MakerHedgeCapBot {
         if let Ok(mut idx) = self.maker_order_index.lock() {
             idx.remove(order_id);
         }
+        self._forget_shared_gross_order_reservation(order_id);
     }
 
     /// Implements order on submit ack for the maker-side BOT workflow.
@@ -602,9 +873,9 @@ impl MakerHedgeCapBot {
         price: f64,
         size: f64,
         origin: &str,
-    ) {
+    ) -> bool {
         if !self._maker_single_inflight_enabled() || order_id.trim().is_empty() {
-            return;
+            return false;
         }
         let trimmed_oid = order_id.trim();
         let trimmed_origin = origin.trim();
@@ -660,6 +931,7 @@ impl MakerHedgeCapBot {
                         size: Some(size.max(0.0)),
                         ts: Some(now),
                         submit_ts: Some(now),
+                        kind: Some("maker".to_string()),
                     },
                 );
                 let _ = self._bot_runtime_save_state_or_dependency_pause(
@@ -667,7 +939,36 @@ impl MakerHedgeCapBot {
                     "maker_order_track_submit",
                 );
             }
+            if !self.cfg.dry_run
+                && !self._remember_shared_gross_order_reservation(
+                    order_id,
+                    key.asset_id.as_str(),
+                    key.side.as_str(),
+                    price,
+                    size.max(0.0),
+                    origin,
+                    "maker",
+                )
+            {
+                let _ = self._cancel(order_id);
+                if let Ok(mut s) = self.state.lock() {
+                    let should_remove = s
+                        .open_orders
+                        .get(&key.asset_id)
+                        .and_then(|order| order.order_id.as_deref())
+                        == Some(order_id);
+                    if should_remove {
+                        s.open_orders.remove(&key.asset_id);
+                        let _ = self._bot_runtime_save_state_or_dependency_pause(
+                            &mut s,
+                            "maker_order_submit_ack_gross_order_remember_failed",
+                        );
+                    }
+                }
+                return false;
+            }
         }
+        true
     }
 
     /// Implements order on submit reject for the maker-side BOT workflow.
@@ -856,11 +1157,16 @@ impl MakerHedgeCapBot {
 
         if let Some(order) = keep_order {
             let oid = self._extract_order_id(&order).unwrap_or_default();
+            if self._order_is_known_taker_buy(oid.as_str(), aid.as_str()) {
+                return;
+            }
             let price = self._extract_order_price(&order);
             let remaining = self._extract_order_remaining_size(&order).max(0.0);
             let size = remaining.max(0.0);
             let reconcile_origin = self._maker_reconcile_inferred_origin(&key);
-            self._maker_order_on_submit_ack(&oid, &key, price, size, &reconcile_origin);
+            if !self._maker_order_on_submit_ack(&oid, &key, price, size, &reconcile_origin) {
+                return;
+            }
             if max_active == 1 {
                 for o in buy_orders {
                     let Some(oid2) = self._extract_order_id(&o) else {
@@ -951,6 +1257,13 @@ impl MakerHedgeCapBot {
             .unwrap_or("")
             .trim()
             .to_string();
+        let known_taker_buy = key_from_index.is_none()
+            && side == "BUY"
+            && !msg_asset_id.is_empty()
+            && self._order_is_known_taker_buy(oid.as_str(), msg_asset_id.as_str());
+        if known_taker_buy {
+            return;
+        }
         let key = if let Some(k) = key_from_index {
             k
         } else {
@@ -1105,6 +1418,7 @@ impl MakerHedgeCapBot {
                         size: Some(remaining),
                         ts: Some(now_ts_f64()),
                         submit_ts,
+                        kind: Some("maker".to_string()),
                     },
                 );
                 let _ = self._bot_runtime_save_state_or_dependency_pause(
@@ -1126,16 +1440,29 @@ impl MakerHedgeCapBot {
         size: f64,
         origin: &str,
     ) -> Option<String> {
+        self._maker_order_upsert_gtc_internal(key, price, size, origin, false)
+    }
+
+    pub(super) fn _maker_order_upsert_gtc_internal(
+        &self,
+        key: &MakerOrderKey,
+        price: f64,
+        size: f64,
+        origin: &str,
+        gross_cap_preapproved: bool,
+    ) -> Option<String> {
         if key.asset_id.trim().is_empty() || key.side != "BUY" {
             return None;
         }
         if !self._maker_single_inflight_enabled() {
-            return self._place_limit_bid_gtc_with_origin(
+            return self._place_limit_bid_gtc_with_origin_internal(
                 &key.asset_id,
                 price,
                 size,
                 Some(true),
                 origin,
+                gross_cap_preapproved,
+                true,
             );
         }
 
@@ -1309,15 +1636,81 @@ impl MakerHedgeCapBot {
             s.remaining = target_size.max(0.0);
             s.origin = target_origin.clone();
         }
-        let oid = self._place_limit_bid_gtc_with_origin(
+        let gross_snapshot = if target_origin.starts_with("BOT_") && !gross_cap_preapproved {
+            let replace_order_ids = slot.order_id.clone().into_iter().collect::<Vec<_>>();
+            match self._gross_cap_snapshot(target_price * target_size, &replace_order_ids) {
+                Ok(snapshot) => {
+                    if let Some(reason) = snapshot.block_reason() {
+                        self._gross_cap_reject_submit(
+                            reason,
+                            key.asset_id.as_str(),
+                            "BUY",
+                            target_origin.as_str(),
+                            snapshot,
+                        );
+                        if let Ok(mut slots) = self.maker_order_slots.lock() {
+                            if let Some(s) = slots.get_mut(key) {
+                                s.state = slot.state;
+                                s.order_id = slot.order_id.clone();
+                                s.price = slot.price;
+                                s.size = slot.size;
+                                s.remaining = slot.remaining;
+                                s.last_submit_ts = slot.last_submit_ts;
+                                s.last_cancel_ts = slot.last_cancel_ts;
+                                s.origin = slot.origin.clone();
+                                s.replace_target = None;
+                            }
+                        }
+                        return None;
+                    }
+                    Some(snapshot)
+                }
+                Err(err) => {
+                    self._gross_cap_shared_state_error(
+                        "maker_single_inflight_submit_gate",
+                        err.as_str(),
+                    );
+                    if let Ok(mut slots) = self.maker_order_slots.lock() {
+                        if let Some(s) = slots.get_mut(key) {
+                            s.state = slot.state;
+                            s.order_id = slot.order_id.clone();
+                            s.price = slot.price;
+                            s.size = slot.size;
+                            s.remaining = slot.remaining;
+                            s.last_submit_ts = slot.last_submit_ts;
+                            s.last_cancel_ts = slot.last_cancel_ts;
+                            s.origin = slot.origin.clone();
+                            s.replace_target = None;
+                        }
+                    }
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let oid = self._place_limit_bid_gtc_with_origin_internal(
             &key.asset_id,
             target_price,
             target_size,
             Some(true),
             &target_origin,
+            gross_cap_preapproved,
+            false,
         );
         if let Some(oid) = oid {
-            self._maker_order_on_submit_ack(&oid, key, target_price, target_size, &target_origin);
+            if !self._maker_order_on_submit_ack(
+                &oid,
+                key,
+                target_price,
+                target_size,
+                &target_origin,
+            ) {
+                return None;
+            }
+            if let Some(snapshot) = gross_snapshot {
+                self._gross_cap_record_order_context(&oid, snapshot);
+            }
             return Some(oid);
         }
         self._maker_order_on_submit_reject(key, &target_origin, "post_order returned no oid");
@@ -1723,32 +2116,129 @@ impl MakerHedgeCapBot {
         if y_qty <= 0.0 || n_qty <= 0.0 {
             return (None, None);
         }
-        let (y_oid, n_oid) = if resolved == "GTC" {
+        let (yes_pair_preview, no_pair_preview) = if resolved == "GTC" {
+            (
+                self._maker_pair_gross_preview_gtc_leg(
+                    yes,
+                    y_px,
+                    y_qty,
+                    &format!("{origin}_YES"),
+                    decide_ts,
+                ),
+                self._maker_pair_gross_preview_gtc_leg(
+                    no,
+                    n_px,
+                    n_qty,
+                    &format!("{origin}_NO"),
+                    decide_ts,
+                ),
+            )
+        } else {
+            (
+                MakerPairGrossPreview {
+                    requested_gross_usd: y_px * y_qty,
+                    replace_order_ids: Vec::new(),
+                },
+                MakerPairGrossPreview {
+                    requested_gross_usd: n_px * n_qty,
+                    replace_order_ids: Vec::new(),
+                },
+            )
+        };
+        let pair_gross_snapshot = if origin.starts_with("BOT_") {
+            let mut pair_preview = yes_pair_preview.clone();
+            pair_preview.requested_gross_usd += no_pair_preview.requested_gross_usd;
+            pair_preview
+                .replace_order_ids
+                .extend(no_pair_preview.replace_order_ids.clone());
+            if pair_preview.requested_gross_usd <= 1e-9 {
+                None
+            } else {
+                match self._gross_cap_snapshot(
+                    pair_preview.requested_gross_usd,
+                    &pair_preview.replace_order_ids,
+                ) {
+                    Ok(snapshot) => {
+                        if let Some(reason) = snapshot.block_reason() {
+                            self._gross_cap_reject_submit(
+                                reason,
+                                self.pair_identity().pair_id.as_str(),
+                                "BUY",
+                                origin,
+                                snapshot,
+                            );
+                            return (None, None);
+                        }
+                        Some(snapshot)
+                    }
+                    Err(err) => {
+                        self._gross_cap_shared_state_error("maker_pair_submit_gate", err.as_str());
+                        return (None, None);
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let (mut y_oid, mut n_oid) = if resolved == "GTC" {
             if self._maker_single_inflight_enabled() {
                 let y_key = MakerOrderKey::buy(yes);
                 let n_key = MakerOrderKey::buy(no);
-                let y_oid =
-                    self._maker_order_upsert_gtc(&y_key, y_px, y_qty, &format!("{origin}_YES"));
-                let n_oid =
-                    self._maker_order_upsert_gtc(&n_key, n_px, n_qty, &format!("{origin}_NO"));
+                let yes_gross_cap_preapproved =
+                    pair_gross_snapshot.is_some() && yes_pair_preview.requested_gross_usd > 1e-9;
+                let y_oid = self._maker_order_upsert_gtc_internal(
+                    &y_key,
+                    y_px,
+                    y_qty,
+                    &format!("{origin}_YES"),
+                    yes_gross_cap_preapproved,
+                );
+                let yes_preview_consumed = yes_pair_preview.requested_gross_usd <= 1e-9
+                    || y_oid
+                        .as_ref()
+                        .map(|oid| !self._refresh_cadence_noop_marker_active(oid))
+                        .unwrap_or(false);
+                let no_gross_cap_preapproved = pair_gross_snapshot.is_some()
+                    && no_pair_preview.requested_gross_usd > 1e-9
+                    && yes_preview_consumed;
+                let n_oid = self._maker_order_upsert_gtc_internal(
+                    &n_key,
+                    n_px,
+                    n_qty,
+                    &format!("{origin}_NO"),
+                    no_gross_cap_preapproved,
+                );
                 (y_oid, n_oid)
             } else {
-                (
-                    self._place_limit_bid_gtc_with_origin(
-                        yes,
-                        y_px,
-                        y_qty,
-                        post_only,
-                        &format!("{origin}_YES"),
-                    ),
-                    self._place_limit_bid_gtc_with_origin(
-                        no,
-                        n_px,
-                        n_qty,
-                        post_only,
-                        &format!("{origin}_NO"),
-                    ),
-                )
+                let yes_gross_cap_preapproved =
+                    pair_gross_snapshot.is_some() && yes_pair_preview.requested_gross_usd > 1e-9;
+                let y_oid = self._place_limit_bid_gtc_with_origin_internal(
+                    yes,
+                    y_px,
+                    y_qty,
+                    post_only,
+                    &format!("{origin}_YES"),
+                    yes_gross_cap_preapproved,
+                    true,
+                );
+                let yes_preview_consumed = yes_pair_preview.requested_gross_usd <= 1e-9
+                    || y_oid
+                        .as_ref()
+                        .map(|oid| !self._refresh_cadence_noop_marker_active(oid))
+                        .unwrap_or(false);
+                let no_gross_cap_preapproved = pair_gross_snapshot.is_some()
+                    && no_pair_preview.requested_gross_usd > 1e-9
+                    && yes_preview_consumed;
+                let n_oid = self._place_limit_bid_gtc_with_origin_internal(
+                    no,
+                    n_px,
+                    n_qty,
+                    post_only,
+                    &format!("{origin}_NO"),
+                    no_gross_cap_preapproved,
+                    true,
+                );
+                (y_oid, n_oid)
             }
         } else {
             let signed_y = json!({
@@ -1771,10 +2261,11 @@ impl MakerHedgeCapBot {
                 resps.get(1).and_then(|o| o.clone()),
             )
         };
-        if let Some(oid) = &y_oid {
+        if let Some(oid) = y_oid.clone() {
+            let mut keep_yes_oid = true;
             if track_taker_fallback {
-                self._remember_taker_order(
-                    oid,
+                if !self._remember_taker_order(
+                    oid.as_str(),
                     yes,
                     y_qty,
                     y_px,
@@ -1782,13 +2273,15 @@ impl MakerHedgeCapBot {
                     LiquidityIntent::TakerException,
                     None,
                     TakerCapPolicy::EnforceCap,
-                );
+                ) {
+                    keep_yes_oid = false;
+                }
             } else {
-                self._forget_taker_order(oid);
+                self._forget_taker_order(oid.as_str());
             }
-            if !self._refresh_cadence_noop_marker_active(oid) {
+            if keep_yes_oid && !self._refresh_cadence_noop_marker_active(oid.as_str()) {
                 self._track_order_execution_context(
-                    oid,
+                    oid.as_str(),
                     &json!({
                         "order_id": oid,
                         "asset_id": yes,
@@ -1813,12 +2306,19 @@ impl MakerHedgeCapBot {
                         },
                     }),
                 );
+                if let Some(snapshot) = pair_gross_snapshot {
+                    self._gross_cap_record_order_context(oid.as_str(), snapshot);
+                }
+            }
+            if !keep_yes_oid {
+                y_oid = None;
             }
         }
-        if let Some(oid) = &n_oid {
+        if let Some(oid) = n_oid.clone() {
+            let mut keep_no_oid = true;
             if track_taker_fallback {
-                self._remember_taker_order(
-                    oid,
+                if !self._remember_taker_order(
+                    oid.as_str(),
                     no,
                     n_qty,
                     n_px,
@@ -1826,13 +2326,15 @@ impl MakerHedgeCapBot {
                     LiquidityIntent::TakerException,
                     None,
                     TakerCapPolicy::EnforceCap,
-                );
+                ) {
+                    keep_no_oid = false;
+                }
             } else {
-                self._forget_taker_order(oid);
+                self._forget_taker_order(oid.as_str());
             }
-            if !self._refresh_cadence_noop_marker_active(oid) {
+            if keep_no_oid && !self._refresh_cadence_noop_marker_active(oid.as_str()) {
                 self._track_order_execution_context(
-                    oid,
+                    oid.as_str(),
                     &json!({
                         "order_id": oid,
                         "asset_id": no,
@@ -1857,6 +2359,12 @@ impl MakerHedgeCapBot {
                         },
                     }),
                 );
+                if let Some(snapshot) = pair_gross_snapshot {
+                    self._gross_cap_record_order_context(oid.as_str(), snapshot);
+                }
+            }
+            if !keep_no_oid {
+                n_oid = None;
             }
         }
         (y_oid, n_oid)

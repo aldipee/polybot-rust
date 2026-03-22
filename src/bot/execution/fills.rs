@@ -247,6 +247,14 @@ impl MakerHedgeCapBot {
         guard.record_pair_liquidity_fill(filled, false);
         let _ = self._bot_runtime_save_state_or_dependency_pause(&mut guard, "apply_fill");
         drop(guard);
+        if let Some(order_id) = order_id {
+            if side_u == "BUY" {
+                self._add_shared_gross_order_applied(order_id, filled);
+            } else {
+                self._forget_shared_gross_order_reservation(order_id);
+            }
+        }
+        let _ = self._refresh_shared_gross_trade_snapshot();
         self._record_daily_liquidity_fill_global(filled, false, fill_ts);
         // Clear seed in-flight cooldown on any fill ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â allows immediate re-seeding
         // of the other side instead of waiting for the hardcoded timeout.
@@ -386,10 +394,11 @@ impl MakerHedgeCapBot {
         liquidity_intent: LiquidityIntent,
         taker_exception_reason: Option<TakerExceptionReason>,
         taker_cap_policy: TakerCapPolicy,
-    ) {
+    ) -> bool {
         if order_id.trim().is_empty() {
-            return;
+            return false;
         }
+        let now = now_ts_f64();
         let rec = TakerOrderRecord {
             order_id: order_id.to_string(),
             asset_id: asset_id.to_string(),
@@ -397,7 +406,7 @@ impl MakerHedgeCapBot {
             applied: 0.0,
             px_limit,
             side: side.to_ascii_uppercase(),
-            ts: now_ts_f64(),
+            ts: now,
             liquidity_intent,
             taker_exception_reason,
             taker_cap_policy,
@@ -405,14 +414,59 @@ impl MakerHedgeCapBot {
         if let Ok(mut m) = self.taker_orders.lock() {
             m.insert(order_id.to_string(), rec);
         }
-        self._remember_shared_pending_taker_order(
-            order_id,
-            asset_id,
-            size,
-            0.0,
-            side,
-            now_ts_f64(),
-        );
+        if side.eq_ignore_ascii_case("BUY") {
+            if let Ok(mut state) = self.state.lock() {
+                let submit_ts = state
+                    .open_orders
+                    .get(asset_id)
+                    .filter(|row| row.order_id.as_deref() == Some(order_id))
+                    .and_then(|row| row.submit_ts.or(row.ts))
+                    .unwrap_or(now);
+                state.open_orders.insert(
+                    asset_id.to_string(),
+                    OpenOrderState {
+                        order_id: Some(order_id.to_string()),
+                        price: Some(px_limit),
+                        size: Some(size),
+                        ts: Some(now),
+                        submit_ts: Some(submit_ts),
+                        kind: Some("taker".to_string()),
+                    },
+                );
+                let _ = self._bot_runtime_save_state_or_dependency_pause(
+                    &mut state,
+                    "remember_taker_open_order",
+                );
+            }
+        }
+        self._remember_shared_pending_taker_order(order_id, asset_id, size, 0.0, side, now);
+        if side.eq_ignore_ascii_case("BUY") {
+            if !self._remember_shared_gross_order_reservation(
+                order_id,
+                asset_id,
+                side,
+                px_limit,
+                size,
+                liquidity_intent.as_str(),
+                "taker",
+            ) {
+                self.logger.warning(&format!(
+                    "[BOT][SAFE_PAUSE] shared gross reservation publish failed for taker BUY order_id={} asset={} -> canceling order",
+                    order_id,
+                    asset_id
+                ));
+                if self._cancel(order_id) {
+                    self._forget_taker_order(order_id);
+                    return false;
+                }
+                self.logger.warning(&format!(
+                    "[BOT][SAFE_PAUSE] failed to cancel taker BUY after shared gross reservation publish failure order_id={} asset={}; keeping local taker tracking while dependency pause is active",
+                    order_id,
+                    asset_id
+                ));
+            }
+        }
+        true
     }
     /// Removes taker order from the BOT''s runtime bookkeeping.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -422,8 +476,39 @@ impl MakerHedgeCapBot {
         if order_id.trim().is_empty() {
             return;
         }
-        if let Ok(mut m) = self.taker_orders.lock() {
-            m.remove(order_id);
+        let removed = if let Ok(mut m) = self.taker_orders.lock() {
+            m.remove(order_id)
+        } else {
+            None
+        };
+        if let Ok(mut state) = self.state.lock() {
+            let remove_asset = removed
+                .as_ref()
+                .map(|record| record.asset_id.clone())
+                .or_else(|| {
+                    state.open_orders.iter().find_map(|(asset_id, row)| {
+                        (row.order_id.as_deref() == Some(order_id)
+                            && row.kind.as_deref() == Some("taker"))
+                        .then(|| asset_id.clone())
+                    })
+                });
+            if let Some(asset_id) = remove_asset {
+                let should_remove = state
+                    .open_orders
+                    .get(asset_id.as_str())
+                    .map(|row| {
+                        row.order_id.as_deref() == Some(order_id)
+                            && row.kind.as_deref() == Some("taker")
+                    })
+                    .unwrap_or(false);
+                if should_remove {
+                    state.open_orders.remove(asset_id.as_str());
+                    let _ = self._bot_runtime_save_state_or_dependency_pause(
+                        &mut state,
+                        "forget_taker_open_order",
+                    );
+                }
+            }
         }
         self._forget_shared_pending_taker_order(order_id);
     }

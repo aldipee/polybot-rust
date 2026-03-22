@@ -44,17 +44,17 @@ Work status legend:
 
 ### Overall Estimate
 
-- Estimated requirement coverage in current scope: `89%`
-- Estimated remaining gap in current scope: `11%`
+- Estimated requirement coverage in current scope: `93%`
+- Estimated remaining gap in current scope: `7%`
 
 ### Work Status Snapshot
 
 - Requirement analysis: `Done`
 - Requirement-only backlog definition: `Done`
 - `REQ-001` scope override recorded: `Done`
-- Active implementation tasks completed: `15 / 24`
+- Active implementation tasks completed: `16 / 24`
 - Tasks ready to start now: `1 / 24`
-- Tasks queued behind earlier work: `2 / 24`
+- Tasks queued behind earlier work: `1 / 24`
 - Tasks blocked by prerequisites: `6 / 24`
 - Tasks marked not applicable: `1`
 
@@ -67,7 +67,7 @@ Work status legend:
 | Execution controls and clip policy | `REQ-014` to `REQ-017`, `REQ-034` | 100% | 0% | Maker-first execution, explicit taker exception reasons, wallet-aware market and daily taker-share caps, shared pending-taker accounting, crash-tolerant shared-state enforcement, the exact env-configurable `12 / 20 / 40 / 80` clip ladder with green-gated `40 / 80` escalation, and the per-side one-cycle-per-second maker refresh cap are now in place. |
 | Config, observability, and auditability | `REQ-023` to `REQ-025` | 84% | 16% | Versioned env snapshots, persisted `config_text` plus `config_version`, next-market-only activation, rollback-safe reload fallback, append-only decision-event persistence, structured runtime-event persistence, linked `decision_event_id` audit trails, and pinned trade or execution metadata now exist. The remaining gap in this area is mostly operational hardening and richer downstream reporting on top of the new audit stream. |
 | Replay, paper, and live safety modes | `REQ-026` to `REQ-029` | 10% | 90% | No true replay engine, importer parity, paper adapter, or shadow-first guarded live flow is present. |
-| Reliability, stale data, and reconciliation | `REQ-030` to `REQ-033` | 84% | 16% | Idempotent BOT order intents, bounded persisted fill dedupe, explicit startup and reconnect reconciliation gates, post-settlement validation handoff, dependency-failure safe-pause, persistence-path-specific pause latching, pause-time BOT order drain across both slot-tracked and direct BOT orders, and exact dual-threshold stale-data enforcement are now in place. Hard stale now latches until quotes are fully fresh again, startup quote-readiness uses the same add-block threshold, legacy flat DB configs preserve their prior stale threshold on reload, and the deprecated single-threshold env now fails activation instead of silently falling back. Current direction still excludes active-market 5-second position reconciliation, and the main remaining gap in this area is gross-cap enforcement under `REQ-032`. |
+| Reliability, stale data, and reconciliation | `REQ-030` to `REQ-033` | 100% | 0% | Idempotent BOT order intents, bounded persisted fill dedupe, explicit startup and reconnect reconciliation gates, post-settlement validation handoff, dependency-failure safe-pause, persistence-path-specific pause latching, pause-time BOT order drain across both slot-tracked and direct BOT orders, exact dual-threshold stale-data enforcement, and wallet-global gross deployed cost caps with shared pending maker/taker reservations are now in place. Hard stale now latches until quotes are fully fresh again, startup quote-readiness uses the same add-block threshold, legacy flat DB configs preserve their prior stale threshold on reload, deprecated single-threshold stale env now fails activation, and shared gross-cap state now refreshes and deduplicates correctly across restart, direct-mode orders, TTL cleanup, and multi-instance same-wallet deployments. Current direction still excludes active-market 5-second position reconciliation. |
 | Validation and launch gates | Section 10 | 8% | 92% | A small unit-test set exists, but replay, simulation, paper KPI, and shadow KPI gates are mostly absent. |
 
 ## Requirement-First Implementation Tasks
@@ -99,7 +99,7 @@ Work status legend:
 | IMP-16 | `REQ-020` | Missing | Blocked | Add the optional model-edge overlay behind a feature flag and require `edge_model_minus_price > 0.02` plus all normal inventory and price guards. | No model-edge overlay implementation was found. | strategy and config layers |
 | IMP-17 | `REQ-027` | Missing | Queued | Build the analytics importer for the provided parquet and csv inputs and reproduce the calibration metrics used by the requirement. | No importer or parity validation pipeline exists. | new importer tool, fixtures, tests |
 | IMP-18 | `REQ-026` | Missing | Blocked | Build deterministic event replay using the same strategy, risk, and ledger code paths as live and paper. | No replay engine or deterministic clock abstraction exists. | new replay module, strategy, execution, persistence wiring |
-| IMP-19 | `REQ-032` | Missing | Queued | Add per-market and portfolio-level gross cost caps enforced before any order approval. | No explicit market-level or portfolio-level gross exposure cap was found. | risk layer, config, runtime wiring |
+| IMP-19 | `REQ-032` | Done | Done | Add per-market and portfolio-level gross cost caps enforced before any order approval. | Implemented: explicit pair and wallet-global gross deployed cost caps now gate maker and taker approvals, shared gross-cap state tracks filled trade cost plus pending maker and taker reservations across same-wallet instances, replacement-aware checks avoid double-counting while still keeping direct refresh adds conservative until live orders are actually canceled, shared-state failures enter dependency pause, and periodic republish plus restart-safe instance dedupe keep portfolio gross accounting accurate across TTL cleanup, reconnect, and multi-instance runs. | `src/config.rs`, `src/env_contract.rs`, `src/bot/execution/gross_caps.rs`, `src/bot/maker_orders.rs`, `src/bot/execution/*`, `src/bot/runtime/loop.rs`, `src/bot/runtime_ws.rs`, `src/helpers.rs`, `src/main.rs`, `src/bot/runtime/tests.rs` |
 | IMP-20 | `REQ-033` | Done | Done | Enforce stale-data policy exactly: block new adds after 2 seconds of staleness and cancel or pause after 5 seconds. | Implemented: dual-threshold stale-data enforcement now blocks creates and reposts at the configured add-block age, enters hard stale dependency pause and cancels BOT working risk orders at the configured hard-pause age, keeps hard-stale recovery latched until quotes are fully fresh again, aligns startup quote-readiness to the same add-block threshold, preserves legacy DB-config stale thresholds during reload, and fails fast when the deprecated single-threshold env is set. | `src/config.rs`, `src/main.rs`, `src/bot/runtime/startup.rs`, `src/bot/runtime/loop.rs`, `src/bot/runtime_ws.rs`, `src/bot/runtime/tests.rs` |
 | IMP-21 | `REQ-034` | Done | Done | Cap quote refresh or cancel-replace activity to one cycle per side per second by default. | Implemented: `MAKER_REPLACE_MIN_INTERVAL_SECONDS` is now the authoritative per-side refresh-cycle cap with a `1.0s` default, voluntary same-side maker refreshes are throttled across single-inflight and direct-order BOT flows, emergency drains still bypass the cap, and direct-mode no-op/submit bookkeeping now preserves live-order context, stable submit timestamps, and refresh-noop markers correctly across restart, pruning, handoffs, and pair-submit paths. | `src/config.rs`, `src/bot/maker_orders.rs`, `src/bot/execution/submit.rs`, `src/bot/execution/latency.rs`, `src/bot/execution/user_events.rs`, `src/bot/runtime/*` |
 
@@ -116,11 +116,11 @@ Work status legend:
 
 This sequence stays tied to the requirement instead of a refactor roadmap:
 
-1. `IMP-19` gross exposure caps
+1. `IMP-22` invariant and property tests for the implemented runtime guards
 2. `IMP-14` true paper plus shadow-first startup safety
 3. `IMP-17` analytics importer parity
 4. `IMP-18` deterministic replay
-5. `IMP-22` to `IMP-25` validation and launch gates
+5. `IMP-23` to `IMP-25` validation and launch gates
 
 ## Short Summary
 
@@ -141,13 +141,14 @@ Recent completed work:
 - `IMP-12` / `REQ-023` implementation work is now `Done`: env now resolves into one authoritative versioned snapshot, sanitized `config_text` and deterministic `config_version` are persisted in `configuration`, invalid reloads keep the previous active version, new valid snapshots activate only on the next market, and the pinned `config_version` now follows each trade and execution context through the market lifecycle.
 - `IMP-13` / `REQ-024` and `REQ-025` implementation work is now `Done`: the bot now persists append-only decision and runtime audit events, links later intents, acks, fills, reconciliation, and settlement records back to a single `decision_event_id`, preserves skipped-market audit rows, uses exchange match time for maker fill audit events, and keeps audit DB writes off the live trading path.
 - `IMP-15` / `REQ-030` and the adjusted in-scope parts of `REQ-031` implementation work is now `Done`: the bot now uses explicit startup and reconnect reconciliation gates, latches dependency-failure pauses until the specific failed persistence path recovers, drains BOT new-risk orders while paused across both slot-tracked and direct BOT orders, persists bounded fill-dedupe history across restart with legacy-recency-safe migration, and keeps post-settlement validation in the safety-gate path without introducing active-market 5-second position polling.
+- `IMP-19` / `REQ-032` implementation work is now `Done`: explicit pair and wallet-global gross deployed cost caps now gate maker and taker order approval, shared gross-cap state tracks filled exposure plus pending maker and taker reservations across same-wallet instances, restart-safe instance dedupe preserves portfolio accuracy across restarts without collapsing sibling live trades, shared reservation republishes now survive long-lived resting orders and expired taker cleanup correctly, and shared-state write failures now unwind or pause new live exposure instead of silently undercounting wallet risk.
 - `IMP-20` / `REQ-033` implementation work is now `Done`: the bot now enforces dual-threshold market-data staleness with add-block and hard-pause cutoffs, aligns startup and await-second-fill quote-readiness to the same add-block threshold, keeps hard-stale recovery latched until quotes are fully fresh again even across other pause reasons, preserves legacy flat DB stale thresholds on reload, and fails fast when the deprecated `MARKET_DATA_STALE_SECONDS` env is set.
 - `IMP-21` / `REQ-034` implementation work is now `Done`: maker refresh cadence is now capped per side with `MAKER_REPLACE_MIN_INTERVAL_SECONDS` defaulting to `1.0`, the cap is enforced across single-inflight and direct BOT handoffs, protective drains still bypass it, and direct-mode restart or prune paths now preserve stable submit timestamps and refresh-noop markers so capped no-ops do not masquerade as fresh submits.
 
 The biggest remaining requirement gaps are:
 
 - true paper, replay, and shadow modes
-- gross exposure caps
+- analytics importer parity
 - validation gates before any guarded live rollout
 
 Intentional scope exception:
@@ -157,5 +158,5 @@ Intentional scope exception:
 
 Current estimate:
 
-- Requirement coverage in current scope: `89%`
-- Remaining requirement gap in current scope: `11%`
+- Requirement coverage in current scope: `93%`
+- Remaining requirement gap in current scope: `7%`

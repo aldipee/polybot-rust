@@ -46,6 +46,15 @@ This document intentionally covers the active `polybot` surface only. It does no
 - `IMPROVE_BID_TICKS`, `REPLACE_IF_PRICE_MOVES_TICKS`, `STALE_SECONDS`, `CLOB_ORDER_META_WARMUP`: order posting and repricing behavior
 - `STALE_SECONDS` remains the order-management stale-order control; it is not the market-data add-block or hard-pause policy
 
+## Gross Exposure Caps
+
+- `BOT_PAIR_GROSS_DEPLOYED_COST_CAP_USD`: outer hard per-market gross deployed cost cap; defaults to current `MAX_TOTAL_COST` when unset through the supported config path
+- `BOT_PORTFOLIO_GROSS_DEPLOYED_COST_CAP_USD`: outer hard wallet-global gross deployed cost cap; defaults to `4 * pair cap`
+- `BOT_PAIR_GROSS_DEPLOYED_COST_BUFFER_USD`, `BOT_PORTFOLIO_GROSS_DEPLOYED_COST_BUFFER_USD`: non-negative buffers that must remain strictly below their cap
+- `BOT_GROSS_CAP_INCLUDE_PENDING_MAKER`, `BOT_GROSS_CAP_INCLUDE_PENDING_TAKER`: whether pending maker and taker reservations count toward gross-cap checks; both default to `true`
+- `BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS`: TTL for the shared wallet-global gross-cap state; defaults to `30` and must be greater than `0.5`
+- `MAX_TOTAL_COST` remains the pair-budget and allocation control; the `BOT_*GROSS*` envs are outer hard guards layered above it, not a rename of that budget surface
+
 ## BOT Runtime Controls
 
 - `BOT_PREARM_LEAD_SECONDS`: pre-arm lead before the market opens

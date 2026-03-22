@@ -225,7 +225,41 @@ impl MakerHedgeCapBot {
                     if reason.trim().is_empty() {
                         "dependency_pause:database:daily_liquidity".to_string()
                     } else {
-                        reason
+                        reason.clone()
+                    }
+                },
+            )?;
+        }
+        if reason.starts_with("dependency_pause:database:gross_cap_state") {
+            let state_file = self._gross_exposure_state_file();
+            let _lock = crate::helpers::acquire_companion_file_lock(
+                &state_file,
+                MakerHedgeCapBot::shared_state_lock_timeout(),
+            )
+            .map_err(|_| {
+                if reason.trim().is_empty() {
+                    "dependency_pause:database:gross_cap_state".to_string()
+                } else {
+                    reason.clone()
+                }
+            })?;
+            let mut snapshot = crate::helpers::load_shared_gross_exposure_state(
+                &state_file,
+                self.cfg.gross_cap_shared_state_ttl_seconds,
+            )
+            .map_err(|_| {
+                if reason.trim().is_empty() {
+                    "dependency_pause:database:gross_cap_state".to_string()
+                } else {
+                    reason.clone()
+                }
+            })?;
+            crate::helpers::save_shared_gross_exposure_state(&state_file, &mut snapshot).map_err(
+                |_| {
+                    if reason.trim().is_empty() {
+                        "dependency_pause:database:gross_cap_state".to_string()
+                    } else {
+                        reason.clone()
                     }
                 },
             )?;
@@ -384,6 +418,8 @@ impl MakerHedgeCapBot {
             );
         }
         self._bot_runtime_mark_reconciliation_clean(scope, now);
+        let _ = self._refresh_shared_gross_trade_snapshot();
+        let _ = self._republish_shared_gross_reservations_from_local_state();
         Ok(())
     }
 

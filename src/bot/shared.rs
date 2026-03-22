@@ -71,6 +71,38 @@ pub(super) struct TakerShareSnapshot {
     pub(super) projected_daily_taker_share: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(super) struct GrossCapSnapshot {
+    pub(super) pair_cap_usd: f64,
+    pub(super) portfolio_cap_usd: f64,
+    pub(super) pair_buffer_usd: f64,
+    pub(super) portfolio_buffer_usd: f64,
+    pub(super) effective_pair_cap_usd: f64,
+    pub(super) effective_portfolio_cap_usd: f64,
+    pub(super) current_pair_filled_gross_usd: f64,
+    pub(super) current_pair_pending_maker_gross_usd: f64,
+    pub(super) current_pair_pending_taker_gross_usd: f64,
+    pub(super) requested_gross_usd: f64,
+    pub(super) projected_pair_gross_usd: f64,
+    pub(super) current_portfolio_filled_gross_usd: f64,
+    pub(super) current_portfolio_pending_gross_usd: f64,
+    pub(super) projected_portfolio_gross_usd: f64,
+    pub(super) include_pending_maker: bool,
+    pub(super) include_pending_taker: bool,
+}
+
+impl GrossCapSnapshot {
+    pub(super) fn block_reason(self) -> Option<&'static str> {
+        if self.projected_pair_gross_usd > self.effective_pair_cap_usd + 1e-9 {
+            Some("gross_cap_market")
+        } else if self.projected_portfolio_gross_usd > self.effective_portfolio_cap_usd + 1e-9 {
+            Some("gross_cap_portfolio")
+        } else {
+            None
+        }
+    }
+}
+
 pub(super) fn taker_submit_reason_allowed(
     side: &str,
     reason: Option<TakerExceptionReason>,

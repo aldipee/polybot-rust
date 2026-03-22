@@ -27,6 +27,26 @@ fn default_maker_replace_min_interval_seconds() -> f64 {
     1.0
 }
 
+fn default_pair_gross_deployed_cost_cap_usd() -> f64 {
+    20.0
+}
+
+fn default_portfolio_gross_deployed_cost_cap_usd() -> f64 {
+    default_pair_gross_deployed_cost_cap_usd() * 4.0
+}
+
+fn default_gross_deployed_cost_buffer_usd() -> f64 {
+    0.0
+}
+
+fn default_gross_cap_include_pending() -> bool {
+    true
+}
+
+fn default_gross_cap_shared_state_ttl_seconds() -> f64 {
+    30.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BotConfig {
     pub clob_host: String,
@@ -51,6 +71,20 @@ pub struct BotConfig {
     pub entry_edge_ticks: i64,
     pub hedge_buffer_ticks: i64,
     pub max_total_cost: f64,
+    #[serde(default = "default_pair_gross_deployed_cost_cap_usd")]
+    pub pair_gross_deployed_cost_cap_usd: f64,
+    #[serde(default = "default_portfolio_gross_deployed_cost_cap_usd")]
+    pub portfolio_gross_deployed_cost_cap_usd: f64,
+    #[serde(default = "default_gross_deployed_cost_buffer_usd")]
+    pub pair_gross_deployed_cost_buffer_usd: f64,
+    #[serde(default = "default_gross_deployed_cost_buffer_usd")]
+    pub portfolio_gross_deployed_cost_buffer_usd: f64,
+    #[serde(default = "default_gross_cap_include_pending")]
+    pub gross_cap_include_pending_maker: bool,
+    #[serde(default = "default_gross_cap_include_pending")]
+    pub gross_cap_include_pending_taker: bool,
+    #[serde(default = "default_gross_cap_shared_state_ttl_seconds")]
+    pub gross_cap_shared_state_ttl_seconds: f64,
     pub reserve_usd: f64,
     pub cancel_all_on_start: bool,
     pub dry_run: bool,
@@ -90,6 +124,13 @@ impl Default for BotConfig {
             entry_edge_ticks: 2,
             hedge_buffer_ticks: 1,
             max_total_cost: 20.0,
+            pair_gross_deployed_cost_cap_usd: 20.0,
+            portfolio_gross_deployed_cost_cap_usd: 80.0,
+            pair_gross_deployed_cost_buffer_usd: 0.0,
+            portfolio_gross_deployed_cost_buffer_usd: 0.0,
+            gross_cap_include_pending_maker: true,
+            gross_cap_include_pending_taker: true,
+            gross_cap_shared_state_ttl_seconds: 30.0,
             reserve_usd: 2.0,
             cancel_all_on_start: true,
             dry_run: false,
@@ -159,6 +200,13 @@ impl BotConfig {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(15.0);
+        self.pair_gross_deployed_cost_cap_usd = self.max_total_cost;
+        self.portfolio_gross_deployed_cost_cap_usd = self.pair_gross_deployed_cost_cap_usd * 4.0;
+        self.pair_gross_deployed_cost_buffer_usd = 0.0;
+        self.portfolio_gross_deployed_cost_buffer_usd = 0.0;
+        self.gross_cap_include_pending_maker = true;
+        self.gross_cap_include_pending_taker = true;
+        self.gross_cap_shared_state_ttl_seconds = 30.0;
         self.reserve_usd = env::var("RESERVE_USD")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -196,6 +244,34 @@ fn validate_stale_data_policy(cfg: &BotConfig) -> Result<()> {
         return Err(anyhow!(
             "Invalid stale-data policy: MARKET_DATA_STALE_HARD_PAUSE_SECONDS must be greater than MARKET_DATA_STALE_ADD_BLOCK_SECONDS"
         ));
+    }
+    Ok(())
+}
+
+fn validate_gross_cap_policy(cfg: &BotConfig) -> Result<()> {
+    let pair_cap = cfg.pair_gross_deployed_cost_cap_usd;
+    let portfolio_cap = cfg.portfolio_gross_deployed_cost_cap_usd;
+    let pair_buffer = cfg.pair_gross_deployed_cost_buffer_usd;
+    let portfolio_buffer = cfg.portfolio_gross_deployed_cost_buffer_usd;
+    let ttl = cfg.gross_cap_shared_state_ttl_seconds;
+
+    if !pair_cap.is_finite() || pair_cap <= 0.0 {
+        return Err(anyhow!("Invalid BOT_PAIR_GROSS_DEPLOYED_COST_CAP_USD"));
+    }
+    if !portfolio_cap.is_finite() || portfolio_cap <= 0.0 {
+        return Err(anyhow!("Invalid BOT_PORTFOLIO_GROSS_DEPLOYED_COST_CAP_USD"));
+    }
+    if !pair_buffer.is_finite() || pair_buffer < 0.0 || pair_buffer >= pair_cap {
+        return Err(anyhow!("Invalid BOT_PAIR_GROSS_DEPLOYED_COST_BUFFER_USD"));
+    }
+    if !portfolio_buffer.is_finite() || portfolio_buffer < 0.0 || portfolio_buffer >= portfolio_cap
+    {
+        return Err(anyhow!(
+            "Invalid BOT_PORTFOLIO_GROSS_DEPLOYED_COST_BUFFER_USD"
+        ));
+    }
+    if !ttl.is_finite() || ttl <= 0.5 {
+        return Err(anyhow!("Invalid BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS"));
     }
     Ok(())
 }
@@ -478,6 +554,34 @@ pub fn build_effective_bot_config_from_env() -> Result<BotConfig> {
     cfg.min_shares = env_float("MIN_SHARES", cfg.min_shares);
     cfg.clip_shares = env_float("CLIP_SHARES", cfg.clip_shares);
     cfg.max_total_cost = env_float("MAX_TOTAL_COST", cfg.max_total_cost);
+    cfg.pair_gross_deployed_cost_cap_usd = env_float(
+        "BOT_PAIR_GROSS_DEPLOYED_COST_CAP_USD",
+        cfg.pair_gross_deployed_cost_cap_usd,
+    );
+    cfg.portfolio_gross_deployed_cost_cap_usd = env_float(
+        "BOT_PORTFOLIO_GROSS_DEPLOYED_COST_CAP_USD",
+        cfg.portfolio_gross_deployed_cost_cap_usd,
+    );
+    cfg.pair_gross_deployed_cost_buffer_usd = env_float(
+        "BOT_PAIR_GROSS_DEPLOYED_COST_BUFFER_USD",
+        cfg.pair_gross_deployed_cost_buffer_usd,
+    );
+    cfg.portfolio_gross_deployed_cost_buffer_usd = env_float(
+        "BOT_PORTFOLIO_GROSS_DEPLOYED_COST_BUFFER_USD",
+        cfg.portfolio_gross_deployed_cost_buffer_usd,
+    );
+    cfg.gross_cap_include_pending_maker = env_bool(
+        "BOT_GROSS_CAP_INCLUDE_PENDING_MAKER",
+        cfg.gross_cap_include_pending_maker,
+    );
+    cfg.gross_cap_include_pending_taker = env_bool(
+        "BOT_GROSS_CAP_INCLUDE_PENDING_TAKER",
+        cfg.gross_cap_include_pending_taker,
+    );
+    cfg.gross_cap_shared_state_ttl_seconds = env_float(
+        "BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS",
+        cfg.gross_cap_shared_state_ttl_seconds,
+    );
     cfg.reserve_usd = env_float("RESERVE_USD", cfg.reserve_usd);
     cfg.dry_run = env_bool("DRY_RUN", cfg.dry_run);
     cfg.log_every = env_int("LOG_EVERY_SECONDS", cfg.log_every) as i64;
@@ -512,6 +616,7 @@ pub fn build_effective_bot_config_from_env() -> Result<BotConfig> {
         return Err(anyhow!("Missing POLYMARKET_FUNDER"));
     }
     validate_stale_data_policy(&cfg)?;
+    validate_gross_cap_policy(&cfg)?;
 
     Ok(cfg)
 }
@@ -612,6 +717,84 @@ fn config_version_from_hash(hash: &str) -> String {
     format!("cfgv1_{short}")
 }
 
+fn snapshot_bot_config_max_total_cost_compat(bot_config: &serde_json::Map<String, Value>) -> f64 {
+    bot_config
+        .get("max_total_cost")
+        .and_then(|value| {
+            value.as_f64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|raw| raw.trim().parse::<f64>().ok())
+            })
+        })
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or_else(default_pair_gross_deployed_cost_cap_usd)
+}
+
+fn backfill_snapshot_bot_config_gross_cap_fields(value: &mut Value) {
+    let Some(bot_config) = value.get_mut("bot_config").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let pair_cap = snapshot_bot_config_max_total_cost_compat(bot_config);
+    if !bot_config.contains_key("pair_gross_deployed_cost_cap_usd") {
+        bot_config.insert(
+            "pair_gross_deployed_cost_cap_usd".to_string(),
+            Value::from(pair_cap),
+        );
+    }
+    if !bot_config.contains_key("portfolio_gross_deployed_cost_cap_usd") {
+        bot_config.insert(
+            "portfolio_gross_deployed_cost_cap_usd".to_string(),
+            Value::from(pair_cap * 4.0),
+        );
+    }
+    if !bot_config.contains_key("pair_gross_deployed_cost_buffer_usd") {
+        bot_config.insert(
+            "pair_gross_deployed_cost_buffer_usd".to_string(),
+            Value::from(default_gross_deployed_cost_buffer_usd()),
+        );
+    }
+    if !bot_config.contains_key("portfolio_gross_deployed_cost_buffer_usd") {
+        bot_config.insert(
+            "portfolio_gross_deployed_cost_buffer_usd".to_string(),
+            Value::from(default_gross_deployed_cost_buffer_usd()),
+        );
+    }
+    if !bot_config.contains_key("gross_cap_include_pending_maker") {
+        bot_config.insert(
+            "gross_cap_include_pending_maker".to_string(),
+            Value::from(default_gross_cap_include_pending()),
+        );
+    }
+    if !bot_config.contains_key("gross_cap_include_pending_taker") {
+        bot_config.insert(
+            "gross_cap_include_pending_taker".to_string(),
+            Value::from(default_gross_cap_include_pending()),
+        );
+    }
+    if !bot_config.contains_key("gross_cap_shared_state_ttl_seconds") {
+        bot_config.insert(
+            "gross_cap_shared_state_ttl_seconds".to_string(),
+            Value::from(default_gross_cap_shared_state_ttl_seconds()),
+        );
+    }
+}
+
+pub(crate) fn snapshot_from_json_text_compat(
+    config_text: &str,
+) -> Result<VersionedConfigSnapshotV1> {
+    let mut value: Value = serde_json::from_str(config_text)?;
+    backfill_snapshot_bot_config_gross_cap_fields(&mut value);
+    Ok(serde_json::from_value(value)?)
+}
+
+pub(crate) fn snapshot_from_json_value_compat(
+    mut value: Value,
+) -> Result<VersionedConfigSnapshotV1> {
+    backfill_snapshot_bot_config_gross_cap_fields(&mut value);
+    Ok(serde_json::from_value(value)?)
+}
+
 pub fn load_versioned_config_bundle_from_env() -> Result<ResolvedVersionedConfigBundle> {
     let effective_bot_config = build_effective_bot_config_from_env()?;
     let runtime_config = bot_runtime_config_from_reader(|key| env::var(key).ok());
@@ -646,6 +829,7 @@ pub fn resolve_versioned_config_bundle_from_snapshot(
     bot_runtime_validate_config(&runtime_config).map_err(|err| anyhow!(err))?;
     let mut effective_bot_config = snapshot.bot_config.clone();
     validate_stale_data_policy(&effective_bot_config)?;
+    validate_gross_cap_policy(&effective_bot_config)?;
     if effective_bot_config.private_key.trim().is_empty() {
         effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
             .unwrap_or_default()
@@ -679,6 +863,7 @@ pub fn build_legacy_versioned_config_bundle(
     loaded_at: String,
 ) -> Result<ResolvedVersionedConfigBundle> {
     validate_stale_data_policy(&effective_bot_config)?;
+    validate_gross_cap_policy(&effective_bot_config)?;
     if effective_bot_config.private_key.trim().is_empty() {
         effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
             .unwrap_or_default()
@@ -728,11 +913,15 @@ mod tests {
             .iter()
             .map(|(key, _)| ((*key).to_string(), env::var(key).ok()))
             .collect::<Vec<_>>();
+        let saved_exec_mode = env::var("EXEC_MODE").ok();
         for (key, value) in vars {
             match value {
                 Some(v) => env::set_var(key, v),
                 None => env::remove_var(key),
             }
+        }
+        if !vars.iter().any(|(key, _)| *key == "EXEC_MODE") {
+            env::set_var("EXEC_MODE", "BOT");
         }
         f();
         for (key, value) in saved {
@@ -740,6 +929,10 @@ mod tests {
                 Some(v) => env::set_var(key, v),
                 None => env::remove_var(key),
             }
+        }
+        match saved_exec_mode {
+            Some(v) => env::set_var("EXEC_MODE", v),
+            None => env::remove_var("EXEC_MODE"),
         }
     }
 
@@ -848,6 +1041,90 @@ mod tests {
     }
 
     #[test]
+    fn gross_cap_defaults_follow_max_total_cost() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MAX_TOTAL_COST", Some("37")),
+                ("BOT_PAIR_GROSS_DEPLOYED_COST_CAP_USD", None),
+                ("BOT_PORTFOLIO_GROSS_DEPLOYED_COST_CAP_USD", None),
+                ("BOT_PAIR_GROSS_DEPLOYED_COST_BUFFER_USD", None),
+                ("BOT_PORTFOLIO_GROSS_DEPLOYED_COST_BUFFER_USD", None),
+                ("BOT_GROSS_CAP_INCLUDE_PENDING_MAKER", None),
+                ("BOT_GROSS_CAP_INCLUDE_PENDING_TAKER", None),
+                ("BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS", None),
+            ],
+            || {
+                let cfg = build_effective_bot_config_from_env().expect("effective config");
+                assert!((cfg.pair_gross_deployed_cost_cap_usd - 37.0).abs() < 1e-9);
+                assert!((cfg.portfolio_gross_deployed_cost_cap_usd - 148.0).abs() < 1e-9);
+                assert_eq!(cfg.pair_gross_deployed_cost_buffer_usd, 0.0);
+                assert_eq!(cfg.portfolio_gross_deployed_cost_buffer_usd, 0.0);
+                assert!(cfg.gross_cap_include_pending_maker);
+                assert!(cfg.gross_cap_include_pending_taker);
+                assert!((cfg.gross_cap_shared_state_ttl_seconds - 30.0).abs() < 1e-9);
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_gross_cap_policy_rejects_bad_buffers_and_ttl() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("BOT_PAIR_GROSS_DEPLOYED_COST_CAP_USD", Some("20")),
+                ("BOT_PORTFOLIO_GROSS_DEPLOYED_COST_CAP_USD", Some("80")),
+                ("BOT_PAIR_GROSS_DEPLOYED_COST_BUFFER_USD", Some("20")),
+                ("BOT_PORTFOLIO_GROSS_DEPLOYED_COST_BUFFER_USD", Some("0")),
+                ("BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS", Some("30")),
+            ],
+            || {
+                let err = build_effective_bot_config_from_env()
+                    .expect_err("pair buffer equal to cap should fail");
+                assert!(err
+                    .to_string()
+                    .contains("BOT_PAIR_GROSS_DEPLOYED_COST_BUFFER_USD"));
+            },
+        );
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("BOT_PAIR_GROSS_DEPLOYED_COST_CAP_USD", Some("20")),
+                ("BOT_PORTFOLIO_GROSS_DEPLOYED_COST_CAP_USD", Some("80")),
+                ("BOT_PAIR_GROSS_DEPLOYED_COST_BUFFER_USD", Some("0")),
+                ("BOT_PORTFOLIO_GROSS_DEPLOYED_COST_BUFFER_USD", Some("0")),
+                ("BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS", Some("0")),
+            ],
+            || {
+                let err = build_effective_bot_config_from_env().expect_err("zero ttl should fail");
+                assert!(err
+                    .to_string()
+                    .contains("BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS"));
+            },
+        );
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("BOT_PAIR_GROSS_DEPLOYED_COST_CAP_USD", Some("20")),
+                ("BOT_PORTFOLIO_GROSS_DEPLOYED_COST_CAP_USD", Some("80")),
+                ("BOT_PAIR_GROSS_DEPLOYED_COST_BUFFER_USD", Some("0")),
+                ("BOT_PORTFOLIO_GROSS_DEPLOYED_COST_BUFFER_USD", Some("0")),
+                ("BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS", Some("0.5")),
+            ],
+            || {
+                let err = build_effective_bot_config_from_env().expect_err("0.5s ttl should fail");
+                assert!(err
+                    .to_string()
+                    .contains("BOT_GROSS_CAP_SHARED_STATE_TTL_SECONDS"));
+            },
+        );
+    }
+
+    #[test]
     fn stale_data_policy_rejects_legacy_single_threshold_env() {
         with_env(
             &[
@@ -927,9 +1204,44 @@ mod tests {
                     .and_then(Value::as_object_mut)
                     .expect("bot config object")
                     .remove("market_data_stale_hard_pause_seconds");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("pair_gross_deployed_cost_cap_usd");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("portfolio_gross_deployed_cost_cap_usd");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("pair_gross_deployed_cost_buffer_usd");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("portfolio_gross_deployed_cost_buffer_usd");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("gross_cap_include_pending_maker");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("gross_cap_include_pending_taker");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("gross_cap_shared_state_ttl_seconds");
 
-                let snapshot: VersionedConfigSnapshotV1 =
-                    serde_json::from_value(value).expect("legacy-like snapshot");
+                let snapshot =
+                    snapshot_from_json_value_compat(value).expect("legacy-like snapshot");
                 let resolved =
                     resolve_versioned_config_bundle_from_snapshot(snapshot).expect("resolved");
                 assert_eq!(
@@ -952,9 +1264,154 @@ mod tests {
                         .abs()
                         < 1e-9
                 );
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .pair_gross_deployed_cost_cap_usd,
+                    resolved.effective_bot_config.max_total_cost
+                );
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .portfolio_gross_deployed_cost_cap_usd,
+                    resolved.effective_bot_config.max_total_cost * 4.0
+                );
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .pair_gross_deployed_cost_buffer_usd,
+                    0.0
+                );
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .portfolio_gross_deployed_cost_buffer_usd,
+                    0.0
+                );
+                assert!(
+                    resolved
+                        .effective_bot_config
+                        .gross_cap_include_pending_maker
+                );
+                assert!(
+                    resolved
+                        .effective_bot_config
+                        .gross_cap_include_pending_taker
+                );
+                assert!(
+                    (resolved
+                        .effective_bot_config
+                        .gross_cap_shared_state_ttl_seconds
+                        - 30.0)
+                        .abs()
+                        < 1e-9
+                );
                 assert!(stale_data_policy_requirement_compliant(
                     &resolved.effective_bot_config
                 ));
+            },
+        );
+    }
+
+    #[test]
+    fn old_snapshot_missing_gross_caps_preserves_max_total_cost_derived_policy() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("MAX_TOTAL_COST", Some("37")),
+                ("MARKET_DATA_STALE_SECONDS", None),
+                ("EXEC_MODE", Some("BOT")),
+            ],
+            || {
+                let bundle = load_versioned_config_bundle_from_env().expect("bundle");
+                let mut value: Value =
+                    serde_json::from_str(&bundle.config_text().expect("config text"))
+                        .expect("snapshot json");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("pair_gross_deployed_cost_cap_usd");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("portfolio_gross_deployed_cost_cap_usd");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("pair_gross_deployed_cost_buffer_usd");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("portfolio_gross_deployed_cost_buffer_usd");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("gross_cap_include_pending_maker");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("gross_cap_include_pending_taker");
+                value
+                    .get_mut("bot_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("bot config object")
+                    .remove("gross_cap_shared_state_ttl_seconds");
+
+                let snapshot =
+                    snapshot_from_json_value_compat(value).expect("legacy-like snapshot");
+                let resolved =
+                    resolve_versioned_config_bundle_from_snapshot(snapshot).expect("resolved");
+
+                assert_eq!(resolved.effective_bot_config.max_total_cost, 37.0);
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .pair_gross_deployed_cost_cap_usd,
+                    37.0
+                );
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .portfolio_gross_deployed_cost_cap_usd,
+                    148.0
+                );
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .pair_gross_deployed_cost_buffer_usd,
+                    0.0
+                );
+                assert_eq!(
+                    resolved
+                        .effective_bot_config
+                        .portfolio_gross_deployed_cost_buffer_usd,
+                    0.0
+                );
+                assert!(
+                    resolved
+                        .effective_bot_config
+                        .gross_cap_include_pending_maker
+                );
+                assert!(
+                    resolved
+                        .effective_bot_config
+                        .gross_cap_include_pending_taker
+                );
+                assert!(
+                    (resolved
+                        .effective_bot_config
+                        .gross_cap_shared_state_ttl_seconds
+                        - 30.0)
+                        .abs()
+                        < 1e-9
+                );
             },
         );
     }

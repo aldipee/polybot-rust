@@ -62,6 +62,18 @@ fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
     out
 }
 
+fn with_shared_state_dir<T>(path: &PathBuf, f: impl FnOnce() -> T) -> T {
+    let _ = path;
+    f()
+}
+
+fn set_shared_state_dir_override(bot: &mut MakerHedgeCapBot, path: &PathBuf) {
+    bot.runtime_flags.insert(
+        "__shared_state_dir_override".to_string(),
+        json!(path.to_string_lossy().to_string()),
+    );
+}
+
 /// Exercises the make BOT runtime test BOT scenario and checks the expected BOT behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
 
@@ -213,6 +225,72 @@ fn startup_reconciliation_gate_clears_to_healthy_when_local_validation_is_clean(
     assert!(runtime_state
         .safety_gate_reason
         .contains("reconciliation_clean"));
+}
+
+#[test]
+fn startup_reconciliation_republishes_recovered_live_maker_buy_after_gate_clears() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_startup_reconcile_republish_recovered_maker_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xstartuprecongrossmaker".to_string();
+        bot.active_trade_id = Some("trade_startup_reconcile_republish_maker".to_string());
+        let now = now_ts_f64();
+        bot._bot_runtime_mark_startup_reconciliation_pending(now);
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_startup_recovered_maker_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(now - 300.0),
+                    submit_ts: Some(now - 300.0),
+                    kind: Some("maker".to_string()),
+                },
+            );
+        }
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.push(json!({
+                "id": "oid_startup_recovered_maker_yes",
+                "order_id": "oid_startup_recovered_maker_yes",
+                "asset_id": "yes_asset_id",
+                "token_id": "yes_asset_id",
+                "side": "BUY",
+                "price": 0.41,
+                "size": 12.0,
+                "remaining_size": 12.0,
+                "status": "LIVE",
+            }));
+        }
+
+        bot._bot_runtime_run_reconciliation_gate("startup", now + 1.0)
+            .expect("startup reconciliation should republish recovered maker buy");
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_startup_recovered_maker_yes")
+            .expect("recovered maker buy should be republished after clean gate");
+        assert_eq!(reservation.kind, "maker");
+        assert!((reservation.remaining_gross() - (0.41 * 12.0)).abs() < 1e-9);
+
+        let runtime_state = bot
+            .bot_runtime_state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        assert_eq!(runtime_state.safety_gate, BotRuntimeSafetyGate::Healthy);
+    });
 }
 
 #[test]
@@ -620,6 +698,7 @@ fn user_event_replacement_does_not_inherit_previous_order_submit_ts() {
                 size: Some(12.0),
                 ts: Some(now_ts_f64()),
                 submit_ts: Some(old_submit_ts),
+                kind: None,
             },
         );
     }
@@ -654,6 +733,308 @@ fn user_event_replacement_does_not_inherit_previous_order_submit_ts() {
         MakerDirectRefreshDecision::Blocked { .. } => {}
         other => panic!("expected blocked direct refresh decision, got {other:?}"),
     }
+}
+
+#[test]
+fn user_order_event_size_only_update_preserves_remaining_size() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_user_order_size_only_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xuserordersizeonly".to_string();
+        bot.active_trade_id = Some("trade_user_order_size_only".to_string());
+        bot._track_order_execution_context(
+            "size_only_yes_oid",
+            &json!({
+                "order_id": "size_only_yes_oid",
+                "asset_id": "yes_asset_id",
+                "side": "BUY",
+                "origin": "BOT_PAIR_BUILD_YES",
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+            }),
+        );
+
+        bot._handle_user_order_event(&json!({
+            "event_type": "order",
+            "asset_id": "yes_asset_id",
+            "order_id": "size_only_yes_oid",
+            "side": "BUY",
+            "type": "UPDATE",
+            "price": 0.41,
+            "size": 7.0,
+            "size_matched": 5.0,
+            "status": "LIVE",
+        }));
+
+        let open_order = bot
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+            .expect("open order from size-only update");
+        assert_eq!(open_order.order_id.as_deref(), Some("size_only_yes_oid"));
+        assert!((open_order.size.unwrap_or(0.0) - 7.0).abs() < 1e-9);
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("size_only_yes_oid")
+            .expect("shared gross reservation for size-only update");
+        assert!((reservation.size - 7.0).abs() < 1e-9);
+        assert!(reservation.applied_size.abs() < 1e-9);
+        assert!((reservation.remaining_size() - 7.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn user_order_event_restores_taker_kind_from_pending_taker_state_without_exec_context() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_user_order_restore_taker_kind_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xuserordertakerkind".to_string();
+        bot.active_trade_id = Some("trade_user_order_taker_kind".to_string());
+        bot.cfg.gross_cap_include_pending_maker = false;
+        bot.cfg.gross_cap_include_pending_taker = true;
+        if let Ok(mut map) = bot.order_exec_context.lock() {
+            map.clear();
+        }
+
+        bot._remember_shared_pending_taker_order(
+            "user_event_taker_yes",
+            "yes_asset_id",
+            8.0,
+            0.0,
+            "BUY",
+            now_ts_f64() - 40.0,
+        );
+
+        bot._handle_user_order_event(&json!({
+            "event_type": "order",
+            "asset_id": "yes_asset_id",
+            "order_id": "user_event_taker_yes",
+            "side": "BUY",
+            "type": "UPDATE",
+            "price": 0.47,
+            "original_size": 8.0,
+            "size_matched": 0.0,
+            "status": "LIVE",
+        }));
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("user_event_taker_yes")
+            .expect("shared gross reservation from user order event");
+        assert_eq!(reservation.kind, "taker");
+        assert!((reservation.remaining_gross() - (0.47 * 8.0)).abs() < 1e-9);
+
+        let snapshot = bot
+            ._gross_cap_snapshot(0.0, &[])
+            .expect("gross snapshot with restored taker kind");
+        assert!(snapshot.current_pair_pending_maker_gross_usd.abs() < 1e-9);
+        assert!((snapshot.current_pair_pending_taker_gross_usd - (0.47 * 8.0)).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn user_order_event_preserves_taker_kind_from_open_order_state_after_long_restart_gap() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_user_order_restore_taker_kind_from_open_order_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xuserordertakerkindopenorder".to_string();
+        bot.active_trade_id = Some("trade_user_order_taker_kind_open_order".to_string());
+        bot.cfg.gross_cap_include_pending_maker = false;
+        bot.cfg.gross_cap_include_pending_taker = true;
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("user_event_restart_taker_yes".to_string()),
+                    price: Some(0.47),
+                    size: Some(8.0),
+                    ts: Some(now_ts_f64() - 300.0),
+                    submit_ts: Some(now_ts_f64() - 300.0),
+                    kind: Some("taker".to_string()),
+                },
+            );
+        }
+        if let Ok(mut map) = bot.order_exec_context.lock() {
+            map.clear();
+        }
+        bot._forget_shared_gross_order_reservation("user_event_restart_taker_yes");
+        bot._forget_shared_pending_taker_order("user_event_restart_taker_yes");
+
+        bot._handle_user_order_event(&json!({
+            "event_type": "order",
+            "asset_id": "yes_asset_id",
+            "order_id": "user_event_restart_taker_yes",
+            "side": "BUY",
+            "type": "UPDATE",
+            "price": 0.47,
+            "original_size": 8.0,
+            "size_matched": 0.0,
+            "status": "LIVE",
+        }));
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("user_event_restart_taker_yes")
+            .expect("shared gross reservation after long-gap user event");
+        assert_eq!(reservation.kind, "taker");
+
+        let open_order = bot
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+            .expect("open order after long-gap user event");
+        assert_eq!(open_order.kind.as_deref(), Some("taker"));
+
+        let snapshot = bot
+            ._gross_cap_snapshot(0.0, &[])
+            .expect("gross snapshot with open-order taker kind");
+        assert!(snapshot.current_pair_pending_maker_gross_usd.abs() < 1e-9);
+        assert!((snapshot.current_pair_pending_taker_gross_usd - (0.47 * 8.0)).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn remember_taker_order_persists_open_order_kind_across_long_restart_gap() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_taker_accept_persist_open_order_kind_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xtakeracceptpersistkind".to_string();
+        bot.active_trade_id = Some("trade_taker_accept_persist_kind".to_string());
+        bot.cfg.gross_cap_include_pending_maker = false;
+        bot.cfg.gross_cap_include_pending_taker = true;
+
+        assert!(bot._remember_taker_order(
+            "accept_restart_taker_yes",
+            "yes_asset_id",
+            8.0,
+            0.47,
+            "BUY",
+            LiquidityIntent::TakerException,
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        ));
+
+        let saved_open_order = bot
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+            .expect("accepted taker order saved into local open_orders");
+        assert_eq!(
+            saved_open_order.order_id.as_deref(),
+            Some("accept_restart_taker_yes")
+        );
+        assert_eq!(saved_open_order.kind.as_deref(), Some("taker"));
+
+        bot._forget_shared_gross_order_reservation("accept_restart_taker_yes");
+        bot._forget_shared_pending_taker_order("accept_restart_taker_yes");
+
+        let mut restarted = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut restarted, &shared_dir);
+        restarted.cfg.dry_run = false;
+        restarted.wallet_address = bot.wallet_address.clone();
+        restarted.active_trade_id = Some("trade_taker_accept_persist_kind_restart".to_string());
+        restarted.cfg.gross_cap_include_pending_maker = false;
+        restarted.cfg.gross_cap_include_pending_taker = true;
+        restarted.state_file = bot.state_file.clone();
+        restarted.state = Arc::new(Mutex::new(
+            crate::helpers::load_state(&restarted.state_file)
+                .expect("load persisted state after restart"),
+        ));
+        let loaded_open_order = restarted
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+            .expect("loaded persisted taker open order");
+        assert_eq!(
+            loaded_open_order.order_id.as_deref(),
+            Some("accept_restart_taker_yes")
+        );
+        assert_eq!(loaded_open_order.kind.as_deref(), Some("taker"));
+        if let Ok(mut cache) = restarted.exchange_orders_cache.lock() {
+            cache.push(json!({
+                "id": "accept_restart_taker_yes",
+                "order_id": "accept_restart_taker_yes",
+                "asset_id": "yes_asset_id",
+                "token_id": "yes_asset_id",
+                "side": "BUY",
+                "price": 0.47,
+                "size": 8.0,
+                "remaining_size": 8.0,
+                "status": "LIVE",
+            }));
+        }
+
+        restarted._reconcile_exchange_orders_for_asset("yes_asset_id", None, true);
+
+        let open_order = restarted
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+            .expect("open order after restart reconciliation");
+        assert_eq!(
+            open_order.order_id.as_deref(),
+            Some("accept_restart_taker_yes")
+        );
+        assert_eq!(open_order.kind.as_deref(), Some("taker"));
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &restarted._gross_exposure_state_file(),
+            restarted.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state after restart reconciliation");
+        let reservation = shared
+            .pending_orders
+            .get("accept_restart_taker_yes")
+            .expect("reconciled shared gross reservation");
+        assert_eq!(reservation.kind, "taker");
+
+        let snapshot = restarted
+            ._gross_cap_snapshot(0.0, &[])
+            .expect("gross snapshot with persisted taker open-order kind");
+        assert!(snapshot.current_pair_pending_maker_gross_usd.abs() < 1e-9);
+        assert!((snapshot.current_pair_pending_taker_gross_usd - (0.47 * 8.0)).abs() < 1e-9);
+    });
 }
 
 #[test]
@@ -1121,6 +1502,1649 @@ fn identical_local_order_retry_reuses_deterministic_intent_oid() {
 
     assert_eq!(oid_a, oid_b);
     assert_ne!(oid_a, oid_c);
+}
+
+#[test]
+fn pair_gross_cap_blocks_combined_pair_seed_submit() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_pair_cap_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.cfg.pair_gross_deployed_cost_cap_usd = 8.0;
+        bot.cfg.portfolio_gross_deployed_cost_cap_usd = 100.0;
+        bot.active_trade_id = Some("trade_pair_cap".to_string());
+
+        let (yes_oid, no_oid) =
+            bot._maker_submit_pair_orders(12, 0.40, 0.40, "GTC", Some(true), "BOT_PAIR_BUILD");
+
+        assert!(yes_oid.is_none());
+        assert!(no_oid.is_none());
+        assert!(bot
+            .state
+            .lock()
+            .map(|state| state.open_orders.is_empty())
+            .unwrap_or(false));
+        assert!(bot
+            .exchange_orders_cache
+            .lock()
+            .map(|orders| orders.is_empty())
+            .unwrap_or(false));
+    });
+}
+
+#[test]
+fn pair_gross_cap_preapproval_counts_retained_live_pair_leg() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_pair_retained_leg_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.cfg.pair_gross_deployed_cost_cap_usd = 7.0;
+        bot.cfg.portfolio_gross_deployed_cost_cap_usd = 100.0;
+        bot.runtime_flags
+            .insert("maker_single_inflight_per_side".to_string(), json!(false));
+        bot.active_trade_id = Some("trade_pair_retained_leg".to_string());
+
+        let yes_oid = bot
+            ._place_limit_bid_gtc_with_origin(
+                "yes_asset_id",
+                0.50,
+                12.0,
+                Some(true),
+                "BOT_PAIR_BUILD_YES",
+            )
+            .expect("existing oversized yes order");
+        bot._remember_shared_gross_order_reservation(
+            &yes_oid,
+            "yes_asset_id",
+            "BUY",
+            0.50,
+            12.0,
+            "BOT_PAIR_BUILD_YES",
+            "maker",
+        );
+        if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+            runtime_state.yes_refresh_cycle.last_cycle_started_ts = now_ts_f64();
+            runtime_state.yes_refresh_cycle.last_origin = "BOT_PAIR_BUILD_YES".to_string();
+            runtime_state.yes_refresh_cycle.last_reason = "test_recent_refresh".to_string();
+        }
+
+        let (next_yes_oid, next_no_oid) =
+            bot._maker_submit_pair_orders(4, 0.50, 0.50, "GTC", Some(true), "BOT_PAIR_BUILD");
+
+        assert!(next_yes_oid.is_none());
+        assert!(next_no_oid.is_none());
+        let open_orders = bot
+            .state
+            .lock()
+            .map(|state| state.open_orders.clone())
+            .unwrap_or_default();
+        assert!(open_orders
+            .get("yes_asset_id")
+            .and_then(|order| order.order_id.clone())
+            .is_some());
+        assert!(!open_orders.contains_key("no_asset_id"));
+    });
+}
+
+#[test]
+fn pair_gross_cap_preapproval_keeps_direct_live_pair_legs_additive_until_cancelled() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_pair_replace_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.cfg.pair_gross_deployed_cost_cap_usd = 10.0;
+        bot.cfg.portfolio_gross_deployed_cost_cap_usd = 100.0;
+        bot.cfg.maker_replace_min_interval_seconds = 0.0;
+        bot.runtime_flags
+            .insert("maker_single_inflight_per_side".to_string(), json!(false));
+        bot.active_trade_id = Some("trade_pair_replace".to_string());
+
+        let (yes_oid, no_oid) =
+            bot._maker_submit_pair_orders(10, 0.50, 0.50, "GTC", Some(true), "BOT_PAIR_BUILD");
+        let yes_oid = yes_oid.expect("initial yes order");
+        let no_oid = no_oid.expect("initial no order");
+
+        let (next_yes_oid, next_no_oid) =
+            bot._maker_submit_pair_orders(10, 0.50, 0.50, "GTC", Some(true), "BOT_PAIR_BUILD");
+
+        assert!(next_yes_oid.is_none());
+        assert!(next_no_oid.is_none());
+        let open_orders = bot
+            .state
+            .lock()
+            .map(|state| state.open_orders.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            open_orders
+                .get("yes_asset_id")
+                .and_then(|order| order.order_id.clone()),
+            Some(yes_oid)
+        );
+        assert_eq!(
+            open_orders
+                .get("no_asset_id")
+                .and_then(|order| order.order_id.clone()),
+            Some(no_oid)
+        );
+    });
+}
+
+#[test]
+fn pair_gross_cap_preapproval_keeps_direct_refresh_legs_additive_until_cancelled() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_pair_direct_started_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.cfg.pair_gross_deployed_cost_cap_usd = 7.0;
+        bot.cfg.portfolio_gross_deployed_cost_cap_usd = 100.0;
+        bot.cfg.maker_replace_min_interval_seconds = 0.0;
+        bot.runtime_flags
+            .insert("maker_single_inflight_per_side".to_string(), json!(false));
+        bot.active_trade_id = Some("trade_pair_direct_started".to_string());
+
+        let yes_oid = bot
+            ._place_limit_bid_gtc_with_origin(
+                "yes_asset_id",
+                0.50,
+                12.0,
+                Some(true),
+                "BOT_PAIR_BUILD_YES",
+            )
+            .expect("existing direct yes order");
+
+        let (next_yes_oid, next_no_oid) =
+            bot._maker_submit_pair_orders(4, 0.50, 0.50, "GTC", Some(true), "BOT_PAIR_BUILD");
+
+        assert!(next_yes_oid.is_none());
+        assert!(next_no_oid.is_none());
+        let open_orders = bot
+            .state
+            .lock()
+            .map(|state| state.open_orders.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            open_orders
+                .get("yes_asset_id")
+                .and_then(|order| order.order_id.clone()),
+            Some(yes_oid)
+        );
+        assert!(!open_orders.contains_key("no_asset_id"));
+    });
+}
+
+#[test]
+fn portfolio_gross_cap_blocks_second_bot_on_same_wallet() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_portfolio_cap_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let wallet = "0xsharedgrosswallet".to_string();
+
+        let mut bot_a = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot_a, &shared_dir);
+        bot_a.wallet_address = wallet.clone();
+        bot_a.market_slug = "gross-other-pair".to_string();
+        bot_a.pair_identity = PairIdentity {
+            pair_id: canonical_pair_id_from_slug("gross-other-pair"),
+            market_slug: "gross-other-pair".to_string(),
+            condition_id: None,
+            yes_asset_id: Some("gross_other_yes_asset_id".to_string()),
+            no_asset_id: Some("gross_other_no_asset_id".to_string()),
+        };
+        bot_a.yes_asset = Some("gross_other_yes_asset_id".to_string());
+        bot_a.no_asset = Some("gross_other_no_asset_id".to_string());
+        bot_a.active_trade_id = Some("trade_a".to_string());
+        if let Ok(mut state) = bot_a.state.lock() {
+            state.c_yes = 15.0;
+            state.c_no = 0.0;
+        }
+        assert!(bot_a._refresh_shared_gross_trade_snapshot());
+
+        let mut bot_b = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot_b, &shared_dir);
+        bot_b.cfg.dry_run = false;
+        bot_b.wallet_address = wallet;
+        bot_b.active_trade_id = Some("trade_b".to_string());
+        bot_b.cfg.pair_gross_deployed_cost_cap_usd = 50.0;
+        bot_b.cfg.portfolio_gross_deployed_cost_cap_usd = 16.0;
+
+        let (yes_oid, no_oid) =
+            bot_b._maker_submit_pair_orders(12, 0.10, 0.10, "GTC", Some(true), "BOT_PAIR_BUILD");
+
+        assert!(yes_oid.is_none());
+        assert!(no_oid.is_none());
+        assert!(bot_b
+            .state
+            .lock()
+            .map(|state| state.open_orders.is_empty())
+            .unwrap_or(false));
+    });
+}
+
+#[test]
+fn single_inflight_pair_submit_does_not_consume_first_leg_after_submit_ack_publish_failure() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_pair_submit_ack_gross_publish_failure_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xpairsubmitackgrossfail".to_string();
+        bot.active_trade_id = Some("trade_pair_submit_ack_gross_fail".to_string());
+
+        let gross_state_file = bot._gross_exposure_state_file();
+        if let Some(parent) = gross_state_file.parent() {
+            std::fs::create_dir_all(parent).expect("create shared gross state dir");
+        }
+        let mut shared = crate::helpers::SharedGrossExposureState::default();
+        crate::helpers::save_shared_gross_exposure_state(&gross_state_file, &mut shared)
+            .expect("seed readable shared gross state");
+        let mut permissions = std::fs::metadata(&gross_state_file)
+            .expect("shared gross state metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&gross_state_file, permissions)
+            .expect("make shared gross state read-only");
+
+        let (yes_oid, no_oid) =
+            bot._maker_submit_pair_orders(12, 0.10, 0.10, "GTC", Some(true), "BOT_PAIR_BUILD");
+
+        assert!(yes_oid.is_none());
+        assert!(no_oid.is_none());
+        assert!(bot
+            .state
+            .lock()
+            .map(|state| state.open_orders.is_empty())
+            .unwrap_or(false));
+        assert!(bot
+            .exchange_orders_cache
+            .lock()
+            .map(|cache| cache.is_empty())
+            .unwrap_or(false));
+        let paused = bot
+            .bot_runtime_state
+            .lock()
+            .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+            .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new()));
+        assert_eq!(paused.0, BotRuntimeSafetyGate::DependencyPaused);
+        assert!(paused
+            .1
+            .starts_with("dependency_pause:database:gross_cap_state"));
+    });
+}
+
+#[test]
+fn gross_cap_snapshot_prefers_local_trade_cost_over_stale_shared_copy() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_self_override_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.wallet_address = "0xgrossself".to_string();
+        bot.active_trade_id = Some("trade_self_new".to_string());
+        if let Ok(mut state) = bot.state.lock() {
+            state.c_yes = 2.0;
+            state.c_no = 3.0;
+        }
+
+        let mut shared = crate::helpers::SharedGrossExposureState::default();
+        let now = now_ts_f64();
+        shared.upsert_trade_snapshot(
+            "trade_self_old",
+            bot.pair_identity().pair_id.as_str(),
+            bot._gross_cap_instance_key().as_str(),
+            99.0,
+            now,
+        );
+        shared.upsert_trade_snapshot("trade_other", "pair_other", "other-instance", 7.0, now);
+        crate::helpers::save_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            &mut shared,
+        )
+        .expect("write stale shared gross state");
+
+        let snapshot = bot
+            ._gross_cap_snapshot(1.0, &[])
+            .expect("gross snapshot should load");
+
+        assert!((snapshot.current_pair_filled_gross_usd - 5.0).abs() < 1e-9);
+        assert!((snapshot.current_portfolio_filled_gross_usd - 12.0).abs() < 1e-9);
+        assert!((snapshot.projected_portfolio_gross_usd - 13.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn gross_cap_snapshot_counts_same_pair_sibling_trade_with_different_instance_key() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_same_pair_sibling_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let instance_dir_a = shared_dir.join("instance_a");
+        let instance_dir_b = shared_dir.join("instance_b");
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.runtime_flags.insert(
+            "__instance_working_dir_override".to_string(),
+            json!(instance_dir_a.to_string_lossy().to_string()),
+        );
+        bot.state_file = PathBuf::from("maker_hedgecap_state_same_market.json");
+        bot.wallet_address = "0xgrosssamepairsibling".to_string();
+        bot.active_trade_id = Some("trade_self_new".to_string());
+        if let Ok(mut state) = bot.state.lock() {
+            state.c_yes = 2.0;
+            state.c_no = 3.0;
+        }
+
+        let mut sibling = make_bot_runtime_test_bot();
+        sibling.runtime_flags.insert(
+            "__instance_working_dir_override".to_string(),
+            json!(instance_dir_b.to_string_lossy().to_string()),
+        );
+        sibling.state_file = PathBuf::from("maker_hedgecap_state_same_market.json");
+
+        let mut shared = crate::helpers::SharedGrossExposureState::default();
+        let now = now_ts_f64();
+        shared.upsert_trade_snapshot(
+            "trade_same_pair_sibling",
+            bot.pair_identity().pair_id.as_str(),
+            sibling._gross_cap_instance_key().as_str(),
+            7.0,
+            now,
+        );
+        crate::helpers::save_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            &mut shared,
+        )
+        .expect("write sibling same-pair shared state");
+
+        let snapshot = bot
+            ._gross_cap_snapshot(1.0, &[])
+            .expect("gross snapshot should load");
+
+        assert!((snapshot.current_pair_filled_gross_usd - 5.0).abs() < 1e-9);
+        assert!((snapshot.current_portfolio_filled_gross_usd - 12.0).abs() < 1e-9);
+        assert!((snapshot.projected_portfolio_gross_usd - 13.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn gross_cap_snapshot_excludes_replaced_order_reservation() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_replace_exclude_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.wallet_address = "0xgrossreplace".to_string();
+        bot.active_trade_id = Some("trade_replace".to_string());
+
+        bot._remember_shared_gross_order_reservation(
+            "old_yes",
+            "yes_asset_id",
+            "BUY",
+            0.50,
+            10.0,
+            "BOT_PAIR_BUILD_YES",
+            "maker",
+        );
+
+        let included = bot
+            ._gross_cap_snapshot(5.0, &[])
+            .expect("snapshot with existing reservation");
+        assert!((included.current_pair_pending_maker_gross_usd - 5.0).abs() < 1e-9);
+        assert!((included.current_portfolio_pending_gross_usd - 5.0).abs() < 1e-9);
+        assert!((included.projected_pair_gross_usd - 10.0).abs() < 1e-9);
+
+        let excluded = bot
+            ._gross_cap_snapshot(5.0, &[String::from("old_yes")])
+            .expect("snapshot excluding replaced reservation");
+        assert!(excluded.current_pair_pending_maker_gross_usd.abs() < 1e-9);
+        assert!(excluded.current_portfolio_pending_gross_usd.abs() < 1e-9);
+        assert!((excluded.projected_pair_gross_usd - 5.0).abs() < 1e-9);
+        assert!((excluded.projected_portfolio_gross_usd - 5.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn reconciliation_republishes_live_bot_orders_into_shared_gross_state() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_republish_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xgrossrepublish".to_string();
+        bot.active_trade_id = Some("trade_republish".to_string());
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_republish_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(now_ts_f64()),
+                    submit_ts: Some(now_ts_f64()),
+                    kind: None,
+                },
+            );
+        }
+        bot._track_order_execution_context(
+            "oid_republish_yes",
+            &json!({
+                "order_id": "oid_republish_yes",
+                "asset_id": "yes_asset_id",
+                "side": "BUY",
+                "origin": "BOT_PAIR_BUILD_YES",
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+            }),
+        );
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load republished shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_republish_yes")
+            .expect("republished reservation");
+        assert_eq!(reservation.trade_id, "trade_republish");
+        assert_eq!(reservation.origin, "BOT_PAIR_BUILD_YES");
+        assert_eq!(reservation.kind, "maker");
+        assert!((reservation.price - 0.41).abs() < 1e-9);
+        assert!((reservation.size - 12.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_skips_dry_run_local_orders() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_republish_dry_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = true;
+        bot.wallet_address = "0xgrossrepublishdry".to_string();
+        bot.active_trade_id = Some("trade_republish_dry".to_string());
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("DRY_LIMIT_GTC_123".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(now_ts_f64()),
+                    submit_ts: Some(now_ts_f64()),
+                    kind: None,
+                },
+            );
+        }
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        assert!(shared.pending_orders.is_empty());
+    });
+}
+
+#[test]
+fn dry_run_single_inflight_maker_submit_does_not_publish_shared_gross_reservation() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_dry_single_inflight_gross_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = true;
+        bot.wallet_address = "0xdrysingleinflightgross".to_string();
+        bot.active_trade_id = Some("trade_dry_single_inflight_gross".to_string());
+        let key = MakerOrderKey::buy("yes_asset_id");
+
+        let oid = bot
+            ._maker_order_upsert_gtc(&key, 0.41, 12.0, "BOT_PAIR_BUILD_YES")
+            .expect("dry-run maker submit");
+
+        assert!(oid.starts_with("DRY_LIMIT_GTC_"));
+        let tracked_oid = bot
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+            .and_then(|order| order.order_id)
+            .expect("local dry-run order tracked");
+        assert_eq!(tracked_oid, oid);
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        assert!(shared.pending_orders.is_empty());
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_refreshes_all_live_direct_buy_orders() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_republish_direct_multi_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xgrossrepublishdirect".to_string();
+        bot.active_trade_id = Some("trade_republish_direct".to_string());
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_direct_new".to_string()),
+                    price: Some(0.43),
+                    size: Some(10.0),
+                    ts: Some(now_ts_f64()),
+                    submit_ts: Some(now_ts_f64()),
+                    kind: None,
+                },
+            );
+        }
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.push(json!({
+                "id": "oid_direct_old",
+                "order_id": "oid_direct_old",
+                "asset_id": "yes_asset_id",
+                "token_id": "yes_asset_id",
+                "side": "BUY",
+                "price": 0.41,
+                "size": 12.0,
+                "remaining_size": 12.0,
+            }));
+            cache.push(json!({
+                "id": "oid_direct_new",
+                "order_id": "oid_direct_new",
+                "asset_id": "yes_asset_id",
+                "token_id": "yes_asset_id",
+                "side": "BUY",
+                "price": 0.43,
+                "size": 10.0,
+                "remaining_size": 10.0,
+            }));
+        }
+        bot._track_order_execution_context(
+            "oid_direct_old",
+            &json!({
+                "order_id": "oid_direct_old",
+                "asset_id": "yes_asset_id",
+                "side": "BUY",
+                "origin": "BOT_PAIR_BUILD_YES",
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+            }),
+        );
+        bot._track_order_execution_context(
+            "oid_direct_new",
+            &json!({
+                "order_id": "oid_direct_new",
+                "asset_id": "yes_asset_id",
+                "side": "BUY",
+                "origin": "BOT_TAPER_YES",
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+            }),
+        );
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let old_order = shared
+            .pending_orders
+            .get("oid_direct_old")
+            .expect("old direct reservation");
+        let new_order = shared
+            .pending_orders
+            .get("oid_direct_new")
+            .expect("new direct reservation");
+        assert_eq!(old_order.kind, "maker");
+        assert_eq!(new_order.kind, "maker");
+        assert!((old_order.price - 0.41).abs() < 1e-9);
+        assert!((new_order.price - 0.43).abs() < 1e-9);
+        assert!((old_order.size - 12.0).abs() < 1e-9);
+        assert!((new_order.size - 10.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_preserves_existing_maker_applied_progress() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_republish_preserve_applied_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xgrossrepublishapplied".to_string();
+        bot.active_trade_id = Some("trade_republish_applied".to_string());
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_republish_applied_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(7.0),
+                    ts: Some(now_ts_f64()),
+                    submit_ts: Some(now_ts_f64()),
+                    kind: None,
+                },
+            );
+        }
+        bot._track_order_execution_context(
+            "oid_republish_applied_yes",
+            &json!({
+                "order_id": "oid_republish_applied_yes",
+                "asset_id": "yes_asset_id",
+                "side": "BUY",
+                "origin": "BOT_PAIR_BUILD_YES",
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+            }),
+        );
+        assert!(bot._remember_shared_gross_order_reservation(
+            "oid_republish_applied_yes",
+            "yes_asset_id",
+            "BUY",
+            0.41,
+            12.0,
+            "BOT_PAIR_BUILD_YES",
+            "maker",
+        ));
+        bot._add_shared_gross_order_applied("oid_republish_applied_yes", 5.0);
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_republish_applied_yes")
+            .expect("republished reservation");
+        assert!((reservation.size - 12.0).abs() < 1e-9);
+        assert!((reservation.applied_size - 5.0).abs() < 1e-9);
+        assert!((reservation.remaining_size() - 7.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_preserves_existing_kind_without_exec_context() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_republish_preserve_kind_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xgrossrepublishkind".to_string();
+        bot.active_trade_id = Some("trade_republish_kind".to_string());
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_republish_kind_yes".to_string()),
+                    price: Some(0.52),
+                    size: Some(9.0),
+                    ts: Some(now_ts_f64()),
+                    submit_ts: Some(now_ts_f64()),
+                    kind: None,
+                },
+            );
+        }
+        if let Ok(mut map) = bot.order_exec_context.lock() {
+            map.clear();
+        }
+        assert!(bot._remember_shared_gross_order_reservation(
+            "oid_republish_kind_yes",
+            "yes_asset_id",
+            "BUY",
+            0.52,
+            9.0,
+            "BOT_AWAIT_SECOND_FILL_YES",
+            "taker",
+        ));
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_republish_kind_yes")
+            .expect("republished reservation");
+        assert_eq!(reservation.kind, "taker");
+        assert_eq!(reservation.origin, "BOT_AWAIT_SECOND_FILL_YES");
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_restores_taker_kind_from_pending_taker_state() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_republish_restore_taker_kind_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xgrossrestoretakerkind".to_string();
+        bot.active_trade_id = Some("trade_restore_taker_kind".to_string());
+        bot.cfg.gross_cap_include_pending_maker = false;
+        bot.cfg.gross_cap_include_pending_taker = true;
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_restart_taker_yes".to_string()),
+                    price: Some(0.47),
+                    size: Some(8.0),
+                    ts: Some(now_ts_f64()),
+                    submit_ts: Some(now_ts_f64() - 40.0),
+                    kind: None,
+                },
+            );
+        }
+        if let Ok(mut map) = bot.order_exec_context.lock() {
+            map.clear();
+        }
+        bot._remember_shared_pending_taker_order(
+            "oid_restart_taker_yes",
+            "yes_asset_id",
+            8.0,
+            0.0,
+            "BUY",
+            now_ts_f64() - 40.0,
+        );
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_restart_taker_yes")
+            .expect("republished taker reservation");
+        assert_eq!(reservation.kind, "taker");
+        assert!((reservation.remaining_gross() - (0.47 * 8.0)).abs() < 1e-9);
+
+        let snapshot = bot
+            ._gross_cap_snapshot(0.0, &[])
+            .expect("gross snapshot with restored taker kind");
+        assert!(snapshot.current_pair_pending_maker_gross_usd.abs() < 1e-9);
+        assert!((snapshot.current_pair_pending_taker_gross_usd - (0.47 * 8.0)).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn runtime_shared_gross_refresh_republishes_live_reservations_before_ttl_expiry() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_refresh_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xgrossrefresh".to_string();
+        bot.active_trade_id = Some("trade_gross_refresh".to_string());
+        bot.cfg.gross_cap_shared_state_ttl_seconds = 3.0;
+        let now = now_ts_f64();
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_refresh_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(now - 10.0),
+                    submit_ts: Some(now - 10.0),
+                    kind: None,
+                },
+            );
+        }
+        bot._track_order_execution_context(
+            "oid_refresh_yes",
+            &json!({
+                "order_id": "oid_refresh_yes",
+                "asset_id": "yes_asset_id",
+                "side": "BUY",
+                "origin": "BOT_PAIR_BUILD_YES",
+                "liquidity_intent": LiquidityIntent::Maker.as_str(),
+            }),
+        );
+
+        let mut last_refresh = now;
+        bot._bot_runtime_refresh_shared_gross_state(now + 0.5, &mut last_refresh);
+        let shared_before = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state before refresh interval");
+        assert!(!shared_before.pending_orders.contains_key("oid_refresh_yes"));
+        assert!((last_refresh - now).abs() < 1e-9);
+
+        bot._bot_runtime_refresh_shared_gross_state(now + 1.1, &mut last_refresh);
+        let shared_after = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state after refresh interval");
+        let reservation = shared_after
+            .pending_orders
+            .get("oid_refresh_yes")
+            .expect("republished reservation after refresh interval");
+        assert_eq!(reservation.trade_id, "trade_gross_refresh");
+        assert!((last_refresh - (now + 1.1)).abs() < 1e-6);
+    });
+}
+
+#[test]
+fn taker_buy_submit_is_blocked_by_pair_gross_cap() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_taker_cap_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xgrosstaker".to_string();
+        bot.active_trade_id = Some("trade_taker_cap".to_string());
+        bot.cfg.pair_gross_deployed_cost_cap_usd = 4.0;
+        bot.cfg.portfolio_gross_deployed_cost_cap_usd = 100.0;
+
+        let oid = bot._place_taker_bid_fak(
+            "yes_asset_id",
+            0.40,
+            12.0,
+            Some("FAK"),
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        );
+
+        assert!(oid.is_none());
+        assert!(bot
+            .taker_orders
+            .lock()
+            .map(|orders| orders.is_empty())
+            .unwrap_or(false));
+    });
+}
+
+#[test]
+fn gross_cap_shared_state_failure_enters_dependency_pause_and_recovers() {
+    let shared_root = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_state_blocker_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&shared_root, "blocked").expect("write blocker file");
+    with_shared_state_dir(&shared_root, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_root);
+        bot.wallet_address = "0xgrosspause".to_string();
+        bot.active_trade_id = Some("trade_gross_pause".to_string());
+        let now = now_ts_f64();
+        set_pair_quotes(&bot, 0.42, 0.43, 0.41, 0.42, now);
+
+        assert!(!bot._refresh_shared_gross_trade_snapshot());
+        let paused = bot
+            .bot_runtime_state
+            .lock()
+            .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+            .unwrap_or((BotRuntimeSafetyGate::Healthy, String::new()));
+        assert_eq!(paused.0, BotRuntimeSafetyGate::DependencyPaused);
+        assert!(paused
+            .1
+            .starts_with("dependency_pause:database:gross_cap_state"));
+
+        std::fs::remove_file(&shared_root).expect("remove blocker file");
+        std::fs::create_dir_all(&shared_root).expect("create recovered shared dir");
+
+        bot._bot_runtime_dependency_healthy()
+            .expect("gross-cap shared state pause should clear only after file recovers");
+        bot._bot_runtime_run_reconciliation_gate("gross_cap_recovery", now + 1.0)
+            .expect("reconciliation after gross-cap recovery");
+        let recovered = bot
+            .bot_runtime_state
+            .lock()
+            .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+            .unwrap_or((BotRuntimeSafetyGate::DependencyPaused, String::new()));
+        assert_eq!(recovered.0, BotRuntimeSafetyGate::Healthy);
+        assert!(recovered
+            .1
+            .contains("reconciliation_clean:gross_cap_recovery"));
+    });
+}
+
+#[test]
+fn direct_submit_unwinds_when_shared_gross_reservation_publish_fails() {
+    let shared_root = std::env::temp_dir().join(format!(
+        "bot_runtime_gross_submit_blocker_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&shared_root, "blocked").expect("write blocker file");
+    with_shared_state_dir(&shared_root, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_root);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xgrosssubmitpause".to_string();
+        bot.active_trade_id = Some("trade_gross_submit_pause".to_string());
+        bot.runtime_flags
+            .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+        let oid = bot._place_limit_bid_gtc_with_origin(
+            "yes_asset_id",
+            0.41,
+            12.0,
+            Some(false),
+            "BOT_PAIR_BUILD_YES",
+        );
+
+        assert!(oid.is_none());
+        let open_order = bot
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.open_orders.get("yes_asset_id").cloned());
+        assert!(open_order.is_none());
+        let cached_orders = bot
+            .exchange_orders_cache
+            .lock()
+            .map(|orders| orders.clone())
+            .unwrap_or_default();
+        assert!(cached_orders.is_empty());
+    });
+}
+
+#[test]
+fn taker_buy_submit_unwinds_when_shared_gross_reservation_publish_fails() {
+    let shared_root = std::env::temp_dir().join(format!(
+        "bot_runtime_taker_gross_submit_blocker_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&shared_root, "blocked").expect("write blocker file");
+    with_shared_state_dir(&shared_root, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_root);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xtakergrosssubmitpause".to_string();
+        bot.active_trade_id = Some("trade_taker_gross_submit_pause".to_string());
+        let now = now_ts_f64();
+        set_pair_quotes(&bot, 0.42, 0.43, 0.41, 0.42, now);
+
+        let oid = bot._place_taker_bid_fak(
+            "yes_asset_id",
+            0.41,
+            12.0,
+            Some("GTC"),
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        );
+
+        assert!(oid.is_none());
+        let taker_orders = bot
+            .taker_orders
+            .lock()
+            .map(|orders| orders.clone())
+            .unwrap_or_default();
+        assert!(taker_orders.is_empty());
+        let cached_orders = bot
+            .exchange_orders_cache
+            .lock()
+            .map(|orders| orders.clone())
+            .unwrap_or_default();
+        assert!(cached_orders.is_empty());
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_includes_live_taker_buys() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_taker_gross_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishtakergross".to_string();
+        bot.active_trade_id = Some("trade_republish_taker_gross".to_string());
+        assert!(bot._remember_taker_order(
+            "oid_republish_taker_yes",
+            "yes_asset_id",
+            12.0,
+            0.41,
+            "BUY",
+            LiquidityIntent::TakerException,
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        ));
+        bot._forget_shared_gross_order_reservation("oid_republish_taker_yes");
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_republish_taker_yes")
+            .expect("republished taker reservation");
+        assert_eq!(reservation.trade_id, "trade_republish_taker_gross");
+        assert_eq!(reservation.kind, "taker");
+        assert_eq!(reservation.asset_id, "yes_asset_id");
+        assert!((reservation.price - 0.41).abs() < 1e-9);
+        assert!((reservation.size - 12.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn cancel_open_order_local_forgets_taker_tracking_after_successful_cancel() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_cancel_local_taker_cleanup_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xcanceltakercleanup".to_string();
+        bot.active_trade_id = Some("trade_cancel_taker_cleanup".to_string());
+
+        assert!(bot._remember_taker_order(
+            "oid_cancel_taker_yes",
+            "yes_asset_id",
+            12.0,
+            0.41,
+            "BUY",
+            LiquidityIntent::TakerException,
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        ));
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.push(json!({
+                "id": "oid_cancel_taker_yes",
+                "order_id": "oid_cancel_taker_yes",
+                "asset_id": "yes_asset_id",
+                "token_id": "yes_asset_id",
+                "side": "BUY",
+                "price": 0.41,
+                "size": 12.0,
+                "remaining_size": 12.0,
+                "status": "LIVE",
+            }));
+        }
+
+        bot._cancel_open_order_local("yes_asset_id", "test_cancel_taker_cleanup");
+
+        assert!(bot
+            .taker_orders
+            .lock()
+            .map(|orders| !orders.contains_key("oid_cancel_taker_yes"))
+            .unwrap_or(false));
+        assert!(bot
+            .state
+            .lock()
+            .map(|state| !state.open_orders.contains_key("yes_asset_id"))
+            .unwrap_or(false));
+
+        let pending_takers = crate::helpers::load_shared_pending_taker_state(
+            &bot._pending_taker_state_file(),
+            bot.taker_order_ttl_seconds as f64,
+        )
+        .expect("load shared pending taker state after local cancel");
+        assert!(!pending_takers.orders.contains_key("oid_cancel_taker_yes"));
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state after local cancel");
+        assert!(!shared.pending_orders.contains_key("oid_cancel_taker_yes"));
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_forgets_expired_taker_buys() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_expired_taker_gross_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishexpiredtakergross".to_string();
+        bot.active_trade_id = Some("trade_republish_expired_taker_gross".to_string());
+        bot.taker_order_ttl_seconds = 5;
+        assert!(bot._remember_taker_order(
+            "oid_republish_expired_taker_yes",
+            "yes_asset_id",
+            12.0,
+            0.41,
+            "BUY",
+            LiquidityIntent::TakerException,
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        ));
+        if let Ok(mut orders) = bot.taker_orders.lock() {
+            if let Some(record) = orders.get_mut("oid_republish_expired_taker_yes") {
+                record.ts = now_ts_f64() - 10.0;
+            }
+        }
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        assert!(!shared
+            .pending_orders
+            .contains_key("oid_republish_expired_taker_yes"));
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_preserves_existing_unconfirmed_taker_buys_before_startup_reconcile(
+) {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_unconfirmed_persisted_taker_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishunconfirmedtakergross".to_string();
+        bot.active_trade_id = Some("trade_republish_unconfirmed_taker_gross".to_string());
+        bot._bot_runtime_mark_startup_reconciliation_pending(now_ts_f64());
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_unconfirmed_taker_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(now_ts_f64() - 300.0),
+                    submit_ts: Some(now_ts_f64() - 300.0),
+                    kind: Some("taker".to_string()),
+                },
+            );
+        }
+        assert!(bot._remember_shared_gross_order_reservation(
+            "oid_unconfirmed_taker_yes",
+            "yes_asset_id",
+            "BUY",
+            0.41,
+            12.0,
+            "BOT_AWAIT_SECOND_FILL_YES",
+            "taker",
+        ));
+        bot._forget_shared_pending_taker_order("oid_unconfirmed_taker_yes");
+        if let Ok(mut takers) = bot.taker_orders.lock() {
+            takers.clear();
+        }
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.clear();
+        }
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_unconfirmed_taker_yes")
+            .expect("existing taker reservation should be preserved until startup reconcile");
+        assert_eq!(reservation.kind, "taker");
+        assert!((reservation.remaining_gross() - (0.41 * 12.0)).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_preserves_existing_unconfirmed_maker_buys_before_startup_reconcile(
+) {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_unconfirmed_persisted_maker_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishunconfirmedmakergross".to_string();
+        bot.active_trade_id = Some("trade_republish_unconfirmed_maker_gross".to_string());
+        bot._bot_runtime_mark_startup_reconciliation_pending(now_ts_f64());
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_unconfirmed_maker_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(now_ts_f64() - 300.0),
+                    submit_ts: Some(now_ts_f64() - 300.0),
+                    kind: Some("maker".to_string()),
+                },
+            );
+        }
+        assert!(bot._remember_shared_gross_order_reservation(
+            "oid_unconfirmed_maker_yes",
+            "yes_asset_id",
+            "BUY",
+            0.41,
+            12.0,
+            "BOT_PAIR_BUILD_YES",
+            "maker",
+        ));
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut ctx) = bot.order_exec_context.lock() {
+            ctx.clear();
+        }
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_unconfirmed_maker_yes")
+            .expect("existing maker reservation should be preserved until startup reconcile");
+        assert_eq!(reservation.kind, "maker");
+        assert!((reservation.remaining_gross() - (0.41 * 12.0)).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_does_not_create_unconfirmed_maker_buys_before_startup_reconcile(
+) {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_unconfirmed_maker_no_create_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishunconfirmedmakernocreate".to_string();
+        bot.active_trade_id = Some("trade_republish_unconfirmed_maker_no_create".to_string());
+        bot._bot_runtime_mark_startup_reconciliation_pending(now_ts_f64());
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_unconfirmed_maker_no_create_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(now_ts_f64() - 300.0),
+                    submit_ts: Some(now_ts_f64() - 300.0),
+                    kind: Some("maker".to_string()),
+                },
+            );
+        }
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut ctx) = bot.order_exec_context.lock() {
+            ctx.clear();
+        }
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        assert!(!shared
+            .pending_orders
+            .contains_key("oid_unconfirmed_maker_no_create_yes"));
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_skips_stale_cached_buys_during_reconnect_reconcile() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_reconnect_stale_cache_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishreconnectgross".to_string();
+        bot.active_trade_id = Some("trade_republish_reconnect_stale_cache".to_string());
+        bot._bot_runtime_mark_reconnect_reconciliation_pending("market_ws", now_ts_f64());
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_reconnect_stale_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(now_ts_f64() - 300.0),
+                    submit_ts: Some(now_ts_f64() - 300.0),
+                    kind: Some("maker".to_string()),
+                },
+            );
+        }
+        assert!(bot._remember_shared_gross_order_reservation(
+            "oid_reconnect_stale_yes",
+            "yes_asset_id",
+            "BUY",
+            0.41,
+            12.0,
+            "BOT_PAIR_BUILD_YES",
+            "maker",
+        ));
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.push(json!({
+                "id": "oid_reconnect_stale_yes",
+                "order_id": "oid_reconnect_stale_yes",
+                "asset_id": "yes_asset_id",
+                "token_id": "yes_asset_id",
+                "side": "BUY",
+                "price": 0.41,
+                "size": 12.0,
+                "remaining_size": 12.0,
+                "status": "LIVE",
+            }));
+        }
+        if let Ok(mut ctx) = bot.order_exec_context.lock() {
+            ctx.clear();
+        }
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        assert!(!shared
+            .pending_orders
+            .contains_key("oid_reconnect_stale_yes"));
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_ignores_stale_exec_context_during_reconnect_reconcile() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_reconnect_stale_context_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishreconnectcontext".to_string();
+        bot.active_trade_id = Some("trade_republish_reconnect_stale_context".to_string());
+        let disconnect_ts = now_ts_f64() - 30.0;
+        bot._bot_runtime_enter_dependency_pause("market_ws", "closed", disconnect_ts);
+        bot._bot_runtime_mark_reconnect_reconciliation_pending("market_ws", disconnect_ts + 5.0);
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_reconnect_context_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(disconnect_ts - 10.0),
+                    submit_ts: Some(disconnect_ts - 10.0),
+                    kind: Some("maker".to_string()),
+                },
+            );
+        }
+        assert!(bot._remember_shared_gross_order_reservation(
+            "oid_reconnect_context_yes",
+            "yes_asset_id",
+            "BUY",
+            0.41,
+            12.0,
+            "BOT_PAIR_BUILD_YES",
+            "maker",
+        ));
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut ctx) = bot.order_exec_context.lock() {
+            ctx.insert(
+                "oid_reconnect_context_yes".to_string(),
+                json!({
+                    "order_id": "oid_reconnect_context_yes",
+                    "origin": "BOT_PAIR_BUILD_YES",
+                    "ts": disconnect_ts - 1.0,
+                }),
+            );
+        }
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        assert!(!shared
+            .pending_orders
+            .contains_key("oid_reconnect_context_yes"));
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_keeps_fresh_exec_context_after_reconnect_event() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_reconnect_fresh_context_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishreconnectfreshctx".to_string();
+        bot.active_trade_id = Some("trade_republish_reconnect_fresh_context".to_string());
+        let disconnect_ts = now_ts_f64() - 30.0;
+        let reconnect_ts = disconnect_ts + 5.0;
+        bot._bot_runtime_enter_dependency_pause("market_ws", "closed", disconnect_ts);
+        bot._bot_runtime_mark_reconnect_reconciliation_pending("market_ws", reconnect_ts);
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_reconnect_fresh_ctx_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(disconnect_ts - 10.0),
+                    submit_ts: Some(disconnect_ts - 10.0),
+                    kind: Some("maker".to_string()),
+                },
+            );
+        }
+        assert!(bot._remember_shared_gross_order_reservation(
+            "oid_reconnect_fresh_ctx_yes",
+            "yes_asset_id",
+            "BUY",
+            0.41,
+            12.0,
+            "BOT_PAIR_BUILD_YES",
+            "maker",
+        ));
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut ctx) = bot.order_exec_context.lock() {
+            ctx.insert(
+                "oid_reconnect_fresh_ctx_yes".to_string(),
+                json!({
+                    "order_id": "oid_reconnect_fresh_ctx_yes",
+                    "origin": "BOT_PAIR_BUILD_YES",
+                    "ts": reconnect_ts + 1.0,
+                }),
+            );
+        }
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_reconnect_fresh_ctx_yes")
+            .expect("fresh reconnect context should preserve reservation");
+        assert_eq!(reservation.kind, "maker");
+        assert!((reservation.remaining_gross() - (0.41 * 12.0)).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn republish_shared_gross_reservations_preserves_existing_maker_buy_during_partial_reconnect() {
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_republish_partial_reconnect_preserve_maker_{}",
+        uuid::Uuid::new_v4()
+    ));
+    with_shared_state_dir(&shared_dir, || {
+        let mut bot = make_bot_runtime_test_bot();
+        set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.cfg.dry_run = false;
+        bot.wallet_address = "0xrepublishpartialreconnectmaker".to_string();
+        bot.active_trade_id = Some("trade_republish_partial_reconnect_maker".to_string());
+        let disconnect_ts = now_ts_f64() - 30.0;
+        bot._bot_runtime_enter_dependency_pause("user_ws", "closed", disconnect_ts);
+        bot._bot_runtime_mark_reconnect_reconciliation_pending("market_ws", disconnect_ts + 5.0);
+        bot.market_connected.store(true, Ordering::SeqCst);
+        bot.user_connected.store(false, Ordering::SeqCst);
+
+        if let Ok(mut state) = bot.state.lock() {
+            state.open_orders.insert(
+                "yes_asset_id".to_string(),
+                OpenOrderState {
+                    order_id: Some("oid_partial_reconnect_yes".to_string()),
+                    price: Some(0.41),
+                    size: Some(12.0),
+                    ts: Some(disconnect_ts - 10.0),
+                    submit_ts: Some(disconnect_ts - 10.0),
+                    kind: Some("maker".to_string()),
+                },
+            );
+        }
+        assert!(bot._remember_shared_gross_order_reservation(
+            "oid_partial_reconnect_yes",
+            "yes_asset_id",
+            "BUY",
+            0.41,
+            12.0,
+            "BOT_PAIR_BUILD_YES",
+            "maker",
+        ));
+        if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut ctx) = bot.order_exec_context.lock() {
+            ctx.clear();
+        }
+
+        let before = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state before partial reconnect refresh");
+        let before_updated_ts = before
+            .pending_orders
+            .get("oid_partial_reconnect_yes")
+            .map(|reservation| reservation.updated_ts)
+            .expect("existing maker reservation before partial reconnect");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(bot._republish_shared_gross_reservations_from_local_state());
+
+        let shared = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load shared gross state");
+        let reservation = shared
+            .pending_orders
+            .get("oid_partial_reconnect_yes")
+            .expect("existing maker reservation should be preserved during partial reconnect");
+        assert_eq!(reservation.kind, "maker");
+        assert!((reservation.remaining_gross() - (0.41 * 12.0)).abs() < 1e-9);
+        assert!(reservation.updated_ts > before_updated_ts);
+    });
 }
 /// Exercises the exec mode defaults to BOT runtime scenario and checks the expected BOT
 /// behavior.
@@ -2007,7 +4031,7 @@ fn taker_share_snapshot_counts_sibling_pending_orders_only_for_daily_share_when_
         runtime_state.taker_fill_shares = 0.0;
     }
 
-    bot_b._remember_taker_order(
+    assert!(bot_b._remember_taker_order(
         "shared-pending-oid",
         "other_yes_asset_id",
         9.0,
@@ -2016,7 +4040,7 @@ fn taker_share_snapshot_counts_sibling_pending_orders_only_for_daily_share_when_
         LiquidityIntent::TakerException,
         Some(TakerExceptionReason::AwaitSecondFillRescue),
         TakerCapPolicy::EnforceCap,
-    );
+    ));
 
     let snapshot = bot_a._taker_share_snapshot(2.0);
     assert!((snapshot.daily_taker_share - 0.0).abs() < 1e-9);

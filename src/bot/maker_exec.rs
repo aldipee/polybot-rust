@@ -396,6 +396,8 @@ impl MakerHedgeCapBot {
         state.record_pair_liquidity_fill(candidate.qty, true);
         let _ = self._bot_runtime_save_state_or_dependency_pause(&mut state, "maker_exec_fill");
         drop(state);
+        self._add_shared_gross_order_applied(candidate.order_id.as_str(), candidate.qty);
+        let _ = self._refresh_shared_gross_trade_snapshot();
         let fill_ts = candidate.match_time.as_deref().and_then(|value| {
             self._fill_event_ts_from_value(Some(&Value::String(value.to_string())))
         });

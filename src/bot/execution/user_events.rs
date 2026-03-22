@@ -92,6 +92,7 @@ impl MakerHedgeCapBot {
                 rec.applied = rec.applied.max(matched_total);
                 rec.ts = now_ts_f64();
                 self._update_shared_pending_taker_order_applied(order_id, rec.applied);
+                self._set_shared_gross_order_applied(order_id, rec.applied);
                 if done_hint || (rec.size > 0.0 && rec.applied >= rec.size - 1e-9) {
                     remove_oid = true;
                 }
@@ -102,6 +103,7 @@ impl MakerHedgeCapBot {
         }
         if remove_oid {
             self._forget_shared_pending_taker_order(order_id);
+            self._forget_shared_gross_order_reservation(order_id);
         }
     }
     /// Handles user trade event for the active BOT flow.
@@ -315,6 +317,7 @@ impl MakerHedgeCapBot {
                         r.applied += size.max(0.0);
                         r.ts = now_ts_f64();
                         self._update_shared_pending_taker_order_applied(&taker_oid, r.applied);
+                        self._set_shared_gross_order_applied(&taker_oid, r.applied);
                         if r.size > 0.0 && r.applied >= r.size - 1e-9 {
                             remove_oid = true;
                         }
@@ -325,6 +328,7 @@ impl MakerHedgeCapBot {
                 }
                 if remove_oid {
                     self._forget_shared_pending_taker_order(&taker_oid);
+                    self._forget_shared_gross_order_reservation(&taker_oid);
                 }
             }
             return;
@@ -502,12 +506,9 @@ impl MakerHedgeCapBot {
             "CANCELLATION" | "CANCELED" | "CANCELLED" | "REJECTION" | "REJECTED"
         ) || matches!(status.as_str(), "CANCELED" | "CANCELLED" | "REJECTED");
         let price = Self::_value_f64(msg.get("price")).unwrap_or(0.0);
-        let original = Self::_value_f64(
-            msg.get("original_size")
-                .or_else(|| msg.get("originalSize"))
-                .or_else(|| msg.get("size")),
-        )
-        .unwrap_or(0.0);
+        let original =
+            Self::_value_f64(msg.get("original_size").or_else(|| msg.get("originalSize")))
+                .unwrap_or(0.0);
         let matched = Self::_value_f64(
             msg.get("size_matched")
                 .or_else(|| msg.get("matched_size"))
@@ -529,6 +530,25 @@ impl MakerHedgeCapBot {
         if !remaining.is_finite() {
             remaining = 0.0;
         }
+        if let Ok(mut cache) = self.exchange_orders_cache.lock() {
+            cache.retain(|entry| self._extract_order_id(entry).as_deref() != Some(oid.as_str()));
+            if !cancelish && remaining > 0.0 {
+                cache.push(json!({
+                    "id": oid.clone(),
+                    "order_id": oid.clone(),
+                    "asset_id": asset_id.clone(),
+                    "token_id": asset_id.clone(),
+                    "side": side.clone(),
+                    "price": price,
+                    "size": remaining,
+                    "remaining_size": remaining,
+                    "original_size": original.max(remaining),
+                    "size_matched": matched.max(0.0),
+                    "status": status.clone(),
+                    "ts": now_ts_f64(),
+                }));
+            }
+        }
         if cancelish || remaining <= 0.0 {
             if let Ok(mut s) = self.state.lock() {
                 let should_remove = s
@@ -545,32 +565,63 @@ impl MakerHedgeCapBot {
                     );
                 }
             }
+            self._forget_shared_gross_order_reservation(oid.as_str());
             return;
         }
+        let context = self._get_order_execution_context(oid.as_str());
+        let existing_shared_reservation =
+            self._shared_gross_order_reservation_snapshot(oid.as_str());
+        let has_pending_taker = self._shared_pending_taker_order_exists(oid.as_str());
+        let mut resolved_kind: Option<String> = None;
         if let Ok(mut s) = self.state.lock() {
             let existing = s.open_orders.get(&asset_id).cloned();
+            let existing_kind = existing
+                .as_ref()
+                .filter(|entry| entry.order_id.as_deref() == Some(oid.as_str()))
+                .and_then(|entry| entry.kind.clone());
             let submit_ts = existing
                 .as_ref()
                 .filter(|entry| entry.order_id.as_deref() == Some(oid.as_str()))
                 .and_then(|entry| entry.submit_ts.or(entry.ts))
                 .or_else(|| {
-                    self._get_order_execution_context(oid.as_str())
-                        .as_ref()
-                        .and_then(|ctx| {
-                            ctx.get("order_submit_ts")
-                                .and_then(|value| value.as_f64())
-                                .or_else(|| ctx.get("decision_ts").and_then(|value| value.as_f64()))
-                        })
+                    context.as_ref().and_then(|ctx| {
+                        ctx.get("order_submit_ts")
+                            .and_then(|value| value.as_f64())
+                            .or_else(|| ctx.get("decision_ts").and_then(|value| value.as_f64()))
+                    })
                 })
                 .or(Some(now_ts_f64()));
+            let kind = context
+                .as_ref()
+                .and_then(|ctx| {
+                    ctx.get("liquidity_intent")
+                        .and_then(|value| value.as_str())
+                        .map(|value| {
+                            if value.eq_ignore_ascii_case("taker_exception") {
+                                "taker".to_string()
+                            } else {
+                                "maker".to_string()
+                            }
+                        })
+                })
+                .or(existing_kind.clone())
+                .or_else(|| has_pending_taker.then(|| "taker".to_string()))
+                .or_else(|| {
+                    existing_shared_reservation
+                        .as_ref()
+                        .map(|reservation| reservation.kind.clone())
+                })
+                .unwrap_or_else(|| "maker".to_string());
+            resolved_kind = Some(kind.clone());
             s.open_orders.insert(
-                asset_id,
+                asset_id.clone(),
                 OpenOrderState {
-                    order_id: Some(oid),
+                    order_id: Some(oid.clone()),
                     price: Some(price),
                     size: Some(remaining),
                     ts: Some(now_ts_f64()),
                     submit_ts,
+                    kind: Some(kind.clone()),
                 },
             );
             let _ = self._bot_runtime_save_state_or_dependency_pause(
@@ -578,6 +629,29 @@ impl MakerHedgeCapBot {
                 "user_event_upsert_open_order",
             );
         }
+        let origin = context
+            .as_ref()
+            .and_then(|ctx| {
+                ctx.get("origin")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+            })
+            .or_else(|| {
+                existing_shared_reservation
+                    .as_ref()
+                    .map(|reservation| reservation.origin.clone())
+            })
+            .unwrap_or_else(|| "BOT_USER_EVENT".to_string());
+        let kind = resolved_kind.unwrap_or_else(|| "maker".to_string());
+        self._remember_shared_gross_order_reservation(
+            oid.as_str(),
+            asset_id.as_str(),
+            "BUY",
+            price,
+            remaining,
+            origin.as_str(),
+            kind.as_str(),
+        );
     }
     /// Handles user event for the active BOT flow.
     /// This reads execution state, exchange payloads, or cached order context for the active

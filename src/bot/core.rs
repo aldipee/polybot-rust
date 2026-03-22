@@ -78,6 +78,20 @@ pub struct MakerHedgeCapBot {
 }
 
 impl MakerHedgeCapBot {
+    fn shared_state_wallet_suffix(wallet_address: &str) -> String {
+        let slug = wallet_address
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>();
+        if slug.trim_matches('_').is_empty() {
+            "default".to_string()
+        } else {
+            slug.trim_matches('_').to_string()
+        }
+    }
+
     fn shared_state_dir() -> PathBuf {
         if let Ok(raw) = std::env::var("POLYBOT_SHARED_STATE_DIR") {
             let trimmed = raw.trim();
@@ -111,33 +125,18 @@ impl MakerHedgeCapBot {
     }
 
     pub(in crate::bot) fn daily_liquidity_state_file_for_wallet(wallet_address: &str) -> PathBuf {
-        let slug = wallet_address
-            .trim()
-            .to_ascii_lowercase()
-            .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-            .collect::<String>();
-        let suffix = if slug.trim_matches('_').is_empty() {
-            "default".to_string()
-        } else {
-            slug.trim_matches('_').to_string()
-        };
+        let suffix = Self::shared_state_wallet_suffix(wallet_address);
         Self::shared_state_dir().join(format!("maker_hedgecap_daily_liquidity_{suffix}.json"))
     }
 
     pub(in crate::bot) fn pending_taker_state_file_for_wallet(wallet_address: &str) -> PathBuf {
-        let slug = wallet_address
-            .trim()
-            .to_ascii_lowercase()
-            .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-            .collect::<String>();
-        let suffix = if slug.trim_matches('_').is_empty() {
-            "default".to_string()
-        } else {
-            slug.trim_matches('_').to_string()
-        };
+        let suffix = Self::shared_state_wallet_suffix(wallet_address);
         Self::shared_state_dir().join(format!("maker_hedgecap_pending_takers_{suffix}.json"))
+    }
+
+    pub(in crate::bot) fn gross_exposure_state_file_for_wallet(wallet_address: &str) -> PathBuf {
+        let suffix = Self::shared_state_wallet_suffix(wallet_address);
+        Self::shared_state_dir().join(format!("maker_hedgecap_gross_exposure_{suffix}.json"))
     }
 
     pub(in crate::bot) fn shared_state_lock_timeout() -> Duration {
@@ -185,7 +184,56 @@ impl MakerHedgeCapBot {
     }
 
     pub(in crate::bot) fn _pending_taker_state_file(&self) -> PathBuf {
-        Self::pending_taker_state_file_for_wallet(self.wallet_address.as_str())
+        let suffix = Self::shared_state_wallet_suffix(self.wallet_address.as_str());
+        self._shared_state_dir()
+            .join(format!("maker_hedgecap_pending_takers_{suffix}.json"))
+    }
+
+    pub(in crate::bot) fn _gross_exposure_state_file(&self) -> PathBuf {
+        let suffix = Self::shared_state_wallet_suffix(self.wallet_address.as_str());
+        self._shared_state_dir()
+            .join(format!("maker_hedgecap_gross_exposure_{suffix}.json"))
+    }
+
+    fn _instance_working_dir(&self) -> PathBuf {
+        if let Some(raw) = self
+            .runtime_flags
+            .get("__instance_working_dir_override")
+            .and_then(|value| value.as_str())
+        {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    pub(in crate::bot) fn _gross_cap_instance_key(&self) -> String {
+        let instance_path = if self.state_file.is_absolute() {
+            self.state_file.clone()
+        } else {
+            self._instance_working_dir().join(&self.state_file)
+        };
+        instance_path
+            .to_string_lossy()
+            .trim()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    }
+
+    pub(in crate::bot) fn _shared_state_dir(&self) -> PathBuf {
+        if let Some(raw) = self
+            .runtime_flags
+            .get("__shared_state_dir_override")
+            .and_then(|value| value.as_str())
+        {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+        Self::shared_state_dir()
     }
 
     /// Builds a fully wired bot instance from a resolved, pinned config bundle,
@@ -328,7 +376,7 @@ impl MakerHedgeCapBot {
         let stale_policy_requirement_compliant =
             crate::config::stale_data_policy_requirement_compliant(&out.cfg);
         out.logger.info(&format!(
-            "[CFG_EFFECTIVE] config_version={} dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale_add_block={}s market_data_stale_hard_pause={}s stale_policy_requirement_compliant={} stop_buffer={}s",
+            "[CFG_EFFECTIVE] config_version={} dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale_add_block={}s market_data_stale_hard_pause={}s stale_policy_requirement_compliant={} pair_gross_cap_usd={:.2} portfolio_gross_cap_usd={:.2} pair_gross_buffer_usd={:.2} portfolio_gross_buffer_usd={:.2} gross_cap_include_pending_maker={} gross_cap_include_pending_taker={} gross_cap_shared_state_ttl_seconds={:.1} stop_buffer={}s",
             out.config_version,
             out.cfg.dry_run,
             out.cfg.max_total_cost,
@@ -342,6 +390,13 @@ impl MakerHedgeCapBot {
             out.cfg.market_data_stale_add_block_seconds,
             out.cfg.market_data_stale_hard_pause_seconds,
             stale_policy_requirement_compliant,
+            out.cfg.pair_gross_deployed_cost_cap_usd,
+            out.cfg.portfolio_gross_deployed_cost_cap_usd,
+            out.cfg.pair_gross_deployed_cost_buffer_usd,
+            out.cfg.portfolio_gross_deployed_cost_buffer_usd,
+            out.cfg.gross_cap_include_pending_maker,
+            out.cfg.gross_cap_include_pending_taker,
+            out.cfg.gross_cap_shared_state_ttl_seconds,
             out.cfg.stop_buffer_seconds
         ));
         if !stale_policy_requirement_compliant {

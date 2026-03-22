@@ -19,6 +19,7 @@ impl MakerHedgeCapBot {
                         ex.retain(|o| self._extract_order_id(o).as_deref() != Some(order_id));
                     }
                     self._maker_order_on_cancel_ack_by_order_id(order_id);
+                    self._forget_shared_gross_order_reservation(order_id);
                     return true;
                 }
                 Err(e) => {
@@ -30,7 +31,11 @@ impl MakerHedgeCapBot {
         if let Ok(mut ex) = self.exchange_orders_cache.lock() {
             let before = ex.len();
             ex.retain(|o| self._extract_order_id(o).as_deref() != Some(order_id));
-            return ex.len() != before;
+            let removed = ex.len() != before;
+            if removed {
+                self._forget_shared_gross_order_reservation(order_id);
+            }
+            return removed;
         }
         false
     }
@@ -39,32 +44,46 @@ impl MakerHedgeCapBot {
     /// BOT runtime.
 
     pub fn _cancel_open_order_local(&self, asset_id: &str, reason: &str) {
-        let oid = self
+        let order = self
             .state
             .lock()
             .ok()
-            .and_then(|s| s.open_orders.get(asset_id).and_then(|o| o.order_id.clone()));
-        if let Some(order_id) = oid {
-            if !reason.trim().is_empty() {
-                self.logger.info(&format!(
-                    "Cancel {} ({reason})",
-                    asset_id
-                        .chars()
-                        .rev()
-                        .take(6)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>()
-                ));
+            .and_then(|s| s.open_orders.get(asset_id).cloned());
+        let mut canceled_taker_order_id: Option<String> = None;
+        if let Some(open_order) = order.as_ref() {
+            if let Some(order_id) = open_order.order_id.clone() {
+                if !reason.trim().is_empty() {
+                    self.logger.info(&format!(
+                        "Cancel {} ({reason})",
+                        asset_id
+                            .chars()
+                            .rev()
+                            .take(6)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect::<String>()
+                    ));
+                }
+                let cancel_succeeded = self._cancel(&order_id);
+                if cancel_succeeded && open_order.kind.as_deref() == Some("taker") {
+                    canceled_taker_order_id = Some(order_id);
+                }
             }
-            let _ = self._cancel(&order_id);
         }
-        if let Ok(mut s) = self.state.lock() {
-            s.open_orders.remove(asset_id);
-            let _ =
-                self._bot_runtime_save_state_or_dependency_pause(&mut s, "cancel_open_order_local");
+        if order.is_some() {
+            // Keep the local open-order mirror cleared even if the exchange cancel raced or
+            // failed; other live-order tracking remains via taker/maker-specific state.
+            if let Ok(mut s) = self.state.lock() {
+                s.open_orders.remove(asset_id);
+                let _ = self
+                    ._bot_runtime_save_state_or_dependency_pause(&mut s, "cancel_open_order_local");
+            }
         }
+        if let Some(order_id) = canceled_taker_order_id.as_deref() {
+            self._forget_taker_order(order_id);
+        }
+        let _ = self._republish_shared_gross_reservations_from_local_state();
     }
     /// Cancels all open orders local for the active BOT flow.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -83,9 +102,13 @@ impl MakerHedgeCapBot {
             self.logger
                 .info(&format!("Cancel local open orders: {reason}"));
         }
+        let mut canceled_taker_order_ids: Vec<String> = Vec::new();
         for row in oo.values() {
             if let Some(oid) = &row.order_id {
-                let _ = self._cancel(oid);
+                let cancel_succeeded = self._cancel(oid);
+                if cancel_succeeded && row.kind.as_deref() == Some("taker") {
+                    canceled_taker_order_ids.push(oid.clone());
+                }
             }
         }
         if let Ok(mut s) = self.state.lock() {
@@ -95,6 +118,10 @@ impl MakerHedgeCapBot {
                 "cancel_all_open_orders_local",
             );
         }
+        for order_id in canceled_taker_order_ids {
+            self._forget_taker_order(order_id.as_str());
+        }
+        let _ = self._republish_shared_gross_reservations_from_local_state();
     }
     /// Cancels all open orders local except for the active BOT flow.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -138,8 +165,17 @@ impl MakerHedgeCapBot {
                 "Cancel local open orders (except {tail}): {reason}"
             ));
         }
-        for oid in to_cancel {
-            let _ = self._cancel(&oid);
+        let mut canceled_taker_order_ids: Vec<String> = Vec::new();
+        for (aid, row) in &oo {
+            if aid == keep_asset_id {
+                continue;
+            }
+            if let Some(oid) = &row.order_id {
+                let cancel_succeeded = self._cancel(oid);
+                if cancel_succeeded && row.kind.as_deref() == Some("taker") {
+                    canceled_taker_order_ids.push(oid.clone());
+                }
+            }
         }
         if let Ok(mut s) = self.state.lock() {
             let kept = s.open_orders.get(keep_asset_id).cloned();
@@ -152,6 +188,10 @@ impl MakerHedgeCapBot {
                 "cancel_all_open_orders_local_except",
             );
         }
+        for order_id in canceled_taker_order_ids {
+            self._forget_taker_order(order_id.as_str());
+        }
+        let _ = self._republish_shared_gross_reservations_from_local_state();
     }
     /// Extracts order id from the provided payload or state.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -376,6 +416,7 @@ impl MakerHedgeCapBot {
                     );
                 }
             }
+            let _ = self._republish_shared_gross_reservations_from_local_state();
             return;
         }
         if mine.len() == 1 {
@@ -387,6 +428,33 @@ impl MakerHedgeCapBot {
                     let existing = s.open_orders.get(asset_id).cloned();
                     let local = existing.as_ref().and_then(|x| x.order_id.clone());
                     if local.as_deref() != Some(oid.as_str()) {
+                        let existing_kind = existing
+                            .as_ref()
+                            .filter(|entry| entry.order_id.as_deref() == Some(oid.as_str()))
+                            .and_then(|entry| entry.kind.clone());
+                        let kind = self
+                            ._get_order_execution_context(oid.as_str())
+                            .and_then(|ctx| {
+                                ctx.get("liquidity_intent")
+                                    .and_then(|value| value.as_str())
+                                    .map(|value| {
+                                        if value.eq_ignore_ascii_case("taker_exception") {
+                                            "taker".to_string()
+                                        } else {
+                                            "maker".to_string()
+                                        }
+                                    })
+                            })
+                            .or(existing_kind)
+                            .or_else(|| {
+                                self._shared_pending_taker_order_exists(oid.as_str())
+                                    .then(|| "taker".to_string())
+                            })
+                            .or_else(|| {
+                                self._shared_gross_order_reservation_snapshot(oid.as_str())
+                                    .map(|reservation| reservation.kind)
+                            })
+                            .unwrap_or_else(|| "maker".to_string());
                         let submit_ts = existing
                             .as_ref()
                             .filter(|entry| entry.order_id.as_deref() == Some(oid.as_str()))
@@ -412,6 +480,7 @@ impl MakerHedgeCapBot {
                                 size: Some(sz),
                                 ts: Some(now),
                                 submit_ts,
+                                kind: Some(kind),
                             },
                         );
                         let _ = self._bot_runtime_save_state_or_dependency_pause(
@@ -420,6 +489,7 @@ impl MakerHedgeCapBot {
                         );
                     }
                 }
+                let _ = self._republish_shared_gross_reservations_from_local_state();
             }
             return;
         }
@@ -502,6 +572,33 @@ impl MakerHedgeCapBot {
                             })
                     })
                     .or(Some(now));
+                let kind = existing
+                    .as_ref()
+                    .filter(|entry| entry.order_id.as_deref() == Some(keep_id.as_str()))
+                    .and_then(|entry| entry.kind.clone())
+                    .or_else(|| {
+                        self._get_order_execution_context(keep_id.as_str())
+                            .and_then(|ctx| {
+                                ctx.get("liquidity_intent")
+                                    .and_then(|value| value.as_str())
+                                    .map(|value| {
+                                        if value.eq_ignore_ascii_case("taker_exception") {
+                                            "taker".to_string()
+                                        } else {
+                                            "maker".to_string()
+                                        }
+                                    })
+                            })
+                    })
+                    .or_else(|| {
+                        self._shared_pending_taker_order_exists(keep_id.as_str())
+                            .then(|| "taker".to_string())
+                    })
+                    .or_else(|| {
+                        self._shared_gross_order_reservation_snapshot(keep_id.as_str())
+                            .map(|reservation| reservation.kind)
+                    })
+                    .unwrap_or_else(|| "maker".to_string());
                 s.open_orders.insert(
                     asset_id.to_string(),
                     OpenOrderState {
@@ -510,6 +607,7 @@ impl MakerHedgeCapBot {
                         size: Some(sz),
                         ts: Some(now),
                         submit_ts,
+                        kind: Some(kind),
                     },
                 );
                 let _ = self._bot_runtime_save_state_or_dependency_pause(
@@ -517,6 +615,7 @@ impl MakerHedgeCapBot {
                     "reconcile_exchange_orders_multi",
                 );
             }
+            let _ = self._republish_shared_gross_reservations_from_local_state();
         }
     }
 }

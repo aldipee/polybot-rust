@@ -198,6 +198,11 @@ impl MakerHedgeCapBot {
                 None
             }
         };
+        let gross_cap = self
+            ._gross_cap_snapshot(0.0, &[])
+            .ok()
+            .map(Self::_gross_cap_snapshot_json)
+            .unwrap_or(Value::Null);
         let payload = json!({
             "decision_event_id": decision_event_id.clone(),
             "trade_id": trade_id.clone(),
@@ -227,6 +232,7 @@ impl MakerHedgeCapBot {
             "match_ratio": decision.map(|value| value.match_ratio).unwrap_or(match_ratio_now),
             "pair_taker_share": pair_taker_share,
             "daily_taker_share": daily_taker_share,
+            "gross_cap": gross_cap,
             "mode": decision.map(|value| value.mode.as_str()),
             "price_zone": decision.map(|value| value.price_zone.as_str()),
             "imbalance_state": decision.map(|value| value.imbalance_state.as_str()),

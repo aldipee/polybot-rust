@@ -75,6 +75,47 @@ impl MakerHedgeCapBot {
         Some((nonce, attempt, family_key, signature))
     }
 
+    fn _handle_gross_reservation_publish_failure_for_direct_submit(
+        &self,
+        asset_id: &str,
+        order_id: &str,
+        previous_open_order: Option<OpenOrderState>,
+        save_context: &str,
+    ) {
+        self.logger.warning(&format!(
+            "[BOT][SAFE_PAUSE] canceling direct order after shared gross reservation publish failed asset={} order_id={}",
+            asset_id,
+            order_id
+        ));
+        if !self._cancel(order_id) {
+            self.logger.warning(&format!(
+                "[BOT][SAFE_PAUSE] failed to cancel direct order after shared gross reservation publish failure asset={} order_id={}",
+                asset_id,
+                order_id
+            ));
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            let current_matches_new = state
+                .open_orders
+                .get(asset_id)
+                .and_then(|order| order.order_id.as_deref())
+                == Some(order_id);
+            if current_matches_new {
+                match previous_open_order {
+                    Some(previous) if previous.order_id.as_deref() != Some(order_id) => {
+                        state.open_orders.insert(asset_id.to_string(), previous);
+                    }
+                    _ => {
+                        state.open_orders.remove(asset_id);
+                    }
+                }
+                let _ = self._bot_runtime_save_state_or_dependency_pause(&mut state, save_context);
+            }
+        }
+        let _ = self._republish_shared_gross_reservations_from_local_state();
+    }
+
     /// Submits order compat through the compatibility execution path.
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
@@ -465,7 +506,9 @@ impl MakerHedgeCapBot {
         } else {
             "LIMIT_GTC"
         };
-        self._place_limit_bid_gtc_with_origin(asset_id, price, size, post_only, origin)
+        self._place_limit_bid_gtc_with_origin_internal(
+            asset_id, price, size, post_only, origin, false, true,
+        )
     }
     /// Places limit bid GTC with origin through the bot''s execution layer.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -478,6 +521,21 @@ impl MakerHedgeCapBot {
         size: f64,
         post_only: Option<bool>,
         origin: &str,
+    ) -> Option<String> {
+        self._place_limit_bid_gtc_with_origin_internal(
+            asset_id, price, size, post_only, origin, false, true,
+        )
+    }
+
+    pub(in crate::bot) fn _place_limit_bid_gtc_with_origin_internal(
+        &self,
+        asset_id: &str,
+        price: f64,
+        size: f64,
+        post_only: Option<bool>,
+        origin: &str,
+        gross_cap_preapproved: bool,
+        publish_shared_gross_reservation: bool,
     ) -> Option<String> {
         let tick = if self.cfg.tick > 0.0 {
             self.cfg.tick
@@ -525,6 +583,35 @@ impl MakerHedgeCapBot {
             );
             return Some(existing_order_id.clone());
         }
+        let gross_snapshot = if origin.starts_with("BOT_") && !gross_cap_preapproved {
+            let replace_order_ids = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .open_orders
+                        .get(asset_id)
+                        .and_then(|order| order.order_id.clone())
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            match self._gross_cap_snapshot(px * size, &replace_order_ids) {
+                Ok(snapshot) => {
+                    if let Some(reason) = snapshot.block_reason() {
+                        self._gross_cap_reject_submit(reason, asset_id, "BUY", origin, snapshot);
+                        return None;
+                    }
+                    Some(snapshot)
+                }
+                Err(err) => {
+                    self._gross_cap_shared_state_error("maker_direct_submit_gate", err.as_str());
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         if self.cfg.dry_run {
             let oid = format!("DRY_LIMIT_GTC_{}", (now_ts_f64() * 1000.0) as i64);
             if let Ok(mut s) = self.state.lock() {
@@ -536,6 +623,7 @@ impl MakerHedgeCapBot {
                         size: Some(size),
                         ts: Some(now_ts_f64()),
                         submit_ts: Some(now_ts_f64()),
+                        kind: Some("maker".to_string()),
                     },
                 );
                 let _ = self
@@ -561,6 +649,9 @@ impl MakerHedgeCapBot {
                 );
                 self._bot_runtime_note_refresh_cycle_submit(side, origin, "direct_submit_dry");
             }
+            if let Some(snapshot) = gross_snapshot {
+                self._gross_cap_record_order_context(&oid, snapshot);
+            }
             return Some(oid);
         }
         let decide_ts = now_ts_f64();
@@ -573,7 +664,9 @@ impl MakerHedgeCapBot {
             "origin": origin,
         });
         let oid = self._post_order_compat(&signed, "GTC", post_only)?;
+        let mut previous_open_order: Option<OpenOrderState> = None;
         if let Ok(mut s) = self.state.lock() {
+            previous_open_order = s.open_orders.get(asset_id).cloned();
             s.open_orders.insert(
                 asset_id.to_string(),
                 OpenOrderState {
@@ -582,6 +675,7 @@ impl MakerHedgeCapBot {
                     size: Some(size),
                     ts: Some(now_ts_f64()),
                     submit_ts: Some(now_ts_f64()),
+                    kind: Some("maker".to_string()),
                 },
             );
             let _ = self._bot_runtime_save_state_or_dependency_pause(&mut s, "place_limit_bid_gtc");
@@ -604,6 +698,22 @@ impl MakerHedgeCapBot {
                 "taker_cap_policy": null,
             }),
         );
+        if let Some(snapshot) = gross_snapshot {
+            self._gross_cap_record_order_context(&oid, snapshot);
+        }
+        if publish_shared_gross_reservation
+            && !self._remember_shared_gross_order_reservation(
+                &oid, asset_id, "BUY", px, size, origin, "maker",
+            )
+        {
+            self._handle_gross_reservation_publish_failure_for_direct_submit(
+                asset_id,
+                oid.as_str(),
+                previous_open_order,
+                "place_limit_bid_gtc_gross_order_remember_failed",
+            );
+            return None;
+        }
         if let MakerDirectRefreshDecision::Started(side) = direct_refresh_decision {
             self._bot_runtime_note_refresh_cycle_started(
                 side,
@@ -626,6 +736,20 @@ impl MakerHedgeCapBot {
         size: f64,
         post_only: Option<bool>,
         origin: &str,
+    ) -> Option<String> {
+        self._place_limit_bid_gtc_exact_with_origin_internal(
+            asset_id, price, size, post_only, origin, false,
+        )
+    }
+
+    pub(in crate::bot) fn _place_limit_bid_gtc_exact_with_origin_internal(
+        &self,
+        asset_id: &str,
+        price: f64,
+        size: f64,
+        post_only: Option<bool>,
+        origin: &str,
+        gross_cap_preapproved: bool,
     ) -> Option<String> {
         let tick = if self.cfg.tick > 0.0 {
             self.cfg.tick
@@ -663,6 +787,38 @@ impl MakerHedgeCapBot {
             );
             return Some(existing_order_id.clone());
         }
+        let gross_snapshot = if origin.starts_with("BOT_") && !gross_cap_preapproved {
+            let replace_order_ids = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .open_orders
+                        .get(asset_id)
+                        .and_then(|order| order.order_id.clone())
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            match self._gross_cap_snapshot(px * size, &replace_order_ids) {
+                Ok(snapshot) => {
+                    if let Some(reason) = snapshot.block_reason() {
+                        self._gross_cap_reject_submit(reason, asset_id, "BUY", origin, snapshot);
+                        return None;
+                    }
+                    Some(snapshot)
+                }
+                Err(err) => {
+                    self._gross_cap_shared_state_error(
+                        "maker_direct_submit_exact_gate",
+                        err.as_str(),
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         if self.cfg.dry_run {
             let oid = format!("DRY_LIMIT_GTC_EXACT_{}", (now_ts_f64() * 1000.0) as i64);
             if let Ok(mut s) = self.state.lock() {
@@ -674,6 +830,7 @@ impl MakerHedgeCapBot {
                         size: Some(size),
                         ts: Some(now_ts_f64()),
                         submit_ts: Some(now_ts_f64()),
+                        kind: Some("maker".to_string()),
                     },
                 );
                 let _ = self._bot_runtime_save_state_or_dependency_pause(
@@ -701,6 +858,9 @@ impl MakerHedgeCapBot {
                 );
                 self._bot_runtime_note_refresh_cycle_submit(side, origin, "direct_submit_dry");
             }
+            if let Some(snapshot) = gross_snapshot {
+                self._gross_cap_record_order_context(&oid, snapshot);
+            }
             return Some(oid);
         }
         let decide_ts = now_ts_f64();
@@ -713,7 +873,9 @@ impl MakerHedgeCapBot {
             "origin": origin,
         });
         let oid = self._post_order_compat(&signed, "GTC", post_only)?;
+        let mut previous_open_order: Option<OpenOrderState> = None;
         if let Ok(mut s) = self.state.lock() {
+            previous_open_order = s.open_orders.get(asset_id).cloned();
             s.open_orders.insert(
                 asset_id.to_string(),
                 OpenOrderState {
@@ -722,6 +884,7 @@ impl MakerHedgeCapBot {
                     size: Some(size),
                     ts: Some(now_ts_f64()),
                     submit_ts: Some(now_ts_f64()),
+                    kind: Some("maker".to_string()),
                 },
             );
             let _ = self
@@ -745,6 +908,20 @@ impl MakerHedgeCapBot {
                 "taker_cap_policy": null,
             }),
         );
+        if let Some(snapshot) = gross_snapshot {
+            self._gross_cap_record_order_context(&oid, snapshot);
+        }
+        if !self._remember_shared_gross_order_reservation(
+            &oid, asset_id, "BUY", px, size, origin, "maker",
+        ) {
+            self._handle_gross_reservation_publish_failure_for_direct_submit(
+                asset_id,
+                oid.as_str(),
+                previous_open_order,
+                "place_limit_bid_gtc_exact_gross_order_remember_failed",
+            );
+            return None;
+        }
         if let MakerDirectRefreshDecision::Started(side) = direct_refresh_decision {
             self._bot_runtime_note_refresh_cycle_started(
                 side,
@@ -968,6 +1145,25 @@ impl MakerHedgeCapBot {
         let ot = self._resolve_order_type(ot_name);
         let taker_reason =
             taker_submit_reason_allowed("BUY", taker_exception_reason, taker_cap_policy).ok()?;
+        let gross_snapshot = match self._gross_cap_snapshot(px * size, &[]) {
+            Ok(snapshot) => {
+                if let Some(reason) = snapshot.block_reason() {
+                    self._gross_cap_reject_submit(
+                        reason,
+                        asset_id,
+                        "BUY",
+                        format!("TAKER_{}_BUY", ot).as_str(),
+                        snapshot,
+                    );
+                    return None;
+                }
+                snapshot
+            }
+            Err(err) => {
+                self._gross_cap_shared_state_error("taker_buy_submit_gate", err.as_str());
+                return None;
+            }
+        };
         if self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER HEDGE BUY asset={} price={px:.2} size={size_int} type={ot}",
@@ -990,7 +1186,7 @@ impl MakerHedgeCapBot {
             "origin": format!("TAKER_{}_BUY", ot),
         });
         let oid = self._post_order_compat(&signed, &ot, None)?;
-        self._remember_taker_order(
+        if !self._remember_taker_order(
             &oid,
             asset_id,
             size,
@@ -999,7 +1195,9 @@ impl MakerHedgeCapBot {
             LiquidityIntent::TakerException,
             Some(taker_reason),
             taker_cap_policy,
-        );
+        ) {
+            return None;
+        }
         self._track_order_execution_context(
             &oid,
             &json!({
@@ -1022,6 +1220,7 @@ impl MakerHedgeCapBot {
                 "projected_daily_taker_share": gate_snapshot.projected_daily_taker_share,
             }),
         );
+        self._gross_cap_record_order_context(&oid, gross_snapshot);
         self.logger.info(&format!(
             "[TAKER {ot}] sent BUY asset={} px={px:.4} sz={size:.0} oid={oid}",
             asset_id
@@ -1076,6 +1275,25 @@ impl MakerHedgeCapBot {
         let ot = self._resolve_order_type(ot_name);
         let taker_reason =
             taker_submit_reason_allowed("BUY", taker_exception_reason, taker_cap_policy).ok()?;
+        let gross_snapshot = match self._gross_cap_snapshot(px * size, &[]) {
+            Ok(snapshot) => {
+                if let Some(reason) = snapshot.block_reason() {
+                    self._gross_cap_reject_submit(
+                        reason,
+                        asset_id,
+                        "BUY",
+                        format!("TAKER_{}_BUY_EXACT", ot).as_str(),
+                        snapshot,
+                    );
+                    return None;
+                }
+                snapshot
+            }
+            Err(err) => {
+                self._gross_cap_shared_state_error("taker_buy_exact_submit_gate", err.as_str());
+                return None;
+            }
+        };
         if self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER HEDGE BUY EXACT asset={} price={px:.2} size={size:.2} type={ot}",
@@ -1098,7 +1316,7 @@ impl MakerHedgeCapBot {
             "origin": format!("TAKER_{}_BUY_EXACT", ot),
         });
         let oid = self._post_order_compat(&signed, &ot, None)?;
-        self._remember_taker_order(
+        if !self._remember_taker_order(
             &oid,
             asset_id,
             size,
@@ -1107,7 +1325,9 @@ impl MakerHedgeCapBot {
             LiquidityIntent::TakerException,
             Some(taker_reason),
             taker_cap_policy,
-        );
+        ) {
+            return None;
+        }
         self._track_order_execution_context(
             &oid,
             &json!({
@@ -1130,6 +1350,7 @@ impl MakerHedgeCapBot {
                 "projected_daily_taker_share": gate_snapshot.projected_daily_taker_share,
             }),
         );
+        self._gross_cap_record_order_context(&oid, gross_snapshot);
         self.logger.info(&format!(
             "[TAKER {ot}] sent BUY asset={} px={px:.4} sz={size:.2} oid={oid}",
             asset_id
@@ -1236,7 +1457,7 @@ impl MakerHedgeCapBot {
                 return None;
             }
         };
-        self._remember_taker_order(
+        if !self._remember_taker_order(
             &oid,
             asset_id,
             size,
@@ -1245,7 +1466,9 @@ impl MakerHedgeCapBot {
             LiquidityIntent::TakerException,
             Some(taker_reason),
             taker_cap_policy,
-        );
+        ) {
+            return None;
+        }
         self._track_order_execution_context(
             &oid,
             &json!({
@@ -1353,7 +1576,7 @@ impl MakerHedgeCapBot {
                 return None;
             }
         };
-        self._remember_taker_order(
+        if !self._remember_taker_order(
             &oid,
             asset_id,
             size,
@@ -1362,7 +1585,9 @@ impl MakerHedgeCapBot {
             LiquidityIntent::TakerException,
             Some(taker_reason),
             taker_cap_policy,
-        );
+        ) {
+            return None;
+        }
         self._track_order_execution_context(
             &oid,
             &json!({

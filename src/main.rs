@@ -18,8 +18,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use chrono_tz::Asia::Jakarta;
 use config::{
     build_legacy_versioned_config_bundle, load_versioned_config_bundle_from_env,
-    resolve_versioned_config_bundle_from_snapshot, stale_data_policy_from_legacy_threshold,
-    BotConfig, ResolvedVersionedConfigBundle, VersionedConfigSnapshotV1,
+    resolve_versioned_config_bundle_from_snapshot, snapshot_from_json_text_compat,
+    stale_data_policy_from_legacy_threshold, BotConfig, ResolvedVersionedConfigBundle,
 };
 use db::{
     date_jakarta, make_engine, make_session_factory, month_start_date_jakarta, now_iso_jakarta,
@@ -1048,6 +1048,7 @@ struct ActiveConfigVersion {
 fn legacy_cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
     let (legacy_stale_add_block_seconds, legacy_stale_hard_pause_seconds) =
         stale_data_policy_from_legacy_threshold(cfg_row.market_data_stale_seconds);
+    let pair_gross_cap = cfg_row.max_total_cost;
     BotConfig {
         clob_host: cfg_row.clob_host.clone(),
         ws_base: cfg_row.ws_base.clone(),
@@ -1066,6 +1067,13 @@ fn legacy_cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
         entry_edge_ticks: cfg_row.entry_edge_ticks,
         hedge_buffer_ticks: cfg_row.hedge_buffer_ticks,
         max_total_cost: cfg_row.max_total_cost,
+        pair_gross_deployed_cost_cap_usd: pair_gross_cap,
+        portfolio_gross_deployed_cost_cap_usd: pair_gross_cap * 4.0,
+        pair_gross_deployed_cost_buffer_usd: 0.0,
+        portfolio_gross_deployed_cost_buffer_usd: 0.0,
+        gross_cap_include_pending_maker: true,
+        gross_cap_include_pending_taker: true,
+        gross_cap_shared_state_ttl_seconds: 30.0,
         reserve_usd: cfg_row.reserve_usd,
         cancel_all_on_start: cfg_row.cancel_all_on_start,
         dry_run: cfg_row.dry_run,
@@ -1082,13 +1090,12 @@ fn legacy_cfg_from_row(cfg_row: &ConfigurationRow) -> BotConfig {
 
 fn config_bundle_from_row(cfg_row: &ConfigurationRow) -> Result<ResolvedVersionedConfigBundle> {
     if !cfg_row.config_text.trim().is_empty() {
-        let snapshot: VersionedConfigSnapshotV1 = serde_json::from_str(&cfg_row.config_text)
-            .with_context(|| {
-                format!(
-                    "failed deserializing config_text for configuration_id={} config_version={}",
-                    cfg_row.configuration_id, cfg_row.config_version
-                )
-            })?;
+        let snapshot = snapshot_from_json_text_compat(&cfg_row.config_text).with_context(|| {
+            format!(
+                "failed deserializing config_text for configuration_id={} config_version={}",
+                cfg_row.configuration_id, cfg_row.config_version
+            )
+        })?;
         return resolve_versioned_config_bundle_from_snapshot(snapshot);
     }
 
@@ -1900,6 +1907,7 @@ mod tests {
             &[
                 ("POLYMARKET_PRIVATE_KEY", Some("secret-from-env")),
                 ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("EXEC_MODE", Some("BOT")),
             ],
             || {
                 let bundle = load_versioned_config_bundle_from_env().expect("env bundle");
@@ -1924,6 +1932,7 @@ mod tests {
             &[
                 ("POLYMARKET_PRIVATE_KEY", Some("secret-from-env")),
                 ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("EXEC_MODE", Some("BOT")),
             ],
             || {
                 let row = configuration_row_from_bundle(String::new());
@@ -1950,6 +1959,18 @@ mod tests {
                         .market_data_stale_hard_pause_seconds,
                     8
                 );
+                assert_eq!(
+                    hydrated
+                        .effective_bot_config
+                        .pair_gross_deployed_cost_cap_usd,
+                    hydrated.effective_bot_config.max_total_cost
+                );
+                assert_eq!(
+                    hydrated
+                        .effective_bot_config
+                        .portfolio_gross_deployed_cost_cap_usd,
+                    hydrated.effective_bot_config.max_total_cost * 4.0
+                );
                 assert!(
                     (hydrated
                         .effective_bot_config
@@ -1969,6 +1990,7 @@ mod tests {
                 ("POLYMARKET_PRIVATE_KEY", Some("secret-from-env")),
                 ("POLYMARKET_FUNDER", Some("0xfunder")),
                 ("MARKET_DATA_STALE_SECONDS", Some("8")),
+                ("EXEC_MODE", Some("BOT")),
             ],
             || {
                 let logger: Arc<dyn LogLike> = setup_item_logger("config_reload_test");
