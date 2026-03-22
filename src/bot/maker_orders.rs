@@ -939,17 +939,15 @@ impl MakerHedgeCapBot {
                     "maker_order_track_submit",
                 );
             }
-            if !self.cfg.dry_run
-                && !self._remember_shared_gross_order_reservation(
-                    order_id,
-                    key.asset_id.as_str(),
-                    key.side.as_str(),
-                    price,
-                    size.max(0.0),
-                    origin,
-                    "maker",
-                )
-            {
+            if !self._remember_shared_gross_order_reservation(
+                order_id,
+                key.asset_id.as_str(),
+                key.side.as_str(),
+                price,
+                size.max(0.0),
+                origin,
+                "maker",
+            ) {
                 let _ = self._cancel(order_id);
                 if let Ok(mut s) = self.state.lock() {
                     let should_remove = s
@@ -1069,7 +1067,7 @@ impl MakerHedgeCapBot {
     /// runtime.
 
     pub(super) fn _maker_order_reconcile_asset(&self, asset_id: &str, intended_price: Option<f64>) {
-        if !self._maker_single_inflight_enabled() || self.cfg.dry_run {
+        if !self._maker_single_inflight_enabled() || !self._bot_runtime_venue_reads_allowed() {
             return;
         }
         let aid = asset_id.trim().to_string();

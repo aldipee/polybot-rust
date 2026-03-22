@@ -1,6 +1,6 @@
 # Environment Reference
 
-Date: 2026-03-20
+Date: 2026-03-22
 Scope: supported operator env for the `polybot` binary only.
 
 This repo now has one supported runtime:
@@ -21,7 +21,7 @@ This document intentionally covers the active `polybot` surface only. It does no
 
 ## Auth and Connectivity
 
-- `POLYMARKET_PRIVATE_KEY`: primary trading credential
+- `POLYMARKET_PRIVATE_KEY`: primary trading credential; required for `shadow` and configured `live`, but not for pure `paper`
 - `POLYMARKET_FUNDER`, `POLYMARKET_WALLET_ADDRESS`, `WALLET_ADDRESS`, `SIGNATURE_TYPE`: wallet/signing metadata and fallbacks
 - `CHAIN_ID`, `CLOB_HOST`, `WS_BASE`, `CLOB_GAMMA_API_URL`: Polymarket API, websocket, and gamma connectivity
 - `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_API_PASSPHRASE`: optional explicit user-websocket auth fallback when derived creds are not used
@@ -33,9 +33,16 @@ This document intentionally covers the active `polybot` surface only. It does no
 - `MARKET_SLUG_STYLE`: slug parsing/generation style
 - `AUTO_DETECT_MARKET_PARAMS`: allows market-param refresh from live market data
 
+## Order Routing Modes
+
+- `BOT_ORDER_MODE`: supported values are `shadow`, `paper`, and `live`; startup defaults to `shadow`
+- `BOT_LIVE_ENABLED`: explicit live-send arming flag; defaults to `false`
+- real venue writes require configured `BOT_ORDER_MODE=live`, `BOT_LIVE_ENABLED=true`, clean reconciliation, dependency health, and fresh market data
+- `DRY_RUN`: deprecated compatibility alias only; if `BOT_ORDER_MODE` is unset, `true` maps to `paper` and `false` maps to `shadow`, while inconsistent `DRY_RUN` and `BOT_ORDER_MODE` settings fail fast
+- `shadow` and `paper` use mode-scoped local or shared state so hypothetical or simulated exposure does not contaminate live companion files
+
 ## Core Trading Controls
 
-- `DRY_RUN`: simulation vs live placement
 - `MIN_SHARES`, `CLIP_SHARES`, `MAX_TOTAL_COST`, `RESERVE_USD`: base sizing and budget caps
 - `LOG_EVERY_SECONDS`, `LOOP_WAIT_SECONDS_MAKER`, `LOOP_WAIT_SECONDS_TAKER`: loop cadence and heartbeat logging
 - `MARKET_DATA_STALE_ADD_BLOCK_SECONDS`, `MARKET_DATA_STALE_HARD_PAUSE_SECONDS`, `STOP_BUFFER_SECONDS`, `WARMUP_SECONDS`: timing and stale-data guards

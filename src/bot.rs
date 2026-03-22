@@ -71,6 +71,32 @@ pub fn require_bot_exec_mode() -> Result<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BotOrderMode {
+    Shadow,
+    Paper,
+    Live,
+}
+
+impl BotOrderMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::Paper => "paper",
+            Self::Live => "live",
+        }
+    }
+
+    pub(crate) fn from_config_value(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "shadow" => Some(Self::Shadow),
+            "paper" => Some(Self::Paper),
+            "live" => Some(Self::Live),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TradeMetrics {
     pub pair_id: String,

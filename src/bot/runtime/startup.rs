@@ -13,9 +13,12 @@ impl MakerHedgeCapBot {
 
     pub(in crate::bot) fn _log_bot_runtime_cfg(&self) {
         let cfg = self._bot_runtime_cfg();
+        let effective_order_mode = self._bot_runtime_effective_order_mode();
         self.logger.info(&format!(
-            "[BOT][CFG] mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% clip_ladder={:.0}/{:.0}/{:.0}/{:.0} await_second_fill_target={:.0}s await_second_fill_deadline={:.0}s await_second_fill_rescue_once=true late_reduce_start={:.0}s late_balance_only_start={:.0}s late_stop_new_orders_start={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
+            "[BOT][CFG] mode={} configured_order_mode={} effective_order_mode={} phase_controller={} prearm_lead={:.0}s open_seed_deadline={:.1}s open_submit_delta_max={:.1}s late_seed_once={} phase_budgets=open:{:.0}-{:.0}% early:{:.0}-{:.0}% main:{:.0}-{:.0}% late:{:.0}-{:.0}% taper:{:.0}-{:.0}% clip_ladder={:.0}/{:.0}/{:.0}/{:.0} await_second_fill_target={:.0}s await_second_fill_deadline={:.0}s await_second_fill_rescue_once=true late_reduce_start={:.0}s late_balance_only_start={:.0}s late_stop_new_orders_start={:.0}s buy_only_normal_flow={} tail_caps={}s:{:.1}%/{}s:{:.1}%/late:{:.1}% bad_regime_window={:.0}s bad_regime_expensive_fraction={:.2}",
             self.exec_mode,
+            self.configured_order_mode,
+            effective_order_mode.as_str(),
             cfg.phase_controller,
             cfg.prearm_lead_seconds,
             cfg.open_both_seed_deadline_seconds,
@@ -130,7 +133,7 @@ impl MakerHedgeCapBot {
         let asset_ids_ready =
             self.condition_id.is_some() && self.yes_asset.is_some() && self.no_asset.is_some();
         let market_ws_ready = self.market_connected.load(Ordering::SeqCst);
-        let user_ws_required = env_bool("REQUIRE_USER_WS_CONNECTED", true);
+        let user_ws_required = self._bot_runtime_user_ws_required();
         let user_ws_ready = !user_ws_required || self.user_connected.load(Ordering::SeqCst);
         let (quotes_ready, quote_input_reason) = if asset_ids_ready {
             self._bot_runtime_quote_input_status()
@@ -637,9 +640,7 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        if env_bool("REQUIRE_USER_WS_CONNECTED", true)
-            && !self.user_connected.load(Ordering::SeqCst)
-        {
+        if self._bot_runtime_user_ws_required() && !self.user_connected.load(Ordering::SeqCst) {
             self._bot_runtime_log_open_both_hold(
                 "user_ws_disconnected",
                 t_into_s,
@@ -1546,9 +1547,7 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        if env_bool("REQUIRE_USER_WS_CONNECTED", true)
-            && !self.user_connected.load(Ordering::SeqCst)
-        {
+        if self._bot_runtime_user_ws_required() && !self.user_connected.load(Ordering::SeqCst) {
             self._bot_runtime_log_await_second_fill_hold(
                 "user_ws_disconnected",
                 Some(missing_side),

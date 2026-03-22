@@ -365,6 +365,7 @@ impl MakerHedgeCapBot {
             thread::sleep(Duration::from_secs_f64(wait_s.min(0.5)));
             let now = now_ts_f64();
             self._bot_runtime_refresh_daily_liquidity_counters();
+            self._paper_runtime_simulate_fills(now);
             self._bot_runtime_refresh_shared_gross_state(now, &mut last_gross_reservation_refresh);
             let t_into_s = now - self.start_ts as f64;
             let seconds_left = self.expiry_ts as f64 - now;
@@ -645,6 +646,12 @@ impl MakerHedgeCapBot {
                     .lock()
                     .map(|st| st.safety_gate_reason.clone())
                     .unwrap_or_default();
+            }
+            let effective_order_mode = self._bot_runtime_effective_order_mode();
+            if matches!(effective_order_mode, BotOrderMode::Live) {
+                if let Ok(mut st) = self.bot_runtime_state.lock() {
+                    st.live_order_write_armed_once = true;
+                }
             }
             self._bot_runtime_note_first_fill(now, qy, qn, cost_yes, cost_no);
             self._bot_runtime_note_await_second_fill_progress(

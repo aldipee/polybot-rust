@@ -254,6 +254,7 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) owner_reason: &'static str,
     pub(in crate::bot) safety_gate: BotRuntimeSafetyGate,
     pub(in crate::bot) safety_gate_reason: String,
+    pub(in crate::bot) live_order_write_armed_once: bool,
     pub(in crate::bot) last_clean_reconcile_ts: f64,
     pub(in crate::bot) last_reconnect_reconcile_ts: f64,
     pub(in crate::bot) last_validation_ts: f64,

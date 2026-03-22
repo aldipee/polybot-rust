@@ -47,6 +47,75 @@ fn default_gross_cap_shared_state_ttl_seconds() -> f64 {
     30.0
 }
 
+fn default_bot_order_mode() -> String {
+    "shadow".to_string()
+}
+
+fn default_bot_live_enabled() -> bool {
+    false
+}
+
+fn parse_env_bool_like(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn order_mode_from_legacy_dry_run(dry_run: bool) -> String {
+    if dry_run {
+        "paper".to_string()
+    } else {
+        default_bot_order_mode()
+    }
+}
+
+fn parse_bot_order_mode(raw: &str) -> Option<String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "shadow" => Some("shadow".to_string()),
+        "paper" => Some("paper".to_string()),
+        "live" => Some("live".to_string()),
+        _ => None,
+    }
+}
+
+fn resolve_bot_order_mode_from_env() -> Result<String> {
+    let explicit_raw = env::var("BOT_ORDER_MODE").unwrap_or_default();
+    let explicit_mode = if explicit_raw.trim().is_empty() {
+        None
+    } else {
+        Some(
+            parse_bot_order_mode(&explicit_raw)
+                .ok_or_else(|| anyhow!("Invalid BOT_ORDER_MODE={}", explicit_raw.trim()))?,
+        )
+    };
+    let dry_run_raw = env::var("DRY_RUN").ok();
+    if let Some(explicit_mode) = explicit_mode {
+        if let Some(raw) = dry_run_raw.as_deref() {
+            let dry_run = parse_env_bool_like(raw).unwrap_or(false);
+            let compat_mode = order_mode_from_legacy_dry_run(dry_run);
+            if explicit_mode != compat_mode {
+                return Err(anyhow!(
+                    "Inconsistent DRY_RUN and BOT_ORDER_MODE; remove DRY_RUN or set BOT_ORDER_MODE to {}",
+                    compat_mode
+                ));
+            }
+        }
+        return Ok(explicit_mode);
+    }
+    Ok(order_mode_from_legacy_dry_run(
+        dry_run_raw
+            .as_deref()
+            .and_then(parse_env_bool_like)
+            .unwrap_or(false),
+    ))
+}
+
+fn execution_order_mode_requires_wallet_observation(order_mode: &str) -> bool {
+    !order_mode.eq_ignore_ascii_case("paper")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BotConfig {
     pub clob_host: String,
@@ -307,6 +376,10 @@ pub struct BotExecutionConfigSnapshot {
     pub exec_latency_csv_path: String,
     pub clob_gamma_host: String,
     pub clob_order_meta_warmup: bool,
+    #[serde(default = "default_bot_order_mode")]
+    pub order_mode: String,
+    #[serde(default = "default_bot_live_enabled")]
+    pub live_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -608,20 +681,18 @@ pub fn build_effective_bot_config_from_env() -> Result<BotConfig> {
         cfg.maker_replace_min_interval_seconds,
     )
     .max(0.0);
-
-    if cfg.private_key.trim().is_empty() {
-        return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
-    }
-    if cfg.funder.clone().unwrap_or_default().trim().is_empty() {
-        return Err(anyhow!("Missing POLYMARKET_FUNDER"));
-    }
+    let order_mode = resolve_bot_order_mode_from_env()?;
+    cfg.dry_run = !order_mode.eq_ignore_ascii_case("live");
     validate_stale_data_policy(&cfg)?;
     validate_gross_cap_policy(&cfg)?;
 
     Ok(cfg)
 }
 
-pub fn build_execution_config_from_env(cfg: &BotConfig) -> Result<BotExecutionConfigSnapshot> {
+fn build_execution_config_from_env_with_order_mode(
+    cfg: &BotConfig,
+    order_mode_override: Option<String>,
+) -> Result<BotExecutionConfigSnapshot> {
     let log_dir = env::var("EXEC_LATENCY_LOG_DIR")
         .unwrap_or_else(|_| "./logs".to_string())
         .trim()
@@ -636,9 +707,30 @@ pub fn build_execution_config_from_env(cfg: &BotConfig) -> Result<BotExecutionCo
             "Unsupported EXEC_MODE={exec_mode}. Only BOT is supported."
         ));
     }
+    let order_mode = match order_mode_override {
+        Some(value) => parse_bot_order_mode(value.as_str())
+            .ok_or_else(|| anyhow!("Invalid BOT_ORDER_MODE={}", value.trim()))?,
+        None => resolve_bot_order_mode_from_env()?,
+    };
+    let live_enabled = env_bool("BOT_LIVE_ENABLED", default_bot_live_enabled());
+    let mut wallet_address = wallet_address_from_env(cfg);
+    if wallet_address.trim().is_empty() && order_mode.eq_ignore_ascii_case("paper") {
+        wallet_address = "paper".to_string();
+    }
+    if execution_order_mode_requires_wallet_observation(order_mode.as_str()) {
+        if cfg.private_key.trim().is_empty() {
+            return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
+        }
+        if cfg.funder.clone().unwrap_or_default().trim().is_empty() {
+            return Err(anyhow!("Missing POLYMARKET_FUNDER"));
+        }
+        if wallet_address.trim().is_empty() {
+            return Err(anyhow!("Missing WALLET_ADDRESS"));
+        }
+    }
 
     Ok(BotExecutionConfigSnapshot {
-        wallet_address: wallet_address_from_env(cfg),
+        wallet_address,
         min_maker_notional: env_float("MIN_MAKER_NOTIONAL", 1.0),
         min_taker_notional: env_float("MIN_TAKER_NOTIONAL", 1.0),
         reconcile_sell_credit_mult: env_float("RECONCILE_SELL_CREDIT_MULT", 1.0).clamp(0.0, 1.0),
@@ -681,7 +773,13 @@ pub fn build_execution_config_from_env(cfg: &BotConfig) -> Result<BotExecutionCo
             .or_else(|_| env::var("GAMMA_HOST"))
             .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string()),
         clob_order_meta_warmup: env_bool("CLOB_ORDER_META_WARMUP", true),
+        order_mode,
+        live_enabled,
     })
+}
+
+pub fn build_execution_config_from_env(cfg: &BotConfig) -> Result<BotExecutionConfigSnapshot> {
+    build_execution_config_from_env_with_order_mode(cfg, None)
 }
 
 fn sanitized_bot_config(cfg: &BotConfig) -> BotConfig {
@@ -780,11 +878,46 @@ fn backfill_snapshot_bot_config_gross_cap_fields(value: &mut Value) {
     }
 }
 
+fn snapshot_bot_config_dry_run_compat(value: &Value) -> bool {
+    value
+        .get("bot_config")
+        .and_then(Value::as_object)
+        .and_then(|bot_config| bot_config.get("dry_run"))
+        .and_then(|raw| {
+            raw.as_bool()
+                .or_else(|| raw.as_str().and_then(parse_env_bool_like))
+        })
+        .unwrap_or(false)
+}
+
+fn backfill_snapshot_execution_mode_fields(value: &mut Value) {
+    let legacy_dry_run = snapshot_bot_config_dry_run_compat(value);
+    let Some(execution_config) = value
+        .get_mut("execution_config")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if !execution_config.contains_key("order_mode") {
+        execution_config.insert(
+            "order_mode".to_string(),
+            Value::from(order_mode_from_legacy_dry_run(legacy_dry_run)),
+        );
+    }
+    if !execution_config.contains_key("live_enabled") {
+        execution_config.insert(
+            "live_enabled".to_string(),
+            Value::from(default_bot_live_enabled()),
+        );
+    }
+}
+
 pub(crate) fn snapshot_from_json_text_compat(
     config_text: &str,
 ) -> Result<VersionedConfigSnapshotV1> {
     let mut value: Value = serde_json::from_str(config_text)?;
     backfill_snapshot_bot_config_gross_cap_fields(&mut value);
+    backfill_snapshot_execution_mode_fields(&mut value);
     Ok(serde_json::from_value(value)?)
 }
 
@@ -792,6 +925,7 @@ pub(crate) fn snapshot_from_json_value_compat(
     mut value: Value,
 ) -> Result<VersionedConfigSnapshotV1> {
     backfill_snapshot_bot_config_gross_cap_fields(&mut value);
+    backfill_snapshot_execution_mode_fields(&mut value);
     Ok(serde_json::from_value(value)?)
 }
 
@@ -822,32 +956,66 @@ pub fn load_versioned_config_bundle_from_env() -> Result<ResolvedVersionedConfig
     })
 }
 
+fn normalize_execution_snapshot_for_mode(
+    effective_bot_config: &mut BotConfig,
+    execution_config: &mut BotExecutionConfigSnapshot,
+) -> Result<()> {
+    if execution_config.order_mode.trim().is_empty() {
+        execution_config.order_mode = order_mode_from_legacy_dry_run(effective_bot_config.dry_run);
+    } else {
+        execution_config.order_mode = parse_bot_order_mode(&execution_config.order_mode)
+            .ok_or_else(|| anyhow!("Invalid BOT_ORDER_MODE={}", execution_config.order_mode))?;
+    }
+    execution_config.wallet_address = execution_config.wallet_address.trim().to_ascii_lowercase();
+    if execution_config.wallet_address.is_empty()
+        && execution_config.order_mode.eq_ignore_ascii_case("paper")
+    {
+        execution_config.wallet_address = "paper".to_string();
+    }
+    if execution_order_mode_requires_wallet_observation(execution_config.order_mode.as_str()) {
+        if effective_bot_config.private_key.trim().is_empty() {
+            effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+        }
+        if execution_config.wallet_address.trim().is_empty()
+            && !effective_bot_config.private_key.trim().is_empty()
+        {
+            execution_config.wallet_address = wallet_address_from_env(effective_bot_config);
+        }
+        if effective_bot_config.private_key.trim().is_empty() {
+            return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
+        }
+        if effective_bot_config
+            .funder
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return Err(anyhow!("Missing POLYMARKET_FUNDER"));
+        }
+        if execution_config.wallet_address.trim().is_empty() {
+            return Err(anyhow!("Missing WALLET_ADDRESS"));
+        }
+    }
+    effective_bot_config.dry_run = !execution_config.order_mode.eq_ignore_ascii_case("live");
+    Ok(())
+}
+
 pub fn resolve_versioned_config_bundle_from_snapshot(
-    snapshot: VersionedConfigSnapshotV1,
+    mut snapshot: VersionedConfigSnapshotV1,
 ) -> Result<ResolvedVersionedConfigBundle> {
     let runtime_config = snapshot.runtime_config.to_runtime_config();
     bot_runtime_validate_config(&runtime_config).map_err(|err| anyhow!(err))?;
     let mut effective_bot_config = snapshot.bot_config.clone();
     validate_stale_data_policy(&effective_bot_config)?;
     validate_gross_cap_policy(&effective_bot_config)?;
-    if effective_bot_config.private_key.trim().is_empty() {
-        effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-    }
-    if effective_bot_config.private_key.trim().is_empty() {
-        return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
-    }
-    if effective_bot_config
-        .funder
-        .clone()
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
-    {
-        return Err(anyhow!("Missing POLYMARKET_FUNDER"));
-    }
+    normalize_execution_snapshot_for_mode(
+        &mut effective_bot_config,
+        &mut snapshot.execution_config,
+    )?;
     Ok(ResolvedVersionedConfigBundle {
         execution_config: snapshot.execution_config.clone(),
         snapshot,
@@ -864,27 +1032,23 @@ pub fn build_legacy_versioned_config_bundle(
 ) -> Result<ResolvedVersionedConfigBundle> {
     validate_stale_data_policy(&effective_bot_config)?;
     validate_gross_cap_policy(&effective_bot_config)?;
-    if effective_bot_config.private_key.trim().is_empty() {
-        effective_bot_config.private_key = env::var("POLYMARKET_PRIVATE_KEY")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-    }
-    if effective_bot_config.private_key.trim().is_empty() {
-        return Err(anyhow!("Missing POLYMARKET_PRIVATE_KEY"));
-    }
-    if effective_bot_config
-        .funder
-        .clone()
+    let runtime_config = bot_runtime_config_from_reader(|key| env::var(key).ok());
+    bot_runtime_validate_config(&runtime_config).map_err(|err| anyhow!(err))?;
+    let legacy_order_mode_override = if env::var("BOT_ORDER_MODE")
         .unwrap_or_default()
         .trim()
         .is_empty()
+        && env::var("DRY_RUN").unwrap_or_default().trim().is_empty()
     {
-        return Err(anyhow!("Missing POLYMARKET_FUNDER"));
-    }
-    let runtime_config = bot_runtime_config_from_reader(|key| env::var(key).ok());
-    bot_runtime_validate_config(&runtime_config).map_err(|err| anyhow!(err))?;
-    let execution_config = build_execution_config_from_env(&effective_bot_config)?;
+        Some(order_mode_from_legacy_dry_run(effective_bot_config.dry_run))
+    } else {
+        None
+    };
+    let mut execution_config = build_execution_config_from_env_with_order_mode(
+        &effective_bot_config,
+        legacy_order_mode_override,
+    )?;
+    normalize_execution_snapshot_for_mode(&mut effective_bot_config, &mut execution_config)?;
     let snapshot = VersionedConfigSnapshotV1 {
         schema_version: "legacy_flat_row".to_string(),
         source: "configuration_row".to_string(),
@@ -987,6 +1151,127 @@ mod tests {
                 let text = right.config_text().expect("config text");
                 assert!(!text.contains("secret-a"));
                 assert!(!text.contains("secret-b"));
+            },
+        );
+    }
+
+    #[test]
+    fn bot_order_mode_defaults_to_shadow_and_live_disabled_false() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("BOT_ORDER_MODE", None),
+                ("BOT_LIVE_ENABLED", None),
+                ("DRY_RUN", None),
+            ],
+            || {
+                let bundle = load_versioned_config_bundle_from_env().expect("bundle");
+                assert_eq!(bundle.execution_config.order_mode, "shadow");
+                assert!(!bundle.execution_config.live_enabled);
+                assert!(bundle.effective_bot_config.dry_run);
+            },
+        );
+    }
+
+    #[test]
+    fn dry_run_true_backfills_to_paper_without_live_credentials() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", None),
+                ("POLYMARKET_FUNDER", None),
+                ("WALLET_ADDRESS", None),
+                ("BOT_ORDER_MODE", None),
+                ("BOT_LIVE_ENABLED", None),
+                ("DRY_RUN", Some("true")),
+            ],
+            || {
+                let bundle = load_versioned_config_bundle_from_env().expect("paper bundle");
+                assert_eq!(bundle.execution_config.order_mode, "paper");
+                assert_eq!(bundle.execution_config.wallet_address, "paper");
+                assert!(bundle.effective_bot_config.dry_run);
+            },
+        );
+    }
+
+    #[test]
+    fn inconsistent_dry_run_and_bot_order_mode_is_rejected() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", Some("secret-a")),
+                ("POLYMARKET_FUNDER", Some("0xfunder")),
+                ("DRY_RUN", Some("true")),
+                ("BOT_ORDER_MODE", Some("live")),
+            ],
+            || {
+                let err = load_versioned_config_bundle_from_env()
+                    .expect_err("inconsistent mode envs should fail");
+                assert!(err
+                    .to_string()
+                    .contains("Inconsistent DRY_RUN and BOT_ORDER_MODE"));
+            },
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_execution_mode_fields_backfills_legacy_dry_run_mode() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", None),
+                ("POLYMARKET_FUNDER", None),
+                ("DRY_RUN", Some("true")),
+                ("BOT_ORDER_MODE", None),
+                ("BOT_LIVE_ENABLED", None),
+            ],
+            || {
+                let bundle = load_versioned_config_bundle_from_env().expect("bundle");
+                let mut value: Value =
+                    serde_json::from_str(&bundle.config_text().expect("config text"))
+                        .expect("snapshot json");
+                value
+                    .get_mut("execution_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("execution config object")
+                    .remove("order_mode");
+                value
+                    .get_mut("execution_config")
+                    .and_then(Value::as_object_mut)
+                    .expect("execution config object")
+                    .remove("live_enabled");
+                let snapshot =
+                    snapshot_from_json_value_compat(value).expect("legacy compat snapshot");
+                let resolved =
+                    resolve_versioned_config_bundle_from_snapshot(snapshot).expect("resolved");
+                assert_eq!(resolved.execution_config.order_mode, "paper");
+                assert!(!resolved.execution_config.live_enabled);
+            },
+        );
+    }
+
+    #[test]
+    fn legacy_dry_run_flat_row_builds_paper_mode_before_env_validation() {
+        with_env(
+            &[
+                ("POLYMARKET_PRIVATE_KEY", None),
+                ("POLYMARKET_FUNDER", None),
+                ("WALLET_ADDRESS", None),
+                ("BOT_ORDER_MODE", None),
+                ("BOT_LIVE_ENABLED", None),
+                ("DRY_RUN", None),
+            ],
+            || {
+                let mut cfg = BotConfig::default();
+                cfg.dry_run = true;
+                let bundle = build_legacy_versioned_config_bundle(
+                    cfg,
+                    "legacy_hash".to_string(),
+                    "legacy_version".to_string(),
+                    "2026-03-22T00:00:00Z".to_string(),
+                )
+                .expect("legacy paper bundle");
+                assert_eq!(bundle.execution_config.order_mode, "paper");
+                assert_eq!(bundle.execution_config.wallet_address, "paper");
+                assert!(bundle.effective_bot_config.dry_run);
             },
         );
     }

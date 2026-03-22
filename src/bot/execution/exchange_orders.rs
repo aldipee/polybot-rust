@@ -8,8 +8,58 @@ impl MakerHedgeCapBot {
         if order_id.trim().is_empty() {
             return false;
         }
-        if self.cfg.dry_run {
-            self.logger.info(&format!("[DRY] cancel {order_id}"));
+        let tracked_taker = self
+            .taker_orders
+            .lock()
+            .map(|orders| orders.contains_key(order_id))
+            .unwrap_or(false)
+            || self
+                .state
+                .lock()
+                .ok()
+                .map(|state| {
+                    state.open_orders.values().any(|row| {
+                        row.order_id.as_deref() == Some(order_id)
+                            && row.kind.as_deref() == Some("taker")
+                    })
+                })
+                .unwrap_or(false);
+        let local_shadow_intent_cancel = matches!(
+            self._bot_runtime_effective_order_mode(),
+            BotOrderMode::Shadow
+        ) && self._is_shadow_intent_order_id(order_id);
+        if local_shadow_intent_cancel || !self._bot_runtime_live_cancel_allowed() {
+            if matches!(
+                self._bot_runtime_effective_order_mode(),
+                BotOrderMode::Paper
+            ) {
+                self.logger
+                    .info(&format!("[PAPER] cancel local order_id={order_id}"));
+            } else {
+                self.logger
+                    .info(&format!("[SHADOW] cancel local order_id={order_id}"));
+            }
+            if let Ok(mut ex) = self.exchange_orders_cache.lock() {
+                ex.retain(|o| self._extract_order_id(o).as_deref() != Some(order_id));
+            }
+            if tracked_taker {
+                self._forget_taker_order(order_id);
+            } else {
+                self._maker_order_on_cancel_ack_by_order_id(order_id);
+                if let Ok(mut state) = self.state.lock() {
+                    let before = state.open_orders.len();
+                    state
+                        .open_orders
+                        .retain(|_, order| order.order_id.as_deref() != Some(order_id));
+                    if state.open_orders.len() != before {
+                        let _ = self._bot_runtime_save_state_or_dependency_pause(
+                            &mut state,
+                            "cancel_local_non_live_clear_open_order",
+                        );
+                    }
+                }
+                self._forget_shared_gross_order_reservation(order_id);
+            }
             return true;
         }
         if let (Some(rt), Some(client)) = (&self.clob_rt, &self.clob_client) {
@@ -18,8 +68,12 @@ impl MakerHedgeCapBot {
                     if let Ok(mut ex) = self.exchange_orders_cache.lock() {
                         ex.retain(|o| self._extract_order_id(o).as_deref() != Some(order_id));
                     }
-                    self._maker_order_on_cancel_ack_by_order_id(order_id);
-                    self._forget_shared_gross_order_reservation(order_id);
+                    if tracked_taker {
+                        self._forget_taker_order(order_id);
+                    } else {
+                        self._maker_order_on_cancel_ack_by_order_id(order_id);
+                        self._forget_shared_gross_order_reservation(order_id);
+                    }
                     return true;
                 }
                 Err(e) => {
@@ -33,9 +87,31 @@ impl MakerHedgeCapBot {
             ex.retain(|o| self._extract_order_id(o).as_deref() != Some(order_id));
             let removed = ex.len() != before;
             if removed {
-                self._forget_shared_gross_order_reservation(order_id);
+                if tracked_taker {
+                    self._forget_taker_order(order_id);
+                } else {
+                    self._forget_shared_gross_order_reservation(order_id);
+                }
+                return true;
             }
-            return removed;
+        }
+        let tracked_maker = self
+            .maker_order_index
+            .lock()
+            .map(|idx| idx.contains_key(order_id))
+            .unwrap_or(false);
+        if tracked_maker {
+            self._forget_shared_gross_order_reservation(order_id);
+            return true;
+        }
+        let tracked_taker = self
+            .taker_orders
+            .lock()
+            .map(|orders| orders.contains_key(order_id))
+            .unwrap_or(false);
+        if tracked_taker {
+            self._forget_taker_order(order_id);
+            return true;
         }
         false
     }
@@ -205,6 +281,99 @@ impl MakerHedgeCapBot {
             .and_then(|v| v.as_str())
             .map(str::to_string)
     }
+
+    pub(in crate::bot) fn _is_shadow_intent_order_id(&self, order_id: &str) -> bool {
+        order_id
+            .trim()
+            .to_ascii_uppercase()
+            .starts_with("SHADOW_INTENT_")
+    }
+
+    pub(in crate::bot) fn _is_shadow_intent_order(&self, o: &Value) -> bool {
+        self._extract_order_id(o)
+            .map(|order_id| self._is_shadow_intent_order_id(order_id.as_str()))
+            .unwrap_or(false)
+    }
+
+    fn _shadow_intents_from_local_state(&self) -> Vec<Value> {
+        if !matches!(
+            self._bot_runtime_effective_order_mode(),
+            BotOrderMode::Shadow
+        ) {
+            return Vec::new();
+        }
+        let now = now_ts_f64();
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .open_orders
+                    .iter()
+                    .filter_map(|(asset_id, order)| {
+                        let order_id = order.order_id.as_deref()?.trim();
+                        if !self._is_shadow_intent_order_id(order_id) {
+                            return None;
+                        }
+                        let price = order.price.unwrap_or(0.0);
+                        let size = order.size.unwrap_or(0.0).max(0.0);
+                        if price <= 0.0 || size <= 1e-9 {
+                            return None;
+                        }
+                        Some(json!({
+                            "id": order_id,
+                            "order_id": order_id,
+                            "asset_id": asset_id,
+                            "token_id": asset_id,
+                            "side": "BUY",
+                            "price": price,
+                            "size": size,
+                            "remaining_size": size,
+                            "original_size": size,
+                            "size_matched": 0.0,
+                            "status": "OPEN",
+                            "order_type": "GTC",
+                            "configured_order_mode": self.configured_order_mode.as_str(),
+                            "effective_order_mode": BotOrderMode::Shadow.as_str(),
+                            "ts": order.ts.or(order.submit_ts).unwrap_or(now),
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn _merge_shadow_intents_with_order_list(&self, mut orders: Vec<Value>) -> Vec<Value> {
+        if !matches!(
+            self._bot_runtime_effective_order_mode(),
+            BotOrderMode::Shadow
+        ) {
+            return orders;
+        }
+        let shadow_local = self._shadow_intents_from_local_state();
+        let shadow_cached = self
+            .exchange_orders_cache
+            .lock()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| self._is_shadow_intent_order(row))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut seen_order_ids = orders
+            .iter()
+            .filter_map(|row| self._extract_order_id(row))
+            .collect::<HashSet<_>>();
+        for row in shadow_local.into_iter().chain(shadow_cached.into_iter()) {
+            let Some(order_id) = self._extract_order_id(&row) else {
+                continue;
+            };
+            if seen_order_ids.insert(order_id) {
+                orders.push(row);
+            }
+        }
+        orders
+    }
     /// Extracts order token id from the provided payload or state.
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
@@ -255,18 +424,28 @@ impl MakerHedgeCapBot {
 
     pub fn _list_open_orders_exchange(&self) -> Vec<Value> {
         let fallback = || {
-            self.exchange_orders_cache
+            let cached = self
+                .exchange_orders_cache
                 .lock()
                 .map(|v| v.clone())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let merged = self._merge_shadow_intents_with_order_list(cached);
+            if let Ok(mut cache) = self.exchange_orders_cache.lock() {
+                *cache = merged.clone();
+            }
+            merged
         };
+        if !self._bot_runtime_venue_reads_allowed() {
+            return fallback();
+        }
         // Prefer raw endpoint parsing first: CLOB /data/orders may return either an array
         // or an object envelope ({data:[...]}), while typed client decoding expects an array.
         if let Some(out) = self._list_open_orders_exchange_raw() {
+            let merged = self._merge_shadow_intents_with_order_list(out);
             if let Ok(mut cache) = self.exchange_orders_cache.lock() {
-                *cache = out.clone();
+                *cache = merged.clone();
             }
-            return out;
+            return merged;
         }
         let (rt, client) = match (&self.clob_rt, &self.clob_client) {
             (Some(rt), Some(client)) => (rt, client),
@@ -307,10 +486,11 @@ impl MakerHedgeCapBot {
                         "created_at": o.created_at,
                     }));
                 }
+                let merged = self._merge_shadow_intents_with_order_list(out);
                 if let Ok(mut cache) = self.exchange_orders_cache.lock() {
-                    *cache = out.clone();
+                    *cache = merged.clone();
                 }
-                out
+                merged
             }
             Err(e) => {
                 self.logger
@@ -324,7 +504,7 @@ impl MakerHedgeCapBot {
     /// BOT runtime.
 
     pub fn _cancel_exchange_orders_for_assets(&self, asset_ids: &[String], reason: &str) {
-        if self.cfg.dry_run {
+        if !self._bot_runtime_live_cancel_allowed() {
             return;
         }
         let aset: HashSet<String> = asset_ids
@@ -375,13 +555,14 @@ impl MakerHedgeCapBot {
         intended_price: Option<f64>,
         force: bool,
     ) {
-        if self._maker_single_inflight_enabled() && !self.cfg.dry_run {
+        if self._maker_single_inflight_enabled() && self._bot_runtime_venue_reads_allowed() {
             self._maker_order_reconcile_asset(asset_id, intended_price);
             if !env_bool("RECONCILE_EXCHANGE_ORDERS", true) {
                 return;
             }
         }
-        if !env_bool("RECONCILE_EXCHANGE_ORDERS", true) || self.cfg.dry_run {
+        if !env_bool("RECONCILE_EXCHANGE_ORDERS", true) || !self._bot_runtime_venue_reads_allowed()
+        {
             return;
         }
         let now = now_ts_f64();

@@ -92,6 +92,8 @@ fn make_pair_build_test_bot() -> MakerHedgeCapBot {
         last_taker_hedge_ts: 0.0,
         taker_hedge_min_interval: 1.0,
         exec_mode: "BOT".to_string(),
+        configured_order_mode: "shadow".to_string(),
+        live_enabled: false,
         loop_wait_seconds_maker: 1.0,
         loop_wait_seconds_taker: 0.2,
         clob_order_meta_warmup: true,

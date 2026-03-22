@@ -264,9 +264,6 @@ impl MakerHedgeCapBot {
     }
 
     pub(in crate::bot) fn _republish_shared_gross_reservations_from_local_state(&self) -> bool {
-        if self.cfg.dry_run {
-            return true;
-        }
         let Some(trade_id) = self
             .active_trade_id
             .as_ref()
@@ -337,7 +334,7 @@ impl MakerHedgeCapBot {
             .unwrap_or((false, false, 0.0));
         let reconnect_dependencies_ready = !reconnect_reconciliation_pending
             || (self.market_connected.load(Ordering::SeqCst)
-                && (!env_bool("REQUIRE_USER_WS_CONNECTED", true)
+                && (!self._bot_runtime_user_ws_required()
                     || self.user_connected.load(Ordering::SeqCst)));
         match self._gross_cap_with_shared_state_mut("gross_order_republish", |state| {
             let mut live_buy_orders: HashMap<String, (String, f64, f64)> = HashMap::new();

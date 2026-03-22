@@ -42,6 +42,8 @@ pub struct MakerHedgeCapBot {
     pub last_taker_hedge_ts: f64,
     pub taker_hedge_min_interval: f64,
     pub exec_mode: String,
+    pub configured_order_mode: String,
+    pub live_enabled: bool,
     pub loop_wait_seconds_maker: f64,
     pub loop_wait_seconds_taker: f64,
     pub clob_order_meta_warmup: bool,
@@ -92,6 +94,36 @@ impl MakerHedgeCapBot {
         }
     }
 
+    fn configured_mode_suffix(order_mode: &str) -> Option<&'static str> {
+        match BotOrderMode::from_config_value(order_mode) {
+            Some(BotOrderMode::Shadow) => Some("shadow"),
+            Some(BotOrderMode::Paper) => Some("paper"),
+            _ => None,
+        }
+    }
+
+    fn mode_scoped_state_file_name(base: &str, configured_order_mode: &str) -> String {
+        let Some(suffix) = Self::configured_mode_suffix(configured_order_mode) else {
+            return base.to_string();
+        };
+        if let Some((stem, ext)) = base.rsplit_once('.') {
+            format!("{stem}_{suffix}.{ext}")
+        } else {
+            format!("{base}_{suffix}")
+        }
+    }
+
+    fn mode_scoped_shared_file_name(base: &str, configured_order_mode: &str) -> String {
+        let Some(suffix) = Self::configured_mode_suffix(configured_order_mode) else {
+            return base.to_string();
+        };
+        if let Some((stem, ext)) = base.rsplit_once('.') {
+            format!("{stem}_{suffix}.{ext}")
+        } else {
+            format!("{base}_{suffix}")
+        }
+    }
+
     fn shared_state_dir() -> PathBuf {
         if let Ok(raw) = std::env::var("POLYBOT_SHARED_STATE_DIR") {
             let trimmed = raw.trim();
@@ -124,19 +156,37 @@ impl MakerHedgeCapBot {
         PathBuf::from(".")
     }
 
-    pub(in crate::bot) fn daily_liquidity_state_file_for_wallet(wallet_address: &str) -> PathBuf {
+    pub(in crate::bot) fn daily_liquidity_state_file_for_wallet(
+        wallet_address: &str,
+        configured_order_mode: &str,
+    ) -> PathBuf {
         let suffix = Self::shared_state_wallet_suffix(wallet_address);
-        Self::shared_state_dir().join(format!("maker_hedgecap_daily_liquidity_{suffix}.json"))
+        Self::shared_state_dir().join(Self::mode_scoped_shared_file_name(
+            format!("maker_hedgecap_daily_liquidity_{suffix}.json").as_str(),
+            configured_order_mode,
+        ))
     }
 
-    pub(in crate::bot) fn pending_taker_state_file_for_wallet(wallet_address: &str) -> PathBuf {
+    pub(in crate::bot) fn pending_taker_state_file_for_wallet(
+        wallet_address: &str,
+        configured_order_mode: &str,
+    ) -> PathBuf {
         let suffix = Self::shared_state_wallet_suffix(wallet_address);
-        Self::shared_state_dir().join(format!("maker_hedgecap_pending_takers_{suffix}.json"))
+        Self::shared_state_dir().join(Self::mode_scoped_shared_file_name(
+            format!("maker_hedgecap_pending_takers_{suffix}.json").as_str(),
+            configured_order_mode,
+        ))
     }
 
-    pub(in crate::bot) fn gross_exposure_state_file_for_wallet(wallet_address: &str) -> PathBuf {
+    pub(in crate::bot) fn gross_exposure_state_file_for_wallet(
+        wallet_address: &str,
+        configured_order_mode: &str,
+    ) -> PathBuf {
         let suffix = Self::shared_state_wallet_suffix(wallet_address);
-        Self::shared_state_dir().join(format!("maker_hedgecap_gross_exposure_{suffix}.json"))
+        Self::shared_state_dir().join(Self::mode_scoped_shared_file_name(
+            format!("maker_hedgecap_gross_exposure_{suffix}.json").as_str(),
+            configured_order_mode,
+        ))
     }
 
     pub(in crate::bot) fn shared_state_lock_timeout() -> Duration {
@@ -186,13 +236,19 @@ impl MakerHedgeCapBot {
     pub(in crate::bot) fn _pending_taker_state_file(&self) -> PathBuf {
         let suffix = Self::shared_state_wallet_suffix(self.wallet_address.as_str());
         self._shared_state_dir()
-            .join(format!("maker_hedgecap_pending_takers_{suffix}.json"))
+            .join(Self::mode_scoped_shared_file_name(
+                format!("maker_hedgecap_pending_takers_{suffix}.json").as_str(),
+                self.configured_order_mode.as_str(),
+            ))
     }
 
     pub(in crate::bot) fn _gross_exposure_state_file(&self) -> PathBuf {
         let suffix = Self::shared_state_wallet_suffix(self.wallet_address.as_str());
         self._shared_state_dir()
-            .join(format!("maker_hedgecap_gross_exposure_{suffix}.json"))
+            .join(Self::mode_scoped_shared_file_name(
+                format!("maker_hedgecap_gross_exposure_{suffix}.json").as_str(),
+                self.configured_order_mode.as_str(),
+            ))
     }
 
     fn _instance_working_dir(&self) -> PathBuf {
@@ -236,6 +292,85 @@ impl MakerHedgeCapBot {
         Self::shared_state_dir()
     }
 
+    pub(in crate::bot) fn _configured_bot_order_mode(&self) -> BotOrderMode {
+        BotOrderMode::from_config_value(self.configured_order_mode.as_str())
+            .unwrap_or(BotOrderMode::Shadow)
+    }
+
+    pub(in crate::bot) fn _bot_runtime_user_ws_required(&self) -> bool {
+        !matches!(self._configured_bot_order_mode(), BotOrderMode::Paper)
+            && env_bool("REQUIRE_USER_WS_CONNECTED", true)
+    }
+
+    pub(in crate::bot) fn _bot_runtime_live_block_reason(&self) -> Option<String> {
+        if !matches!(self._configured_bot_order_mode(), BotOrderMode::Live) {
+            return None;
+        }
+        if !self.live_enabled {
+            return Some("live_mode_disarmed".to_string());
+        }
+        let (safety_gate, safety_gate_reason) = self
+            .bot_runtime_state
+            .lock()
+            .map(|state| (state.safety_gate, state.safety_gate_reason.clone()))
+            .unwrap_or((BotRuntimeSafetyGate::DependencyPaused, String::new()));
+        if !matches!(safety_gate, BotRuntimeSafetyGate::Healthy) {
+            return Some(if safety_gate_reason.trim().is_empty() {
+                safety_gate.as_str().to_string()
+            } else {
+                safety_gate_reason
+            });
+        }
+        if !self.market_connected.load(Ordering::SeqCst) {
+            return Some("market_ws_disconnected".to_string());
+        }
+        if self._bot_runtime_user_ws_required() && !self.user_connected.load(Ordering::SeqCst) {
+            return Some("user_ws_disconnected".to_string());
+        }
+        if self._bot_runtime_persistence_healthy().is_err() {
+            return Some("dependency_pause:database".to_string());
+        }
+        let stale_status = self._bot_runtime_market_data_stale_status();
+        if !stale_status.is_fresh() {
+            return Some(format!("market_data_stale:{}", stale_status.stage.as_str()));
+        }
+        None
+    }
+
+    pub(in crate::bot) fn _bot_runtime_effective_order_mode(&self) -> BotOrderMode {
+        match self._configured_bot_order_mode() {
+            BotOrderMode::Paper => BotOrderMode::Paper,
+            BotOrderMode::Shadow => BotOrderMode::Shadow,
+            BotOrderMode::Live => {
+                if self._bot_runtime_live_block_reason().is_some() {
+                    BotOrderMode::Shadow
+                } else {
+                    BotOrderMode::Live
+                }
+            }
+        }
+    }
+
+    pub(in crate::bot) fn _bot_runtime_live_write_allowed(&self) -> bool {
+        matches!(self._bot_runtime_effective_order_mode(), BotOrderMode::Live)
+    }
+
+    pub(in crate::bot) fn _bot_runtime_live_cancel_allowed(&self) -> bool {
+        if matches!(self._bot_runtime_effective_order_mode(), BotOrderMode::Live) {
+            return true;
+        }
+        matches!(self._configured_bot_order_mode(), BotOrderMode::Live)
+            && self
+                .bot_runtime_state
+                .lock()
+                .map(|state| state.live_order_write_armed_once)
+                .unwrap_or(false)
+    }
+
+    pub(in crate::bot) fn _bot_runtime_venue_reads_allowed(&self) -> bool {
+        !matches!(self._configured_bot_order_mode(), BotOrderMode::Paper)
+    }
+
     /// Builds a fully wired bot instance from a resolved, pinned config bundle,
     /// derived market metadata, and optional latency/CLOB clients.
     ///
@@ -249,14 +384,21 @@ impl MakerHedgeCapBot {
         let cfg = resolved_cfg.effective_bot_config;
         let bot_runtime_cfg = resolved_cfg.runtime_config;
         let execution_cfg = resolved_cfg.execution_config;
+        let configured_order_mode = execution_cfg.order_mode.trim().to_ascii_lowercase();
+        let live_enabled = execution_cfg.live_enabled;
         let config_version = resolved_cfg.snapshot.config_version.clone();
-        let state_file = PathBuf::from(format!("maker_hedgecap_state_{market_slug}.json"));
+        let state_file = PathBuf::from(Self::mode_scoped_state_file_name(
+            format!("maker_hedgecap_state_{market_slug}.json").as_str(),
+            configured_order_mode.as_str(),
+        ));
         let state = load_state(&state_file)?;
         let start_trade_iso = crate::db::now_iso_jakarta();
 
         let wallet_address = execution_cfg.wallet_address.trim().to_ascii_lowercase();
-        let daily_liquidity_state_file =
-            Self::daily_liquidity_state_file_for_wallet(wallet_address.as_str());
+        let daily_liquidity_state_file = Self::daily_liquidity_state_file_for_wallet(
+            wallet_address.as_str(),
+            configured_order_mode.as_str(),
+        );
         if let Some(parent) = daily_liquidity_state_file.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -290,7 +432,11 @@ impl MakerHedgeCapBot {
             None
         };
         let (clob_rt, clob_client, clob_api_creds) =
-            Self::_init_native_clob_client(&cfg, &bot_logger, &execution_cfg.clob_gamma_host)?;
+            if configured_order_mode.eq_ignore_ascii_case("paper") {
+                (None, None, None)
+            } else {
+                Self::_init_native_clob_client(&cfg, &bot_logger, &execution_cfg.clob_gamma_host)?
+            };
 
         let mut out = Self {
             cfg,
@@ -335,6 +481,8 @@ impl MakerHedgeCapBot {
             last_taker_hedge_ts: 0.0,
             taker_hedge_min_interval: execution_cfg.taker_hedge_min_interval,
             exec_mode: execution_cfg.exec_mode.clone(),
+            configured_order_mode: configured_order_mode.clone(),
+            live_enabled,
             loop_wait_seconds_maker: execution_cfg.loop_wait_seconds_maker,
             loop_wait_seconds_taker: execution_cfg.loop_wait_seconds_taker,
             clob_order_meta_warmup: execution_cfg.clob_order_meta_warmup,
@@ -375,10 +523,14 @@ impl MakerHedgeCapBot {
         let effective_entry_edge_ticks = out.cfg.entry_edge_ticks.max(out.min_entry_edge_ticks);
         let stale_policy_requirement_compliant =
             crate::config::stale_data_policy_requirement_compliant(&out.cfg);
+        let effective_order_mode = out._bot_runtime_effective_order_mode();
         out.logger.info(&format!(
-            "[CFG_EFFECTIVE] config_version={} dry_run={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale_add_block={}s market_data_stale_hard_pause={}s stale_policy_requirement_compliant={} pair_gross_cap_usd={:.2} portfolio_gross_cap_usd={:.2} pair_gross_buffer_usd={:.2} portfolio_gross_buffer_usd={:.2} gross_cap_include_pending_maker={} gross_cap_include_pending_taker={} gross_cap_shared_state_ttl_seconds={:.1} stop_buffer={}s",
+            "[CFG_EFFECTIVE] config_version={} dry_run={} configured_order_mode={} effective_order_mode={} live_enabled={} max_total_cost={:.2} reserve_usd={:.2} min_shares={:.2} clip_shares={:.2} entry_edge_ticks={} min_entry_edge_ticks={} effective_entry_edge_ticks={} log_every={} market_data_stale_add_block={}s market_data_stale_hard_pause={}s stale_policy_requirement_compliant={} pair_gross_cap_usd={:.2} portfolio_gross_cap_usd={:.2} pair_gross_buffer_usd={:.2} portfolio_gross_buffer_usd={:.2} gross_cap_include_pending_maker={} gross_cap_include_pending_taker={} gross_cap_shared_state_ttl_seconds={:.1} stop_buffer={}s",
             out.config_version,
             out.cfg.dry_run,
+            out.configured_order_mode,
+            effective_order_mode.as_str(),
+            out.live_enabled,
             out.cfg.max_total_cost,
             out.cfg.reserve_usd,
             out.cfg.min_shares,

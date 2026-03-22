@@ -79,6 +79,36 @@ impl MakerHedgeCapBot {
         );
     }
 
+    fn _audit_augmented_payload(&self, payload: Value) -> Value {
+        let mut payload_obj = match payload {
+            Value::Object(map) => map,
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("payload".to_string(), other);
+                map
+            }
+        };
+        payload_obj.insert(
+            "configured_order_mode".to_string(),
+            Value::String(self.configured_order_mode.clone()),
+        );
+        payload_obj.insert(
+            "effective_order_mode".to_string(),
+            Value::String(
+                self._bot_runtime_effective_order_mode()
+                    .as_str()
+                    .to_string(),
+            ),
+        );
+        payload_obj.insert(
+            "live_order_mode_block_reason".to_string(),
+            self._bot_runtime_live_block_reason()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        Value::Object(payload_obj)
+    }
+
     pub(in crate::bot) fn _audit_insert_runtime_event(
         &self,
         event_kind: &str,
@@ -94,6 +124,7 @@ impl MakerHedgeCapBot {
         let (pair_id, market_slug, condition_id, yes_asset_id, no_asset_id) =
             self._audit_pair_identity_fields();
         let event_id = new_uuid();
+        let payload = self._audit_augmented_payload(payload);
         let payload_text = serde_json::to_string(&payload).ok()?;
         let row = TradeRuntimeEventInsert {
             event_id: event_id.clone(),
@@ -203,7 +234,7 @@ impl MakerHedgeCapBot {
             .ok()
             .map(Self::_gross_cap_snapshot_json)
             .unwrap_or(Value::Null);
-        let payload = json!({
+        let payload = self._audit_augmented_payload(json!({
             "decision_event_id": decision_event_id.clone(),
             "trade_id": trade_id.clone(),
             "pair_id": pair_id.clone(),
@@ -255,7 +286,7 @@ impl MakerHedgeCapBot {
             "requested_rung": decision.map(|value| value.requested_rung.as_str()),
             "clip_bucket": decision.map(|value| value.clip_bucket),
             "requested_large_clip": decision.map(|value| value.requested_large_clip),
-        });
+        }));
         let payload_text = serde_json::to_string(&payload).ok()?;
         let row = TradeDecisionEventInsert {
             decision_event_id: decision_event_id.clone(),

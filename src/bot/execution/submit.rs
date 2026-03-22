@@ -116,6 +116,61 @@ impl MakerHedgeCapBot {
         let _ = self._republish_shared_gross_reservations_from_local_state();
     }
 
+    fn _non_live_order_id_prefix(mode: BotOrderMode) -> &'static str {
+        match mode {
+            BotOrderMode::Paper => "PAPER_INTENT",
+            BotOrderMode::Shadow | BotOrderMode::Live => "SHADOW_INTENT",
+        }
+    }
+
+    fn _record_non_live_order_intent(
+        &self,
+        mode: BotOrderMode,
+        asset_id: &str,
+        side_u: &str,
+        price: f64,
+        size: f64,
+        order_type: &str,
+        post_only: Option<bool>,
+        origin: &str,
+        intent: &(u64, u64, String, String),
+    ) -> Option<String> {
+        let oid = format!("{}_{}", Self::_non_live_order_id_prefix(mode), intent.0);
+        let row = json!({
+            "id": oid,
+            "order_id": oid,
+            "asset_id": asset_id,
+            "side": side_u,
+            "price": price,
+            "size": size,
+            "nonce": intent.0,
+            "intent_attempt": intent.1,
+            "intent_family_key": intent.2,
+            "intent_signature": intent.3,
+            "order_type": order_type.to_ascii_uppercase(),
+            "post_only": post_only,
+            "origin": origin,
+            "configured_order_mode": self.configured_order_mode.as_str(),
+            "effective_order_mode": mode.as_str(),
+            "ts": now_ts_f64(),
+        });
+        if let Ok(mut ex) = self.exchange_orders_cache.lock() {
+            ex.push(row);
+        }
+        self.logger.info(&format!(
+            "[{}] synthetic_order asset={} side={} price={:.4} size={:.4} origin={} order_type={} post_only={}",
+            mode.as_str().to_ascii_uppercase(),
+            asset_id,
+            side_u,
+            price,
+            size,
+            origin,
+            order_type.to_ascii_uppercase(),
+            post_only.unwrap_or(false),
+        ));
+        Some(oid)
+    }
+
     /// Submits order compat through the compatibility execution path.
     /// This reads execution state, exchange payloads, or cached order context for the active
     /// BOT runtime.
@@ -126,9 +181,6 @@ impl MakerHedgeCapBot {
         order_type: &str,
         post_only: Option<bool>,
     ) -> Option<String> {
-        if self.cfg.dry_run {
-            return None;
-        }
         let asset_id = signed_order
             .get("asset_id")
             .or_else(|| signed_order.get("token_id"))
@@ -198,28 +250,28 @@ impl MakerHedgeCapBot {
             price,
             size,
         )?;
-        let local_fallback = || {
-            let oid = format!("LOCAL_INTENT_{}", intent.0);
-            let row = json!({
-                "id": oid,
-                "order_id": oid,
-                "asset_id": asset_id,
-                "side": side_u,
-                "price": price,
-                "size": size,
-                "nonce": intent.0,
-                "intent_attempt": intent.1,
-                "intent_family_key": intent.2,
-                "intent_signature": intent.3,
-                "order_type": order_type.to_ascii_uppercase(),
-                "post_only": post_only,
-                "ts": now_ts_f64(),
-            });
-            if let Ok(mut ex) = self.exchange_orders_cache.lock() {
-                ex.push(row);
-            }
-            Some(oid)
+        let effective_order_mode = self._bot_runtime_effective_order_mode();
+        let local_fallback_mode = if matches!(effective_order_mode, BotOrderMode::Live) {
+            BotOrderMode::Shadow
+        } else {
+            effective_order_mode
         };
+        let local_fallback = || {
+            self._record_non_live_order_intent(
+                local_fallback_mode,
+                asset_id.as_str(),
+                side_u.as_str(),
+                price,
+                size,
+                order_type,
+                post_only,
+                origin.as_str(),
+                &intent,
+            )
+        };
+        if !matches!(effective_order_mode, BotOrderMode::Live) {
+            return local_fallback();
+        }
         let (rt, client) = match (&self.clob_rt, &self.clob_client) {
             (Some(rt), Some(client)) => (rt, client),
             _ => return local_fallback(),
@@ -395,9 +447,6 @@ impl MakerHedgeCapBot {
         order_type: &str,
         post_only: Option<bool>,
     ) -> Vec<Option<String>> {
-        if self.cfg.dry_run {
-            return signed_orders.iter().map(|_| None).collect();
-        }
         signed_orders
             .iter()
             .map(|o| self._post_order_compat(o, order_type, post_only))
@@ -445,7 +494,7 @@ impl MakerHedgeCapBot {
         if price > maker_max {
             return None;
         }
-        if self.cfg.dry_run {
+        if false && self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] POSTONLY BID asset={} price={price:.2} size={size:.4} notional={:.2}",
                 asset_id
@@ -612,7 +661,7 @@ impl MakerHedgeCapBot {
         } else {
             None
         };
-        if self.cfg.dry_run {
+        if false && self.cfg.dry_run {
             let oid = format!("DRY_LIMIT_GTC_{}", (now_ts_f64() * 1000.0) as i64);
             if let Ok(mut s) = self.state.lock() {
                 s.open_orders.insert(
@@ -819,7 +868,7 @@ impl MakerHedgeCapBot {
         } else {
             None
         };
-        if self.cfg.dry_run {
+        if false && self.cfg.dry_run {
             let oid = format!("DRY_LIMIT_GTC_EXACT_{}", (now_ts_f64() * 1000.0) as i64);
             if let Ok(mut s) = self.state.lock() {
                 s.open_orders.insert(
@@ -1164,7 +1213,7 @@ impl MakerHedgeCapBot {
                 return None;
             }
         };
-        if self.cfg.dry_run {
+        if false && self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER HEDGE BUY asset={} price={px:.2} size={size_int} type={ot}",
                 asset_id
@@ -1221,6 +1270,18 @@ impl MakerHedgeCapBot {
             }),
         );
         self._gross_cap_record_order_context(&oid, gross_snapshot);
+        self._paper_try_resolve_order(
+            &oid,
+            asset_id,
+            "BUY",
+            px,
+            size,
+            format!("TAKER_{}_BUY", ot).as_str(),
+            "taker",
+            ot.as_str(),
+            now_ts_f64(),
+        );
+        self._shadow_try_resolve_taker_order(&oid, ot.as_str());
         self.logger.info(&format!(
             "[TAKER {ot}] sent BUY asset={} px={px:.4} sz={size:.0} oid={oid}",
             asset_id
@@ -1294,7 +1355,7 @@ impl MakerHedgeCapBot {
                 return None;
             }
         };
-        if self.cfg.dry_run {
+        if false && self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER HEDGE BUY EXACT asset={} price={px:.2} size={size:.2} type={ot}",
                 asset_id
@@ -1351,6 +1412,18 @@ impl MakerHedgeCapBot {
             }),
         );
         self._gross_cap_record_order_context(&oid, gross_snapshot);
+        self._paper_try_resolve_order(
+            &oid,
+            asset_id,
+            "BUY",
+            px,
+            size,
+            format!("TAKER_{}_BUY_EXACT", ot).as_str(),
+            "taker",
+            ot.as_str(),
+            now_ts_f64(),
+        );
+        self._shadow_try_resolve_taker_order(&oid, ot.as_str());
         self.logger.info(&format!(
             "[TAKER {ot}] sent BUY asset={} px={px:.4} sz={size:.2} oid={oid}",
             asset_id
@@ -1426,7 +1499,7 @@ impl MakerHedgeCapBot {
         let ot = self._resolve_order_type(ot_name);
         let taker_reason =
             taker_submit_reason_allowed("SELL", taker_exception_reason, taker_cap_policy).ok()?;
-        if self.cfg.dry_run {
+        if false && self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER SELL asset={} price={px:.2} size={sz_disp} type={ot}",
                 asset_id
@@ -1491,6 +1564,18 @@ impl MakerHedgeCapBot {
                 "projected_daily_taker_share": gate_snapshot.projected_daily_taker_share,
             }),
         );
+        self._paper_try_resolve_order(
+            &oid,
+            asset_id,
+            "SELL",
+            px,
+            size,
+            format!("TAKER_{}_SELL", ot).as_str(),
+            "taker",
+            ot.as_str(),
+            now_ts_f64(),
+        );
+        self._shadow_try_resolve_taker_order(&oid, ot.as_str());
         self.logger.info(&format!(
             "[TAKER {ot}] sent SELL asset={} px={px:.4} sz={sz_disp} oid={oid}",
             asset_id
@@ -1545,7 +1630,7 @@ impl MakerHedgeCapBot {
         let ot = self._resolve_order_type(ot_name);
         let taker_reason =
             taker_submit_reason_allowed("SELL", taker_exception_reason, taker_cap_policy).ok()?;
-        if self.cfg.dry_run {
+        if false && self.cfg.dry_run {
             self.logger.info(&format!(
                 "[DRY] TAKER SELL EXACT asset={} price={px:.4} size={size:.4} type={ot}",
                 asset_id
@@ -1610,6 +1695,18 @@ impl MakerHedgeCapBot {
                 "projected_daily_taker_share": gate_snapshot.projected_daily_taker_share,
             }),
         );
+        self._paper_try_resolve_order(
+            &oid,
+            asset_id,
+            "SELL",
+            px,
+            size,
+            format!("TAKER_{}_SELL_EXACT", ot).as_str(),
+            "taker",
+            ot.as_str(),
+            now_ts_f64(),
+        );
+        self._shadow_try_resolve_taker_order(&oid, ot.as_str());
         self.logger.info(&format!(
             "[TAKER {ot}] sent SELL asset={} px={px:.4} sz={size:.4} oid={oid}",
             asset_id

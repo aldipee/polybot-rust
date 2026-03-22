@@ -227,6 +227,32 @@ impl MakerHedgeCapBot {
             return false;
         }
         guard.record_seen_trade_key(trade_key, fill_ts.unwrap_or_else(now_ts_f64));
+        let is_maker = order_id
+            .and_then(|oid| {
+                self._get_order_execution_context(oid)
+                    .as_ref()
+                    .and_then(|ctx| ctx.get("liquidity_intent").and_then(|value| value.as_str()))
+                    .map(|intent| intent.eq_ignore_ascii_case("maker"))
+            })
+            .unwrap_or_else(|| {
+                order_id
+                    .map(|oid| {
+                        guard.open_orders.values().any(|order| {
+                            order.order_id.as_deref() == Some(oid)
+                                && order
+                                    .kind
+                                    .as_deref()
+                                    .map(|kind| kind.eq_ignore_ascii_case("maker"))
+                                    .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+                    || origin
+                        .map(|value| {
+                            value.starts_with("BOT_") || value.starts_with("MAKER_POSTONLY")
+                        })
+                        .unwrap_or(false)
+            });
         let yes_asset = self.yes_asset.as_deref().unwrap_or_default();
         let sign = if side_u == "BUY" { 1.0 } else { -1.0 };
         let qty = sign * filled;
@@ -244,7 +270,7 @@ impl MakerHedgeCapBot {
         let opened_position = side_u == "BUY" && qty_before <= 1e-12 && qty_after > 1e-12;
         let closed_position = qty_after <= 1e-12;
         let mark_first_entry_fill = side_u == "BUY" && qty_after > qty_before + 1e-12;
-        guard.record_pair_liquidity_fill(filled, false);
+        guard.record_pair_liquidity_fill(filled, is_maker);
         let _ = self._bot_runtime_save_state_or_dependency_pause(&mut guard, "apply_fill");
         drop(guard);
         if let Some(order_id) = order_id {
@@ -255,7 +281,7 @@ impl MakerHedgeCapBot {
             }
         }
         let _ = self._refresh_shared_gross_trade_snapshot();
-        self._record_daily_liquidity_fill_global(filled, false, fill_ts);
+        self._record_daily_liquidity_fill_global(filled, is_maker, fill_ts);
         // Clear seed in-flight cooldown on any fill ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â allows immediate re-seeding
         // of the other side instead of waiting for the hardcoded timeout.
         self._runtime_ts_set("__maker_skew_seed_inflight_until", 0.0);
@@ -290,11 +316,307 @@ impl MakerHedgeCapBot {
                 }
             }
         }
-        self._bot_runtime_note_observed_fill(asset_id, filled, false, side, order_id, origin);
+        self._bot_runtime_note_observed_fill(asset_id, filled, is_maker, side, order_id, origin);
         self._audit_record_fill_event(
             order_id, asset_id, side, price, filled, false, fill_ts, origin,
         );
         true
+    }
+
+    fn _paper_order_crosses_quotes(&self, asset_id: &str, side: &str, px_limit: f64) -> bool {
+        let Some((bid, ask)) = self._best_bid_ask(asset_id) else {
+            return false;
+        };
+        match side.trim().to_ascii_uppercase().as_str() {
+            "BUY" => ask > 0.0 && ask <= px_limit + 1e-9,
+            "SELL" => bid > 0.0 && bid + 1e-9 >= px_limit,
+            _ => false,
+        }
+    }
+
+    fn _paper_remove_cached_order(&self, order_id: &str) {
+        if let Ok(mut cache) = self.exchange_orders_cache.lock() {
+            cache.retain(|row| self._extract_order_id(row).as_deref() != Some(order_id));
+        }
+    }
+
+    fn _paper_update_maker_order_after_fill(
+        &self,
+        order_id: &str,
+        asset_id: &str,
+        remaining_after: f64,
+        now: f64,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if remaining_after <= 1e-9 {
+                state
+                    .open_orders
+                    .retain(|_, order| order.order_id.as_deref() != Some(order_id));
+            } else if let Some(order) = state.open_orders.get_mut(asset_id) {
+                if order.order_id.as_deref() == Some(order_id) {
+                    order.size = Some(remaining_after.max(0.0));
+                    order.ts = Some(now);
+                }
+            }
+            let _ =
+                self._bot_runtime_save_state_or_dependency_pause(&mut state, "paper_maker_fill");
+        }
+        if let Ok(mut slots) = self.maker_order_slots.lock() {
+            for slot in slots.values_mut() {
+                if slot.order_id.as_deref() == Some(order_id) {
+                    slot.remaining = remaining_after.max(0.0);
+                    if remaining_after <= 1e-9 {
+                        slot.state = MakerOrderLifecycle::Idle;
+                        slot.order_id = None;
+                        slot.replace_target = None;
+                    }
+                    break;
+                }
+            }
+        }
+        if remaining_after <= 1e-9 {
+            if let Ok(mut idx) = self.maker_order_index.lock() {
+                idx.remove(order_id);
+            }
+            self._paper_remove_cached_order(order_id);
+            self._forget_shared_gross_order_reservation(order_id);
+        }
+    }
+
+    fn _paper_update_taker_order_after_fill(
+        &self,
+        order_id: &str,
+        asset_id: &str,
+        remaining_after: f64,
+        applied_after: f64,
+        now: f64,
+    ) {
+        if let Ok(mut orders) = self.taker_orders.lock() {
+            if let Some(record) = orders.get_mut(order_id) {
+                record.applied = applied_after.max(0.0);
+                record.ts = now;
+            }
+        }
+        self._update_shared_pending_taker_order_applied(order_id, applied_after.max(0.0));
+        self._set_shared_gross_order_applied(order_id, applied_after.max(0.0));
+        if let Ok(mut state) = self.state.lock() {
+            if remaining_after <= 1e-9 {
+                state
+                    .open_orders
+                    .retain(|_, order| order.order_id.as_deref() != Some(order_id));
+            } else if let Some(order) = state.open_orders.get_mut(asset_id) {
+                if order.order_id.as_deref() == Some(order_id) {
+                    order.size = Some(remaining_after.max(0.0));
+                    order.ts = Some(now);
+                }
+            }
+            let _ =
+                self._bot_runtime_save_state_or_dependency_pause(&mut state, "paper_taker_fill");
+        }
+        if remaining_after <= 1e-9 {
+            self._forget_taker_order(order_id);
+            self._paper_remove_cached_order(order_id);
+        }
+    }
+
+    pub(in crate::bot) fn _paper_try_resolve_order(
+        &self,
+        order_id: &str,
+        asset_id: &str,
+        side: &str,
+        px_limit: f64,
+        remaining: f64,
+        origin: &str,
+        kind: &str,
+        order_type: &str,
+        now: f64,
+    ) {
+        if !matches!(
+            self._bot_runtime_effective_order_mode(),
+            BotOrderMode::Paper
+        ) || order_id.trim().is_empty()
+            || asset_id.trim().is_empty()
+            || remaining <= 1e-9
+        {
+            return;
+        }
+        let order_type_u = order_type.trim().to_ascii_uppercase();
+        let fillable = self._paper_order_crosses_quotes(asset_id, side, px_limit);
+        if !fillable {
+            if matches!(order_type_u.as_str(), "FAK" | "FOK") {
+                if kind.eq_ignore_ascii_case("taker") {
+                    self._forget_taker_order(order_id);
+                }
+                self._paper_remove_cached_order(order_id);
+            }
+            return;
+        }
+        let fill_size = if matches!(order_type_u.as_str(), "FAK" | "FOK") {
+            remaining
+        } else {
+            remaining.min(self.cfg.min_shares.max(1.0))
+        };
+        if fill_size <= 1e-9 {
+            return;
+        }
+        let trade_key = format!("paper:{order_id}:{}", now_ns());
+        if !self._apply_fill_with_fill_ts(
+            asset_id,
+            px_limit,
+            fill_size,
+            trade_key.as_str(),
+            side,
+            Some(now),
+            Some(order_id),
+            Some(origin),
+        ) {
+            return;
+        }
+        let remaining_after = (remaining - fill_size).max(0.0);
+        if kind.eq_ignore_ascii_case("taker") {
+            let applied_after = self
+                .taker_orders
+                .lock()
+                .ok()
+                .and_then(|orders| orders.get(order_id).cloned())
+                .map(|record| (record.applied + fill_size).min(record.size.max(0.0)))
+                .unwrap_or(fill_size);
+            if matches!(order_type_u.as_str(), "FAK" | "FOK") {
+                self._forget_taker_order(order_id);
+                self._paper_remove_cached_order(order_id);
+            } else {
+                self._paper_update_taker_order_after_fill(
+                    order_id,
+                    asset_id,
+                    remaining_after,
+                    applied_after,
+                    now,
+                );
+            }
+        } else {
+            self._paper_update_maker_order_after_fill(order_id, asset_id, remaining_after, now);
+        }
+    }
+
+    pub(in crate::bot) fn _shadow_try_resolve_taker_order(&self, order_id: &str, order_type: &str) {
+        if !matches!(
+            self._bot_runtime_effective_order_mode(),
+            BotOrderMode::Shadow
+        ) || order_id.trim().is_empty()
+        {
+            return;
+        }
+        let order_type_u = order_type.trim().to_ascii_uppercase();
+        if !matches!(order_type_u.as_str(), "FAK" | "FOK") {
+            return;
+        }
+        self._forget_taker_order(order_id);
+        self._paper_remove_cached_order(order_id);
+    }
+
+    pub(in crate::bot) fn _paper_runtime_simulate_fills(&self, now: f64) {
+        if !matches!(
+            self._bot_runtime_effective_order_mode(),
+            BotOrderMode::Paper
+        ) {
+            return;
+        }
+        let maker_orders = self
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .open_orders
+                    .iter()
+                    .filter_map(|(asset_id, order)| {
+                        let order_id = order.order_id.clone()?;
+                        if order
+                            .kind
+                            .as_deref()
+                            .map(|kind| kind.eq_ignore_ascii_case("taker"))
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        Some((
+                            order_id,
+                            asset_id.clone(),
+                            order.price.unwrap_or(0.0),
+                            order.size.unwrap_or(0.0),
+                            self._get_order_execution_context(
+                                order.order_id.as_deref().unwrap_or_default(),
+                            )
+                            .and_then(|ctx| {
+                                ctx.get("origin")
+                                    .and_then(|value| value.as_str())
+                                    .map(|value| value.to_string())
+                            })
+                            .unwrap_or_else(|| "BOT_PAPER_MAKER".to_string()),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (order_id, asset_id, price, remaining, origin) in maker_orders {
+            self._paper_try_resolve_order(
+                order_id.as_str(),
+                asset_id.as_str(),
+                "BUY",
+                price,
+                remaining,
+                origin.as_str(),
+                "maker",
+                "GTC",
+                now,
+            );
+        }
+        let taker_orders = self
+            .taker_orders
+            .lock()
+            .map(|orders| {
+                orders
+                    .values()
+                    .cloned()
+                    .map(|record| {
+                        let origin = self
+                            ._get_order_execution_context(record.order_id.as_str())
+                            .and_then(|ctx| {
+                                ctx.get("origin")
+                                    .and_then(|value| value.as_str())
+                                    .map(|value| value.to_string())
+                            })
+                            .unwrap_or_else(|| {
+                                format!("TAKER_{}_{}", self.hedge_taker_order_type, record.side)
+                            });
+                        (record, origin)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (record, origin) in taker_orders {
+            let remaining = (record.size - record.applied).max(0.0);
+            if remaining <= 1e-9 {
+                continue;
+            }
+            let order_type = if origin.contains("_FOK_") {
+                "FOK"
+            } else if origin.contains("_FAK_") {
+                "FAK"
+            } else {
+                "GTC"
+            };
+            self._paper_try_resolve_order(
+                record.order_id.as_str(),
+                record.asset_id.as_str(),
+                record.side.as_str(),
+                record.px_limit,
+                remaining,
+                origin.as_str(),
+                "taker",
+                order_type,
+                now,
+            );
+        }
     }
     /// Applies fill locked nodedupe to the current BOT state.
     /// This reads execution state, exchange payloads, or cached order context for the active
@@ -476,11 +798,17 @@ impl MakerHedgeCapBot {
         if order_id.trim().is_empty() {
             return;
         }
+        let shared_pending_taker = self._shared_pending_taker_order_exists(order_id);
+        let shared_gross_taker = self
+            ._shared_gross_order_reservation_snapshot(order_id)
+            .map(|reservation| reservation.kind.eq_ignore_ascii_case("taker"))
+            .unwrap_or(false);
         let removed = if let Ok(mut m) = self.taker_orders.lock() {
             m.remove(order_id)
         } else {
             None
         };
+        let mut removed_local_taker = false;
         if let Ok(mut state) = self.state.lock() {
             let remove_asset = removed
                 .as_ref()
@@ -502,6 +830,7 @@ impl MakerHedgeCapBot {
                     })
                     .unwrap_or(false);
                 if should_remove {
+                    removed_local_taker = true;
                     state.open_orders.remove(asset_id.as_str());
                     let _ = self._bot_runtime_save_state_or_dependency_pause(
                         &mut state,
@@ -511,6 +840,9 @@ impl MakerHedgeCapBot {
             }
         }
         self._forget_shared_pending_taker_order(order_id);
+        if removed.is_some() || removed_local_taker || shared_pending_taker || shared_gross_taker {
+            self._forget_shared_gross_order_reservation(order_id);
+        }
     }
     /// Returns whether recent taker order is true for the current BOT context.
     /// This reads execution state, exchange payloads, or cached order context for the active

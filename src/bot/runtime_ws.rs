@@ -183,7 +183,7 @@ impl MakerHedgeCapBot {
         }
     }
 
-    fn _bot_runtime_persistence_healthy(&self) -> Result<(), String> {
+    pub(in crate::bot) fn _bot_runtime_persistence_healthy(&self) -> Result<(), String> {
         let (gate, reason) = self
             .bot_runtime_state
             .lock()
@@ -271,9 +271,7 @@ impl MakerHedgeCapBot {
         if !self.market_connected.load(Ordering::SeqCst) {
             return Err("dependency_pause:market_ws".to_string());
         }
-        if env_bool("REQUIRE_USER_WS_CONNECTED", true)
-            && !self.user_connected.load(Ordering::SeqCst)
-        {
+        if self._bot_runtime_user_ws_required() && !self.user_connected.load(Ordering::SeqCst) {
             return Err("dependency_pause:user_ws".to_string());
         }
         self._bot_runtime_persistence_healthy()?;
@@ -520,7 +518,9 @@ impl MakerHedgeCapBot {
         }
         let reason = thread::scope(|scope| {
             scope.spawn(|| self._ws_runner("market"));
-            scope.spawn(|| self._ws_runner("user"));
+            if self._bot_runtime_user_ws_required() {
+                scope.spawn(|| self._ws_runner("user"));
+            }
             let out = self._run_bot_runtime_loop();
             self.stop();
             out
@@ -931,9 +931,7 @@ impl MakerHedgeCapBot {
         if !self.market_connected.load(Ordering::SeqCst) {
             return false;
         }
-        if env_bool("REQUIRE_USER_WS_CONNECTED", true)
-            && !self.user_connected.load(Ordering::SeqCst)
-        {
+        if self._bot_runtime_user_ws_required() && !self.user_connected.load(Ordering::SeqCst) {
             return false;
         }
         self._bot_runtime_market_data_stale_status().is_fresh()

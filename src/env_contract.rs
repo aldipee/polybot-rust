@@ -30,6 +30,8 @@ pub const ENV_CONTRACT_KEYS: &[&str] = &[
     "MARKET_SYMBOL",
     // Core execution and sizing
     "CLOB_ORDER_META_WARMUP",
+    "BOT_LIVE_ENABLED",
+    "BOT_ORDER_MODE",
     "CLIP_SHARES",
     "DRY_RUN",
     "ENTRY_EDGE_TICKS",

@@ -3,6 +3,7 @@ use proptest::prelude::*;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::mpsc::sync_channel;
 use std::sync::OnceLock;
 struct BotRuntimeNoopLogger;
 impl LogLike for BotRuntimeNoopLogger {
@@ -144,6 +145,8 @@ fn make_bot_runtime_test_bot() -> MakerHedgeCapBot {
         last_taker_hedge_ts: 0.0,
         taker_hedge_min_interval: 1.0,
         exec_mode: "BOT".to_string(),
+        configured_order_mode: "shadow".to_string(),
+        live_enabled: false,
         loop_wait_seconds_maker: 1.0,
         loop_wait_seconds_taker: 0.2,
         clob_order_meta_warmup: true,
@@ -206,6 +209,506 @@ fn set_daily_liquidity_state(
         let _ =
             crate::helpers::save_daily_liquidity_state(&bot.daily_liquidity_state_file, &mut state);
     }
+}
+
+#[test]
+fn configured_live_disarmed_uses_effective_shadow_mode() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = false;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.40, 0.41, 0.40, 0.41, now);
+
+    assert!(matches!(
+        bot._bot_runtime_effective_order_mode(),
+        BotOrderMode::Shadow
+    ));
+    assert_eq!(
+        bot._bot_runtime_live_block_reason().as_deref(),
+        Some("live_mode_disarmed")
+    );
+    let oid = bot
+        ._place_limit_bid_gtc_with_origin(
+            "yes_asset_id",
+            0.40,
+            12.0,
+            Some(true),
+            "BOT_OPEN_BOTH_YES",
+        )
+        .expect("shadow-routed submit");
+    assert!(oid.starts_with("SHADOW_INTENT_"));
+}
+
+#[test]
+fn shadow_direct_reconcile_preserves_persisted_shadow_intent() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.runtime_flags
+        .insert("maker_single_inflight_per_side".to_string(), json!(false));
+
+    let oid = bot
+        ._place_limit_bid_gtc_with_origin(
+            "yes_asset_id",
+            0.40,
+            12.0,
+            Some(true),
+            "BOT_OPEN_BOTH_YES",
+        )
+        .expect("shadow direct submit");
+    assert!(oid.starts_with("SHADOW_INTENT_"));
+
+    if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+        *cache = vec![json!({
+            "id": "real_order_yes_1",
+            "order_id": "real_order_yes_1",
+            "asset_id": "yes_asset_id",
+            "token_id": "yes_asset_id",
+            "side": "BUY",
+            "price": 0.39,
+            "size": 7.0,
+            "remaining_size": 7.0,
+            "original_size": 7.0,
+        })];
+    }
+
+    bot._reconcile_exchange_orders_for_asset("yes_asset_id", Some(0.40), true);
+
+    let open_order = bot
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+        .expect("shadow local open order");
+    assert_eq!(open_order.order_id.as_deref(), Some(oid.as_str()));
+    let cached_ids = bot
+        .exchange_orders_cache
+        .lock()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| bot._extract_order_id(row))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(cached_ids.iter().any(|id| id == oid.as_str()));
+}
+
+#[test]
+fn shadow_single_inflight_reconcile_preserves_persisted_shadow_intent() {
+    let bot = make_bot_runtime_test_bot();
+    let key = MakerOrderKey::buy("yes_asset_id");
+
+    let oid = bot
+        ._maker_order_upsert_gtc(&key, 0.40, 12.0, "BOT_OPEN_BOTH_YES")
+        .expect("shadow single-inflight submit");
+    assert!(oid.starts_with("SHADOW_INTENT_"));
+
+    if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+        *cache = vec![json!({
+            "id": "real_order_yes_2",
+            "order_id": "real_order_yes_2",
+            "asset_id": "yes_asset_id",
+            "token_id": "yes_asset_id",
+            "side": "BUY",
+            "price": 0.39,
+            "size": 6.0,
+            "remaining_size": 6.0,
+            "original_size": 6.0,
+        })];
+    }
+
+    bot._maker_order_reconcile_asset("yes_asset_id", Some(0.40));
+
+    let open_order = bot
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+        .expect("shadow local single-inflight order");
+    assert_eq!(open_order.order_id.as_deref(), Some(oid.as_str()));
+    let slot = bot._maker_order_slot_get(&key);
+    assert_eq!(slot.order_id.as_deref(), Some(oid.as_str()));
+    assert_eq!(slot.state, MakerOrderLifecycle::Working);
+}
+
+#[test]
+fn downgraded_live_shadow_intent_cancel_clears_local_state() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = true;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.40, 0.41, 0.40, 0.41, now);
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.safety_gate = BotRuntimeSafetyGate::DependencyPaused;
+        runtime_state.safety_gate_reason = "dependency_pause:test".to_string();
+        runtime_state.live_order_write_armed_once = true;
+    }
+
+    assert!(matches!(
+        bot._bot_runtime_effective_order_mode(),
+        BotOrderMode::Shadow
+    ));
+    assert!(bot._bot_runtime_live_cancel_allowed());
+
+    let key = MakerOrderKey::buy("yes_asset_id");
+    let oid = bot
+        ._maker_order_upsert_gtc(&key, 0.40, 12.0, "BOT_OPEN_BOTH_YES")
+        .expect("downgraded-live shadow submit");
+    assert!(oid.starts_with("SHADOW_INTENT_"));
+
+    if let Ok(mut cache) = bot.exchange_orders_cache.lock() {
+        cache.clear();
+    }
+
+    assert!(bot._cancel(oid.as_str()));
+    assert!(bot
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.open_orders.get("yes_asset_id").cloned())
+        .is_none());
+    let slot = bot._maker_order_slot_get(&key);
+    assert_eq!(slot.state, MakerOrderLifecycle::Idle);
+    assert!(slot.order_id.is_none());
+}
+
+#[test]
+fn configured_live_with_fresh_quotes_and_clean_gate_is_effectively_live() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = true;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.40, 0.41, 0.40, 0.41, now);
+
+    assert!(matches!(
+        bot._bot_runtime_effective_order_mode(),
+        BotOrderMode::Live
+    ));
+    assert!(bot._bot_runtime_live_write_allowed());
+}
+
+#[test]
+fn startup_reconciliation_pending_keeps_configured_live_in_shadow() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = true;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.40, 0.41, 0.40, 0.41, now);
+    bot._bot_runtime_mark_startup_reconciliation_pending(now);
+
+    assert!(matches!(
+        bot._bot_runtime_effective_order_mode(),
+        BotOrderMode::Shadow
+    ));
+    assert_eq!(
+        bot._bot_runtime_live_block_reason().as_deref(),
+        Some("startup_reconciliation_pending")
+    );
+}
+
+#[test]
+fn hard_stale_demotes_configured_live_back_to_shadow() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = true;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.40, 0.41, 0.40, 0.41, now - 10.0);
+
+    assert!(matches!(
+        bot._bot_runtime_effective_order_mode(),
+        BotOrderMode::Shadow
+    ));
+    assert_eq!(
+        bot._bot_runtime_live_block_reason().as_deref(),
+        Some("market_data_stale:hard_paused")
+    );
+}
+
+#[test]
+fn paper_taker_fak_buy_fills_immediately_on_cross() {
+    let mut bot = make_bot_runtime_test_bot();
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_paper_taker_fill_shared_{}",
+        uuid::Uuid::new_v4()
+    ));
+    set_shared_state_dir_override(&mut bot, &shared_dir);
+    bot.configured_order_mode = "paper".to_string();
+    bot.active_trade_id = Some("paper_taker_trade".to_string());
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.maker_fill_shares = 100.0;
+    }
+    set_daily_liquidity_state(&bot, 100.0, 0.0);
+    bot._bot_runtime_refresh_daily_liquidity_counters();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.39, 0.40, 0.59, 0.60, now);
+
+    let oid = bot
+        ._place_taker_bid_fak(
+            "yes_asset_id",
+            0.41,
+            5.0,
+            Some("FAK"),
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        )
+        .expect("paper taker order");
+    assert!(oid.starts_with("PAPER_INTENT_"));
+    let state = bot
+        .state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert!((state.q_yes - 5.0).abs() < 1e-9);
+    assert!(bot
+        .taker_orders
+        .lock()
+        .map(|orders| !orders.contains_key(oid.as_str()))
+        .unwrap_or(true));
+    let shared = crate::helpers::load_shared_gross_exposure_state(
+        &bot._gross_exposure_state_file(),
+        bot.cfg.gross_cap_shared_state_ttl_seconds,
+    )
+    .expect("paper gross state");
+    assert!(shared.pending_orders.is_empty());
+}
+
+#[test]
+fn paper_taker_fak_buy_non_cross_clears_shared_gross_reservation() {
+    let mut bot = make_bot_runtime_test_bot();
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_paper_taker_miss_shared_{}",
+        uuid::Uuid::new_v4()
+    ));
+    set_shared_state_dir_override(&mut bot, &shared_dir);
+    bot.configured_order_mode = "paper".to_string();
+    bot.active_trade_id = Some("paper_taker_trade_miss".to_string());
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.maker_fill_shares = 100.0;
+    }
+    set_daily_liquidity_state(&bot, 100.0, 0.0);
+    bot._bot_runtime_refresh_daily_liquidity_counters();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.39, 0.50, 0.49, 0.60, now);
+
+    let oid = bot
+        ._place_taker_bid_fak(
+            "yes_asset_id",
+            0.41,
+            5.0,
+            Some("FAK"),
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        )
+        .expect("paper taker order");
+    assert!(oid.starts_with("PAPER_INTENT_"));
+    assert!(bot
+        .taker_orders
+        .lock()
+        .map(|orders| !orders.contains_key(oid.as_str()))
+        .unwrap_or(true));
+    let shared = crate::helpers::load_shared_gross_exposure_state(
+        &bot._gross_exposure_state_file(),
+        bot.cfg.gross_cap_shared_state_ttl_seconds,
+    )
+    .expect("paper gross state");
+    assert!(shared.pending_orders.is_empty());
+}
+
+#[test]
+fn shadow_taker_fak_buy_auto_clears_pending_tracking() {
+    let mut bot = make_bot_runtime_test_bot();
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_shadow_taker_cleanup_shared_{}",
+        uuid::Uuid::new_v4()
+    ));
+    set_shared_state_dir_override(&mut bot, &shared_dir);
+    bot.active_trade_id = Some("shadow_taker_trade".to_string());
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.maker_fill_shares = 100.0;
+    }
+    set_daily_liquidity_state(&bot, 100.0, 0.0);
+    bot._bot_runtime_refresh_daily_liquidity_counters();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.39, 0.50, 0.49, 0.60, now);
+
+    let oid = bot
+        ._place_taker_bid_fak(
+            "yes_asset_id",
+            0.41,
+            5.0,
+            Some("FAK"),
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        )
+        .expect("shadow taker order");
+    assert!(oid.starts_with("SHADOW_INTENT_"));
+    let state = bot
+        .state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert!(state.q_yes.abs() < 1e-9);
+    assert!(!state
+        .open_orders
+        .values()
+        .any(|order| order.order_id.as_deref() == Some(oid.as_str())));
+    assert!(bot
+        .taker_orders
+        .lock()
+        .map(|orders| !orders.contains_key(oid.as_str()))
+        .unwrap_or(true));
+    assert!(bot
+        .exchange_orders_cache
+        .lock()
+        .map(|rows| {
+            !rows
+                .iter()
+                .any(|row| bot._extract_order_id(row).as_deref() == Some(oid.as_str()))
+        })
+        .unwrap_or(true));
+    let pending = crate::helpers::load_shared_pending_taker_state(
+        &bot._pending_taker_state_file(),
+        bot.taker_order_ttl_seconds as f64,
+    )
+    .expect("shadow pending taker state");
+    assert!(pending.orders.is_empty());
+    let shared = crate::helpers::load_shared_gross_exposure_state(
+        &bot._gross_exposure_state_file(),
+        bot.cfg.gross_cap_shared_state_ttl_seconds,
+    )
+    .expect("shadow gross state");
+    assert!(shared.pending_orders.is_empty());
+}
+
+#[test]
+fn paper_maker_order_only_fills_on_touch_and_updates_remaining() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "paper".to_string();
+    let oid = bot
+        ._maker_order_upsert_gtc(
+            &MakerOrderKey::buy("yes_asset_id"),
+            0.40,
+            12.0,
+            "BOT_PAIR_BUILD_YES",
+        )
+        .expect("paper maker order");
+    assert!(oid.starts_with("PAPER_INTENT_"));
+
+    set_pair_quotes(&bot, 0.38, 0.42, 0.58, 0.62, now_ts_f64());
+    bot._paper_runtime_simulate_fills(now_ts_f64());
+    let before_touch = bot
+        .state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert!(before_touch.q_yes.abs() < 1e-9);
+
+    set_pair_quotes(&bot, 0.39, 0.40, 0.59, 0.60, now_ts_f64());
+    bot._paper_runtime_simulate_fills(now_ts_f64());
+    let after_touch = bot
+        .state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    assert!((after_touch.q_yes - bot.cfg.min_shares).abs() < 1e-9);
+    let remaining = after_touch
+        .open_orders
+        .get("yes_asset_id")
+        .and_then(|order| order.size)
+        .expect("paper maker order remaining");
+    assert!((remaining - (12.0 - bot.cfg.min_shares)).abs() < 1e-9);
+}
+
+#[test]
+fn non_live_cancel_clears_taker_tracking_and_pending_files() {
+    let mut bot = make_bot_runtime_test_bot();
+    let shared_dir = std::env::temp_dir().join(format!(
+        "bot_runtime_non_live_taker_cancel_shared_{}",
+        uuid::Uuid::new_v4()
+    ));
+    set_shared_state_dir_override(&mut bot, &shared_dir);
+    bot.configured_order_mode = "paper".to_string();
+    bot.active_trade_id = Some("paper_taker_cancel_trade".to_string());
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.maker_fill_shares = 100.0;
+    }
+    set_daily_liquidity_state(&bot, 100.0, 0.0);
+    bot._bot_runtime_refresh_daily_liquidity_counters();
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.39, 0.50, 0.49, 0.60, now);
+
+    let oid = bot
+        ._place_taker_bid_fak(
+            "yes_asset_id",
+            0.41,
+            5.0,
+            Some("GTC"),
+            Some(TakerExceptionReason::AwaitSecondFillRescue),
+            TakerCapPolicy::EnforceCap,
+        )
+        .expect("paper taker gtc order");
+    assert!(bot._cancel(oid.as_str()));
+    assert!(bot
+        .taker_orders
+        .lock()
+        .map(|orders| !orders.contains_key(oid.as_str()))
+        .unwrap_or(true));
+    let pending_takers = crate::helpers::load_shared_pending_taker_state(
+        &bot._pending_taker_state_file(),
+        bot.taker_order_ttl_seconds as f64,
+    )
+    .expect("pending taker state");
+    assert!(pending_takers.orders.is_empty());
+    let shared = crate::helpers::load_shared_gross_exposure_state(
+        &bot._gross_exposure_state_file(),
+        bot.cfg.gross_cap_shared_state_ttl_seconds,
+    )
+    .expect("paper gross state");
+    assert!(shared.pending_orders.is_empty());
+}
+
+#[test]
+fn audit_runtime_event_payload_includes_order_modes() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = false;
+    bot.active_trade_id = Some("trade_audit_modes".to_string());
+    let (tx, rx) = sync_channel(1);
+    bot.audit_runtime_tx = Some(tx);
+
+    let event_id = bot._audit_insert_runtime_event(
+        "risk_block",
+        None,
+        None,
+        None,
+        None,
+        Some("test_reason"),
+        json!({"foo": "bar"}),
+    );
+    assert!(event_id.is_some());
+    let task = rx.recv().expect("audit runtime task");
+    let row = match task {
+        AuditWriteTask::Runtime(row) => row,
+        other => panic!("expected runtime audit task, got {other:?}"),
+    };
+    let payload: serde_json::Value =
+        serde_json::from_str(&row.payload_json).expect("audit payload json");
+    assert_eq!(
+        payload
+            .get("configured_order_mode")
+            .and_then(|value| value.as_str()),
+        Some("live")
+    );
+    assert_eq!(
+        payload
+            .get("effective_order_mode")
+            .and_then(|value| value.as_str()),
+        Some("shadow")
+    );
+    assert_eq!(
+        payload
+            .get("live_order_mode_block_reason")
+            .and_then(|value| value.as_str()),
+        Some("live_mode_disarmed")
+    );
 }
 
 #[test]
@@ -483,6 +986,10 @@ fn dependency_pause_cancels_direct_bot_orders_without_single_inflight() {
 fn maker_refresh_cycle_cap_blocks_second_yes_cycle_within_interval() {
     let mut bot = make_bot_runtime_test_bot();
     bot.cfg.maker_replace_min_interval_seconds = 1.0;
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = true;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.40, 0.41, 0.40, 0.41, now);
     let key = MakerOrderKey::buy("yes_asset_id");
 
     let oid = bot
@@ -583,7 +1090,11 @@ fn direct_refresh_decision_does_not_start_cycle_before_submit_succeeds() {
 
 #[test]
 fn protective_refresh_cancel_bypasses_cadence_cap() {
-    let bot = make_bot_runtime_test_bot();
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = true;
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.40, 0.41, 0.40, 0.41, now);
     let key = MakerOrderKey::buy("yes_asset_id");
 
     let oid = bot
@@ -1617,6 +2128,17 @@ fn pair_gross_cap_preapproval_keeps_direct_live_pair_legs_additive_until_cancell
             bot._maker_submit_pair_orders(10, 0.50, 0.50, "GTC", Some(true), "BOT_PAIR_BUILD");
         let yes_oid = yes_oid.expect("initial yes order");
         let no_oid = no_oid.expect("initial no order");
+        let shared_after_first = crate::helpers::load_shared_gross_exposure_state(
+            &bot._gross_exposure_state_file(),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("shared gross state after first pair submit");
+        assert!(shared_after_first
+            .pending_orders
+            .contains_key(yes_oid.as_str()));
+        assert!(shared_after_first
+            .pending_orders
+            .contains_key(no_oid.as_str()));
 
         let (next_yes_oid, next_no_oid) =
             bot._maker_submit_pair_orders(10, 0.50, 0.50, "GTC", Some(true), "BOT_PAIR_BUILD");
@@ -1994,6 +2516,7 @@ fn republish_shared_gross_reservations_skips_dry_run_local_orders() {
     with_shared_state_dir(&shared_dir, || {
         let mut bot = make_bot_runtime_test_bot();
         set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.configured_order_mode = "paper".to_string();
         bot.cfg.dry_run = true;
         bot.wallet_address = "0xgrossrepublishdry".to_string();
         bot.active_trade_id = Some("trade_republish_dry".to_string());
@@ -2001,12 +2524,12 @@ fn republish_shared_gross_reservations_skips_dry_run_local_orders() {
             state.open_orders.insert(
                 "yes_asset_id".to_string(),
                 OpenOrderState {
-                    order_id: Some("DRY_LIMIT_GTC_123".to_string()),
+                    order_id: Some("PAPER_INTENT_123".to_string()),
                     price: Some(0.41),
                     size: Some(12.0),
                     ts: Some(now_ts_f64()),
                     submit_ts: Some(now_ts_f64()),
-                    kind: None,
+                    kind: Some("maker".to_string()),
                 },
             );
         }
@@ -2018,7 +2541,13 @@ fn republish_shared_gross_reservations_skips_dry_run_local_orders() {
             bot.cfg.gross_cap_shared_state_ttl_seconds,
         )
         .expect("load shared gross state");
-        assert!(shared.pending_orders.is_empty());
+        assert!(shared.pending_orders.contains_key("PAPER_INTENT_123"));
+        let live_shared = crate::helpers::load_shared_gross_exposure_state(
+            &MakerHedgeCapBot::gross_exposure_state_file_for_wallet(&bot.wallet_address, "live"),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load live shared gross state");
+        assert!(live_shared.pending_orders.is_empty());
     });
 }
 
@@ -2031,6 +2560,7 @@ fn dry_run_single_inflight_maker_submit_does_not_publish_shared_gross_reservatio
     with_shared_state_dir(&shared_dir, || {
         let mut bot = make_bot_runtime_test_bot();
         set_shared_state_dir_override(&mut bot, &shared_dir);
+        bot.configured_order_mode = "paper".to_string();
         bot.cfg.dry_run = true;
         bot.wallet_address = "0xdrysingleinflightgross".to_string();
         bot.active_trade_id = Some("trade_dry_single_inflight_gross".to_string());
@@ -2040,7 +2570,7 @@ fn dry_run_single_inflight_maker_submit_does_not_publish_shared_gross_reservatio
             ._maker_order_upsert_gtc(&key, 0.41, 12.0, "BOT_PAIR_BUILD_YES")
             .expect("dry-run maker submit");
 
-        assert!(oid.starts_with("DRY_LIMIT_GTC_"));
+        assert!(oid.starts_with("PAPER_INTENT_"));
         let tracked_oid = bot
             .state
             .lock()
@@ -2055,7 +2585,13 @@ fn dry_run_single_inflight_maker_submit_does_not_publish_shared_gross_reservatio
             bot.cfg.gross_cap_shared_state_ttl_seconds,
         )
         .expect("load shared gross state");
-        assert!(shared.pending_orders.is_empty());
+        assert!(shared.pending_orders.contains_key(oid.as_str()));
+        let live_shared = crate::helpers::load_shared_gross_exposure_state(
+            &MakerHedgeCapBot::gross_exposure_state_file_for_wallet(&bot.wallet_address, "live"),
+            bot.cfg.gross_cap_shared_state_ttl_seconds,
+        )
+        .expect("load live shared gross state");
+        assert!(live_shared.pending_orders.is_empty());
     });
 }
 
@@ -3176,7 +3712,7 @@ fn wallet_daily_liquidity_file_uses_shared_state_dir_override() {
     let prior = std::env::var("POLYBOT_SHARED_STATE_DIR").ok();
     std::env::set_var("POLYBOT_SHARED_STATE_DIR", "__shared_state_test");
 
-    let path = MakerHedgeCapBot::daily_liquidity_state_file_for_wallet("0xAbC");
+    let path = MakerHedgeCapBot::daily_liquidity_state_file_for_wallet("0xAbC", "live");
 
     match prior {
         Some(value) => std::env::set_var("POLYBOT_SHARED_STATE_DIR", value),
@@ -4346,7 +4882,8 @@ fn taker_share_snapshot_counts_sibling_pending_orders_only_for_daily_share_when_
     };
     bot_b.yes_asset = Some("other_yes_asset_id".to_string());
     bot_b.no_asset = Some("other_no_asset_id".to_string());
-    let daily_file = MakerHedgeCapBot::daily_liquidity_state_file_for_wallet(&shared_wallet);
+    let daily_file =
+        MakerHedgeCapBot::daily_liquidity_state_file_for_wallet(&shared_wallet, "live");
     bot_a.daily_liquidity_state_file = daily_file.clone();
     bot_b.daily_liquidity_state_file = daily_file.clone();
     set_daily_liquidity_state(&bot_a, 90.0, 0.0);
@@ -4374,6 +4911,7 @@ fn taker_share_snapshot_counts_sibling_pending_orders_only_for_daily_share_when_
     bot_b._forget_taker_order("shared-pending-oid");
     let _ = std::fs::remove_file(MakerHedgeCapBot::pending_taker_state_file_for_wallet(
         &shared_wallet,
+        "live",
     ));
     let _ = std::fs::remove_file(&daily_file);
     let _ = std::fs::remove_dir_all(&shared_dir);
