@@ -37,3 +37,6 @@ uuid = { version = "1.11", features = ["v4"] }
 
 [patch.crates-io]
 rs-clob-client = { path = "vendor/rs-clob-client" }
+
+[dev-dependencies]
+proptest = "1"

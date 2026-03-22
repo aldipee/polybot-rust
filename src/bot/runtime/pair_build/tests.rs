@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use proptest::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -180,6 +181,54 @@ fn bot_runtime_pair_build_paired_cost_band_transitions() {
         bot_runtime_pair_build_projected_paired_cost_band(0.90),
         BotRuntimePairedCostBand::Preferred
     );
+}
+
+#[test]
+fn pair_build_price_zone_invariant_blocks_all_adds_at_or_above_one_for_both_modes() {
+    let blocking_cases = [
+        (1.0, BotRuntimePairedCostBand::StopAdd),
+        (1.000_001, BotRuntimePairedCostBand::StopAdd),
+        (1.029, BotRuntimePairedCostBand::StopAdd),
+        (1.029_999, BotRuntimePairedCostBand::StopAdd),
+        (1.03, BotRuntimePairedCostBand::Danger),
+        (1.20, BotRuntimePairedCostBand::Danger),
+    ];
+    let non_blocking_cases = [0.90, 0.94, 0.97, 0.999];
+
+    for mode in [
+        BotRuntimeMarginalCostMode::BalancedAdd,
+        BotRuntimeMarginalCostMode::RebalanceAdd,
+    ] {
+        for (cost, expected_band) in blocking_cases {
+            let band = bot_runtime_pair_build_projected_paired_cost_band(cost);
+            assert_eq!(
+                band, expected_band,
+                "mode={mode:?} cost={cost} should stay in the blocking zone"
+            );
+            assert!(
+                bot_runtime_pair_build_price_zone_hold_reason(band, mode, cost).is_some(),
+                "mode={mode:?} cost={cost} should produce a blocking hold reason"
+            );
+        }
+
+        for cost in non_blocking_cases {
+            let band = bot_runtime_pair_build_projected_paired_cost_band(cost);
+            assert!(
+                matches!(
+                    band,
+                    BotRuntimePairedCostBand::Preferred
+                        | BotRuntimePairedCostBand::Acceptable
+                        | BotRuntimePairedCostBand::Caution
+                ),
+                "mode={mode:?} cost={cost} should stay below the stop-add boundary"
+            );
+            assert_eq!(
+                bot_runtime_pair_build_price_zone_hold_reason(band, mode, cost),
+                None,
+                "mode={mode:?} cost={cost} should not be blocked below 1.00"
+            );
+        }
+    }
 }
 
 #[test]
@@ -368,6 +417,193 @@ fn residual_direction_hold_reason_blocks_speculative_and_underdog_adds() {
         bot_runtime_pair_build_residual_direction_hold_reason(&underdog_increase).as_deref(),
         Some("underdog_residual_increase_block:NO:NO:NO")
     );
+}
+
+#[test]
+fn underdog_residual_invariant_only_flags_repairs_that_create_or_worsen_it() {
+    let cases = [
+        (
+            "paired_growth_keeps_favorite_residual",
+            BotRuntimePairBuildMode::PairedGrowth,
+            None,
+            4.0,
+            10.0,
+            6.0,
+            Some(OutcomeSide::No),
+            Some(OutcomeSide::Yes),
+            4.0,
+            false,
+        ),
+        (
+            "smaller_repair_keeps_favorite_residual",
+            BotRuntimePairBuildMode::LighterSideFirst,
+            Some(OutcomeSide::No),
+            2.0,
+            12.0,
+            8.0,
+            Some(OutcomeSide::No),
+            Some(OutcomeSide::Yes),
+            2.0,
+            false,
+        ),
+        (
+            "exact_gap_repair_clears_residual",
+            BotRuntimePairBuildMode::LighterSideFirst,
+            Some(OutcomeSide::No),
+            4.0,
+            12.0,
+            8.0,
+            Some(OutcomeSide::No),
+            None,
+            0.0,
+            false,
+        ),
+        (
+            "overshoot_creates_underdog_residual",
+            BotRuntimePairBuildMode::LighterSideFirst,
+            Some(OutcomeSide::No),
+            6.0,
+            12.0,
+            8.0,
+            Some(OutcomeSide::No),
+            Some(OutcomeSide::No),
+            2.0,
+            true,
+        ),
+        (
+            "adding_on_existing_underdog_worsens_it",
+            BotRuntimePairBuildMode::LighterSideFirst,
+            Some(OutcomeSide::No),
+            2.0,
+            8.0,
+            12.0,
+            Some(OutcomeSide::No),
+            Some(OutcomeSide::No),
+            6.0,
+            true,
+        ),
+        (
+            "repairing_favorite_reduces_existing_underdog",
+            BotRuntimePairBuildMode::LighterSideFirst,
+            Some(OutcomeSide::Yes),
+            2.0,
+            8.0,
+            12.0,
+            Some(OutcomeSide::No),
+            Some(OutcomeSide::No),
+            2.0,
+            false,
+        ),
+    ];
+
+    for (
+        label,
+        mode,
+        side,
+        clip,
+        q_yes,
+        q_no,
+        underdog_side,
+        expected_residual_side,
+        expected_residual_magnitude,
+        expected_flag,
+    ) in cases
+    {
+        let (projected_side, projected_magnitude) =
+            bot_runtime_projected_residual_side_and_magnitude(mode, side, clip, q_yes, q_no);
+        assert_eq!(
+            projected_side, expected_residual_side,
+            "{label}: projected residual side should match the invariant expectation"
+        );
+        assert!(
+            (projected_magnitude - expected_residual_magnitude).abs() < 1e-9,
+            "{label}: projected residual magnitude should match the invariant expectation"
+        );
+        assert_eq!(
+            bot_runtime_would_increase_underdog_residual_for_side(
+                mode,
+                side,
+                clip,
+                q_yes,
+                q_no,
+                underdog_side,
+            ),
+            expected_flag,
+            "{label}: underdog residual flag should only trip when the add worsens or creates it"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        failure_persistence: None,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0xFACEB00C),
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn underdog_residual_property_matches_projected_side_and_magnitude(
+        q_yes in 0u16..200u16,
+        q_no in 0u16..200u16,
+        clip in 0u16..120u16,
+        is_repair in any::<bool>(),
+        add_yes in any::<bool>(),
+        underdog_case in 0u8..3u8,
+    ) {
+        let q_yes = f64::from(q_yes);
+        let q_no = f64::from(q_no);
+        let clip = f64::from(clip);
+        let mode = if is_repair {
+            BotRuntimePairBuildMode::LighterSideFirst
+        } else {
+            BotRuntimePairBuildMode::PairedGrowth
+        };
+        let side = if is_repair {
+            Some(if add_yes {
+                OutcomeSide::Yes
+            } else {
+                OutcomeSide::No
+            })
+        } else {
+            None
+        };
+        let underdog_side = match underdog_case {
+            0 => None,
+            1 => Some(OutcomeSide::Yes),
+            _ => Some(OutcomeSide::No),
+        };
+
+        let current_residual_side = bot_runtime_residual_side(q_yes, q_no);
+        let current_residual_magnitude = bot_runtime_residual_magnitude(q_yes, q_no);
+        let (projected_residual_side, projected_residual_magnitude) =
+            bot_runtime_projected_residual_side_and_magnitude(mode, side, clip, q_yes, q_no);
+        let increases = bot_runtime_would_increase_underdog_residual_for_side(
+            mode,
+            side,
+            clip,
+            q_yes,
+            q_no,
+            underdog_side,
+        );
+
+        let expected = match underdog_side {
+            Some(underdog) if projected_residual_side == Some(underdog) && projected_residual_magnitude > 1e-9 => {
+                current_residual_side != Some(underdog)
+                    || projected_residual_magnitude > current_residual_magnitude + 1e-9
+            }
+            _ => false,
+        };
+
+        prop_assert_eq!(increases, expected);
+        if increases {
+            prop_assert_eq!(projected_residual_side, underdog_side);
+            prop_assert!(projected_residual_magnitude > 1e-9);
+        }
+        if projected_residual_side != underdog_side || projected_residual_magnitude <= 1e-9 {
+            prop_assert!(!increases);
+        }
+    }
 }
 
 #[test]

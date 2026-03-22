@@ -2985,6 +2985,7 @@ dependencies = [
  "native-tls",
  "postgres",
  "postgres-native-tls",
+ "proptest",
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.28",

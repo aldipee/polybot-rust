@@ -1,5 +1,7 @@
 use super::*;
+use proptest::prelude::*;
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 struct BotRuntimeNoopLogger;
@@ -3662,6 +3664,116 @@ fn bot_runtime_owner_routes_await_second_fill_and_taper() {
         (BotRuntimeControlOwner::AwaitSettlement, "await_settlement")
     );
 }
+
+#[test]
+fn owner_invariant_routes_any_one_sided_inventory_to_await_second_fill() {
+    let one_sided_cases = [(5.0, 0.0), (0.0, 5.0), (12.0, 0.0), (0.0, 9.0)];
+
+    for phase in [
+        BotRuntimePhase::OpenBoth,
+        BotRuntimePhase::PairBuild,
+        BotRuntimePhase::Taper,
+    ] {
+        for (q_yes, q_no) in one_sided_cases {
+            let (owner, reason) = bot_runtime_owner_for_snapshot(phase, q_yes, q_no, false);
+            assert_eq!(
+                owner,
+                BotRuntimeControlOwner::AwaitSecondFill,
+                "phase={phase:?} q_yes={q_yes} q_no={q_no} should never scale before both sides fill"
+            );
+            assert_eq!(
+                reason, "startup_asymmetry",
+                "phase={phase:?} q_yes={q_yes} q_no={q_no} should surface the stable asymmetry reason"
+            );
+        }
+    }
+}
+
+#[test]
+fn owner_routing_boundaries_cover_zero_live_both_live_and_startup_pause_cases() {
+    let cases = [
+        (
+            BotRuntimePhase::OpenBoth,
+            0.0,
+            0.0,
+            false,
+            BotRuntimeControlOwner::OpenBoth,
+            "seed_both_sides",
+        ),
+        (
+            BotRuntimePhase::OpenBoth,
+            4.0,
+            4.0,
+            false,
+            BotRuntimeControlOwner::PairBuild,
+            "both_sides_live",
+        ),
+        (
+            BotRuntimePhase::PairBuild,
+            0.0,
+            0.0,
+            false,
+            BotRuntimeControlOwner::OpenBoth,
+            "seed_both_sides",
+        ),
+        (
+            BotRuntimePhase::PairBuild,
+            4.0,
+            4.0,
+            false,
+            BotRuntimeControlOwner::PairBuild,
+            "paired_replenishment",
+        ),
+        (
+            BotRuntimePhase::Taper,
+            0.0,
+            0.0,
+            false,
+            BotRuntimeControlOwner::Taper,
+            "late_taper",
+        ),
+        (
+            BotRuntimePhase::Taper,
+            4.0,
+            4.0,
+            false,
+            BotRuntimeControlOwner::Taper,
+            "late_taper",
+        ),
+        (
+            BotRuntimePhase::OpenBoth,
+            4.0,
+            4.0,
+            true,
+            BotRuntimeControlOwner::AwaitSecondFill,
+            "startup_hard_paused",
+        ),
+        (
+            BotRuntimePhase::PairBuild,
+            4.0,
+            4.0,
+            true,
+            BotRuntimeControlOwner::AwaitSecondFill,
+            "startup_hard_paused",
+        ),
+        (
+            BotRuntimePhase::Taper,
+            4.0,
+            4.0,
+            true,
+            BotRuntimeControlOwner::AwaitSecondFill,
+            "startup_hard_paused",
+        ),
+    ];
+
+    for (phase, q_yes, q_no, hard_paused, expected_owner, expected_reason) in cases {
+        assert_eq!(
+            bot_runtime_owner_for_snapshot(phase, q_yes, q_no, hard_paused),
+            (expected_owner, expected_reason),
+            "phase={phase:?} q_yes={q_yes} q_no={q_no} hard_paused={hard_paused}"
+        );
+    }
+}
 /// Exercises the BOT runtime open both handler only runs for open both owner scenario and
 /// checks the expected BOT behavior.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -3923,6 +4035,218 @@ fn apply_fill_updates_pair_owned_position_without_side_orphans() {
     assert!((paired.total_cost - 4.25).abs() < 1e-9);
     assert_eq!(paired.paired_size, 5.0);
     assert_eq!(paired.unmatched_size, 0.0);
+}
+
+#[test]
+fn apply_fill_invariant_preserves_quantity_and_cost_through_multi_fill_sequence() {
+    struct FillStep {
+        asset_id: &'static str,
+        price: f64,
+        filled: f64,
+        trade_key: &'static str,
+        side: &'static str,
+        expected_applied: bool,
+        expected_q_yes: f64,
+        expected_q_no: f64,
+        expected_c_yes: f64,
+        expected_c_no: f64,
+    }
+
+    let bot = make_bot_runtime_test_bot();
+    let steps = [
+        FillStep {
+            asset_id: "yes_asset_id",
+            price: 0.40,
+            filled: 5.0,
+            trade_key: "seq-fill-1",
+            side: "BUY",
+            expected_applied: true,
+            expected_q_yes: 5.0,
+            expected_q_no: 0.0,
+            expected_c_yes: 2.0,
+            expected_c_no: 0.0,
+        },
+        FillStep {
+            asset_id: "yes_asset_id",
+            price: 0.40,
+            filled: 5.0,
+            trade_key: "seq-fill-1",
+            side: "BUY",
+            expected_applied: false,
+            expected_q_yes: 5.0,
+            expected_q_no: 0.0,
+            expected_c_yes: 2.0,
+            expected_c_no: 0.0,
+        },
+        FillStep {
+            asset_id: "no_asset_id",
+            price: 0.45,
+            filled: 3.0,
+            trade_key: "seq-fill-2",
+            side: "BUY",
+            expected_applied: true,
+            expected_q_yes: 5.0,
+            expected_q_no: 3.0,
+            expected_c_yes: 2.0,
+            expected_c_no: 1.35,
+        },
+        FillStep {
+            asset_id: "no_asset_id",
+            price: 0.55,
+            filled: 4.0,
+            trade_key: "seq-fill-3",
+            side: "BUY",
+            expected_applied: true,
+            expected_q_yes: 5.0,
+            expected_q_no: 7.0,
+            expected_c_yes: 2.0,
+            expected_c_no: 3.55,
+        },
+        FillStep {
+            asset_id: "yes_asset_id",
+            price: 0.60,
+            filled: 2.0,
+            trade_key: "seq-fill-4",
+            side: "SELL",
+            expected_applied: true,
+            expected_q_yes: 3.0,
+            expected_q_no: 7.0,
+            expected_c_yes: 0.8,
+            expected_c_no: 3.55,
+        },
+        FillStep {
+            asset_id: "no_asset_id",
+            price: 0.30,
+            filled: 1.0,
+            trade_key: "seq-fill-5",
+            side: "SELL",
+            expected_applied: true,
+            expected_q_yes: 3.0,
+            expected_q_no: 6.0,
+            expected_c_yes: 0.8,
+            expected_c_no: 3.25,
+        },
+    ];
+
+    for step in steps {
+        assert_eq!(
+            bot._apply_fill(
+                step.asset_id,
+                step.price,
+                step.filled,
+                step.trade_key,
+                step.side,
+            ),
+            step.expected_applied,
+            "trade_key={} side={} should match the expected dedupe/apply outcome",
+            step.trade_key,
+            step.side
+        );
+        let snapshot = bot._pair_snapshot_from_state(BotRuntimePhase::PairBuild, 60.0);
+        assert!((snapshot.position.q_yes - step.expected_q_yes).abs() < 1e-9);
+        assert!((snapshot.position.q_no - step.expected_q_no).abs() < 1e-9);
+        assert!((snapshot.position.c_yes - step.expected_c_yes).abs() < 1e-9);
+        assert!((snapshot.position.c_no - step.expected_c_no).abs() < 1e-9);
+        assert!(
+            (snapshot.total_cost - (step.expected_c_yes + step.expected_c_no)).abs() < 1e-9,
+            "trade_key={} should preserve total cost conservation",
+            step.trade_key
+        );
+        assert!(
+            (snapshot.paired_size - step.expected_q_yes.min(step.expected_q_no)).abs() < 1e-9,
+            "trade_key={} should preserve paired size conservation",
+            step.trade_key
+        );
+        assert!(
+            (snapshot.unmatched_size - (step.expected_q_yes - step.expected_q_no).abs()).abs()
+                < 1e-9,
+            "trade_key={} should preserve unmatched size conservation",
+            step.trade_key
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        failure_persistence: None,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0xC0DEC0DE),
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn fill_stream_property_preserves_quantity_conservation_and_dedupe(
+        ops in prop::collection::vec(
+            (
+                any::<bool>(),
+                1u32..100u32,
+                1u32..13u32,
+                0u8..8u8,
+                any::<bool>(),
+            ),
+            1..=16
+        )
+    ) {
+        let bot = make_bot_runtime_test_bot();
+        let mut seen = HashSet::<String>::new();
+        let mut expected_q_yes = 0.0f64;
+        let mut expected_q_no = 0.0f64;
+        let mut expected_c_yes = 0.0f64;
+        let mut expected_c_no = 0.0f64;
+
+        for (idx, (is_yes, cents, shares, trade_key_ix, is_buy)) in ops.into_iter().enumerate() {
+            let asset_id = if is_yes { "yes_asset_id" } else { "no_asset_id" };
+            let side = if is_buy { "BUY" } else { "SELL" };
+            let price = f64::from(cents) / 100.0;
+            let filled = f64::from(shares);
+            let trade_key = format!("prop-fill-{trade_key_ix}");
+            let expected_applied = seen.insert(trade_key.clone());
+
+            let (applied, actual_q_yes, actual_q_no, actual_c_yes, actual_c_no) = {
+                let mut guard = bot.state.lock().expect("state lock");
+                let applied = if guard.has_seen_trade_key(&trade_key) {
+                    false
+                } else {
+                    guard.record_seen_trade_key(&trade_key, idx as f64 + 1.0);
+                    bot._apply_fill_locked_nodedupe(&mut guard, asset_id, price, filled, side)
+                        .is_some()
+                };
+                (applied, guard.q_yes, guard.q_no, guard.c_yes, guard.c_no)
+            };
+
+            prop_assert_eq!(applied, expected_applied);
+
+            if expected_applied {
+                let qty = if is_buy { filled } else { -filled };
+                if is_yes {
+                    expected_q_yes = (expected_q_yes + qty).max(0.0);
+                    expected_c_yes = (expected_c_yes + price * qty).max(0.0);
+                } else {
+                    expected_q_no = (expected_q_no + qty).max(0.0);
+                    expected_c_no = (expected_c_no + price * qty).max(0.0);
+                }
+            }
+
+            prop_assert!((actual_q_yes - expected_q_yes).abs() < 1e-9);
+            prop_assert!((actual_q_no - expected_q_no).abs() < 1e-9);
+            prop_assert!((actual_c_yes - expected_c_yes).abs() < 1e-9);
+            prop_assert!((actual_c_no - expected_c_no).abs() < 1e-9);
+
+            let paired_qty = actual_q_yes.min(actual_q_no);
+            let residual_qty = (actual_q_yes - actual_q_no).abs();
+            let dominant_side_qty = actual_q_yes.max(actual_q_no);
+            let total_side_qty = actual_q_yes + actual_q_no;
+            let unmatched = unmatched_fraction(actual_q_yes, actual_q_no);
+
+            prop_assert!(actual_q_yes >= -1e-9);
+            prop_assert!(actual_q_no >= -1e-9);
+            prop_assert!(actual_c_yes >= -1e-9);
+            prop_assert!(actual_c_no >= -1e-9);
+            prop_assert!((paired_qty + residual_qty - dominant_side_qty).abs() < 1e-9);
+            prop_assert!(((2.0 * paired_qty) + residual_qty - total_side_qty).abs() < 1e-9);
+            prop_assert!(unmatched >= -1e-9 && unmatched <= 1.0 + 1e-9);
+        }
+    }
 }
 
 #[test]
