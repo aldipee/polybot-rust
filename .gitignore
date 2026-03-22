@@ -9,5 +9,6 @@ utils/__pycache__/
 *.env
 *.json
 !tests/replay/scenarios/**/*.json
+!tests/analysis_import/**/*.json
 target_hotfix/
 rtds_prices.jsonl

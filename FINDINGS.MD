@@ -7,6 +7,7 @@ Scope covered here:
 - `IMP-13` (`REQ-024`, `REQ-025`)
 - `IMP-14` (`REQ-028`, `REQ-029`)
 - `IMP-15` (`REQ-030`, adjusted `REQ-031`)
+- `IMP-17` (`REQ-027`)
 - `IMP-18` (`REQ-026`)
 - `IMP-19` (`REQ-032`)
 - `IMP-20` (`REQ-033`)
@@ -26,12 +27,13 @@ Status legend:
 | `IMP-13` | `REQ-024`, `REQ-025` | 5 | 5 | 0 | Fixed |
 | `IMP-14` | `REQ-028`, `REQ-029` | 6 | 6 | 0 | Fixed |
 | `IMP-15` | `REQ-030`, adjusted `REQ-031` | 5 | 5 | 0 | Fixed |
+| `IMP-17` | `REQ-027` | 4 | 4 | 0 | Fixed |
 | `IMP-18` | `REQ-026` | 12 | 12 | 0 | Fixed |
 | `IMP-19` | `REQ-032` | 35 | 34 | 1 | Fixed |
 | `IMP-20` | `REQ-033` | 5 | 5 | 0 | Fixed |
 | `IMP-21` | `REQ-034` | 12 | 12 | 0 | Fixed |
 | `IMP-23` | Section 10 replay certification | 2 | 0 | 2 | Fixed |
-| **Total** |  | **82** | **79** | **3** | **Fixed** |
+| **Total** |  | **86** | **83** | **3** | **Fixed** |
 
 ## IMP-13
 
@@ -63,6 +65,15 @@ Requirement mapping: `REQ-030`, adjusted `REQ-031`
 3. `P2` Legacy seen-trade-key migration lost recency ordering and could shrink the dedupe window. `Runtime`, `Fixed`
 4. `P1` Daily-liquidity persistence pauses were cleared by main-state recovery even if the daily-liquidity file was still failing. `Runtime`, `Fixed`
 5. `P1` Direct BOT order cleanup depended on execution-latency logging being enabled. `Runtime`, `Fixed`
+
+## IMP-17
+
+Requirement mapping: `REQ-027`
+
+1. `P2` The analysis importer binary read `DB_URL` before loading `.env`, so local project-root runs could fail even though the repo's other entrypoints worked. `Runtime`, `Fixed`
+2. `P2` Analysis imports were marked `COMPLETED` in Postgres before `summary.json` was written, which could leave false successful runs on output-directory failures. `Runtime`, `Fixed`
+3. `P2` Price-zone classification used strict threshold comparisons instead of the runtime's `1e-9` boundary tolerance, so parity buckets could drift at `0.94 / 0.97 / 1.00 / 1.03`. `Runtime`, `Fixed`
+4. `P3` The live `polybot` binary compiled a duplicate copy of the `analysis_import` module solely to satisfy a crate-path dependency from `db.rs`. `Runtime`, `Fixed`
 
 ## IMP-18
 
@@ -159,5 +170,6 @@ Requirement mapping: Section 10 replay certification
 
 - This document records findings that were actually raised during implementation hardening, not hypothetical future risks.
 - `IMP-19` generated the largest follow-up volume because it introduced wallet-global shared state, multi-instance coordination, restart recovery, TTL cleanup, maker and taker reservation accounting, and local-to-shared state republish logic all at once.
+- `IMP-17` findings were narrower and focused on importer parity correctness, CLI ergonomics, summary completion semantics, and one binary-linkage hygiene issue rather than live trading-path behavior.
 - `IMP-18` generated a second cluster of follow-up parity fixes because deterministic replay had to become self-contained across schedule metadata, settlement inputs, captured order IDs, trade identity, and machine-local env differences.
 - The non-runtime findings in this document are the shared-state test-isolation issue under `IMP-19` plus the replay certification fixture-portability issues under `IMP-23`.

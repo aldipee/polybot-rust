@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, Duration, Utc};
 use chrono_tz::Asia::Jakarta;
 use native_tls::TlsConnector;
+use polybot::analysis_import::AnalysisImportResult;
 use postgres::Client;
 use postgres_native_tls::MakeTlsConnector;
 use serde::{Deserialize, Serialize};
@@ -543,6 +544,142 @@ CREATE TABLE IF NOT EXISTS trade_runtime_events (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS analysis_import_run (
+  import_run_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  dataset_dir TEXT NOT NULL,
+  trade_parquet_path TEXT NOT NULL,
+  close_csv_path TEXT NOT NULL,
+  schema_doc_path TEXT NOT NULL,
+  trade_parquet_sha256 TEXT NOT NULL,
+  close_csv_sha256 TEXT NOT NULL,
+  schema_doc_sha256 TEXT NOT NULL,
+  trade_parquet_mtime TEXT NULL,
+  close_csv_mtime TEXT NULL,
+  schema_doc_mtime TEXT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL,
+  summary_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS analysis_trade_row (
+  import_run_id TEXT NOT NULL,
+  row_ordinal BIGINT NOT NULL,
+  "trade_identity_key" TEXT NOT NULL,
+  "proxyWallet" TEXT NOT NULL,
+  "side" TEXT NOT NULL,
+  "asset" TEXT NOT NULL,
+  "conditionId" TEXT NOT NULL,
+  "size" DOUBLE PRECISION NOT NULL,
+  "price" DOUBLE PRECISION NOT NULL,
+  "timestamp" BIGINT NOT NULL,
+  "title" TEXT NOT NULL,
+  "slug" TEXT NULL,
+  "eventSlug" TEXT NOT NULL,
+  "outcome" TEXT NOT NULL,
+  "outcomeIndex" BIGINT NOT NULL,
+  "transactionHash" TEXT NULL,
+  "is_taker" BOOLEAN NOT NULL,
+  "window_start" BIGINT NULL,
+  "window_end" BIGINT NULL,
+  "t_remain_s" DOUBLE PRECISION NULL,
+  "t_into_s" DOUBLE PRECISION NULL,
+  "trade_time_utc" TEXT NULL,
+  "binance_btc_trade_px" DOUBLE PRECISION NULL,
+  "binance_btc_start_px" DOUBLE PRECISION NULL,
+  "binance_delta_from_start" DOUBLE PRECISION NULL,
+  "binance_rsi14_at_trade" DOUBLE PRECISION NULL,
+  "binance_vol30m_1m_at_trade" DOUBLE PRECISION NULL,
+  "binance_up_model" DOUBLE PRECISION NULL,
+  "binance_down_model" DOUBLE PRECISION NULL,
+  "edge_model_minus_price" DOUBLE PRECISION NULL,
+  "final_outcome" TEXT NULL,
+  "snapshot_status" TEXT NOT NULL,
+  "snapshot_requested_ts_ms" BIGINT NULL,
+  "snapshot_market_id" BIGINT NULL,
+  "snapshot_time" TEXT NULL,
+  "snapshot_match_delta_ms" DOUBLE PRECISION NULL,
+  "snapshot_id" DOUBLE PRECISION NULL,
+  "snapsot_market_btc_price" DOUBLE PRECISION NULL,
+  "snapshot_price_up" DOUBLE PRECISION NULL,
+  "snapshot_price_down" DOUBLE PRECISION NULL,
+  "snapshot_last_trade_price_up" DOUBLE PRECISION NULL,
+  "snapshot_last_trade_price_down" DOUBLE PRECISION NULL,
+  "snapshot_min_order_size_up" DOUBLE PRECISION NULL,
+  "snapshot_min_order_size_down" DOUBLE PRECISION NULL,
+  "snapshot_tick_size_up" DOUBLE PRECISION NULL,
+  "snapshot_tick_size_down" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_up_bid_count" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_up_ask_count" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_up_spread" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_up_bid_1_price" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_up_bid_1_size" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_up_ask_1_price" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_up_ask_1_size" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_down_bid_count" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_down_ask_count" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_down_spread" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_down_bid_1_price" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_down_bid_1_size" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_down_ask_1_price" DOUBLE PRECISION NULL,
+  "snapshot_orderbook_down_ask_1_size" DOUBLE PRECISION NULL,
+  "snapsot_market_btc_price_to_beat" DOUBLE PRECISION NULL,
+  "snapsot_btc_price_delta" DOUBLE PRECISION NULL,
+  row_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (import_run_id, "trade_identity_key")
+);
+
+CREATE TABLE IF NOT EXISTS analysis_close_position_row (
+  import_run_id TEXT NOT NULL,
+  row_ordinal BIGINT NOT NULL,
+  "proxyWallet" TEXT NOT NULL,
+  "asset" TEXT NOT NULL,
+  "conditionId" TEXT NOT NULL,
+  "avgPrice" DOUBLE PRECISION NOT NULL,
+  "totalBought" DOUBLE PRECISION NOT NULL,
+  "realizedPnl" DOUBLE PRECISION NOT NULL,
+  "curPrice" DOUBLE PRECISION NOT NULL,
+  "title" TEXT NOT NULL,
+  "slug" TEXT NOT NULL,
+  "icon" TEXT NOT NULL,
+  "eventSlug" TEXT NOT NULL,
+  "outcome" TEXT NOT NULL,
+  "outcomeIndex" BIGINT NOT NULL,
+  "oppositeOutcome" TEXT NOT NULL,
+  "oppositeAsset" TEXT NOT NULL,
+  "endDate" TEXT NOT NULL,
+  "timestamp" BIGINT NOT NULL,
+  row_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (import_run_id, row_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS analysis_pair_rollup (
+  import_run_id TEXT NOT NULL,
+  condition_id TEXT NOT NULL,
+  event_slug TEXT NOT NULL,
+  trade_outcomes_csv TEXT NOT NULL,
+  close_outcomes_csv TEXT NOT NULL,
+  both_sided_close BOOLEAN NOT NULL,
+  total_trade_count BIGINT NOT NULL,
+  taker_trade_count BIGINT NOT NULL,
+  total_notional DOUBLE PRECISION NOT NULL,
+  taker_notional DOUBLE PRECISION NOT NULL,
+  up_avg_price DOUBLE PRECISION NULL,
+  down_avg_price DOUBLE PRECISION NULL,
+  up_total_bought DOUBLE PRECISION NULL,
+  down_total_bought DOUBLE PRECISION NULL,
+  up_realized_pnl DOUBLE PRECISION NULL,
+  down_realized_pnl DOUBLE PRECISION NULL,
+  up_cur_price DOUBLE PRECISION NULL,
+  down_cur_price DOUBLE PRECISION NULL,
+  rollup_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (import_run_id, condition_id)
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
   ON trade (bot_id, pair_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_configuration_config_version_unique
@@ -553,6 +690,12 @@ CREATE INDEX IF NOT EXISTS idx_trade_runtime_events_trade_ts
   ON trade_runtime_events (trade_id, event_ts);
 CREATE INDEX IF NOT EXISTS idx_trade_runtime_events_decision
   ON trade_runtime_events (decision_event_id);
+CREATE INDEX IF NOT EXISTS idx_analysis_trade_row_import_condition
+  ON analysis_trade_row (import_run_id, "conditionId");
+CREATE INDEX IF NOT EXISTS idx_analysis_close_position_import_condition
+  ON analysis_close_position_row (import_run_id, "conditionId");
+CREATE INDEX IF NOT EXISTS idx_analysis_pair_rollup_import
+  ON analysis_pair_rollup (import_run_id);
 "#,
         )
         .context("failed creating schema")?;
@@ -704,6 +847,256 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
 "#,
         )
         .context("failed migrating configuration schema for PostgreSQL compatibility")?;
+        Ok(())
+    }
+
+    pub fn persist_analysis_import(&self, result: &AnalysisImportResult) -> Result<()> {
+        let mut conn = open_conn(&self.engine)?;
+        let now = now_iso_jakarta();
+        let mut tx = conn
+            .transaction()
+            .context("failed starting analysis import transaction")?;
+
+        let summary_json = serde_json::to_string(&result.summary)
+            .context("failed serializing analysis summary json")?;
+        tx.execute(
+            "INSERT INTO analysis_import_run (
+                import_run_id, status, dataset_dir, trade_parquet_path, close_csv_path, schema_doc_path,
+                trade_parquet_sha256, close_csv_sha256, schema_doc_sha256,
+                trade_parquet_mtime, close_csv_mtime, schema_doc_mtime,
+                started_at, completed_at, summary_json, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9,
+                $10, $11, $12,
+                $13, $14, $15, $16
+            )",
+            &[
+                &result.source.import_run_id,
+                &"COMPLETED",
+                &result.source.dataset_dir.to_string_lossy().to_string(),
+                &result.source.trade_parquet_path.to_string_lossy().to_string(),
+                &result.source.close_csv_path.to_string_lossy().to_string(),
+                &result.source.schema_doc_path.to_string_lossy().to_string(),
+                &result.source.trade_parquet_sha256,
+                &result.source.close_csv_sha256,
+                &result.source.schema_doc_sha256,
+                &result.source.trade_parquet_mtime,
+                &result.source.close_csv_mtime,
+                &result.source.schema_doc_mtime,
+                &result.source.started_at,
+                &result.source.completed_at,
+                &summary_json,
+                &now,
+            ],
+        )
+        .context("failed inserting analysis_import_run")?;
+
+        let trade_stmt = tx.prepare(
+            "INSERT INTO analysis_trade_row (
+                import_run_id, row_ordinal, \"trade_identity_key\", \"proxyWallet\", \"side\", \"asset\", \"conditionId\", \"size\",
+                \"price\", \"timestamp\", \"title\", \"slug\", \"eventSlug\", \"outcome\", \"outcomeIndex\", \"transactionHash\",
+                \"is_taker\", \"window_start\", \"window_end\", \"t_remain_s\", \"t_into_s\", \"trade_time_utc\",
+                \"binance_btc_trade_px\", \"binance_btc_start_px\", \"binance_delta_from_start\", \"binance_rsi14_at_trade\",
+                \"binance_vol30m_1m_at_trade\", \"binance_up_model\", \"binance_down_model\", \"edge_model_minus_price\",
+                \"final_outcome\", \"snapshot_status\", \"snapshot_requested_ts_ms\", \"snapshot_market_id\", \"snapshot_time\",
+                \"snapshot_match_delta_ms\", \"snapshot_id\", \"snapsot_market_btc_price\", \"snapshot_price_up\", \"snapshot_price_down\",
+                \"snapshot_last_trade_price_up\", \"snapshot_last_trade_price_down\", \"snapshot_min_order_size_up\",
+                \"snapshot_min_order_size_down\", \"snapshot_tick_size_up\", \"snapshot_tick_size_down\",
+                \"snapshot_orderbook_up_bid_count\", \"snapshot_orderbook_up_ask_count\", \"snapshot_orderbook_up_spread\",
+                \"snapshot_orderbook_up_bid_1_price\", \"snapshot_orderbook_up_bid_1_size\", \"snapshot_orderbook_up_ask_1_price\",
+                \"snapshot_orderbook_up_ask_1_size\", \"snapshot_orderbook_down_bid_count\", \"snapshot_orderbook_down_ask_count\",
+                \"snapshot_orderbook_down_spread\", \"snapshot_orderbook_down_bid_1_price\", \"snapshot_orderbook_down_bid_1_size\",
+                \"snapshot_orderbook_down_ask_1_price\", \"snapshot_orderbook_down_ask_1_size\", \"snapsot_market_btc_price_to_beat\",
+                \"snapsot_btc_price_delta\", row_json, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12, $13, $14, $15, $16,
+                $17, $18, $19, $20, $21, $22,
+                $23, $24, $25, $26,
+                $27, $28, $29, $30,
+                $31, $32, $33, $34, $35,
+                $36, $37, $38, $39, $40,
+                $41, $42, $43,
+                $44, $45, $46,
+                $47, $48, $49,
+                $50, $51, $52,
+                $53, $54, $55,
+                $56, $57, $58,
+                $59, $60, $61,
+                $62, $63, $64
+            )",
+        )
+        .context("failed preparing analysis_trade_row insert")?;
+
+        for (idx, row) in result.trade_rows.iter().enumerate() {
+            let row_json =
+                serde_json::to_string(row).context("failed serializing analysis trade row")?;
+            tx.execute(
+                &trade_stmt,
+                &[
+                    &result.source.import_run_id,
+                    &(idx as i64),
+                    &row.trade_identity_key,
+                    &row.proxyWallet,
+                    &row.side,
+                    &row.asset,
+                    &row.conditionId,
+                    &row.size,
+                    &row.price,
+                    &row.timestamp,
+                    &row.title,
+                    &row.slug,
+                    &row.eventSlug,
+                    &row.outcome,
+                    &row.outcomeIndex,
+                    &row.transactionHash,
+                    &row.is_taker,
+                    &row.window_start,
+                    &row.window_end,
+                    &row.t_remain_s,
+                    &row.t_into_s,
+                    &row.trade_time_utc,
+                    &row.binance_btc_trade_px,
+                    &row.binance_btc_start_px,
+                    &row.binance_delta_from_start,
+                    &row.binance_rsi14_at_trade,
+                    &row.binance_vol30m_1m_at_trade,
+                    &row.binance_up_model,
+                    &row.binance_down_model,
+                    &row.edge_model_minus_price,
+                    &row.final_outcome,
+                    &row.snapshot_status,
+                    &row.snapshot_requested_ts_ms,
+                    &row.snapshot_market_id,
+                    &row.snapshot_time,
+                    &row.snapshot_match_delta_ms,
+                    &row.snapshot_id,
+                    &row.snapsot_market_btc_price,
+                    &row.snapshot_price_up,
+                    &row.snapshot_price_down,
+                    &row.snapshot_last_trade_price_up,
+                    &row.snapshot_last_trade_price_down,
+                    &row.snapshot_min_order_size_up,
+                    &row.snapshot_min_order_size_down,
+                    &row.snapshot_tick_size_up,
+                    &row.snapshot_tick_size_down,
+                    &row.snapshot_orderbook_up_bid_count,
+                    &row.snapshot_orderbook_up_ask_count,
+                    &row.snapshot_orderbook_up_spread,
+                    &row.snapshot_orderbook_up_bid_1_price,
+                    &row.snapshot_orderbook_up_bid_1_size,
+                    &row.snapshot_orderbook_up_ask_1_price,
+                    &row.snapshot_orderbook_up_ask_1_size,
+                    &row.snapshot_orderbook_down_bid_count,
+                    &row.snapshot_orderbook_down_ask_count,
+                    &row.snapshot_orderbook_down_spread,
+                    &row.snapshot_orderbook_down_bid_1_price,
+                    &row.snapshot_orderbook_down_bid_1_size,
+                    &row.snapshot_orderbook_down_ask_1_price,
+                    &row.snapshot_orderbook_down_ask_1_size,
+                    &row.snapsot_market_btc_price_to_beat,
+                    &row.snapsot_btc_price_delta,
+                    &row_json,
+                    &now,
+                ],
+            )
+            .context("failed inserting analysis_trade_row")?;
+        }
+
+        let close_stmt = tx.prepare(
+            "INSERT INTO analysis_close_position_row (
+                import_run_id, row_ordinal, \"proxyWallet\", \"asset\", \"conditionId\", \"avgPrice\", \"totalBought\",
+                \"realizedPnl\", \"curPrice\", \"title\", \"slug\", \"icon\", \"eventSlug\", \"outcome\", \"outcomeIndex\",
+                \"oppositeOutcome\", \"oppositeAsset\", \"endDate\", \"timestamp\", row_json, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10, $11, $12, $13, $14, $15,
+                $16, $17, $18, $19, $20, $21
+            )",
+        )
+        .context("failed preparing analysis_close_position_row insert")?;
+
+        for (idx, row) in result.close_rows.iter().enumerate() {
+            let row_json = serde_json::to_string(row)
+                .context("failed serializing analysis close-position row")?;
+            tx.execute(
+                &close_stmt,
+                &[
+                    &result.source.import_run_id,
+                    &(idx as i64),
+                    &row.proxyWallet,
+                    &row.asset,
+                    &row.conditionId,
+                    &row.avgPrice,
+                    &row.totalBought,
+                    &row.realizedPnl,
+                    &row.curPrice,
+                    &row.title,
+                    &row.slug,
+                    &row.icon,
+                    &row.eventSlug,
+                    &row.outcome,
+                    &row.outcomeIndex,
+                    &row.oppositeOutcome,
+                    &row.oppositeAsset,
+                    &row.endDate,
+                    &row.timestamp,
+                    &row_json,
+                    &now,
+                ],
+            )
+            .context("failed inserting analysis_close_position_row")?;
+        }
+
+        let rollup_stmt = tx.prepare(
+            "INSERT INTO analysis_pair_rollup (
+                import_run_id, condition_id, event_slug, trade_outcomes_csv, close_outcomes_csv, both_sided_close,
+                total_trade_count, taker_trade_count, total_notional, taker_notional, up_avg_price, down_avg_price,
+                up_total_bought, down_total_bought, up_realized_pnl, down_realized_pnl, up_cur_price, down_cur_price,
+                rollup_json, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18,
+                $19, $20
+            )",
+        )
+        .context("failed preparing analysis_pair_rollup insert")?;
+
+        for row in &result.pair_rollups {
+            let rollup_json =
+                serde_json::to_string(row).context("failed serializing analysis pair rollup")?;
+            tx.execute(
+                &rollup_stmt,
+                &[
+                    &result.source.import_run_id,
+                    &row.condition_id,
+                    &row.event_slug,
+                    &row.trade_outcomes_csv,
+                    &row.close_outcomes_csv,
+                    &row.both_sided_close,
+                    &row.total_trade_count,
+                    &row.taker_trade_count,
+                    &row.total_notional,
+                    &row.taker_notional,
+                    &row.up_avg_price,
+                    &row.down_avg_price,
+                    &row.up_total_bought,
+                    &row.down_total_bought,
+                    &row.up_realized_pnl,
+                    &row.down_realized_pnl,
+                    &row.up_cur_price,
+                    &row.down_cur_price,
+                    &rollup_json,
+                    &now,
+                ],
+            )
+            .context("failed inserting analysis_pair_rollup")?;
+        }
+
+        tx.commit()
+            .context("failed committing analysis import transaction")?;
         Ok(())
     }
 

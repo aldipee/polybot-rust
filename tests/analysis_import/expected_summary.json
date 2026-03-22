@@ -1,0 +1,71 @@
+{
+  "dataset": {
+    "trade_parquet": "vidarx_trade_profitable.parquet",
+    "close_csv": "vidarx_close_position_profitable.csv",
+    "schema_doc": "dataset_schema.md"
+  },
+  "counts": {
+    "parquet_rows": 29342,
+    "close_rows": 209,
+    "filtered_market_count": 105,
+    "closed_position_pair_count": 105,
+    "two_sided_pairs": 104
+  },
+  "metrics": {
+    "two_sided_participation_rate": "0.990476",
+    "taker_share": "0.126167",
+    "taker_share_notional": "0.305692",
+    "weighted_pair_sum_median": "0.990000"
+  },
+  "coverage": {
+    "skipped_pair_cost_count": 80,
+    "skipped_outcome_count": 6997
+  },
+  "price_zone_summary": {
+    "preferred": {
+      "trade_count": 11496,
+      "trade_notional": "105857.718984",
+      "taker_trade_rate": "0.112213",
+      "resolved_trade_count": 8987,
+      "winner_alignment_rate": "0.362190",
+      "skipped_pair_cost_count": 0,
+      "skipped_outcome_count": 2509
+    },
+    "acceptable": {
+      "trade_count": 2566,
+      "trade_notional": "40527.938199",
+      "taker_trade_rate": "0.165627",
+      "resolved_trade_count": 1902,
+      "winner_alignment_rate": "0.552576",
+      "skipped_pair_cost_count": 0,
+      "skipped_outcome_count": 664
+    },
+    "caution": {
+      "trade_count": 4235,
+      "trade_notional": "60155.587527",
+      "taker_trade_rate": "0.120661",
+      "resolved_trade_count": 3184,
+      "winner_alignment_rate": "0.498116",
+      "skipped_pair_cost_count": 0,
+      "skipped_outcome_count": 1051
+    },
+    "stop_add": {
+      "trade_count": 3300,
+      "trade_notional": "44654.075787",
+      "taker_trade_rate": "0.108485",
+      "resolved_trade_count": 2330,
+      "winner_alignment_rate": "0.468670",
+      "skipped_pair_cost_count": 0,
+      "skipped_outcome_count": 970
+    },
+    "danger": {
+      "trade_count": 7665,
+      "trade_notional": "141571.350857",
+      "taker_trade_rate": "0.145858",
+      "resolved_trade_count": 5929,
+      "winner_alignment_rate": "0.585596",
+      "skipped_pair_cost_count": 0,
+      "skipped_outcome_count": 1736
+    }
+  }
+}

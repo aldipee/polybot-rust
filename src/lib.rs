@@ -1,5 +1,8 @@
 #![recursion_limit = "256"]
 
+extern crate self as polybot;
+
+pub mod analysis_import;
 pub mod bot;
 pub mod config;
 pub mod db;
