@@ -1177,6 +1177,91 @@ fn bot_runtime_pair_build_handler_submits_paired_growth_orders() {
 }
 
 #[test]
+fn paper_pair_build_handler_does_not_hold_on_user_ws_disconnect_after_both_sides_restored() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 500.0;
+    bot.configured_order_mode = "paper".to_string();
+    bot.user_connected
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    set_quotes(&bot, 0.30, 0.35, 0.30, 0.35);
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(40.0, 40.0, 0.0, 5.0, 5.0, 0.0, 0.0, &cfg);
+
+    let contexts = bot.order_exec_context.lock().expect("exec context");
+    let origins: Vec<String> = contexts
+        .values()
+        .filter_map(|value| {
+            value
+                .get("origin")
+                .and_then(|origin| origin.as_str())
+                .map(ToString::to_string)
+        })
+        .collect();
+    assert!(
+        origins.iter().any(|origin| origin == "BOT_PAIR_BUILD_YES"),
+        "origins={origins:?}"
+    );
+    assert!(
+        origins.iter().any(|origin| origin == "BOT_PAIR_BUILD_NO"),
+        "origins={origins:?}"
+    );
+    drop(contexts);
+
+    let state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert_ne!(
+        state.pair_build_last_hold_reason,
+        "hold:user_ws_disconnected"
+    );
+}
+
+#[test]
+fn shadow_pair_build_handler_still_holds_on_user_ws_disconnect() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 500.0;
+    bot.user_connected
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    set_quotes(&bot, 0.30, 0.35, 0.30, 0.35);
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(40.0, 40.0, 0.0, 5.0, 5.0, 0.0, 0.0, &cfg);
+
+    let contexts = bot.order_exec_context.lock().expect("exec context");
+    assert!(contexts.is_empty(), "contexts={contexts:?}");
+    drop(contexts);
+
+    let state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert_eq!(
+        state.pair_build_last_hold_reason,
+        "hold:user_ws_disconnected"
+    );
+}
+
+#[test]
+fn live_pair_build_handler_still_holds_on_user_ws_disconnect() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 500.0;
+    bot.configured_order_mode = "live".to_string();
+    bot.live_enabled = true;
+    bot.user_connected
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    set_quotes(&bot, 0.30, 0.35, 0.30, 0.35);
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_pair_build_handler(40.0, 40.0, 0.0, 5.0, 5.0, 0.0, 0.0, &cfg);
+
+    let contexts = bot.order_exec_context.lock().expect("exec context");
+    assert!(contexts.is_empty(), "contexts={contexts:?}");
+    drop(contexts);
+
+    let state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert_eq!(
+        state.pair_build_last_hold_reason,
+        "hold:user_ws_disconnected"
+    );
+}
+
+#[test]
 fn pair_build_handler_blocks_balanced_add_at_stop_add_zone_without_tail_repair_priority() {
     let mut bot = make_pair_build_test_bot();
     bot.cfg.max_total_cost = 100.0;

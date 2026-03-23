@@ -5243,6 +5243,101 @@ fn imbalance_hold_keeps_live_taper_lighter_repair_orders() {
 }
 
 #[test]
+fn paper_taper_handler_does_not_hold_on_user_ws_disconnect() {
+    let mut bot = make_bot_runtime_test_bot();
+    bot.configured_order_mode = "paper".to_string();
+    bot.user_connected
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let now = now_ts_f64();
+    set_pair_quotes(&bot, 0.10, 0.12, 0.10, 0.12, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-lighter-yes".to_string()),
+                origin: "BOT_TAPER_LIGHTER".to_string(),
+                last_submit_ts: 200.0,
+                price: 0.10,
+                remaining: 0.50,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-no".to_string()),
+                origin: "BOT_TAPER_NO".to_string(),
+                last_submit_ts: 200.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(200.0, 200.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::Working);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::CancelPending);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert_ne!(
+        runtime_state.taper_last_hold_reason,
+        "hold:user_ws_disconnected"
+    );
+}
+
+#[test]
+fn shadow_taper_handler_still_holds_on_user_ws_disconnect() {
+    let bot = make_bot_runtime_test_bot();
+    let now = now_ts_f64();
+    bot.user_connected
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    set_pair_quotes(&bot, 0.10, 0.12, 0.10, 0.12, now);
+    if let Ok(mut slots) = bot.maker_order_slots.lock() {
+        slots.insert(
+            MakerOrderKey::buy("yes_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-lighter-yes".to_string()),
+                origin: "BOT_TAPER_LIGHTER".to_string(),
+                last_submit_ts: 200.0,
+                price: 0.10,
+                remaining: 0.50,
+                ..MakerOrderSlot::default()
+            },
+        );
+        slots.insert(
+            MakerOrderKey::buy("no_asset_id"),
+            MakerOrderSlot {
+                state: MakerOrderLifecycle::Working,
+                order_id: Some("oid-taper-no".to_string()),
+                origin: "BOT_TAPER_NO".to_string(),
+                last_submit_ts: 200.0,
+                ..MakerOrderSlot::default()
+            },
+        );
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    bot._bot_runtime_taper_handler(200.0, 200.0, 0.60, 2.5, 3.5, 0.25, 0.35, &cfg);
+
+    let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));
+    let no_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("no_asset_id"));
+    assert_eq!(yes_slot.state, MakerOrderLifecycle::Working);
+    assert_eq!(no_slot.state, MakerOrderLifecycle::Working);
+
+    let runtime_state = bot.bot_runtime_state.lock().expect("runtime state");
+    assert_eq!(
+        runtime_state.taper_last_hold_reason,
+        "hold:user_ws_disconnected"
+    );
+}
+
+#[test]
 fn imbalance_hold_cancels_oversized_live_taper_lighter_repair() {
     let bot = make_bot_runtime_test_bot();
     let now = now_ts_f64();

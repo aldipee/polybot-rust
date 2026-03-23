@@ -26,7 +26,7 @@ Status legend:
 | IMP | Requirement mapping | Total findings | Runtime findings | Test-only findings | Status |
 |---|---|---:|---:|---:|---|
 | `IMP-13` | `REQ-024`, `REQ-025` | 5 | 5 | 0 | Fixed |
-| `IMP-14` | `REQ-028`, `REQ-029` | 6 | 6 | 0 | Fixed |
+| `IMP-14` | `REQ-028`, `REQ-029` | 7 | 7 | 0 | Fixed |
 | `IMP-15` | `REQ-030`, adjusted `REQ-031` | 5 | 5 | 0 | Fixed |
 | `IMP-17` | `REQ-027` | 4 | 4 | 0 | Fixed |
 | `IMP-18` | `REQ-026` | 12 | 12 | 0 | Fixed |
@@ -35,7 +35,7 @@ Status legend:
 | `IMP-21` | `REQ-034` | 12 | 12 | 0 | Fixed |
 | `IMP-24` | Section 10 KPI gates | 17 | 17 | 0 | Fixed |
 | `IMP-23` | Section 10 replay certification | 2 | 0 | 2 | Fixed |
-| **Total** |  | **103** | **100** | **3** | **Fixed** |
+| **Total** |  | **104** | **101** | **3** | **Fixed** |
 
 ## IMP-13
 
@@ -57,6 +57,7 @@ Requirement mapping: `REQ-028`, `REQ-029`
 4. `P1` Shadow intents could disappear during open-order reconciliation when venue reads overwrote the hypothetical working set. `Runtime`, `Fixed`
 5. `P1` Guarded-live fallback sessions could try venue cancels for synthetic `SHADOW_INTENT_*` orders after live had been armed once. `Runtime`, `Fixed`
 6. `P1` Shadow `FAK` or `FOK` takers could remain pending until TTL expiry even though shadow mode can never fill them. `Runtime`, `Fixed`
+7. `P1` `PairBuild` and `Taper` still hard-required user websocket connectivity in paper mode even though paper is supposed to differ from live only in execution and fill simulation. `Runtime`, `Fixed`
 
 ## IMP-15
 
@@ -197,4 +198,5 @@ Requirement mapping: Section 10 KPI gates
 - `IMP-17` findings were narrower and focused on importer parity correctness, CLI ergonomics, summary completion semantics, and one binary-linkage hygiene issue rather than live trading-path behavior.
 - `IMP-18` generated a second cluster of follow-up parity fixes because deterministic replay had to become self-contained across schedule metadata, settlement inputs, captured order IDs, trade identity, and machine-local env differences.
 - `IMP-24` generated a concentrated KPI-hardening cluster around terminal settlement audit repair, profile attribution for missing summaries, and deterministic same-second ordering of runtime versus decision evidence.
+- `IMP-14` also picked up a late paper-parity hardening fix: the remaining direct `REQUIRE_USER_WS_CONNECTED` gates in `PairBuild` and `Taper` were replaced with the shared paper-aware helper, and the affected replay oracle was refreshed to match the intended paper behavior.
 - The non-runtime findings in this document are the shared-state test-isolation issue under `IMP-19` plus the replay certification fixture-portability issues under `IMP-23`.

@@ -3,6 +3,8 @@
 Date: 2026-03-22
 Scope: supported operator env for the `polybot` binary only.
 
+For the full operator runbook, including startup steps, replay, KPI review, analysis import, helper binaries, artifact locations, and troubleshooting, see [OPERATIONS.md](/c:/Works/aldipranata.com/bot-dev/OPERATIONS.md).
+
 This repo now has one supported runtime:
 
 - `EXEC_MODE=BOT`
@@ -40,6 +42,7 @@ This document intentionally covers the active `polybot` surface only. It does no
 - real venue writes require configured `BOT_ORDER_MODE=live`, `BOT_LIVE_ENABLED=true`, clean reconciliation, dependency health, and fresh market data
 - `DRY_RUN`: deprecated compatibility alias only; if `BOT_ORDER_MODE` is unset, `true` maps to `paper` and `false` maps to `shadow`, while inconsistent `DRY_RUN` and `BOT_ORDER_MODE` settings fail fast
 - `shadow` and `paper` use mode-scoped local or shared state so hypothetical or simulated exposure does not contaminate live companion files
+- `paper` uses live market data with simulated execution, and paper `PairBuild` / `Taper` do not require user websocket connectivity
 
 ## Replay Capture
 
@@ -88,7 +91,7 @@ This document intentionally covers the active `polybot` surface only. It does no
 
 ## Market Data and Reconciliation
 
-- `REQUIRE_USER_WS_CONNECTED`, `WS_PING_INTERVAL`, `WS_IO_TIMEOUT_SECONDS`, `DEBUG_THROTTLE_SECONDS`: websocket health and debug throttling
+- `REQUIRE_USER_WS_CONNECTED`, `WS_PING_INTERVAL`, `WS_IO_TIMEOUT_SECONDS`, `DEBUG_THROTTLE_SECONDS`: websocket health and debug throttling; `REQUIRE_USER_WS_CONNECTED` still governs `shadow` and `live`, while paper `PairBuild` / `Taper` ignore it for parity with paper-mode runtime flow
 - `ORDERBOOK_HTTP_TIMEOUT`, `BOOK_CACHE_TTL_SECONDS`: orderbook snapshot fetch/cache behavior
 - `RECONCILE_EXCHANGE_ORDERS`, `RECONCILE_INTERVAL_SECONDS`: exchange-order reconciliation cadence
 - `RECONCILE_USE_DATA_API`, `MISMATCH_RECONCILE_FROM_BALANCE`: explicit non-default state-reconciliation source selection; both default to `false`, and `MISMATCH_RECONCILE_FROM_BALANCE` is legacy compatibility only

@@ -14,8 +14,8 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-pub const TRADE_PARQUET_FILENAME: &str = "vidarx_trade_profitable.parquet";
-pub const CLOSE_CSV_FILENAME: &str = "vidarx_close_position_profitable.csv";
+pub const TRADE_PARQUET_FILENAME: &str = "vidarx_trade_all.parquet";
+pub const CLOSE_CSV_FILENAME: &str = "vidarx_trade_all_closed_position.csv";
 pub const SCHEMA_DOC_FILENAME: &str = "dataset_schema.md";
 
 const TRADE_PARQUET_COLUMNS: [(&str, ColumnKind); 60] = [

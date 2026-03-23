@@ -159,9 +159,7 @@ impl MakerHedgeCapBot {
             );
             return;
         }
-        if env_bool("REQUIRE_USER_WS_CONNECTED", true)
-            && !self.user_connected.load(Ordering::SeqCst)
-        {
+        if self._bot_runtime_user_ws_required() && !self.user_connected.load(Ordering::SeqCst) {
             self._bot_runtime_log_taper_state(
                 "hold",
                 "user_ws_disconnected",
