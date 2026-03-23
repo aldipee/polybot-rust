@@ -25,7 +25,7 @@ use config::{
 use db::{
     date_jakarta, make_engine, make_session_factory, month_start_date_jakarta, now_iso_jakarta,
     week_start_date_jakarta, BotRepository, BotRow, BotTradeStats, ConfigurationRow,
-    TradePairMetadata,
+    TradePairMetadata, TradeValidationRepairOutcome,
 };
 use env_utils::{env_bool, env_float, env_int};
 use gamma::fetch_market_by_slug;
@@ -73,6 +73,16 @@ fn holding_duration_seconds(entry_iso: &str, exit_iso: &str) -> Option<f64> {
     let end = chrono::DateTime::parse_from_rfc3339(exit_iso).ok()?;
     let ms = (end - start).num_milliseconds();
     Some((ms.max(0) as f64) / 1000.0)
+}
+
+fn iso_plus_seconds(base_iso: &str, seconds: i64) -> String {
+    chrono::DateTime::parse_from_rfc3339(base_iso)
+        .map(|dt| {
+            (dt + ChronoDuration::seconds(seconds))
+                .with_timezone(&Jakarta)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
+        .unwrap_or_else(|_| now_iso_jakarta())
 }
 
 fn analytics_exit_reason(raw_reason: &str) -> String {
@@ -903,7 +913,7 @@ fn reconcile_unvalidated_trades_with_polymarket(
     bot_id: &str,
     cfg: &BotConfig,
     logger: &Arc<dyn LogLike>,
-) -> Result<()> {
+) -> Result<HashMap<String, TradeValidationRepairOutcome>> {
     let lookback_days = env_int("TRADE_VALIDATION_LOOKBACK_DAYS", 7).max(0) as i64;
     let max_trades = env_int("TRADE_VALIDATION_MAX_TRADES_PER_POLL", 100).max(1) as i64;
     let page_limit = env_int("TRADE_VALIDATION_PAGE_LIMIT", 50).clamp(1, 50) as i64;
@@ -916,13 +926,13 @@ fn reconcile_unvalidated_trades_with_polymarket(
 
     let candidates = repo.list_unvalidated_trades_for_bot(bot_id, &start_date, max_trades)?;
     if candidates.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
 
     let users = trade_validation_users(cfg);
     if users.is_empty() {
         logger.warning("[TRADE_VALIDATE] skip: no user address configured");
-        return Ok(());
+        return Ok(HashMap::new());
     }
 
     let base = env::var("POLY_DATA_API_BASE_URL")
@@ -948,7 +958,7 @@ fn reconcile_unvalidated_trades_with_polymarket(
     }
     if !any_success {
         logger.warning("[TRADE_VALIDATE] no successful closed-positions responses");
-        return Ok(());
+        return Ok(HashMap::new());
     }
 
     let mut by_slug: HashMap<String, Vec<usize>> = HashMap::new();
@@ -966,6 +976,7 @@ fn reconcile_unvalidated_trades_with_polymarket(
     let checked_at = now_iso_jakarta();
     let mut validated_count = 0_i64;
     let mut touched_count = 0_i64;
+    let mut validation_repairs: HashMap<String, TradeValidationRepairOutcome> = HashMap::new();
 
     for t in candidates {
         let trade_slug = t.slug.trim().to_ascii_lowercase();
@@ -1021,7 +1032,9 @@ fn reconcile_unvalidated_trades_with_polymarket(
         }
 
         let source = format!("POLYMARKET_CLOSED_POSITIONS({match_key},rows={pnl_rows})");
-        repo.mark_trade_validated_from_polymarket(&t.trade_id, pnl_sum, &checked_at, &source)?;
+        let repair_outcome =
+            repo.mark_trade_validated_from_polymarket(&t.trade_id, pnl_sum, &checked_at, &source)?;
+        validation_repairs.insert(t.trade_id.clone(), repair_outcome);
         validated_count += 1;
         logger.info(&format!(
             "[TRADE_VALIDATE] validated trade_id={} slug={} pnl={:+.6} source={}",
@@ -1037,7 +1050,13 @@ fn reconcile_unvalidated_trades_with_polymarket(
         touched_count,
         all_rows.len()
     ));
-    Ok(())
+    Ok(validation_repairs)
+}
+
+fn post_market_validation_audit_runtime_event_adjustment(
+    repair_outcome: TradeValidationRepairOutcome,
+) -> u32 {
+    repair_outcome.inserted_runtime_event_count()
 }
 
 #[derive(Debug, Clone)]
@@ -1463,6 +1482,7 @@ fn run() -> Result<()> {
 
             let repo = bg_session_factory.repository();
             let mut metrics = bot.trade_metrics_snapshot();
+            let mut await_settlement_summary_pending = false;
             let has_trade_activity = metrics.fill_count > 0
                 || metrics.total_cost > 1e-9
                 || metrics.q_yes > 1e-9
@@ -1503,6 +1523,12 @@ fn run() -> Result<()> {
                     "Trade row {trade_id} handed off to settlement. reason={}",
                     await_snapshot.raw_exit_reason
                 ));
+                let await_decomp = polybot::kpi_gate::settlement_pnl_decomposition(
+                    metrics.lp,
+                    await_snapshot.q_yes,
+                    await_snapshot.q_no,
+                    await_snapshot.cpp,
+                );
                 bot._audit_record_settlement_event(
                     "await_settlement_handoff",
                     json!({
@@ -1514,6 +1540,10 @@ fn run() -> Result<()> {
                         "q_no": await_snapshot.q_no,
                         "total_cost": await_snapshot.total_cost,
                         "cpp": await_snapshot.cpp,
+                        "paired_qty": await_decomp.paired_qty,
+                        "residual_qty": await_decomp.residual_qty,
+                        "paired_realized_pnl": await_decomp.paired_realized_pnl,
+                        "residual_realized_pnl": await_decomp.residual_realized_pnl,
                     }),
                 );
 
@@ -1569,6 +1599,12 @@ fn run() -> Result<()> {
                         metrics.q_yes,
                         metrics.q_no
                     ));
+                    let settled_decomp = polybot::kpi_gate::settlement_pnl_decomposition(
+                        metrics.lp,
+                        metrics.q_yes,
+                        metrics.q_no,
+                        metrics.cpp,
+                    );
                     bot._audit_record_settlement_event(
                         "settled",
                         json!({
@@ -1581,14 +1617,25 @@ fn run() -> Result<()> {
                             "q_no": metrics.q_no,
                             "snapshot_market_slug": snapshot.market_slug,
                             "snapshot_resolution_price": snapshot.resolution_price,
+                            "paired_qty": settled_decomp.paired_qty,
+                            "residual_qty": settled_decomp.residual_qty,
+                            "paired_realized_pnl": settled_decomp.paired_realized_pnl,
+                            "residual_realized_pnl": settled_decomp.residual_realized_pnl,
                         }),
                     );
+                    bot._audit_record_run_summary(&metrics, "SETTLED", "settled");
                 } else {
                     bot.persist_state();
                     bg_logger.info(&format!(
                         "Trade row {trade_id} remains AWAIT_SETTLEMENT. reason=resolution_snapshot_unavailable pair_id={}",
                         metrics.pair_id
                     ));
+                    let unresolved_decomp = polybot::kpi_gate::settlement_pnl_decomposition(
+                        metrics.lp,
+                        metrics.q_yes,
+                        metrics.q_no,
+                        metrics.cpp,
+                    );
                     bot._audit_record_settlement_event(
                         "resolution_snapshot_unavailable",
                         json!({
@@ -1598,20 +1645,99 @@ fn run() -> Result<()> {
                             "q_yes": metrics.q_yes,
                             "q_no": metrics.q_no,
                             "total_cost": metrics.total_cost,
+                            "paired_qty": unresolved_decomp.paired_qty,
+                            "residual_qty": unresolved_decomp.residual_qty,
+                            "paired_realized_pnl": unresolved_decomp.paired_realized_pnl,
+                            "residual_realized_pnl": unresolved_decomp.residual_realized_pnl,
                         }),
                     );
+                    await_settlement_summary_pending = true;
                 }
             }
 
+            let mut post_market_validation_repairs: HashMap<String, TradeValidationRepairOutcome> =
+                HashMap::new();
             if bg_trade_validation_enabled && bg_trade_validation_after_market_enabled {
                 let repo = bg_session_factory.repository();
-                if let Err(e) = reconcile_unvalidated_trades_with_polymarket(
+                match reconcile_unvalidated_trades_with_polymarket(
                     &repo, &bg_bot_id, &bg_cfg, &bg_logger,
                 ) {
-                    bg_logger.warning(&format!(
-                        "[TRADE_VALIDATE] post-market poll error trade_id={} err={e:#}",
-                        trade_id
-                    ));
+                    Ok(repairs) => {
+                        post_market_validation_repairs = repairs;
+                    }
+                    Err(e) => {
+                        bg_logger.warning(&format!(
+                            "[TRADE_VALIDATE] post-market poll error trade_id={} err={e:#}",
+                            trade_id
+                        ));
+                    }
+                }
+            }
+            if await_settlement_summary_pending {
+                let terminal_state = repo
+                    .load_trade_validation_terminal_state(&trade_id)
+                    .ok()
+                    .flatten();
+                let validation_repair_outcome = post_market_validation_repairs
+                    .get(&trade_id)
+                    .copied()
+                    .unwrap_or_default();
+                let validated_settled = terminal_state.as_ref().is_some_and(|state| {
+                    state.claim_status.as_deref() == Some("SETTLED")
+                        && state.validation_status.eq_ignore_ascii_case("VALIDATED")
+                });
+                if let Some(state) = terminal_state.as_ref() {
+                    metrics.lp = state.lp;
+                }
+                if validated_settled {
+                    let repair_base_ts = now_iso_jakarta();
+                    let settlement_event_ts = iso_plus_seconds(repair_base_ts.as_str(), 1);
+                    let run_summary_event_ts = iso_plus_seconds(repair_base_ts.as_str(), 2);
+                    let validated_decomp = polybot::kpi_gate::settlement_pnl_decomposition(
+                        metrics.lp,
+                        metrics.q_yes,
+                        metrics.q_no,
+                        metrics.cpp,
+                    );
+                    if !validation_repair_outcome.inserted_settlement_event {
+                        bot._audit_record_settlement_event_at(
+                            "settled",
+                            json!({
+                                "trade_id": trade_id,
+                                "reason_code": "settled",
+                                "resolved_lp": metrics.lp,
+                                "total_cost": metrics.total_cost,
+                                "cpp": metrics.cpp,
+                                "q_yes": metrics.q_yes,
+                                "q_no": metrics.q_no,
+                                "settlement_source": terminal_state
+                                    .as_ref()
+                                    .and_then(|state| state.validation_source.clone()),
+                                "paired_qty": validated_decomp.paired_qty,
+                                "residual_qty": validated_decomp.residual_qty,
+                                "paired_realized_pnl": validated_decomp.paired_realized_pnl,
+                                "residual_realized_pnl": validated_decomp.residual_realized_pnl,
+                            }),
+                            Some(settlement_event_ts.as_str()),
+                        );
+                    }
+                    if !validation_repair_outcome.inserted_run_summary {
+                        bot._audit_record_run_summary_at_with_extra_runtime_count(
+                            &metrics,
+                            "SETTLED",
+                            "validated_from_polymarket",
+                            post_market_validation_audit_runtime_event_adjustment(
+                                validation_repair_outcome,
+                            ),
+                            Some(run_summary_event_ts.as_str()),
+                        );
+                    }
+                } else {
+                    bot._audit_record_run_summary(
+                        &metrics,
+                        "AWAIT_SETTLEMENT",
+                        "resolution_snapshot_unavailable",
+                    );
                 }
             }
 
@@ -1682,12 +1808,15 @@ fn run() -> Result<()> {
 mod tests {
     use super::{
         activate_next_config, build_await_settlement_trade_snapshot, config_bundle_from_row,
-        payout_from_resolution_diff, realized_lp_from_resolution_record, require_bot_exec_mode,
-        settlement_metadata_json, ActiveConfigVersion,
+        iso_plus_seconds, payout_from_resolution_diff,
+        post_market_validation_audit_runtime_event_adjustment, realized_lp_from_resolution_record,
+        require_bot_exec_mode, settlement_metadata_json, ActiveConfigVersion,
     };
     use crate::bot::TradeMetrics;
     use crate::config::load_versioned_config_bundle_from_env;
-    use crate::db::{make_engine, make_session_factory, ConfigurationRow};
+    use crate::db::{
+        make_engine, make_session_factory, ConfigurationRow, TradeValidationRepairOutcome,
+    };
     use crate::logging::{setup_item_logger, LogLike};
     use crate::rtds::ResolutionSnapshot;
     use serde_json::Value;
@@ -1902,6 +2031,35 @@ mod tests {
         assert_eq!(snapshot.entry_price, Some(8.4 / 18.0));
         assert!(snapshot.holding_duration_seconds.unwrap_or_default() > 0.0);
         assert_eq!(snapshot.end_trade_iso, "2024-01-01T00:05:00Z");
+    }
+
+    #[test]
+    fn iso_plus_seconds_advances_post_market_repair_event_order() {
+        let base = "2026-03-23T09:06:00+07:00";
+        let settlement_ts = iso_plus_seconds(base, 1);
+        let run_summary_ts = iso_plus_seconds(base, 2);
+        assert_eq!(settlement_ts, "2026-03-23T09:06:01+07:00");
+        assert_eq!(run_summary_ts, "2026-03-23T09:06:02+07:00");
+        assert!(settlement_ts.as_str() > base);
+        assert!(run_summary_ts > settlement_ts);
+    }
+
+    #[test]
+    fn post_market_validation_summary_adjustment_counts_repo_inserted_runtime_rows() {
+        assert_eq!(
+            post_market_validation_audit_runtime_event_adjustment(TradeValidationRepairOutcome {
+                inserted_settlement_event: true,
+                inserted_run_summary: false,
+            }),
+            1
+        );
+        assert_eq!(
+            post_market_validation_audit_runtime_event_adjustment(TradeValidationRepairOutcome {
+                inserted_settlement_event: false,
+                inserted_run_summary: false,
+            }),
+            0
+        );
     }
 
     #[test]

@@ -710,6 +710,32 @@ impl MakerHedgeCapBot {
                                     "[AUDIT] runtime_event_insert_failed event_id={} event_kind={} trade_id={} err={:#}",
                                     row.event_id, row.event_kind, row.trade_id, err
                                 ));
+                                let audit_drop = crate::db::TradeRuntimeEventInsert {
+                                    event_id: crate::db::new_uuid(),
+                                    trade_id: row.trade_id.clone(),
+                                    pair_id: row.pair_id.clone(),
+                                    market_slug: row.market_slug.clone(),
+                                    condition_id: row.condition_id.clone(),
+                                    yes_asset_id: row.yes_asset_id.clone(),
+                                    no_asset_id: row.no_asset_id.clone(),
+                                    config_version: row.config_version.clone(),
+                                    event_kind: "audit_drop".to_string(),
+                                    event_ts: crate::db::now_iso_jakarta(),
+                                    decision_event_id: None,
+                                    order_id: None,
+                                    asset_id: None,
+                                    side: None,
+                                    reason_code: Some("runtime_insert_failed".to_string()),
+                                    payload_json: serde_json::to_string(&json!({
+                                        "drop_stage": "insert",
+                                        "dropped_audit_kind": "runtime",
+                                        "dropped_identifier": row.event_id,
+                                        "dropped_name": row.event_kind,
+                                        "error": format!("{:#}", err),
+                                    }))
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                                };
+                                let _ = worker_repo.insert_trade_runtime_event(&audit_drop);
                             }
                         }
                         AuditWriteTask::Decision {
@@ -722,6 +748,32 @@ impl MakerHedgeCapBot {
                                     "[AUDIT] decision_event_insert_failed decision_event_id={} decision_scope={} trade_id={} err={:#}",
                                     row.decision_event_id, row.decision_scope, row.trade_id, err
                                 ));
+                                let audit_drop = crate::db::TradeRuntimeEventInsert {
+                                    event_id: crate::db::new_uuid(),
+                                    trade_id: row.trade_id.clone(),
+                                    pair_id: row.pair_id.clone(),
+                                    market_slug: row.market_slug.clone(),
+                                    condition_id: row.condition_id.clone(),
+                                    yes_asset_id: row.yes_asset_id.clone(),
+                                    no_asset_id: row.no_asset_id.clone(),
+                                    config_version: row.config_version.clone(),
+                                    event_kind: "audit_drop".to_string(),
+                                    event_ts: crate::db::now_iso_jakarta(),
+                                    decision_event_id: Some(row.decision_event_id.clone()),
+                                    order_id: None,
+                                    asset_id: None,
+                                    side: None,
+                                    reason_code: Some("decision_insert_failed".to_string()),
+                                    payload_json: serde_json::to_string(&json!({
+                                        "drop_stage": "insert",
+                                        "dropped_audit_kind": "decision",
+                                        "dropped_identifier": row.decision_event_id,
+                                        "dropped_name": row.decision_scope,
+                                        "error": format!("{:#}", err),
+                                    }))
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                                };
+                                let _ = worker_repo.insert_trade_runtime_event(&audit_drop);
                                 continue;
                             }
                             if let Err(err) = worker_repo
@@ -732,6 +784,9 @@ impl MakerHedgeCapBot {
                                     row.decision_event_id, trade_id, err
                                 ));
                             }
+                        }
+                        AuditWriteTask::Flush(ack_tx) => {
+                            let _ = ack_tx.send(());
                         }
                     }
                 }

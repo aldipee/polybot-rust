@@ -13,6 +13,7 @@ pub(crate) enum AuditWriteTask {
         trade_id: String,
         latest_summary: TradeDecisionUpsert,
     },
+    Flush(std::sync::mpsc::Sender<()>),
 }
 
 impl MakerHedgeCapBot {
@@ -55,6 +56,180 @@ impl MakerHedgeCapBot {
         if let Ok(mut st) = self.bot_runtime_state.lock() {
             st.audit_runtime_event_count = st.audit_runtime_event_count.saturating_add(1);
         }
+    }
+
+    fn _audit_drain_async_writes(&self, timeout: std::time::Duration) {
+        let Some(tx) = self.audit_runtime_tx.clone() else {
+            return;
+        };
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let deadline = std::time::Instant::now() + timeout;
+        let mut barrier_ack_tx = Some(ack_tx);
+        loop {
+            let task = AuditWriteTask::Flush(
+                barrier_ack_tx
+                    .take()
+                    .expect("flush barrier sender should still be available"),
+            );
+            match tx.try_send(task) {
+                Ok(()) => break,
+                Err(TrySendError::Full(AuditWriteTask::Flush(returned_tx))) => {
+                    barrier_ack_tx = Some(returned_tx);
+                    if std::time::Instant::now() >= deadline {
+                        self.logger.warning(
+                            "[AUDIT] async_audit_flush_timeout stage=enqueue reason=queue_full",
+                        );
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.logger.warning(
+                        "[AUDIT] async_audit_flush_failed stage=enqueue reason=queue_disconnected",
+                    );
+                    return;
+                }
+                Err(TrySendError::Full(_)) => {
+                    self.logger.warning(
+                        "[AUDIT] async_audit_flush_failed stage=enqueue reason=unexpected_task",
+                    );
+                    return;
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if ack_rx.recv_timeout(remaining).is_err() {
+            self.logger
+                .warning("[AUDIT] async_audit_flush_timeout stage=ack reason=recv_timeout");
+        }
+    }
+
+    fn _audit_insert_runtime_event_direct(
+        &self,
+        event_kind: &str,
+        reason_code: Option<&str>,
+        payload: Value,
+        capture_replay: bool,
+    ) -> Option<String> {
+        self._audit_insert_runtime_event_direct_at(
+            event_kind,
+            reason_code,
+            payload,
+            capture_replay,
+            None,
+        )
+    }
+
+    fn _audit_insert_runtime_event_direct_at(
+        &self,
+        event_kind: &str,
+        reason_code: Option<&str>,
+        payload: Value,
+        capture_replay: bool,
+        event_ts: Option<&str>,
+    ) -> Option<String> {
+        let repo = self.audit_repo.clone()?;
+        let trade_id = self
+            .active_trade_id
+            .clone()
+            .unwrap_or_else(|| "replay".to_string());
+        let (pair_id, market_slug, condition_id, yes_asset_id, no_asset_id) =
+            self._audit_pair_identity_fields();
+        let event_id = new_uuid();
+        let payload = self._audit_augmented_payload(payload);
+        let payload_text = serde_json::to_string(&payload).ok()?;
+        let row = TradeRuntimeEventInsert {
+            event_id: event_id.clone(),
+            trade_id: trade_id.clone(),
+            pair_id,
+            market_slug,
+            condition_id,
+            yes_asset_id,
+            no_asset_id,
+            config_version: self.config_version.clone(),
+            event_kind: event_kind.to_string(),
+            event_ts: event_ts
+                .map(|value| value.to_string())
+                .unwrap_or_else(now_iso_jakarta),
+            decision_event_id: None,
+            order_id: None,
+            asset_id: None,
+            side: None,
+            reason_code: reason_code.map(|value| value.to_string()),
+            payload_json: payload_text,
+        };
+        self._audit_emit_structured_event(event_kind, event_kind, payload);
+        if capture_replay {
+            if let Some(recorder) = self.replay_recorder.as_ref() {
+                recorder.record_runtime_event(&row);
+            }
+        }
+        if repo.insert_trade_runtime_event(&row).is_ok() {
+            self._audit_note_runtime_event_inserted();
+            Some(event_id)
+        } else {
+            self.logger.warning(&format!(
+                "[AUDIT] direct_runtime_event_insert_failed event_id={} event_kind={} trade_id={}",
+                row.event_id, row.event_kind, row.trade_id
+            ));
+            if row.event_kind != "audit_drop" {
+                let drop_payload = self._audit_augmented_payload(json!({
+                    "drop_stage": "insert",
+                    "dropped_audit_kind": "runtime",
+                    "dropped_identifier": row.event_id,
+                    "dropped_name": row.event_kind,
+                    "error": "direct_insert_failed",
+                }));
+                if let Ok(payload_json) = serde_json::to_string(&drop_payload) {
+                    let drop_row = TradeRuntimeEventInsert {
+                        event_id: new_uuid(),
+                        trade_id: row.trade_id.clone(),
+                        pair_id: row.pair_id.clone(),
+                        market_slug: row.market_slug.clone(),
+                        condition_id: row.condition_id.clone(),
+                        yes_asset_id: row.yes_asset_id.clone(),
+                        no_asset_id: row.no_asset_id.clone(),
+                        config_version: row.config_version.clone(),
+                        event_kind: "audit_drop".to_string(),
+                        event_ts: now_iso_jakarta(),
+                        decision_event_id: None,
+                        order_id: None,
+                        asset_id: None,
+                        side: None,
+                        reason_code: Some("runtime_direct_insert_failed".to_string()),
+                        payload_json,
+                    };
+                    if repo.insert_trade_runtime_event(&drop_row).is_ok() {
+                        self._audit_note_runtime_event_inserted();
+                    } else {
+                        self.logger.warning(&format!(
+                            "[AUDIT] audit_drop_insert_failed dropped_event_id={} dropped_event_kind={} trade_id={}",
+                            row.event_id, row.event_kind, row.trade_id
+                        ));
+                    }
+                }
+            }
+            None
+        }
+    }
+
+    fn _audit_record_drop_event(
+        &self,
+        drop_stage: &str,
+        dropped_audit_kind: &str,
+        dropped_identifier: &str,
+        dropped_name: &str,
+        reason: &str,
+        error: Option<&str>,
+    ) {
+        let payload = json!({
+            "drop_stage": drop_stage,
+            "dropped_audit_kind": dropped_audit_kind,
+            "dropped_identifier": dropped_identifier,
+            "dropped_name": dropped_name,
+            "error": error,
+        });
+        let _ = self._audit_insert_runtime_event_direct("audit_drop", Some(reason), payload, false);
     }
 
     fn _audit_logger_level_for_event_kind(event_kind: &str) -> &'static str {
@@ -119,6 +294,29 @@ impl MakerHedgeCapBot {
         reason_code: Option<&str>,
         payload: Value,
     ) -> Option<String> {
+        self._audit_insert_runtime_event_at(
+            event_kind,
+            decision_event_id,
+            order_id,
+            asset_id,
+            side,
+            reason_code,
+            payload,
+            None,
+        )
+    }
+
+    pub(in crate::bot) fn _audit_insert_runtime_event_at(
+        &self,
+        event_kind: &str,
+        decision_event_id: Option<&str>,
+        order_id: Option<&str>,
+        asset_id: Option<&str>,
+        side: Option<&str>,
+        reason_code: Option<&str>,
+        payload: Value,
+        event_ts: Option<&str>,
+    ) -> Option<String> {
         let trade_id = self
             .active_trade_id
             .clone()
@@ -139,7 +337,9 @@ impl MakerHedgeCapBot {
             no_asset_id,
             config_version: self.config_version.clone(),
             event_kind: event_kind.to_string(),
-            event_ts: now_iso_jakarta(),
+            event_ts: event_ts
+                .map(|value| value.to_string())
+                .unwrap_or_else(now_iso_jakarta),
             decision_event_id: decision_event_id.map(|value| value.to_string()),
             order_id: order_id.map(|value| value.to_string()),
             asset_id: asset_id.map(|value| value.to_string()),
@@ -165,6 +365,14 @@ impl MakerHedgeCapBot {
                     "[AUDIT] runtime_event_drop reason=queue_full event_id={} event_kind={} trade_id={}",
                     event_id, event_kind, trade_id
                 ));
+                self._audit_record_drop_event(
+                    "enqueue",
+                    "runtime",
+                    event_id.as_str(),
+                    event_kind,
+                    "runtime_enqueue_queue_full",
+                    None,
+                );
                 None
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -172,6 +380,14 @@ impl MakerHedgeCapBot {
                     "[AUDIT] runtime_event_drop reason=queue_disconnected event_id={} event_kind={} trade_id={}",
                     event_id, event_kind, trade_id
                 ));
+                self._audit_record_drop_event(
+                    "enqueue",
+                    "runtime",
+                    event_id.as_str(),
+                    event_kind,
+                    "runtime_enqueue_queue_disconnected",
+                    None,
+                );
                 None
             }
         }
@@ -365,6 +581,14 @@ impl MakerHedgeCapBot {
                     "[AUDIT] decision_event_drop reason=queue_full decision_event_id={} trade_id={}",
                     decision_event_id, trade_id
                 ));
+                self._audit_record_drop_event(
+                    "enqueue",
+                    "decision",
+                    decision_event_id.as_str(),
+                    decision_scope,
+                    "decision_enqueue_queue_full",
+                    None,
+                );
                 None
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -372,6 +596,14 @@ impl MakerHedgeCapBot {
                     "[AUDIT] decision_event_drop reason=queue_disconnected decision_event_id={} trade_id={}",
                     decision_event_id, trade_id
                 ));
+                self._audit_record_drop_event(
+                    "enqueue",
+                    "decision",
+                    decision_event_id.as_str(),
+                    decision_scope,
+                    "decision_enqueue_queue_disconnected",
+                    None,
+                );
                 None
             }
         }
@@ -577,6 +809,10 @@ impl MakerHedgeCapBot {
         mut payload: Value,
     ) {
         if let Some(obj) = payload.as_object_mut() {
+            if self.start_ts > 0 {
+                obj.entry("t_into_seconds".to_string())
+                    .or_insert(json!((now_ts_f64() - self.start_ts as f64).max(0.0)));
+            }
             if let Ok(st) = self.bot_runtime_state.lock() {
                 obj.entry("safety_gate".to_string())
                     .or_insert(json!(st.safety_gate.as_str()));
@@ -596,7 +832,16 @@ impl MakerHedgeCapBot {
     }
 
     pub(crate) fn _audit_record_settlement_event(&self, reason_code: &str, payload: Value) {
-        let _ = self._audit_insert_runtime_event(
+        self._audit_record_settlement_event_at(reason_code, payload, None);
+    }
+
+    pub(crate) fn _audit_record_settlement_event_at(
+        &self,
+        reason_code: &str,
+        payload: Value,
+        event_ts: Option<&str>,
+    ) {
+        let _ = self._audit_insert_runtime_event_at(
             "settlement",
             None,
             None,
@@ -604,6 +849,193 @@ impl MakerHedgeCapBot {
             None,
             Some(reason_code),
             payload,
+            event_ts,
+        );
+    }
+
+    pub(crate) fn _audit_record_run_summary(
+        &self,
+        trade_metrics: &TradeMetrics,
+        settlement_status: &str,
+        settlement_reason: &str,
+    ) {
+        self._audit_record_run_summary_at_with_extra_runtime_count(
+            trade_metrics,
+            settlement_status,
+            settlement_reason,
+            0,
+            None,
+        );
+    }
+
+    pub(crate) fn _audit_record_run_summary_at(
+        &self,
+        trade_metrics: &TradeMetrics,
+        settlement_status: &str,
+        settlement_reason: &str,
+        event_ts: Option<&str>,
+    ) {
+        self._audit_record_run_summary_at_with_extra_runtime_count(
+            trade_metrics,
+            settlement_status,
+            settlement_reason,
+            0,
+            event_ts,
+        );
+    }
+
+    pub(crate) fn _audit_record_run_summary_at_with_extra_runtime_count(
+        &self,
+        trade_metrics: &TradeMetrics,
+        settlement_status: &str,
+        settlement_reason: &str,
+        extra_runtime_event_count: u32,
+        event_ts: Option<&str>,
+    ) {
+        self._audit_drain_async_writes(std::time::Duration::from_secs(5));
+        let state = self
+            .state
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let runtime_metrics = bot_runtime_metrics_snapshot(
+            &self
+                .bot_runtime_state
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_default(),
+            state.q_yes,
+            state.q_no,
+            state.c_yes,
+            state.c_no,
+            state.c_yes + state.c_no,
+        );
+        let (phase, owner, safety_gate, safety_gate_reason) = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| {
+                (
+                    st.phase.as_str().to_string(),
+                    st.owner.as_str().to_string(),
+                    st.safety_gate.as_str().to_string(),
+                    st.safety_gate_reason.clone(),
+                )
+            })
+            .unwrap_or_else(|_| {
+                (
+                    "PreArm".to_string(),
+                    "PreArm".to_string(),
+                    "Healthy".to_string(),
+                    String::new(),
+                )
+            });
+        let payload = json!({
+            "trade_id": self.active_trade_id.clone(),
+            "phase": phase,
+            "owner": owner,
+            "safety_gate": safety_gate,
+            "safety_gate_reason": safety_gate_reason,
+            "fill_count": trade_metrics.fill_count,
+            "market_participated": runtime_metrics.market_participated,
+            "entry_reason": trade_metrics.entry_reason,
+            "exit_reason": trade_metrics.exit_reason,
+            "settlement_status": settlement_status,
+            "settlement_reason": settlement_reason,
+            "q_yes": trade_metrics.q_yes,
+            "q_no": trade_metrics.q_no,
+            "total_cost": trade_metrics.total_cost,
+            "cpp": trade_metrics.cpp,
+            "paired_size": runtime_metrics.paired_size,
+            "unmatched_size": runtime_metrics.unmatched_size,
+            "unmatched_fraction": runtime_metrics.unmatched_fraction,
+            "pair_taker_share": runtime_metrics.pair_taker_share,
+            "daily_taker_share": runtime_metrics.daily_taker_share,
+            "open_both_seed_by_deadline_met": runtime_metrics.open_both_seed_by_deadline_met,
+            "open_both_submit_delta_met": runtime_metrics.open_both_submit_delta_met,
+            "open_both_first_submit_delta_ms": runtime_metrics.open_both_first_submit_delta_ms,
+            "second_side_by_15s": runtime_metrics.second_side_by_15s,
+            "second_side_by_30s": runtime_metrics.second_side_by_30s,
+            "first_fill_to_second_fill_ms": runtime_metrics.first_fill_to_second_fill_ms,
+            "await_second_fill_hard_paused": runtime_metrics.await_second_fill_hard_paused,
+            "startup_completion_blocked_count": runtime_metrics.startup_completion_blocked_count,
+            "audit_decision_event_count": runtime_metrics.audit_decision_event_count,
+            "audit_runtime_event_count": runtime_metrics
+                .audit_runtime_event_count
+                .saturating_add(extra_runtime_event_count)
+                .saturating_add(1),
+        });
+        let _ = self._audit_insert_runtime_event_direct_at(
+            "run_summary",
+            Some("completed"),
+            payload,
+            false,
+            event_ts,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn audit_flush_barrier_waits_for_prior_tasks() {
+        let (tx, rx) = mpsc::sync_channel::<AuditWriteTask>(4);
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let worker_observed = observed.clone();
+        let handle = std::thread::spawn(move || {
+            while let Ok(task) = rx.recv() {
+                match task {
+                    AuditWriteTask::Runtime(_) => worker_observed
+                        .lock()
+                        .expect("lock")
+                        .push("runtime".to_string()),
+                    AuditWriteTask::Flush(ack_tx) => {
+                        worker_observed
+                            .lock()
+                            .expect("lock")
+                            .push("flush".to_string());
+                        let _ = ack_tx.send(());
+                        break;
+                    }
+                    AuditWriteTask::Decision { .. } => {
+                        worker_observed
+                            .lock()
+                            .expect("lock")
+                            .push("decision".to_string());
+                    }
+                }
+            }
+        });
+        tx.send(AuditWriteTask::Runtime(TradeRuntimeEventInsert {
+            event_id: "evt".to_string(),
+            trade_id: "trade".to_string(),
+            pair_id: "pair".to_string(),
+            market_slug: "market".to_string(),
+            condition_id: None,
+            yes_asset_id: None,
+            no_asset_id: None,
+            config_version: "cfg".to_string(),
+            event_kind: "settlement".to_string(),
+            event_ts: "2026-03-23T00:00:00+07:00".to_string(),
+            decision_event_id: None,
+            order_id: None,
+            asset_id: None,
+            side: None,
+            reason_code: Some("settled".to_string()),
+            payload_json: "{}".to_string(),
+        }))
+        .expect("send runtime");
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        tx.send(AuditWriteTask::Flush(ack_tx)).expect("send flush");
+        ack_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("flush ack");
+        handle.join().expect("worker join");
+        assert_eq!(
+            observed.lock().expect("lock").clone(),
+            vec!["runtime".to_string(), "flush".to_string()]
         );
     }
 }

@@ -12,6 +12,7 @@ Scope covered here:
 - `IMP-19` (`REQ-032`)
 - `IMP-20` (`REQ-033`)
 - `IMP-21` (`REQ-034`)
+- `IMP-24` (Section 10 KPI gates)
 - `IMP-23` (Section 10 replay certification)
 
 Status legend:
@@ -32,8 +33,9 @@ Status legend:
 | `IMP-19` | `REQ-032` | 35 | 34 | 1 | Fixed |
 | `IMP-20` | `REQ-033` | 5 | 5 | 0 | Fixed |
 | `IMP-21` | `REQ-034` | 12 | 12 | 0 | Fixed |
+| `IMP-24` | Section 10 KPI gates | 17 | 17 | 0 | Fixed |
 | `IMP-23` | Section 10 replay certification | 2 | 0 | 2 | Fixed |
-| **Total** |  | **86** | **83** | **3** | **Fixed** |
+| **Total** |  | **103** | **100** | **3** | **Fixed** |
 
 ## IMP-13
 
@@ -166,10 +168,33 @@ Requirement mapping: Section 10 replay certification
 1. `P1` Empty `initial_state/` replay fixture directories were not preserved on a clean clone because git does not track empty directories. `Test-only`, `Fixed`
 2. `P1` Replay certification fixture JSON files were still swallowed by the repo-wide `*.json` ignore rule, so required scenario bundles would disappear from normal commits and fresh clones. `Test-only`, `Fixed`
 
+## IMP-24
+
+Requirement mapping: Section 10 KPI gates
+
+1. `P1` Terminal `run_summary` rows could be emitted before post-run validation had a chance to settle the trade, creating false settlement mismatches for otherwise healthy runs. `Runtime`, `Fixed`
+2. `P2` Direct runtime-event inserts such as `run_summary` could fail without emitting a compensating `audit_drop`, which let KPI integrity silently miss lost audit rows. `Runtime`, `Fixed`
+3. `P1` KPI profile selection could be widened from any per-event mode tag instead of staying anchored to the terminal `run_summary.effective_order_mode`. `Runtime`, `Fixed`
+4. `P1` Trades missing terminal `run_summary` rows could still satisfy sample sufficiency thresholds even though multiple run-level KPIs skipped them. `Runtime`, `Fixed`
+5. `P1` Missing-summary attribution could incorrectly blame the shadow profile from transient shadow-tagged events in runs whose terminal mode was actually different. `Runtime`, `Fixed`
+6. `P1` Missing shadow summaries could be missed entirely when attribution fell back to `configured_order_mode` instead of stable effective-mode evidence. `Runtime`, `Fixed`
+7. `P1` `run_summary` audit counts could freeze before queued audit writes drained, making healthy runs fail logging integrity nondeterministically. `Runtime`, `Fixed`
+8. `P1` Later startup validation could settle a trade whose terminal audit trail had already been frozen at `AWAIT_SETTLEMENT`, causing false settlement-reconciliation failures. `Runtime`, `Fixed`
+9. `P1` Startup validation repair events could sort before earlier unresolved terminal events when they shared the same second-precision timestamp. `Runtime`, `Fixed`
+10. `P1` After-market validation repair could hit the same timestamp-ordering problem, leaving repaired trades nondeterministically interpreted as unresolved. `Runtime`, `Fixed`
+11. `P1` Mixed-mode runs that finished shadow could be excluded from shadow missing-summary attribution if the fallback required all observed effective modes to match. `Runtime`, `Fixed`
+12. `P1` The "last observed mode" fallback could still depend on random UUID ordering for same-second events. `Runtime`, `Fixed`
+13. `P1` Same-second later live decisions could be overridden by earlier shadow state-transition runtime rows because the fallback hard-ranked all runtime rows after decisions. `Runtime`, `Fixed`
+14. `P2` Same-second earlier shadow `risk_block` rows could be forced after later live decisions across loop iterations, misattributing missing summaries to the shadow profile. `Runtime`, `Fixed`
+15. `P2` Loop-level `risk_block` payloads without `t_into_seconds` could still lose to earlier live decisions in same-second missing-summary attribution. `Runtime`, `Fixed`
+16. `P2` Shadow adapter-recovery evaluation sorted same-second runtime rows by random `event_id`, making quick reconnect recovery nondeterministic. `Runtime`, `Fixed`
+17. `P1` Repo-side validation repair plus shutdown settlement handling could double-publish `settled` runtime events and make `run_summary` audit counts disagree with persisted rows. `Runtime`, `Fixed`
+
 ## Notes
 
 - This document records findings that were actually raised during implementation hardening, not hypothetical future risks.
 - `IMP-19` generated the largest follow-up volume because it introduced wallet-global shared state, multi-instance coordination, restart recovery, TTL cleanup, maker and taker reservation accounting, and local-to-shared state republish logic all at once.
 - `IMP-17` findings were narrower and focused on importer parity correctness, CLI ergonomics, summary completion semantics, and one binary-linkage hygiene issue rather than live trading-path behavior.
 - `IMP-18` generated a second cluster of follow-up parity fixes because deterministic replay had to become self-contained across schedule metadata, settlement inputs, captured order IDs, trade identity, and machine-local env differences.
+- `IMP-24` generated a concentrated KPI-hardening cluster around terminal settlement audit repair, profile attribution for missing summaries, and deterministic same-second ordering of runtime versus decision evidence.
 - The non-runtime findings in this document are the shared-state test-isolation issue under `IMP-19` plus the replay certification fixture-portability issues under `IMP-23`.

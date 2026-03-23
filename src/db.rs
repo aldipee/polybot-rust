@@ -5,10 +5,14 @@ use chrono::{Datelike, Duration, Utc};
 use chrono_tz::Asia::Jakarta;
 use native_tls::TlsConnector;
 use polybot::analysis_import::AnalysisImportResult;
-use postgres::Client;
+use polybot::kpi_gate::{
+    settlement_pnl_decomposition, KpiDecisionEventRow, KpiGateReport, KpiRuntimeEventRow,
+    KpiTradeRow,
+};
+use postgres::{Client, Row};
 use postgres_native_tls::MakeTlsConnector;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -158,6 +162,15 @@ pub struct UnvalidatedTradeRow {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct TradeValidationTerminalState {
+    pub trade_id: String,
+    pub lp: f64,
+    pub claim_status: Option<String>,
+    pub validation_status: String,
+    pub validation_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TradePairMetadata {
     pub pair_id: String,
     pub market_slug: String,
@@ -304,6 +317,109 @@ fn canonicalize_json(v: Value) -> Value {
         }
         Value::Array(arr) => Value::Array(arr.into_iter().map(canonicalize_json).collect()),
         other => other,
+    }
+}
+
+fn trade_row_from_pg_row(row: &Row) -> TradeRow {
+    TradeRow {
+        trade_id: row.get(0),
+        bot_id: row.get(1),
+        slug: row.get(2),
+        pair_id: row.get(3),
+        condition_id: row.get(4),
+        yes_asset_id: row.get(5),
+        no_asset_id: row.get(6),
+        configuration_id: row.get(7),
+        config_version: row.get(8),
+        date: row.get(9),
+        start_trade: row.get(10),
+        end_trade: row.get(11),
+        entry_time: row.get(12),
+        holding_duration_seconds: row.get(13),
+        entry_reason: row.get(14),
+        exit_time: row.get(15),
+        exit_reason_category: row.get(16),
+        stop_loss_category: row.get(17),
+        entry_price: row.get(18),
+        exit_price: row.get(19),
+        lp: row.get(20),
+        total_cost: row.get(21),
+        q_yes: row.get(22),
+        q_no: row.get(23),
+        cpp: row.get(24),
+        status: row.get(25),
+        claim_status: row.get(26),
+        meta_data: row.get(27),
+        exit_reason: row.get(28),
+        validation_status: row.get(29),
+        validation_checked_at: row.get(30),
+        validation_validated_at: row.get(31),
+        validation_source: row.get(32),
+    }
+}
+
+fn parse_run_summary_settlement_status(payload_json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("settlement_status")
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+}
+
+fn repaired_validated_run_summary_payload(
+    prior_payload_json: &str,
+    trade: &TradeRow,
+    settlement_status: &str,
+    settlement_reason: &str,
+    audit_decision_event_count: u32,
+    audit_runtime_event_count: u32,
+) -> Result<String> {
+    let mut payload: Value = serde_json::from_str(prior_payload_json)
+        .context("failed parsing prior run_summary payload")?;
+    let obj = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("prior run_summary payload must be a JSON object"))?;
+    obj.insert("trade_id".to_string(), json!(trade.trade_id));
+    if let Some(entry_reason) = trade.entry_reason.as_ref() {
+        obj.insert("entry_reason".to_string(), json!(entry_reason));
+    }
+    obj.insert("exit_reason".to_string(), json!(trade.exit_reason));
+    obj.insert("settlement_status".to_string(), json!(settlement_status));
+    obj.insert("settlement_reason".to_string(), json!(settlement_reason));
+    obj.insert("q_yes".to_string(), json!(trade.q_yes));
+    obj.insert("q_no".to_string(), json!(trade.q_no));
+    obj.insert("total_cost".to_string(), json!(trade.total_cost));
+    obj.insert("cpp".to_string(), json!(trade.cpp));
+    obj.insert(
+        "audit_decision_event_count".to_string(),
+        json!(audit_decision_event_count),
+    );
+    obj.insert(
+        "audit_runtime_event_count".to_string(),
+        json!(audit_runtime_event_count),
+    );
+    serde_json::to_string(&payload).context("failed serializing repaired run_summary payload")
+}
+
+fn iso_plus_seconds(base_iso: &str, seconds: i64) -> String {
+    chrono::DateTime::parse_from_rfc3339(base_iso)
+        .map(|dt| {
+            (dt + Duration::seconds(seconds))
+                .with_timezone(&Jakarta)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
+        .unwrap_or_else(|_| now_iso_jakarta())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TradeValidationRepairOutcome {
+    pub inserted_settlement_event: bool,
+    pub inserted_run_summary: bool,
+}
+
+impl TradeValidationRepairOutcome {
+    pub fn inserted_runtime_event_count(self) -> u32 {
+        (self.inserted_settlement_event as u32).saturating_add(self.inserted_run_summary as u32)
     }
 }
 
@@ -680,6 +796,31 @@ CREATE TABLE IF NOT EXISTS analysis_pair_rollup (
   PRIMARY KEY (import_run_id, condition_id)
 );
 
+CREATE TABLE IF NOT EXISTS kpi_gate_run (
+  kpi_run_id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL,
+  profile TEXT NOT NULL,
+  window_start TEXT NOT NULL,
+  window_end TEXT NOT NULL,
+  overall_status TEXT NOT NULL,
+  summary_path TEXT NOT NULL,
+  summary_json TEXT NOT NULL,
+  distinct_trading_days BIGINT NOT NULL,
+  settled_pairs BIGINT NOT NULL,
+  selected_trade_count BIGINT NOT NULL,
+  participating_run_count BIGINT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kpi_gate_metric (
+  kpi_run_id TEXT NOT NULL,
+  metric_name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (kpi_run_id, metric_name)
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
   ON trade (bot_id, pair_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_configuration_config_version_unique
@@ -696,6 +837,10 @@ CREATE INDEX IF NOT EXISTS idx_analysis_close_position_import_condition
   ON analysis_close_position_row (import_run_id, "conditionId");
 CREATE INDEX IF NOT EXISTS idx_analysis_pair_rollup_import
   ON analysis_pair_rollup (import_run_id);
+CREATE INDEX IF NOT EXISTS idx_kpi_gate_run_bot_window
+  ON kpi_gate_run (bot_id, profile, window_start, window_end);
+CREATE INDEX IF NOT EXISTS idx_kpi_gate_metric_run
+  ON kpi_gate_metric (kpi_run_id);
 "#,
         )
         .context("failed creating schema")?;
@@ -1097,6 +1242,195 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
 
         tx.commit()
             .context("failed committing analysis import transaction")?;
+        Ok(())
+    }
+
+    pub fn load_kpi_trades(
+        &self,
+        bot_id: &str,
+        window_start: &str,
+        window_end: &str,
+    ) -> Result<Vec<KpiTradeRow>> {
+        let mut conn = open_conn(&self.engine)?;
+        let rows = conn.query(
+            "SELECT
+                trade_id, bot_id, pair_id, slug, date, start_trade, end_trade,
+                entry_reason, exit_reason, lp, total_cost, q_yes, q_no, cpp,
+                status, claim_status, meta_data
+             FROM trade
+             WHERE bot_id = $1
+               AND start_trade <= $3
+               AND COALESCE(NULLIF(end_trade, ''), start_trade) >= $2
+             ORDER BY start_trade ASC, trade_id ASC",
+            &[&bot_id, &window_start, &window_end],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| KpiTradeRow {
+                trade_id: row.get(0),
+                bot_id: row.get(1),
+                pair_id: row.get(2),
+                market_slug: row.get(3),
+                date: row.get(4),
+                start_trade: row.get(5),
+                end_trade: row.get(6),
+                entry_reason: row.get(7),
+                exit_reason: row.get(8),
+                lp: row.get(9),
+                total_cost: row.get(10),
+                q_yes: row.get(11),
+                q_no: row.get(12),
+                cpp: row.get(13),
+                status: row.get(14),
+                claim_status: row.get(15),
+                meta_data: row.get(16),
+            })
+            .collect())
+    }
+
+    pub fn load_kpi_decision_events(
+        &self,
+        bot_id: &str,
+        window_start: &str,
+        window_end: &str,
+    ) -> Result<Vec<KpiDecisionEventRow>> {
+        let mut conn = open_conn(&self.engine)?;
+        let rows = conn.query(
+            "SELECT
+                e.decision_event_id, e.trade_id, e.decision_ts, e.approved,
+                e.reason_code, e.phase, e.owner, e.submit_origin, e.submit_side, e.payload_json
+             FROM trade_decision_events e
+             INNER JOIN trade t ON t.trade_id = e.trade_id
+             WHERE t.bot_id = $1
+               AND t.start_trade <= $3
+               AND COALESCE(NULLIF(t.end_trade, ''), t.start_trade) >= $2
+             ORDER BY e.decision_ts ASC, e.decision_event_id ASC",
+            &[&bot_id, &window_start, &window_end],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| KpiDecisionEventRow {
+                decision_event_id: row.get(0),
+                trade_id: row.get(1),
+                decision_ts: row.get(2),
+                approved: row.get(3),
+                reason_code: row.get(4),
+                phase: row.get(5),
+                owner: row.get(6),
+                submit_origin: row.get(7),
+                submit_side: row.get(8),
+                payload_json: row.get(9),
+            })
+            .collect())
+    }
+
+    pub fn load_kpi_runtime_events(
+        &self,
+        bot_id: &str,
+        window_start: &str,
+        window_end: &str,
+    ) -> Result<Vec<KpiRuntimeEventRow>> {
+        let mut conn = open_conn(&self.engine)?;
+        let rows = conn.query(
+            "SELECT
+                e.event_id, e.trade_id, e.event_kind, e.event_ts, e.reason_code, e.payload_json
+             FROM trade_runtime_events e
+             INNER JOIN trade t ON t.trade_id = e.trade_id
+             WHERE t.bot_id = $1
+               AND t.start_trade <= $3
+               AND COALESCE(NULLIF(t.end_trade, ''), t.start_trade) >= $2
+             ORDER BY e.event_ts ASC, e.event_id ASC",
+            &[&bot_id, &window_start, &window_end],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| KpiRuntimeEventRow {
+                event_id: row.get(0),
+                trade_id: row.get(1),
+                event_kind: row.get(2),
+                event_ts: row.get(3),
+                reason_code: row.get(4),
+                payload_json: row.get(5),
+            })
+            .collect())
+    }
+
+    pub fn persist_kpi_gate_report(
+        &self,
+        report: &KpiGateReport,
+        summary_path: &std::path::Path,
+    ) -> Result<()> {
+        let mut conn = open_conn(&self.engine)?;
+        let now = now_iso_jakarta();
+        let mut tx = conn
+            .transaction()
+            .context("failed starting kpi gate transaction")?;
+        let summary_json =
+            serde_json::to_string(report).context("failed serializing kpi gate summary json")?;
+        tx.execute(
+            "INSERT INTO kpi_gate_run (
+                kpi_run_id, bot_id, profile, window_start, window_end, overall_status,
+                summary_path, summary_json, distinct_trading_days, settled_pairs,
+                selected_trade_count, participating_run_count, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12, $13
+            )",
+            &[
+                &report.run_id,
+                &report
+                    .metadata
+                    .get("bot_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default(),
+                &report
+                    .metadata
+                    .get("profile")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default(),
+                &report
+                    .metadata
+                    .get("window_start")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default(),
+                &report
+                    .metadata
+                    .get("window_end")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default(),
+                &report.overall_status,
+                &summary_path.to_string_lossy().to_string(),
+                &summary_json,
+                &(report.sample_coverage.distinct_trading_days as i64),
+                &(report.sample_coverage.settled_pairs as i64),
+                &(report.sample_coverage.selected_trade_count as i64),
+                &(report.sample_coverage.participating_run_count as i64),
+                &now,
+            ],
+        )
+        .context("failed inserting kpi_gate_run")?;
+
+        for (metric_name, metric) in &report.metrics {
+            let details_json = serde_json::to_string(&metric.details)
+                .context("failed serializing kpi gate metric details")?;
+            tx.execute(
+                "INSERT INTO kpi_gate_metric (
+                    kpi_run_id, metric_name, status, details_json, created_at
+                ) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &report.run_id,
+                    &metric_name,
+                    &metric.status,
+                    &details_json,
+                    &now,
+                ],
+            )
+            .with_context(|| format!("failed inserting kpi gate metric {metric_name}"))?;
+        }
+
+        tx.commit()
+            .context("failed committing kpi gate transaction")?;
         Ok(())
     }
 
@@ -1850,7 +2184,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         lp: f64,
         checked_at_iso: &str,
         source: &str,
-    ) -> Result<()> {
+    ) -> Result<TradeValidationRepairOutcome> {
         let status = if lp > 0.0 {
             "WON"
         } else if lp < 0.0 {
@@ -1860,46 +2194,239 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
         };
         let validated = "VALIDATED".to_string();
         let mut conn = open_conn(&self.engine)?;
-        conn.execute(
-            "UPDATE trade
-             SET lp = $1,
-                 status = $2,
-                 validation_status = $3,
-                 validation_checked_at = $4,
-                 validation_validated_at = $5,
-                 validation_source = $6,
-                 claim_status = CASE
-                    WHEN COALESCE(claim_status, '') IN ('', 'AWAIT_SETTLEMENT')
-                        THEN 'SETTLED'
-                    ELSE claim_status
-                 END,
-                 end_trade = CASE
-                    WHEN COALESCE(trim(end_trade), '') = ''
-                        THEN $4
-                    ELSE end_trade
-                 END,
-                 exit_time = COALESCE(exit_time, $4),
-                 exit_price = COALESCE(
-                    exit_price,
-                    CASE
-                        WHEN COALESCE(q_yes, 0.0) + COALESCE(q_no, 0.0) > 1e-9
-                            THEN (COALESCE(total_cost, 0.0) + $1)
-                                / (COALESCE(q_yes, 0.0) + COALESCE(q_no, 0.0))
-                        ELSE NULL
-                    END
-                 )
-             WHERE trade_id = $7",
-            &[
-                &lp,
-                &status,
-                &validated,
-                &checked_at_iso,
-                &checked_at_iso,
-                &source,
-                &trade_id,
-            ],
+        let mut tx = conn
+            .transaction()
+            .context("failed starting trade validation transaction")?;
+        let latest_run_summary_payload = tx
+            .query_opt(
+                "SELECT payload_json
+                 FROM trade_runtime_events
+                 WHERE trade_id = $1
+                   AND event_kind = 'run_summary'
+                 ORDER BY event_ts DESC, event_id DESC
+                 LIMIT 1",
+                &[&trade_id],
+            )?
+            .map(|row| row.get::<usize, String>(0));
+        let latest_terminal_settlement_reason = tx
+            .query_opt(
+                "SELECT reason_code
+                 FROM trade_runtime_events
+                 WHERE trade_id = $1
+                   AND event_kind = 'settlement'
+                   AND COALESCE(reason_code, '') IN ('settled', 'resolution_snapshot_unavailable')
+                 ORDER BY event_ts DESC, event_id DESC
+                 LIMIT 1",
+                &[&trade_id],
+            )?
+            .and_then(|row| row.get::<usize, Option<String>>(0));
+        let decision_event_count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*)::BIGINT
+                 FROM trade_decision_events
+                 WHERE trade_id = $1",
+                &[&trade_id],
+            )?
+            .get(0);
+        let runtime_event_count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*)::BIGINT
+                 FROM trade_runtime_events
+                 WHERE trade_id = $1",
+                &[&trade_id],
+            )?
+            .get(0);
+        let updated_row = tx
+            .query_one(
+                "UPDATE trade
+                 SET lp = $1,
+                     status = $2,
+                     validation_status = $3,
+                     validation_checked_at = $4,
+                     validation_validated_at = $5,
+                     validation_source = $6,
+                     claim_status = CASE
+                        WHEN COALESCE(claim_status, '') IN ('', 'AWAIT_SETTLEMENT')
+                            THEN 'SETTLED'
+                        ELSE claim_status
+                     END,
+                     end_trade = CASE
+                        WHEN COALESCE(trim(end_trade), '') = ''
+                            THEN $4
+                        ELSE end_trade
+                     END,
+                     exit_time = COALESCE(exit_time, $4),
+                     exit_price = COALESCE(
+                        exit_price,
+                        CASE
+                            WHEN COALESCE(q_yes, 0.0) + COALESCE(q_no, 0.0) > 1e-9
+                                THEN (COALESCE(total_cost, 0.0) + $1)
+                                    / (COALESCE(q_yes, 0.0) + COALESCE(q_no, 0.0))
+                            ELSE NULL
+                        END
+                     )
+                 WHERE trade_id = $7
+                 RETURNING
+                    trade_id, bot_id, slug, pair_id, condition_id, yes_asset_id, no_asset_id,
+                    configuration_id, config_version, date, start_trade, end_trade,
+                    entry_time, holding_duration_seconds, entry_reason, exit_time,
+                    exit_reason_category, stop_loss_category, entry_price, exit_price,
+                    lp, total_cost, q_yes, q_no, cpp, status, claim_status, meta_data,
+                    exit_reason, COALESCE(validation_status, ''),
+                    validation_checked_at, validation_validated_at, validation_source",
+                &[
+                    &lp,
+                    &status,
+                    &validated,
+                    &checked_at_iso,
+                    &checked_at_iso,
+                    &source,
+                    &trade_id,
+                ],
+            )
+            .with_context(|| format!("failed validating trade {}", trade_id))?;
+        let trade = trade_row_from_pg_row(&updated_row);
+        let should_insert_settlement = !matches!(
+            latest_terminal_settlement_reason.as_deref(),
+            Some("settled")
+        );
+        let should_insert_run_summary = latest_run_summary_payload
+            .as_deref()
+            .and_then(parse_run_summary_settlement_status)
+            .map(|status| !status.eq_ignore_ascii_case("SETTLED"))
+            .unwrap_or(false);
+        let base_event_ts = trade
+            .validation_validated_at
+            .clone()
+            .or_else(|| trade.validation_checked_at.clone())
+            .unwrap_or_else(now_iso_jakarta);
+        let settlement_event_ts = iso_plus_seconds(base_event_ts.as_str(), 1);
+        let run_summary_event_ts = iso_plus_seconds(base_event_ts.as_str(), 2);
+
+        if should_insert_settlement {
+            let decomp = settlement_pnl_decomposition(trade.lp, trade.q_yes, trade.q_no, trade.cpp);
+            let settlement_payload = serde_json::to_string(&json!({
+                "trade_id": trade.trade_id.clone(),
+                "reason_code": "settled",
+                "resolved_lp": trade.lp,
+                "total_cost": trade.total_cost,
+                "cpp": trade.cpp,
+                "q_yes": trade.q_yes,
+                "q_no": trade.q_no,
+                "settlement_source": trade.validation_source.clone(),
+                "paired_qty": decomp.paired_qty,
+                "residual_qty": decomp.residual_qty,
+                "paired_realized_pnl": decomp.paired_realized_pnl,
+                "residual_realized_pnl": decomp.residual_realized_pnl,
+            }))
+            .context("failed serializing validation settlement payload")?;
+            tx.execute(
+                "INSERT INTO trade_runtime_events (
+                    event_id, trade_id, pair_id, market_slug, condition_id, yes_asset_id,
+                    no_asset_id, config_version, event_kind, event_ts, decision_event_id,
+                    order_id, asset_id, side, reason_code, payload_json, created_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6,
+                    $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15, $16, $17
+                )",
+                &[
+                    &new_uuid(),
+                    &trade.trade_id,
+                    &trade.pair_id,
+                    &trade.slug,
+                    &trade.condition_id,
+                    &trade.yes_asset_id,
+                    &trade.no_asset_id,
+                    &trade.config_version,
+                    &"settlement".to_string(),
+                    &settlement_event_ts,
+                    &Option::<String>::None,
+                    &Option::<String>::None,
+                    &Option::<String>::None,
+                    &Option::<String>::None,
+                    &Some("settled".to_string()),
+                    &settlement_payload,
+                    &now_iso_jakarta(),
+                ],
+            )
+            .context("failed inserting validation settlement runtime event")?;
+        }
+
+        if should_insert_run_summary {
+            if let Some(latest_run_summary_payload) = latest_run_summary_payload.as_deref() {
+                let payload_json = repaired_validated_run_summary_payload(
+                    latest_run_summary_payload,
+                    &trade,
+                    "SETTLED",
+                    "validated_from_polymarket",
+                    decision_event_count.max(0) as u32,
+                    runtime_event_count
+                        .max(0)
+                        .saturating_add(if should_insert_settlement { 1 } else { 0 })
+                        .saturating_add(1) as u32,
+                )?;
+                tx.execute(
+                    "INSERT INTO trade_runtime_events (
+                        event_id, trade_id, pair_id, market_slug, condition_id, yes_asset_id,
+                        no_asset_id, config_version, event_kind, event_ts, decision_event_id,
+                        order_id, asset_id, side, reason_code, payload_json, created_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6,
+                        $7, $8, $9, $10, $11,
+                        $12, $13, $14, $15, $16, $17
+                    )",
+                    &[
+                        &new_uuid(),
+                        &trade.trade_id,
+                        &trade.pair_id,
+                        &trade.slug,
+                        &trade.condition_id,
+                        &trade.yes_asset_id,
+                        &trade.no_asset_id,
+                        &trade.config_version,
+                        &"run_summary".to_string(),
+                        &run_summary_event_ts,
+                        &Option::<String>::None,
+                        &Option::<String>::None,
+                        &Option::<String>::None,
+                        &Option::<String>::None,
+                        &Some("completed".to_string()),
+                        &payload_json,
+                        &now_iso_jakarta(),
+                    ],
+                )
+                .context("failed inserting validation run_summary runtime event")?;
+            }
+        }
+
+        tx.commit()
+            .context("failed committing trade validation transaction")?;
+        Ok(TradeValidationRepairOutcome {
+            inserted_settlement_event: should_insert_settlement,
+            inserted_run_summary: should_insert_run_summary
+                && latest_run_summary_payload.as_deref().is_some(),
+        })
+    }
+
+    pub fn load_trade_validation_terminal_state(
+        &self,
+        trade_id: &str,
+    ) -> Result<Option<TradeValidationTerminalState>> {
+        let mut conn = open_conn(&self.engine)?;
+        let row = conn.query_opt(
+            "SELECT trade_id, lp, claim_status, COALESCE(validation_status, ''), validation_source
+             FROM trade
+             WHERE trade_id = $1",
+            &[&trade_id],
         )?;
-        Ok(())
+        Ok(row.map(|row| TradeValidationTerminalState {
+            trade_id: row.get(0),
+            lp: row.get(1),
+            claim_status: row.get(2),
+            validation_status: row.get(3),
+            validation_source: row.get(4),
+        }))
     }
 
     pub fn upsert_trade_decision(&self, trade_id: &str, row: &TradeDecisionUpsert) -> Result<()> {
@@ -2185,6 +2712,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_bot_pair_id_unique
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
 
     #[test]
     fn normalized_trade_pair_metadata_canonicalizes_slug_variants_to_one_pair_id() {
@@ -2215,5 +2743,127 @@ mod tests {
         assert_eq!(pair.condition_id.as_deref(), Some("cond"));
         assert_eq!(pair.yes_asset_id.as_deref(), Some("yes"));
         assert_eq!(pair.no_asset_id.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn iso_plus_seconds_makes_repair_events_sort_after_unresolved_rows() {
+        let base = "2026-03-23T09:06:00+07:00";
+        let settlement_ts = iso_plus_seconds(base, 1);
+        let run_summary_ts = iso_plus_seconds(base, 2);
+        assert_eq!(settlement_ts, "2026-03-23T09:06:01+07:00");
+        assert_eq!(run_summary_ts, "2026-03-23T09:06:02+07:00");
+        assert!(settlement_ts.as_str() > base);
+        assert!(run_summary_ts > settlement_ts);
+    }
+
+    #[test]
+    fn validation_repair_outcome_counts_inserted_runtime_rows() {
+        let outcome = TradeValidationRepairOutcome {
+            inserted_settlement_event: true,
+            inserted_run_summary: false,
+        };
+        assert_eq!(outcome.inserted_runtime_event_count(), 1);
+
+        let outcome = TradeValidationRepairOutcome {
+            inserted_settlement_event: true,
+            inserted_run_summary: true,
+        };
+        assert_eq!(outcome.inserted_runtime_event_count(), 2);
+    }
+
+    #[test]
+    fn repaired_validated_run_summary_payload_flips_terminal_state_and_counts() {
+        let trade = TradeRow {
+            trade_id: "trade-1".to_string(),
+            bot_id: "bot-1".to_string(),
+            slug: "market-a".to_string(),
+            pair_id: "pair-a".to_string(),
+            condition_id: Some("cond-a".to_string()),
+            yes_asset_id: Some("yes-a".to_string()),
+            no_asset_id: Some("no-a".to_string()),
+            configuration_id: "cfg-id".to_string(),
+            config_version: "cfg-v1".to_string(),
+            date: "2026-03-23".to_string(),
+            start_trade: "2026-03-23T09:00:00+07:00".to_string(),
+            end_trade: "2026-03-23T09:05:00+07:00".to_string(),
+            entry_time: Some("2026-03-23T09:00:01+07:00".to_string()),
+            holding_duration_seconds: Some(299.0),
+            entry_reason: Some("BOT_OPEN_BOTH".to_string()),
+            exit_time: Some("2026-03-23T09:05:00+07:00".to_string()),
+            exit_reason_category: Some("RESOLUTION".to_string()),
+            stop_loss_category: None,
+            entry_price: Some(0.45),
+            exit_price: Some(0.55),
+            lp: 1.25,
+            total_cost: 8.5,
+            q_yes: 10.0,
+            q_no: 9.0,
+            cpp: 0.45,
+            status: Some("WON".to_string()),
+            claim_status: Some("SETTLED".to_string()),
+            meta_data: None,
+            exit_reason: "AWAIT_SETTLEMENT".to_string(),
+            validation_status: "VALIDATED".to_string(),
+            validation_checked_at: Some("2026-03-23T09:06:00+07:00".to_string()),
+            validation_validated_at: Some("2026-03-23T09:06:00+07:00".to_string()),
+            validation_source: Some("POLYMARKET_CLOSED_POSITIONS".to_string()),
+        };
+        let prior_payload = json!({
+            "trade_id": "trade-1",
+            "phase": "AwaitSettlement",
+            "owner": "AwaitSettlement",
+            "safety_gate": "Healthy",
+            "configured_order_mode": "paper",
+            "effective_order_mode": "paper",
+            "market_participated": true,
+            "exit_reason": "AWAIT_SETTLEMENT",
+            "settlement_status": "AWAIT_SETTLEMENT",
+            "settlement_reason": "resolution_snapshot_unavailable",
+            "audit_decision_event_count": 5,
+            "audit_runtime_event_count": 12
+        })
+        .to_string();
+
+        let repaired = repaired_validated_run_summary_payload(
+            &prior_payload,
+            &trade,
+            "SETTLED",
+            "validated_from_polymarket",
+            5,
+            14,
+        )
+        .expect("repaired payload");
+        let parsed: Value = serde_json::from_str(&repaired).expect("valid repaired json");
+        assert_eq!(
+            parsed.get("settlement_status").and_then(Value::as_str),
+            Some("SETTLED")
+        );
+        assert_eq!(
+            parsed.get("settlement_reason").and_then(Value::as_str),
+            Some("validated_from_polymarket")
+        );
+        assert_eq!(
+            parsed
+                .get("audit_runtime_event_count")
+                .and_then(Value::as_u64),
+            Some(14)
+        );
+        assert_eq!(
+            parsed
+                .get("audit_decision_event_count")
+                .and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(parsed.get("q_yes").and_then(Value::as_f64), Some(10.0));
+        assert_eq!(parsed.get("q_no").and_then(Value::as_f64), Some(9.0));
+        assert_eq!(parsed.get("cpp").and_then(Value::as_f64), Some(0.45));
+        assert_eq!(
+            parsed.get("configured_order_mode").and_then(Value::as_str),
+            Some("paper")
+        );
+        assert_eq!(
+            parsed.get("effective_order_mode").and_then(Value::as_str),
+            Some("paper")
+        );
     }
 }

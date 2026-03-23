@@ -52,10 +52,10 @@ Work status legend:
 - Requirement analysis: `Done`
 - Requirement-only backlog definition: `Done`
 - `REQ-001` scope override recorded: `Done`
-- Active implementation tasks completed: `21 / 24`
-- Tasks ready to start now: `0 / 24`
+- Active implementation tasks completed: `22 / 24`
+- Tasks ready to start now: `1 / 24`
 - Tasks queued behind earlier work: `0 / 24`
-- Tasks blocked by prerequisites: `3 / 24`
+- Tasks blocked by prerequisites: `1 / 24`
 - Tasks marked not applicable: `1`
 
 ### Coverage by Requirement Area
@@ -68,7 +68,7 @@ Work status legend:
 | Config, observability, and auditability | `REQ-023` to `REQ-025` | 84% | 16% | Versioned env snapshots, persisted `config_text` plus `config_version`, next-market-only activation, rollback-safe reload fallback, append-only decision-event persistence, structured runtime-event persistence, linked `decision_event_id` audit trails, and pinned trade or execution metadata now exist. The remaining gap in this area is mostly operational hardening and richer downstream reporting on top of the new audit stream. |
 | Replay, paper, and live safety modes | `REQ-026` to `REQ-029` | 100% | 0% | A true paper adapter, default shadow routing, guarded live arming, effective-order-mode dispatch, mode-scoped local or shared state, deterministic replay from captured event tapes, and analytics importer parity against the checked-in historical parquet and csv dataset are now in place. |
 | Reliability, stale data, and reconciliation | `REQ-030` to `REQ-033` | 100% | 0% | Idempotent BOT order intents, bounded persisted fill dedupe, explicit startup and reconnect reconciliation gates, post-settlement validation handoff, dependency-failure safe-pause, persistence-path-specific pause latching, pause-time BOT order drain across both slot-tracked and direct BOT orders, exact dual-threshold stale-data enforcement, and wallet-global gross deployed cost caps with shared pending maker/taker reservations are now in place. Hard stale now latches until quotes are fully fresh again, startup quote-readiness uses the same add-block threshold, legacy flat DB configs preserve their prior stale threshold on reload, deprecated single-threshold stale env now fails activation, and shared gross-cap state now refreshes and deduplicates correctly across restart, direct-mode orders, TTL cleanup, and multi-instance same-wallet deployments. Current direction still excludes active-market 5-second position reconciliation. |
-| Validation and launch gates | Section 10 | 60% | 40% | Requirement-grade invariant and property coverage now exists for no-scale-before-both-filled, no add at `>= 1.00`, no underdog residual increase, and quantity conservation, there is a deterministic replay foundation with scenario bundles and oracle comparison, and there is now a committed replay certification suite for good open, one-side lag, stale-data hold, reconnect reconciliation mismatch, and late settlement. Paper or shadow KPI gates and deployment gates are still absent. |
+| Validation and launch gates | Section 10 | 85% | 15% | Requirement-grade invariant and property coverage now exists for no-scale-before-both-filled, no add at `>= 1.00`, no underdog residual increase, and quantity conservation, there is a deterministic replay foundation with scenario bundles and oracle comparison, there is now a committed replay certification suite for good open, one-side lag, stale-data hold, reconnect reconciliation mismatch, and late settlement, and paper or shadow KPI gating now exists with deterministic JSON summaries, persisted KPI rows, and terminal audit-settlement integrity checks. The remaining gap in this area is the final deployment and rollback gate that enforces those results before guarded live promotion. |
 
 ## Requirement-First Implementation Tasks
 
@@ -109,14 +109,14 @@ Work status legend:
 |---|---|---|---|---|---|---|
 | IMP-22 | Section 10 unit and property tests | Done | Done | Add invariant tests for no scale-up before both sides fill, no add at `>= 1.00`, no underdog residual increase, and quantity conservation. | Implemented: deterministic invariant tests plus fixed-seed property tests now cover owner routing, price-zone blocking, underdog residual hard blocks, fill dedupe idempotence, and quantity or cost conservation across generated fill streams. | `Cargo.toml`, `src/bot/runtime/tests.rs`, `src/bot/runtime/pair_build/tests.rs` |
 | IMP-23 | Section 10 replay and simulation tests | Done | Done | Add deterministic replay scenarios for good opens, one-side lag, stale data, reconciliation mismatch, and late settlement. | Implemented: committed replay certification fixtures now cover healthy paired opens, one-side lag into `AwaitSecondFill`, stale-data hold escalation, reconnect reconciliation mismatch recovery, and late settlement handoff, and the integration harness enforces both exact replay-oracle parity and scenario-specific semantic assertions. | `tests/replay_certification.rs`, `tests/replay/scenarios/*` |
-| IMP-24 | Section 10 paper and shadow KPIs | Missing | Blocked | Add KPI reporting for seed timing, second-fill timing, taker share, imbalance, price-zone mix, and reconciliation health. | No paper or shadow KPI gate exists today. | metrics, dashboards, reports |
-| IMP-25 | Section 10 deployment and rollback gates | Missing | Blocked | Add launch gates so live canary is blocked until replay, paper, shadow, and reconciliation criteria pass. | No requirement-grade go or no-go gate is implemented. | startup checks, admin controls, deployment docs |
+| IMP-24 | Section 10 paper and shadow KPIs | Done | Done | Add KPI reporting for seed timing, second-fill timing, taker share, imbalance, price-zone mix, and reconciliation health. | Implemented: the repo now has a dedicated KPI gate subsystem with paper and shadow sample sufficiency checks, deterministic per-metric pass/warn/fail evaluation, JSON summary output, persisted `kpi_gate_run` and `kpi_gate_metric` rows, terminal `run_summary` and `audit_drop` observability, and hardened same-second audit ordering plus settlement repair handling so KPI integrity stays deterministic. | `src/kpi_gate/*`, `src/bin/kpi_gate.rs`, `src/db.rs`, `src/bot/audit.rs`, `src/bot/runtime/loop.rs`, `src/main.rs` |
+| IMP-25 | Section 10 deployment and rollback gates | Missing | Ready | Add launch gates so live canary is blocked until replay, paper, shadow, and reconciliation criteria pass. | No requirement-grade go or no-go gate is implemented yet, but replay certification and KPI summaries now exist for a deployment gate to consume. | startup checks, admin controls, deployment docs |
 
 ## Recommended Build Order
 
 This sequence stays tied to the requirement instead of a refactor roadmap:
 
-1. `IMP-24` and `IMP-25` paper or shadow KPI gates plus deployment rollback gates
+1. `IMP-25` deployment and rollback gates
 
 ## Short Summary
 
@@ -145,12 +145,12 @@ Recent completed work:
 - `IMP-22` / Section 10 unit and property test work is now `Done`: the test suite now includes deterministic invariant coverage for owner routing, stop-add and danger price zones, and underdog residual hard blocks, plus fixed-seed property tests for underdog residual math and fill-stream quantity or cost conservation with duplicate-fill idempotence.
 - `IMP-18` / `REQ-026` implementation work is now `Done`: the repo now has a dedicated replay binary, replay scenario folders with captured config, initial state, normalized event tapes, and optional oracle files, deterministic replay time and ID plumbing, replay-scoped state isolation, captured order-ack reuse, captured resolution-state replay, manifest-persisted trade IDs, and replay-bundle env override restoration so offline runs match captured behavior instead of ambient machine settings.
 - `IMP-23` / Section 10 replay certification work is now `Done`: the repo now has a committed replay certification suite with exact-oracle and semantic checks for good open, one-side lag into `AwaitSecondFill`, stale-data hold escalation, reconnect reconciliation mismatch recovery, and late settlement handoff, plus fixture-integrity checks that keep the scenario bundle set reproducible on a clean clone.
+- `IMP-24` / Section 10 paper and shadow KPI gate work is now `Done`: the repo now has a dedicated KPI gate subsystem, deterministic JSON summaries, persisted KPI rows, sample sufficiency checks for paper and shadow windows, audit-drop and run-summary observability, and hardened settlement and intra-second audit ordering so KPI pass or warn or fail results stay stable under later validation repair and quick reconnect paths.
 
 The biggest remaining requirement gaps are:
 
-- analytics importer parity
-- paper or shadow KPI gates
 - deployment and rollback launch controls before any guarded live rollout
+- the optional model-edge overlay under `REQ-020`
 
 Intentional scope exception:
 

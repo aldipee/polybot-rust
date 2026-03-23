@@ -563,6 +563,7 @@ impl MakerHedgeCapBot {
                 Some(hold_reason.as_str()),
                 json!({
                     "pair_id": pair_id.clone(),
+                    "t_into_seconds": t_into_s.max(0.0),
                     "phase": phase.as_str(),
                     "owner": owner.as_str(),
                     "safety_gate": safety_gate.as_str(),
@@ -632,6 +633,7 @@ impl MakerHedgeCapBot {
                 Some(hold_reason),
                 json!({
                     "pair_id": pair_id.clone(),
+                    "t_into_seconds": t_into_s.max(0.0),
                     "phase": phase.as_str(),
                     "owner": owner.as_str(),
                     "safety_gate": safety_gate.as_str(),
@@ -992,6 +994,7 @@ impl MakerHedgeCapBot {
                     Some(hold_reason.as_str()),
                     json!({
                         "pair_id": pair_id,
+                        "t_into_seconds": t_into_s.max(0.0),
                         "phase": phase.as_str(),
                         "owner": owner.as_str(),
                         "safety_gate": safety_gate.as_str(),
@@ -1034,6 +1037,7 @@ impl MakerHedgeCapBot {
                     Some(hold_reason),
                     json!({
                         "pair_id": pair_id,
+                        "t_into_seconds": t_into_s.max(0.0),
                         "phase": phase.as_str(),
                         "owner": owner.as_str(),
                         "safety_gate": safety_gate.as_str(),

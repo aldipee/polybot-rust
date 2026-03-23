@@ -10,6 +10,7 @@ pub mod env_contract;
 pub mod env_utils;
 pub mod gamma;
 pub mod helpers;
+pub mod kpi_gate;
 pub mod latency_log;
 pub mod logging;
 pub mod r2_storage;
