@@ -25,6 +25,7 @@ pub(crate) struct BotRuntimeConfigSnapshot {
     pub(crate) imbalance_target_fraction: f64,
     pub(crate) imbalance_warning_fraction: f64,
     pub(crate) imbalance_disable_fraction: f64,
+    pub(crate) imbalance_recovery_fraction: f64,
     pub(crate) clip_ladder: [f64; 4],
     pub(crate) repair_reserve_buffer_usd: f64,
     pub(crate) buy_only_normal_flow: bool,
@@ -65,6 +66,7 @@ pub(crate) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot {
         imbalance_target_fraction: 0.07,
         imbalance_warning_fraction: 0.12,
         imbalance_disable_fraction: 0.20,
+        imbalance_recovery_fraction: 0.12,
         clip_ladder: [12.0, 20.0, 40.0, 80.0],
         repair_reserve_buffer_usd: 1.0,
         buy_only_normal_flow: true,
@@ -293,6 +295,11 @@ where
         "BOT_IMBALANCE_DISABLE_FRACTION",
         cfg.imbalance_disable_fraction,
     );
+    cfg.imbalance_recovery_fraction = bot_runtime_env_float(
+        &mut get,
+        "BOT_IMBALANCE_RECOVERY_FRACTION",
+        cfg.imbalance_recovery_fraction,
+    );
     cfg.buy_only_normal_flow = bot_runtime_env_bool(
         &mut get,
         "BOT_BUY_ONLY_NORMAL_FLOW",
@@ -409,6 +416,12 @@ pub(crate) fn bot_runtime_validate_config(
         || cfg.imbalance_disable_fraction > 1.0
     {
         return Err("invalid_imbalance_disable_fraction");
+    }
+    if !cfg.imbalance_recovery_fraction.is_finite()
+        || cfg.imbalance_recovery_fraction <= 0.0
+        || cfg.imbalance_recovery_fraction >= cfg.imbalance_disable_fraction
+    {
+        return Err("invalid_imbalance_recovery_fraction");
     }
     if cfg
         .clip_ladder

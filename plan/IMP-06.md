@@ -52,23 +52,25 @@ The new canonical thresholds will be:
 ### 3. PairBuild and Taper behavior
 - Compute current imbalance state before planning any size-increasing action.
 - If current state is `HardDisable`:
-  - cancel BOT-owned pair-build and taper orders
-  - emit a stable `hard_imbalance_disable` reason
-  - submit no new orders for the rest of the market
-  - continue passive monitoring and later settlement only
+  - cancel BOT-owned growth, taper, open-both, and await-second-fill orders
+  - preserve and allow lighter-side repair orders (`BOT_PAIR_BUILD_LIGHTER`) that reduce imbalance
+  - emit a stable `hard_imbalance_disable` reason when no valid repair is available
+  - recovery: when `unmatched_fraction` drops below `imbalance_recovery_fraction` (default 0.12,
+    env: `BOT_IMBALANCE_RECOVERY_FRACTION`), transition back to computed state (Warning/Throttle/Normal)
+  - hysteresis gap (disable at 0.20, recover at 0.12) prevents rapid state oscillation
 - If current state is `Throttle` or `Warning`:
   - do not allow normal paired growth
   - cancel any live paired-growth orders
   - allow only lighter-side / lagging-side repair that reduces imbalance
 - Any candidate order must compute projected unmatched fraction before submit.
-- Block any candidate order whose projected unmatched fraction is `>= 0.20`, even if current state is still below hard-disable.
+- Block any candidate order whose projected unmatched fraction is `>= 0.20`, unless already in `HardDisable` and the repair reduces imbalance.
 - `bot_runtime_pair_build_materially_skewed(...)` stops being the authoritative switch for leaving normal accumulation.
   - paired growth eligibility now requires `current_unmatched_fraction < 0.07`
   - lighter-side repair remains allowed only when it improves imbalance
 - `Taper` inherits the same imbalance gating:
   - no paired optional adds when state is not `Normal`
   - repair-only while in `Throttle` or `Warning`
-  - no new orders in `HardDisable`
+  - no new taper orders in `HardDisable` (lighter-side repair handled by pair-build path)
 
 ### 4. Logging and observability
 - Update pair-build, taper, and loop metrics/logs to include:

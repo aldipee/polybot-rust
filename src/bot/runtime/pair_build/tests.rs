@@ -1766,7 +1766,19 @@ fn pair_build_decision_uses_exact_unmatched_fraction_thresholds() {
 
     let hard_disable = bot_runtime_pair_build_decision(
         100.0, 12.0, 8.0, 4.2, 2.8, 0.30, 0.32, 0.30, 0.32, 100.0, 7.0, 1.0, 1.0, 0.01, &cfg, false,
-    )
-    .expect_err("hard disable should block");
-    assert!(hard_disable.starts_with("hard_imbalance_disable:"));
+    );
+    match hard_disable {
+        Ok(d) => {
+            assert_eq!(d.mode, BotRuntimePairBuildMode::LighterSideFirst);
+            assert_eq!(d.imbalance_state, BotRuntimeImbalanceState::HardDisable);
+            assert!(d.reduces_imbalance);
+        }
+        Err(reason) => {
+            // Repair may fail for clip sizing reasons, but not due to hard_imbalance_disable gate
+            assert!(
+                !reason.starts_with("hard_imbalance_disable:"),
+                "should not hard-block; got: {reason}"
+            );
+        }
+    }
 }

@@ -408,6 +408,8 @@ pub struct BotRuntimeConfigSnapshotV1 {
     pub imbalance_target_fraction: f64,
     pub imbalance_warning_fraction: f64,
     pub imbalance_disable_fraction: f64,
+    #[serde(default = "default_imbalance_recovery_fraction")]
+    pub imbalance_recovery_fraction: f64,
     pub clip_ladder: [f64; 4],
     pub repair_reserve_buffer_usd: f64,
     pub buy_only_normal_flow: bool,
@@ -418,6 +420,10 @@ pub struct BotRuntimeConfigSnapshotV1 {
     pub tail_cap_late_fraction: f64,
     pub bad_regime_window_seconds: f64,
     pub bad_regime_expensive_fraction: f64,
+}
+
+fn default_imbalance_recovery_fraction() -> f64 {
+    0.12
 }
 
 impl From<&BotRuntimeConfigSnapshot> for BotRuntimeConfigSnapshotV1 {
@@ -447,6 +453,7 @@ impl From<&BotRuntimeConfigSnapshot> for BotRuntimeConfigSnapshotV1 {
             imbalance_target_fraction: value.imbalance_target_fraction,
             imbalance_warning_fraction: value.imbalance_warning_fraction,
             imbalance_disable_fraction: value.imbalance_disable_fraction,
+            imbalance_recovery_fraction: value.imbalance_recovery_fraction,
             clip_ladder: value.clip_ladder,
             repair_reserve_buffer_usd: value.repair_reserve_buffer_usd,
             buy_only_normal_flow: value.buy_only_normal_flow,
@@ -488,6 +495,7 @@ impl BotRuntimeConfigSnapshotV1 {
             imbalance_target_fraction: self.imbalance_target_fraction,
             imbalance_warning_fraction: self.imbalance_warning_fraction,
             imbalance_disable_fraction: self.imbalance_disable_fraction,
+            imbalance_recovery_fraction: self.imbalance_recovery_fraction,
             clip_ladder: self.clip_ladder,
             repair_reserve_buffer_usd: self.repair_reserve_buffer_usd,
             buy_only_normal_flow: self.buy_only_normal_flow,

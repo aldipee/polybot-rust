@@ -4507,18 +4507,37 @@ fn startup_one_sided_fill_does_not_latch_hard_disable_forever() {
 }
 
 #[test]
-fn post_completion_hard_disable_remains_sticky() {
+fn post_completion_hard_disable_remains_above_recovery_threshold() {
     let bot = make_bot_runtime_test_bot();
     let cfg = bot_runtime_config_defaults();
 
+    // Enter HardDisable: 12 vs 8 => unmatched_fraction = 4/20 = 0.20
     assert_eq!(
         bot._bot_runtime_note_imbalance_state(20.0, 12.0, 8.0, &cfg),
         BotRuntimeImbalanceState::HardDisable
     );
+    // Improve slightly but still above recovery (0.12): 14 vs 11 => 3/25 = 0.12 >= 0.12
     assert_eq!(
-        bot._bot_runtime_note_imbalance_state(25.0, 12.0, 12.0, &cfg),
+        bot._bot_runtime_note_imbalance_state(25.0, 14.0, 11.0, &cfg),
         BotRuntimeImbalanceState::HardDisable
     );
+}
+
+#[test]
+fn hard_disable_recovers_when_fraction_drops_below_recovery() {
+    let bot = make_bot_runtime_test_bot();
+    let cfg = bot_runtime_config_defaults();
+
+    // Enter HardDisable: 12 vs 8 => unmatched_fraction = 4/20 = 0.20
+    assert_eq!(
+        bot._bot_runtime_note_imbalance_state(20.0, 12.0, 8.0, &cfg),
+        BotRuntimeImbalanceState::HardDisable
+    );
+    // Recover: 12 vs 11 => 1/23 = 0.043 < 0.12 (recovery threshold)
+    let recovered = bot._bot_runtime_note_imbalance_state(30.0, 12.0, 11.0, &cfg);
+    assert_ne!(recovered, BotRuntimeImbalanceState::HardDisable);
+    // With fraction 0.043, should be Normal (< 0.07)
+    assert_eq!(recovered, BotRuntimeImbalanceState::Normal);
 }
 
 /// Exercises the pair identity normalization scenario and checks the expected BOT behavior.

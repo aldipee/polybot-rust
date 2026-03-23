@@ -327,15 +327,6 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     let qty_gap = (q_yes.max(0.0) - q_no.max(0.0)).abs();
     let inventory_vwap_sum = inventory_vwap_sum(q_yes, q_no, cost_yes, cost_no);
     let market_snapshot_vwap_sum = market_snapshot_vwap_sum(y_bid, y_ask, n_bid, n_ask);
-    if matches!(
-        current_imbalance_state,
-        BotRuntimeImbalanceState::HardDisable
-    ) {
-        return Err(format!(
-            "hard_imbalance_disable:{current_unmatched_fraction:.3}"
-        ));
-    }
-
     let cpp_hint = if !inventory_vwap_sum.is_finite() || !market_snapshot_vwap_sum.is_finite() {
         BotRuntimePairBuildCppHint::Small
     } else {
@@ -443,7 +434,12 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
                         q_yes,
                         q_no,
                     );
-                    if projected_unmatched_fraction + 1e-9 >= cfg.imbalance_disable_fraction {
+                    if projected_unmatched_fraction + 1e-9 >= cfg.imbalance_disable_fraction
+                        && !matches!(
+                            current_imbalance_state,
+                            BotRuntimeImbalanceState::HardDisable
+                        )
+                    {
                         return Err(format!(
                             "projected_hard_imbalance_block:{projected_unmatched_fraction:.3}"
                         ));

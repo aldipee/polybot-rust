@@ -269,37 +269,24 @@ impl MakerHedgeCapBot {
             return;
         }
         if matches!(imbalance_state, BotRuntimeImbalanceState::HardDisable) {
-            let cancelled_open_both = self._bot_runtime_cancel_order_family(
+            self._bot_runtime_cancel_order_family(
                 "BOT_OPEN_BOTH",
                 None,
                 "bot_runtime_pair_build_hard_imbalance_disable",
             );
-            let cancelled_pair_build = self._bot_runtime_cancel_pair_build_orders(
+            self._bot_runtime_cancel_pair_build_growth_orders(
                 None,
                 "bot_runtime_pair_build_hard_imbalance_disable",
             );
-            let cancelled_taper = self._bot_runtime_cancel_taper_orders(
+            self._bot_runtime_cancel_taper_orders(
                 None,
                 "bot_runtime_pair_build_hard_imbalance_disable",
             );
-            let cancelled_await_second_fill = self._bot_runtime_cancel_await_second_fill_orders(
+            self._bot_runtime_cancel_await_second_fill_orders(
                 None,
                 "bot_runtime_pair_build_hard_imbalance_disable",
             );
-            let cancelled = cancelled_open_both
-                || cancelled_pair_build
-                || cancelled_taper
-                || cancelled_await_second_fill;
-            self._bot_runtime_log_pair_build_state(
-                if cancelled { "rest" } else { "hold" },
-                "hard_imbalance_disable",
-                None,
-                t_into_s,
-                total_cost,
-                q_yes,
-                q_no,
-            );
-            return;
+            // Fall through to plan computation for lighter-side repair
         }
         if q_yes <= 1e-9 || q_no <= 1e-9 {
             let cancelled = self._bot_runtime_cancel_pair_build_orders(

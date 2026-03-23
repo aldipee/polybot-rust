@@ -19,7 +19,11 @@ impl MakerHedgeCapBot {
             let next_state = if !pair_completed {
                 previous_state
             } else if matches!(previous_state, BotRuntimeImbalanceState::HardDisable) {
-                BotRuntimeImbalanceState::HardDisable
+                if current_fraction + 1e-9 < cfg.imbalance_recovery_fraction {
+                    computed_state
+                } else {
+                    BotRuntimeImbalanceState::HardDisable
+                }
             } else {
                 computed_state
             };
