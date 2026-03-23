@@ -177,7 +177,10 @@ impl MakerHedgeCapBot {
             } else if !same_refresh_family && now - slot.last_cancel_ts < replace_min {
                 return MakerPairGrossPreview::default();
             }
-            return MakerPairGrossPreview::default();
+            return MakerPairGrossPreview {
+                requested_gross_usd: price * size,
+                replace_order_ids: slot.order_id.clone().into_iter().collect(),
+            };
         }
 
         MakerPairGrossPreview {
