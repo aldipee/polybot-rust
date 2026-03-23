@@ -166,19 +166,19 @@ fn bot_runtime_pair_build_clip_bucket_boundaries() {
 #[test]
 fn bot_runtime_pair_build_paired_cost_band_transitions() {
     assert_eq!(
-        bot_runtime_pair_build_projected_paired_cost_band(1.03),
+        bot_runtime_pair_build_projected_paired_cost_band(1.05),
         BotRuntimePairedCostBand::Danger
     );
     assert_eq!(
-        bot_runtime_pair_build_projected_paired_cost_band(1.01),
+        bot_runtime_pair_build_projected_paired_cost_band(1.03),
         BotRuntimePairedCostBand::StopAdd
     );
     assert_eq!(
-        bot_runtime_pair_build_projected_paired_cost_band(0.99),
+        bot_runtime_pair_build_projected_paired_cost_band(1.00),
         BotRuntimePairedCostBand::Caution
     );
     assert_eq!(
-        bot_runtime_pair_build_projected_paired_cost_band(0.95),
+        bot_runtime_pair_build_projected_paired_cost_band(0.97),
         BotRuntimePairedCostBand::Acceptable
     );
     assert_eq!(
@@ -190,14 +190,14 @@ fn bot_runtime_pair_build_paired_cost_band_transitions() {
 #[test]
 fn pair_build_price_zone_invariant_blocks_all_adds_at_or_above_one_for_both_modes() {
     let blocking_cases = [
-        (1.0, BotRuntimePairedCostBand::StopAdd),
-        (1.000_001, BotRuntimePairedCostBand::StopAdd),
-        (1.029, BotRuntimePairedCostBand::StopAdd),
-        (1.029_999, BotRuntimePairedCostBand::StopAdd),
-        (1.03, BotRuntimePairedCostBand::Danger),
+        (1.02, BotRuntimePairedCostBand::StopAdd),
+        (1.020_001, BotRuntimePairedCostBand::StopAdd),
+        (1.049, BotRuntimePairedCostBand::StopAdd),
+        (1.049_999, BotRuntimePairedCostBand::StopAdd),
+        (1.05, BotRuntimePairedCostBand::Danger),
         (1.20, BotRuntimePairedCostBand::Danger),
     ];
-    let non_blocking_cases = [0.90, 0.94, 0.97, 0.999];
+    let non_blocking_cases = [0.90, 0.96, 0.99, 1.019];
 
     for mode in [
         BotRuntimeMarginalCostMode::BalancedAdd,
@@ -239,7 +239,7 @@ fn pair_build_price_zone_invariant_blocks_all_adds_at_or_above_one_for_both_mode
 fn pair_build_decision_surfaces_balanced_add_stop_add_zone_for_runtime_gating() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
-        60.0, 20.0, 20.0, 6.0, 6.0, 0.50, 0.52, 0.50, 0.52, 40.0, 12.0, 1.0, 1.0, 0.01, &cfg, false,
+        60.0, 20.0, 20.0, 6.0, 6.0, 0.51, 0.53, 0.51, 0.53, 40.0, 12.0, 1.0, 1.0, 0.01, &cfg, false,
     )
     .expect("raw decision should surface the stop-add zone for later runtime gating");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::PairedGrowth);
@@ -248,14 +248,14 @@ fn pair_build_decision_surfaces_balanced_add_stop_add_zone_for_runtime_gating() 
         decision.marginal_cost_mode,
         BotRuntimeMarginalCostMode::BalancedAdd
     );
-    assert!((decision.effective_marginal_pair_cost - 1.0).abs() < 1e-9);
+    assert!((decision.effective_marginal_pair_cost - 1.02).abs() < 1e-9);
 }
 
 #[test]
 fn pair_build_decision_allows_balanced_add_below_one_even_with_high_inventory_vwap() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
-        60.0, 20.0, 20.0, 10.4, 10.4, 0.49, 0.51, 0.49, 0.51, 80.0, 20.8, 1.0, 1.0, 0.01, &cfg,
+        60.0, 20.0, 20.0, 10.4, 10.4, 0.50, 0.52, 0.50, 0.52, 80.0, 20.8, 1.0, 1.0, 0.01, &cfg,
         false,
     )
     .expect("caution-zone balanced add should remain legal");
@@ -265,7 +265,7 @@ fn pair_build_decision_allows_balanced_add_below_one_even_with_high_inventory_vw
         decision.marginal_cost_mode,
         BotRuntimeMarginalCostMode::BalancedAdd
     );
-    assert!((decision.effective_marginal_pair_cost - 0.98).abs() < 1e-9);
+    assert!((decision.effective_marginal_pair_cost - 1.00).abs() < 1e-9);
 }
 
 #[test]
@@ -277,7 +277,7 @@ fn pair_build_decision_uses_rebalance_effective_marginal_pair_cost() {
     .expect("sub-one rebalance add should remain legal");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::LighterSideFirst);
     assert_eq!(decision.side, Some(OutcomeSide::No));
-    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::Acceptable);
+    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::Preferred);
     assert_eq!(
         decision.marginal_cost_mode,
         BotRuntimeMarginalCostMode::RebalanceAdd
@@ -722,7 +722,7 @@ fn pair_build_repair_budget_cap_uses_lagging_side_order_price() {
 fn pair_build_decision_surfaces_rebalance_add_stop_add_zone_for_runtime_gating() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
-        60.0, 14.0, 10.0, 8.4, 6.0, 0.60, 0.62, 0.40, 0.42, 80.0, 14.4, 1.0, 1.0, 0.01, &cfg, false,
+        60.0, 14.0, 10.0, 8.4, 6.0, 0.60, 0.62, 0.42, 0.44, 80.0, 14.4, 1.0, 1.0, 0.01, &cfg, false,
     )
     .expect("raw repair decision should surface the stop-add zone for later runtime gating");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::LighterSideFirst);
@@ -732,7 +732,7 @@ fn pair_build_decision_surfaces_rebalance_add_stop_add_zone_for_runtime_gating()
         decision.marginal_cost_mode,
         BotRuntimeMarginalCostMode::RebalanceAdd
     );
-    assert!((decision.effective_marginal_pair_cost - 1.0).abs() < 1e-9);
+    assert!((decision.effective_marginal_pair_cost - 1.02).abs() < 1e-9);
 }
 
 #[test]
@@ -1265,7 +1265,7 @@ fn live_pair_build_handler_still_holds_on_user_ws_disconnect() {
 fn pair_build_handler_blocks_balanced_add_at_stop_add_zone_without_tail_repair_priority() {
     let mut bot = make_pair_build_test_bot();
     bot.cfg.max_total_cost = 100.0;
-    set_quotes(&bot, 0.50, 0.52, 0.50, 0.52);
+    set_quotes(&bot, 0.51, 0.53, 0.51, 0.53);
 
     let cfg = *bot._bot_runtime_cfg();
     bot._bot_runtime_pair_build_handler(40.0, 40.0, 0.0, 20.0, 20.0, 6.0, 6.0, &cfg);
@@ -1279,7 +1279,7 @@ fn pair_build_handler_blocks_balanced_add_at_stop_add_zone_without_tail_repair_p
     assert!(
         runtime_state
             .pair_build_last_hold_reason
-            .contains("price_zone_stop_add:balanced_add:1.000"),
+            .contains("price_zone_stop_add:balanced_add:1.020"),
         "actual_reason={}",
         runtime_state.pair_build_last_hold_reason
     );

@@ -150,7 +150,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_green_conditions(
     let both_sides_filled = q_yes > 1e-9 && q_no > 1e-9;
     let projected_unmatched_fraction =
         bot_runtime_projected_unmatched_fraction(mode, side, clip.max(0.0), q_yes, q_no);
-    let price_ok = effective_marginal_pair_cost + 1e-9 < 0.94;
+    let price_ok = effective_marginal_pair_cost + 1e-9 < 0.97;
     let imbalance_ok = projected_unmatched_fraction + 1e-9 < cfg.imbalance_target_fraction;
     let time_ok = t_into_s + 1e-9 < 180.0;
     let budget_ok = remaining_budget + 1e-9 >= clip.max(0.0) * budget_reference_cost.max(0.0);
@@ -339,8 +339,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     let cpp_hint = if !inventory_vwap_sum.is_finite() || !market_snapshot_vwap_sum.is_finite() {
         BotRuntimePairBuildCppHint::Small
     } else {
-        let medium_threshold = (market_snapshot_vwap_sum + 0.02).max(0.99);
-        let small_threshold = (market_snapshot_vwap_sum + 0.05).max(1.02);
+        let medium_threshold = (market_snapshot_vwap_sum + 0.04).max(1.01);
+        let small_threshold = (market_snapshot_vwap_sum + 0.08).max(1.05);
         if inventory_vwap_sum > small_threshold {
             BotRuntimePairBuildCppHint::Small
         } else if inventory_vwap_sum > medium_threshold {
@@ -1101,8 +1101,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_cpp_pace_seconds(
     }
     match decision.cpp_hint {
         BotRuntimePairBuildCppHint::Normal => None,
-        BotRuntimePairBuildCppHint::Medium => Some(3.0),
-        BotRuntimePairBuildCppHint::Small => Some(6.0),
+        BotRuntimePairBuildCppHint::Medium => Some(1.0),
+        BotRuntimePairBuildCppHint::Small => Some(2.0),
     }
 }
 

@@ -357,6 +357,13 @@ impl MakerHedgeCapBot {
             return;
         }
         if self._bot_runtime_user_ws_required() && !self.user_connected.load(Ordering::SeqCst) {
+            self.logger.info(&format!(
+                "[BOT][PAIR_BUILD][DIAG] user_ws_required={} user_connected={} configured_order_mode={} t_into={:.1}s",
+                self._bot_runtime_user_ws_required(),
+                self.user_connected.load(Ordering::SeqCst),
+                self.configured_order_mode,
+                t_into_s,
+            ));
             self._bot_runtime_log_pair_build_state(
                 "hold",
                 "user_ws_disconnected",

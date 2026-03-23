@@ -581,7 +581,12 @@ impl MakerHedgeCapBot {
             market_last_update_ts: Arc::new(Mutex::new(0.0)),
             best_quotes: Arc::new(Mutex::new(HashMap::new())),
             market_connected: Arc::new(AtomicBool::new(false)),
-            user_connected: Arc::new(AtomicBool::new(false)),
+            user_connected: Arc::new(AtomicBool::new(
+                matches!(
+                    BotOrderMode::from_config_value(configured_order_mode.as_str()),
+                    Some(BotOrderMode::Paper)
+                ),
+            )),
             book_cache: Arc::new(Mutex::new(HashMap::new())),
             debug_last_ts: Arc::new(Mutex::new(HashMap::new())),
             fsm_state: Arc::new(Mutex::new("ACCUMULATE".to_string())),

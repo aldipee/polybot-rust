@@ -2080,9 +2080,31 @@ impl MakerHedgeCapBot {
             );
             return;
         };
+        // Cap the missing side bid to preserve structural edge (combined VWAP < 0.97).
+        // If the filled side has a known VWAP, cap missing_bid so that
+        // filled_side_vwap + missing_bid <= 0.97 (3% structural edge target).
+        let capped_missing_bid = {
+            let (filled_qty, filled_cost) = match missing_side {
+                OutcomeSide::Yes => (q_no, cost_no),
+                OutcomeSide::No => (q_yes, cost_yes),
+            };
+            if filled_qty > 1e-9 {
+                let filled_vwap = filled_cost / filled_qty;
+                let max_missing_price = (0.97 - filled_vwap).max(0.01);
+                if missing_bid > max_missing_price {
+                    self.logger.info(&format!(
+                        "[BOT][AWAIT_SECOND_FILL] pair_id={} capping missing_bid from {:.3} to {:.3} (filled_vwap={:.3} edge_cap=0.97)",
+                        pair_id, missing_bid, max_missing_price, filled_vwap,
+                    ));
+                }
+                missing_bid.min(max_missing_price)
+            } else {
+                missing_bid
+            }
+        };
         let oid = self._maker_order_upsert_gtc(
             &key,
-            missing_bid,
+            capped_missing_bid,
             size_int as f64,
             "BOT_AWAIT_SECOND_FILL",
         );

@@ -5069,7 +5069,7 @@ fn taper_handler_blocks_balanced_add_at_stop_add_zone_after_runtime_gating() {
     let mut bot = make_bot_runtime_test_bot();
     bot.cfg.max_total_cost = 500.0;
     let now = now_ts_f64();
-    set_pair_quotes(&bot, 0.50, 0.52, 0.50, 0.52, now);
+    set_pair_quotes(&bot, 0.51, 0.53, 0.51, 0.53, now);
 
     let cfg = *bot._bot_runtime_cfg();
     bot._bot_runtime_taper_handler(200.0, 200.0, 12.0, 20.0, 20.0, 6.0, 6.0, &cfg);
@@ -5083,7 +5083,7 @@ fn taper_handler_blocks_balanced_add_at_stop_add_zone_after_runtime_gating() {
     assert!(
         runtime_state
             .taper_last_hold_reason
-            .starts_with("hold:price_zone_stop_add:balanced_add:1.000"),
+            .starts_with("hold:price_zone_stop_add:balanced_add:1.020"),
         "actual_reason={}",
         runtime_state.taper_last_hold_reason
     );
