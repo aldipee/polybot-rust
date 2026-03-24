@@ -72,10 +72,15 @@ impl MakerHedgeCapBot {
                 .lock()
                 .map(|st| st.imbalance_state)
                 .unwrap_or(BotRuntimeImbalanceState::Normal);
+            // IMP-26: Also allow lighter-side repair in Throttle state when pair sum
+            // is temporarily above 1.00.  Vidardx data shows markets routinely cross
+            // above 1.00 and recover through continued cheap lagging-side accumulation.
             let imbalance_repair = decision.mode == BotRuntimePairBuildMode::LighterSideFirst
                 && matches!(
                     runtime_imbalance_state,
-                    BotRuntimeImbalanceState::HardDisable | BotRuntimeImbalanceState::Warning
+                    BotRuntimeImbalanceState::HardDisable
+                        | BotRuntimeImbalanceState::Warning
+                        | BotRuntimeImbalanceState::Throttle
                 );
             if !imbalance_repair {
                 return Err(reason);

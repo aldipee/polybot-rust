@@ -5863,13 +5863,16 @@ fn await_second_fill_rescue_hard_pauses_when_taker_cap_is_breached() {
     let cfg = *bot._bot_runtime_cfg();
     bot._bot_runtime_await_second_fill_handler(now, 31.0, 2.0, 5.0, 0.0, 2.0, 0.0, &cfg);
 
+    // IMP-26: With continuous accumulation, taker cap breach no longer causes
+    // hard pause.  Rescue is marked as used and the bot continues with maker
+    // orders instead of hard-pausing.
     let runtime_state = bot
         .bot_runtime_state
         .lock()
         .map(|st| st.clone())
         .unwrap_or_default();
-    assert!(!runtime_state.await_second_fill_rescue_used);
-    assert!(runtime_state.await_second_fill_hard_paused);
+    assert!(runtime_state.await_second_fill_rescue_used);
+    assert!(!runtime_state.await_second_fill_hard_paused);
 }
 
 #[test]

@@ -1609,7 +1609,14 @@ impl MakerHedgeCapBot {
         let (missing_bid, missing_ask) = missing_quote
             .map(|(bid, ask, _)| (bid, ask))
             .unwrap_or((0.0, 0.0));
-        let size_int = if deadline_elapsed {
+        // IMP-26: Compute maker size for both pre- and post-deadline.
+        // Post-deadline, we continue posting maker orders instead of hard-pausing.
+        // The zero_missing_bid check is skipped post-deadline since the bid may
+        // legitimately be zero while the ask is available for rescue evaluation.
+        let size_int = if deadline_elapsed && missing_bid <= 0.0 {
+            // Post-deadline with no bid: size not computable from bid.
+            // Rescue flow uses missing_ask directly. Maker flow will use
+            // the edge-capped bid which may be > 0 even when market bid is 0.
             None
         } else {
             if missing_bid <= 0.0 {
@@ -1658,7 +1665,13 @@ impl MakerHedgeCapBot {
                 q_no,
             );
         }
-        if time_since_first_side_s >= bot_runtime_await_second_fill_deadline_seconds() - 1e-9 {
+        // IMP-26: Post-deadline flow restructured for continuous accumulation.
+        // Instead of hard-pausing when rescue fails, fall through to maker flow.
+        if time_since_first_side_s >= bot_runtime_await_second_fill_deadline_seconds() - 1e-9
+            && !rescue_used
+        {
+            // First attempt: cancel existing maker orders and try taker rescue.
+            // This only runs once (rescue_used is set after attempt).
             if maker_slot_family_live(&prev_slot, "BOT_AWAIT_SECOND_FILL")
                 && prev_slot.state != MakerOrderLifecycle::CancelPending
             {
@@ -1706,28 +1719,6 @@ impl MakerHedgeCapBot {
                 );
                 return;
             }
-            if rescue_used {
-                self._bot_runtime_mark_await_second_fill_hard_paused(
-                    now,
-                    "still_one_sided_after_rescue",
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                self._bot_runtime_log_await_second_fill_hold(
-                    "hard_paused",
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                return;
-            }
             let rescue_budget_clip = bot_runtime_await_second_fill_repair_size(
                 cfg.clip_ladder[0],
                 self.cfg.min_shares,
@@ -1753,262 +1744,150 @@ impl MakerHedgeCapBot {
                 cost_no,
                 missing_ask,
             );
-            let Some(rescue_size) = rescue_size else {
-                self._bot_runtime_mark_await_second_fill_hard_paused(
-                    now,
-                    "rescue_clip_unavailable",
+            // Determine if taker rescue is viable.
+            let rescue_viable = rescue_size.is_some()
+                && marginal_pair_sum.map_or(false, |ps| ps < 1.0 - 1e-9);
+            if rescue_viable {
+                let rescue_size = rescue_size.unwrap();
+                let marginal_pair_sum = marginal_pair_sum.unwrap();
+                let (yes_bid_for_residual, no_bid_for_residual) = match missing_side {
+                    OutcomeSide::Yes => (
+                        missing_bid,
+                        self._best_bid_ask(no_asset)
+                            .map(|(bid, _)| bid)
+                            .unwrap_or(0.0),
+                    ),
+                    OutcomeSide::No => (
+                        self._best_bid_ask(yes_asset)
+                            .map(|(bid, _)| bid)
+                            .unwrap_or(0.0),
+                        missing_bid,
+                    ),
+                };
+                let (favorite_side, underdog_side) = bot_runtime_favorite_underdog_sides(
+                    yes_bid_for_residual,
+                    no_bid_for_residual,
+                    self.cfg.tick.max(0.0001),
+                );
+                let residual_side = bot_runtime_residual_side(q_yes, q_no);
+                let projected_residual_side = bot_runtime_projected_residual_side_and_magnitude(
+                    BotRuntimePairBuildMode::LighterSideFirst,
                     Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
+                    rescue_size as f64,
                     q_yes,
                     q_no,
-                );
-                self._bot_runtime_log_await_second_fill_hold(
-                    "rescue_clip_unavailable",
+                )
+                .0;
+                let residual_kind =
+                    bot_runtime_residual_kind(favorite_side, underdog_side, residual_side);
+                let increases_underdog_residual = bot_runtime_would_increase_underdog_residual_for_side(
+                    BotRuntimePairBuildMode::LighterSideFirst,
                     Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
+                    rescue_size as f64,
                     q_yes,
                     q_no,
+                    underdog_side,
                 );
-                return;
-            };
-            let Some(marginal_pair_sum) = marginal_pair_sum else {
-                self._bot_runtime_mark_await_second_fill_hard_paused(
-                    now,
-                    "rescue_pair_sum_unavailable",
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                self._bot_runtime_log_await_second_fill_hold(
-                    "rescue_pair_sum_unavailable",
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                return;
-            };
-            let (yes_bid_for_residual, no_bid_for_residual) = match missing_side {
-                OutcomeSide::Yes => (
-                    missing_bid,
-                    self._best_bid_ask(no_asset)
-                        .map(|(bid, _)| bid)
-                        .unwrap_or(0.0),
-                ),
-                OutcomeSide::No => (
-                    self._best_bid_ask(yes_asset)
-                        .map(|(bid, _)| bid)
-                        .unwrap_or(0.0),
-                    missing_bid,
-                ),
-            };
-            let (favorite_side, underdog_side) = bot_runtime_favorite_underdog_sides(
-                yes_bid_for_residual,
-                no_bid_for_residual,
-                self.cfg.tick.max(0.0001),
-            );
-            let residual_side = bot_runtime_residual_side(q_yes, q_no);
-            let projected_residual_side = bot_runtime_projected_residual_side_and_magnitude(
-                BotRuntimePairBuildMode::LighterSideFirst,
-                Some(missing_side),
-                rescue_size as f64,
-                q_yes,
-                q_no,
-            )
-            .0;
-            let residual_kind =
-                bot_runtime_residual_kind(favorite_side, underdog_side, residual_side);
-            let increases_underdog_residual = bot_runtime_would_increase_underdog_residual_for_side(
-                BotRuntimePairBuildMode::LighterSideFirst,
-                Some(missing_side),
-                rescue_size as f64,
-                q_yes,
-                q_no,
-                underdog_side,
-            );
-            if increases_underdog_residual {
-                let reason = format!(
-                    "underdog_residual_increase_block:{}:{}:{}",
-                    missing_side.as_str(),
-                    residual_side.map(|side| side.as_str()).unwrap_or("NONE"),
-                    underdog_side.map(|side| side.as_str()).unwrap_or("NONE")
-                );
-                let _ = self._bot_runtime_cancel_bot_orders_on_side(
-                    missing_side,
-                    "bot_runtime_await_second_fill_residual_hold",
-                );
-                self._bot_runtime_mark_await_second_fill_hard_paused(
-                    now,
-                    reason.as_str(),
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                self._bot_runtime_log_await_second_fill_hold(
-                    reason.as_str(),
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                return;
+                if !increases_underdog_residual {
+                    if let Ok(_) = self._evaluate_taker_submit_gate(
+                        "BUY",
+                        missing_asset,
+                        rescue_size as f64,
+                        Some(TakerExceptionReason::AwaitSecondFillRescue),
+                        TakerCapPolicy::EnforceCap,
+                    ) {
+                        self._set_pending_entry_reason("BOT_AWAIT_SECOND_FILL_RESCUE");
+                        let oid = self._place_taker_bid_fak(
+                            missing_asset,
+                            missing_ask,
+                            rescue_size as f64,
+                            Some("FAK"),
+                            Some(TakerExceptionReason::AwaitSecondFillRescue),
+                            TakerCapPolicy::EnforceCap,
+                        );
+                        if let Some(order_id) = oid.as_deref() {
+                            let decision_event_id = self._audit_insert_decision_event(
+                                "await_second_fill",
+                                None,
+                                true,
+                                "await_second_fill_rescue_submit",
+                                Some("BOT_AWAIT_SECOND_FILL_RESCUE"),
+                                Some(missing_side.as_str()),
+                                t_into_s,
+                                total_cost,
+                                q_yes,
+                                q_no,
+                            );
+                            if let Ok(mut st) = self.bot_runtime_state.lock() {
+                                st.await_second_fill_rescue_used = true;
+                                st.await_second_fill_rescue_attempted_ts = now;
+                                st.second_side_by_30s = false;
+                                st.await_second_fill_last_hold_reason.clear();
+                            }
+                            if let Some(decision_event_id) = decision_event_id.as_deref() {
+                                self._audit_attach_decision_context(
+                                    order_id,
+                                    decision_event_id,
+                                    "await_second_fill_rescue_submit",
+                                );
+                            }
+                            self._merge_order_execution_context_fields(
+                                order_id,
+                                &json!({
+                                    "origin": "BOT_AWAIT_SECOND_FILL_RESCUE",
+                                    "bot_runtime_await_second_fill_rescue": true,
+                                    "missing_side": missing_side.as_str(),
+                                }),
+                            );
+                            self.logger.warning(&format!(
+                                "[BOT][AWAIT_SECOND_FILL] pair_id={} rescue_attempted missing_side={} ask={:.3} clip={} visible_ask={:.2} marginal_pair_sum={:.3} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} t_into={:.1}s since_first_side={:.1}s",
+                                pair_id,
+                                missing_side.as_str(),
+                                missing_ask,
+                                rescue_size,
+                                visible_ask_size.max(0.0),
+                                marginal_pair_sum,
+                                favorite_side
+                                    .map(|side| side.as_str().to_string())
+                                    .unwrap_or_else(|| "NA".to_string()),
+                                underdog_side
+                                    .map(|side| side.as_str().to_string())
+                                    .unwrap_or_else(|| "NA".to_string()),
+                                residual_side
+                                    .map(|side| side.as_str().to_string())
+                                    .unwrap_or_else(|| "NA".to_string()),
+                                projected_residual_side
+                                    .map(|side| side.as_str().to_string())
+                                    .unwrap_or_else(|| "NA".to_string()),
+                                residual_kind.as_str(),
+                                BotRuntimeOneSideExceptionKind::SecondSideCompletion.as_str(),
+                                increases_underdog_residual,
+                                t_into_s.max(0.0),
+                                time_since_first_side_s
+                            ));
+                            self._bot_runtime_clear_await_second_fill_hold();
+                        }
+                    }
+                }
             }
-            if marginal_pair_sum >= 1.0 - 1e-9 {
-                self._bot_runtime_mark_await_second_fill_hard_paused(
-                    now,
-                    "rescue_pair_sum_too_high",
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                self._bot_runtime_log_await_second_fill_hold(
-                    &format!("rescue_pair_sum_too_high:{marginal_pair_sum:.3}"),
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                return;
-            }
-            if let Err(reason) = self._evaluate_taker_submit_gate(
-                "BUY",
-                missing_asset,
-                rescue_size as f64,
-                Some(TakerExceptionReason::AwaitSecondFillRescue),
-                TakerCapPolicy::EnforceCap,
-            ) {
-                self._bot_runtime_mark_await_second_fill_hard_paused(
-                    now,
-                    reason.as_str(),
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                self._bot_runtime_log_await_second_fill_hold(
-                    reason.as_str(),
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                return;
-            }
-            self._set_pending_entry_reason("BOT_AWAIT_SECOND_FILL_RESCUE");
-            let oid = self._place_taker_bid_fak(
-                missing_asset,
-                missing_ask,
-                rescue_size as f64,
-                Some("FAK"),
-                Some(TakerExceptionReason::AwaitSecondFillRescue),
-                TakerCapPolicy::EnforceCap,
-            );
-            if let Some(order_id) = oid.as_deref() {
-                let decision_event_id = self._audit_insert_decision_event(
-                    "await_second_fill",
-                    None,
-                    true,
-                    "await_second_fill_rescue_submit",
-                    Some("BOT_AWAIT_SECOND_FILL_RESCUE"),
-                    Some(missing_side.as_str()),
-                    t_into_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                if let Ok(mut st) = self.bot_runtime_state.lock() {
-                    st.await_second_fill_rescue_used = true;
+            // IMP-26: Mark rescue as used regardless of outcome. On next tick,
+            // the bot will fall through to the maker order flow below.
+            if let Ok(mut st) = self.bot_runtime_state.lock() {
+                st.await_second_fill_rescue_used = true;
+                if st.await_second_fill_rescue_attempted_ts <= 0.0 {
                     st.await_second_fill_rescue_attempted_ts = now;
-                    st.second_side_by_30s = false;
-                    st.await_second_fill_last_hold_reason.clear();
                 }
-                if let Some(decision_event_id) = decision_event_id.as_deref() {
-                    self._audit_attach_decision_context(
-                        order_id,
-                        decision_event_id,
-                        "await_second_fill_rescue_submit",
-                    );
-                }
-                self._merge_order_execution_context_fields(
-                    order_id,
-                    &json!({
-                        "origin": "BOT_AWAIT_SECOND_FILL_RESCUE",
-                        "bot_runtime_await_second_fill_rescue": true,
-                        "missing_side": missing_side.as_str(),
-                    }),
-                );
-                self.logger.warning(&format!(
-                    "[BOT][AWAIT_SECOND_FILL] pair_id={} rescue_attempted missing_side={} ask={:.3} clip={} visible_ask={:.2} marginal_pair_sum={:.3} favorite_side={} underdog_side={} residual_side={} projected_residual_side={} residual_kind={} one_side_exception_kind={} increases_underdog_residual={} t_into={:.1}s since_first_side={:.1}s",
-                    pair_id,
-                    missing_side.as_str(),
-                    missing_ask,
-                    rescue_size,
-                    visible_ask_size.max(0.0),
-                    marginal_pair_sum,
-                    favorite_side
-                        .map(|side| side.as_str().to_string())
-                        .unwrap_or_else(|| "NA".to_string()),
-                    underdog_side
-                        .map(|side| side.as_str().to_string())
-                        .unwrap_or_else(|| "NA".to_string()),
-                    residual_side
-                        .map(|side| side.as_str().to_string())
-                        .unwrap_or_else(|| "NA".to_string()),
-                    projected_residual_side
-                        .map(|side| side.as_str().to_string())
-                        .unwrap_or_else(|| "NA".to_string()),
-                    residual_kind.as_str(),
-                    BotRuntimeOneSideExceptionKind::SecondSideCompletion.as_str(),
-                    increases_underdog_residual,
-                    t_into_s.max(0.0),
-                    time_since_first_side_s
-                ));
-                self._bot_runtime_clear_await_second_fill_hold();
-            } else {
-                self._bot_runtime_mark_await_second_fill_hard_paused(
-                    now,
-                    "rescue_submit_failed",
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
-                self._bot_runtime_log_await_second_fill_hold(
-                    "rescue_submit_failed",
-                    Some(missing_side),
-                    t_into_s,
-                    time_since_first_side_s,
-                    total_cost,
-                    q_yes,
-                    q_no,
-                );
             }
-            return;
+            if !rescue_viable {
+                self.logger.info(&format!(
+                    "[BOT][AWAIT_SECOND_FILL] pair_id={} rescue_skipped (pair_sum={} clip={}) — continuing maker flow t_into={:.1}s since_first_side={:.1}s",
+                    pair_id,
+                    marginal_pair_sum.map_or("N/A".to_string(), |ps| format!("{:.3}", ps)),
+                    rescue_size.map_or("N/A".to_string(), |s| format!("{}", s)),
+                    t_into_s, time_since_first_side_s,
+                ));
+            }
+            // Fall through to maker order placement below (don't return).
         }
         if maker_slot_family_live(&prev_slot, "BOT_AWAIT_SECOND_FILL") {
             let age_s = (now - prev_slot.last_submit_ts).max(0.0);
@@ -2096,12 +1975,12 @@ impl MakerHedgeCapBot {
             );
             return;
         };
-        // Cap the missing side bid to preserve structural edge (combined VWAP < 0.97).
-        // If the filled side has a known VWAP, cap missing_bid so that
-        // filled_side_vwap + missing_bid <= 1.00 (at-par StopAdd boundary).
-        // During startup AwaitSecondFill the bot has already committed to one
-        // side and must complete the pair — blocking at 0.97 leaves a naked
-        // position.  Paired growth will enforce the tighter Caution threshold.
+        // IMP-26: Cap the missing side bid so that filled_side_vwap + missing_bid <= 1.05.
+        // Raised from 1.00 to 1.05 to allow continued accumulation when pair sum is
+        // temporarily above 1.00.  Vidardx data shows avg max pair sum ~1.03, and
+        // markets routinely recover through cheap maker accumulation.  The 0.05
+        // tolerance gives breathing room while preventing absurd overpayment.
+        // Paired growth will enforce the tighter StopAdd threshold.
         let capped_missing_bid = {
             let (filled_qty, filled_cost) = match missing_side {
                 OutcomeSide::Yes => (q_no, cost_no),
@@ -2109,10 +1988,10 @@ impl MakerHedgeCapBot {
             };
             if filled_qty > 1e-9 {
                 let filled_vwap = filled_cost / filled_qty;
-                let max_missing_price = (1.00 - filled_vwap).max(0.01);
+                let max_missing_price = (1.05 - filled_vwap).max(0.01);
                 if missing_bid > max_missing_price {
                     self.logger.info(&format!(
-                        "[BOT][AWAIT_SECOND_FILL] pair_id={} capping missing_bid from {:.3} to {:.3} (filled_vwap={:.3} edge_cap=1.00)",
+                        "[BOT][AWAIT_SECOND_FILL] pair_id={} capping missing_bid from {:.3} to {:.3} (filled_vwap={:.3} edge_cap=1.05)",
                         pair_id, missing_bid, max_missing_price, filled_vwap,
                     ));
                 }
