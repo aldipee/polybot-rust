@@ -861,6 +861,23 @@ fn repair_requested_rung_rejects_ladder_when_min_valid_clip_exceeds_gap() {
 }
 
 #[test]
+fn repair_clip_choice_allows_seed_overshoot_for_near_seed_gap() {
+    let cfg = bot_runtime_config_defaults();
+    // gap=11, ladder[0]=12: gap >= 12*0.5=6 so seed overshoot allowed
+    let result = bot_runtime_repair_clip_choice(f64::INFINITY, 11.0, Some(12.0), Some(12.0), &cfg);
+    assert_eq!(result, Some((12.0, BotRuntimeClipRung::Seed)));
+    // gap=7: still >= 6, allowed
+    let result = bot_runtime_repair_clip_choice(f64::INFINITY, 7.0, Some(12.0), Some(12.0), &cfg);
+    assert_eq!(result, Some((12.0, BotRuntimeClipRung::Seed)));
+    // gap=5: below threshold (5 < 6), NOT allowed
+    let result = bot_runtime_repair_clip_choice(f64::INFINITY, 5.0, Some(12.0), Some(12.0), &cfg);
+    assert!(result.is_none());
+    // gap=1: well below threshold, NOT allowed
+    let result = bot_runtime_repair_clip_choice(f64::INFINITY, 1.0, Some(12.0), Some(12.0), &cfg);
+    assert!(result.is_none());
+}
+
+#[test]
 fn tail_repair_priority_keeps_paired_growth_when_min_notional_would_overshoot_gap() {
     let cfg = bot_runtime_config_defaults();
     let decision = BotRuntimePairBuildDecision {

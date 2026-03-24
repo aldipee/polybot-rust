@@ -115,14 +115,27 @@ pub(in crate::bot) fn bot_runtime_repair_clip_choice(
             return Some((clip, rung));
         }
     }
-    exact_gap_clip
-        .filter(|clip| {
-            *clip > 0.0
-                && *clip <= max_clip + 1e-9
-                && *clip + 1e-9 < cfg.clip_ladder[0]
-                && *clip + 1e-9 >= min_valid_clip
-        })
-        .map(|clip| (clip, BotRuntimeClipRung::ExactGapRepair))
+    // Sub-ladder exact-gap repair: the gap is smaller than the seed rung but
+    // large enough to meet min_valid_clip.
+    if let Some(clip) = exact_gap_clip.filter(|clip| {
+        *clip > 0.0
+            && *clip <= max_clip + 1e-9
+            && *clip + 1e-9 < cfg.clip_ladder[0]
+            && *clip + 1e-9 >= min_valid_clip
+    }) {
+        return Some((clip, BotRuntimeClipRung::ExactGapRepair));
+    }
+    // When the gap is just below the seed rung (within one lot of ladder[0]),
+    // allow the seed rung as a repair clip. A small overshoot (e.g., buying 12
+    // to fill an 11-share gap) is preferable to sitting idle. Only permit this
+    // when the gap is at least half the seed size to avoid gross overshooting.
+    if gap + 1e-9 >= cfg.clip_ladder[0] * 0.5 && gap + 1e-9 < cfg.clip_ladder[0] {
+        let seed = cfg.clip_ladder[0];
+        if seed <= max_clip + 1e-9 && seed + 1e-9 >= min_valid_clip {
+            return Some((seed, BotRuntimeClipRung::Seed));
+        }
+    }
+    None
 }
 
 pub(in crate::bot) fn bot_runtime_repair_requested_rung(
