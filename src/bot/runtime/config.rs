@@ -69,7 +69,7 @@ pub(crate) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot {
         target_both_sides_by_30s: 0.80,
         target_both_sides_by_60s: 0.95,
         late_reduce_start_seconds: 180.0,
-        late_balance_only_start_seconds: 225.0,
+        late_balance_only_start_seconds: 240.0, // IMP-27: extend ReduceClips through full Taper
         late_stop_new_orders_start_seconds: 240.0,
         legacy_late_window_budget_mode: false,
         imbalance_target_fraction: 0.07,
@@ -455,13 +455,14 @@ pub(crate) fn bot_runtime_validate_config(
     if invalid_late_balance_only {
         return Err("invalid_late_balance_only_start_seconds");
     }
+    // IMP-27: Allow late_stop == late_balance_only (disables BalanceOnly mode).
     let invalid_late_stop_new_orders = if cfg.legacy_late_window_budget_mode {
         !cfg.late_stop_new_orders_start_seconds.is_finite()
             || cfg.late_stop_new_orders_start_seconds < cfg.late_balance_only_start_seconds
             || cfg.late_stop_new_orders_start_seconds > 300.0
     } else {
         !cfg.late_stop_new_orders_start_seconds.is_finite()
-            || cfg.late_stop_new_orders_start_seconds <= cfg.late_balance_only_start_seconds
+            || cfg.late_stop_new_orders_start_seconds < cfg.late_balance_only_start_seconds
             || cfg.late_stop_new_orders_start_seconds > 300.0
     };
     if invalid_late_stop_new_orders {

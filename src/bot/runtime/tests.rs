@@ -3786,7 +3786,7 @@ fn bot_runtime_config_defaults_include_exact_open_time_targets() {
     assert_eq!(cfg.imbalance_disable_fraction, 0.20);
     assert_eq!(cfg.clip_ladder, [12.0, 20.0, 40.0, 80.0]);
     assert_eq!(cfg.late_reduce_start_seconds, 180.0);
-    assert_eq!(cfg.late_balance_only_start_seconds, 225.0);
+    assert_eq!(cfg.late_balance_only_start_seconds, 240.0); // IMP-27
     assert_eq!(cfg.late_stop_new_orders_start_seconds, 240.0);
 }
 
@@ -3827,8 +3827,10 @@ fn bot_runtime_validate_config_rejects_invalid_open_time_targets() {
         Err("invalid_late_balance_only_start_seconds")
     );
 
+    // IMP-27: late_stop == late_balance_only is now valid (disables BalanceOnly).
+    // Test that late_stop < late_balance_only is still rejected.
     let mut cfg = bot_runtime_config_defaults();
-    cfg.late_stop_new_orders_start_seconds = cfg.late_balance_only_start_seconds;
+    cfg.late_stop_new_orders_start_seconds = cfg.late_balance_only_start_seconds - 1.0;
     assert_eq!(
         bot_runtime_validate_config(&cfg),
         Err("invalid_late_stop_new_orders_start_seconds")
@@ -4069,13 +4071,15 @@ fn bot_runtime_taper_mode_uses_exact_late_window_boundaries() {
         bot_runtime_taper_mode(224.9, &cfg),
         BotRuntimeTaperMode::ReduceClips
     );
+    // IMP-27: BalanceOnly shifted from 225s to 240s (same as AwaitSettlement),
+    // so ReduceClips now covers the full Taper window.
     assert_eq!(
         bot_runtime_taper_mode(225.0, &cfg),
-        BotRuntimeTaperMode::BalanceOnly
+        BotRuntimeTaperMode::ReduceClips
     );
     assert_eq!(
         bot_runtime_taper_mode(239.9, &cfg),
-        BotRuntimeTaperMode::BalanceOnly
+        BotRuntimeTaperMode::ReduceClips
     );
 }
 
@@ -4100,6 +4104,8 @@ fn taper_maintenance_decision_downshifts_paired_growth_to_min_lot() {
 
 #[test]
 fn late_window_fill_and_submit_counters_follow_180_225_240_thresholds() {
+    // IMP-27: late_balance_only_start_seconds moved from 225 to 240.
+    // The "after_225" counters now use the 240 threshold from config.
     let cfg = bot_runtime_config_defaults();
     let mut state = BotRuntimeState::default();
     bot_runtime_note_fill_event(&mut state, 179.9, 1.0, true, &cfg);
@@ -4110,20 +4116,26 @@ fn late_window_fill_and_submit_counters_follow_180_225_240_thresholds() {
     assert_eq!(state.late_fill_events_after_180, 1);
     assert_eq!(state.late_fill_events_after_225, 0);
 
+    // At 225s, still below the new 240s threshold for "after_225" counter
     bot_runtime_note_fill_event(&mut state, 225.0, 1.0, true, &cfg);
     assert_eq!(state.late_fill_events_after_180, 2);
+    assert_eq!(state.late_fill_events_after_225, 0);
+
+    // At 240s, crosses the threshold
+    bot_runtime_note_fill_event(&mut state, 240.0, 1.0, true, &cfg);
+    assert_eq!(state.late_fill_events_after_180, 3);
     assert_eq!(state.late_fill_events_after_225, 1);
 
     let bot = make_bot_runtime_test_bot();
     bot._bot_runtime_note_taper_submit(224.9, &cfg);
-    bot._bot_runtime_note_taper_submit(225.0, &cfg);
+    bot._bot_runtime_note_taper_submit(239.9, &cfg);
     bot._bot_runtime_note_taper_submit(240.0, &cfg);
     let state = bot
         .bot_runtime_state
         .lock()
         .map(|st| st.clone())
         .unwrap_or_default();
-    assert_eq!(state.late_new_orders_after_225, 2);
+    assert_eq!(state.late_new_orders_after_225, 1);
     assert_eq!(state.late_new_orders_after_240, 1);
 }
 
@@ -5147,6 +5159,8 @@ fn rebalance_price_zone_hold_cancels_live_taper_lighter_order() {
 
 #[test]
 fn balance_only_window_cancels_live_taper_growth_orders_before_new_repair_work() {
+    // IMP-27: BalanceOnly now starts at 240s (same as AwaitSettlement).
+    // Use a custom config with the old 225s boundary to test the cancel logic.
     let bot = make_bot_runtime_test_bot();
     let now = now_ts_f64();
     set_pair_quotes(&bot, 0.30, 0.32, 0.30, 0.32, now);
@@ -5173,7 +5187,8 @@ fn balance_only_window_cancels_live_taper_growth_orders_before_new_repair_work()
         );
     }
 
-    let cfg = *bot._bot_runtime_cfg();
+    let mut cfg = *bot._bot_runtime_cfg();
+    cfg.late_balance_only_start_seconds = 225.0; // override to test BalanceOnly behavior
     bot._bot_runtime_taper_handler(230.0, 230.0, 12.0, 20.0, 20.0, 6.0, 6.0, &cfg);
 
     let yes_slot = bot._maker_order_slot_get(&MakerOrderKey::buy("yes_asset_id"));

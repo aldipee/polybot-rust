@@ -583,10 +583,18 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     } else {
         f64::INFINITY
     };
+    // IMP-27: Use smaller clips when pair sum is elevated (Caution zone+)
+    // to maximize VWAP averaging benefit.  Vidardx uses median 12 shares.
+    let pair_sum_clip_cap = if pair_sum >= 0.97 - 1e-9 {
+        cfg.clip_ladder[0]
+    } else {
+        f64::INFINITY
+    };
     let final_clip_cap = large_allowed_clip_cap
         .min(cpp_clip_cap)
         .min(pair_budget_clip_cap)
-        .min(cooldown_clip_cap);
+        .min(cooldown_clip_cap)
+        .min(pair_sum_clip_cap);
     let Some((clip, selected_rung)) = bot_runtime_growth_clip_choice(final_clip_cap, cfg) else {
         return Err("budget_too_small".to_string());
     };

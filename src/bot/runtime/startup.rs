@@ -1505,20 +1505,11 @@ impl MakerHedgeCapBot {
                 return;
             }
         };
+        // IMP-27: Only cancel BOT_OPEN_BOTH on the filled side (seed orders are done).
+        // Don't cancel pair_build/taper/await_second_fill on the filled side —
+        // we now post BOT_FILLED_SIDE orders there for both-side accumulation.
         let _ = self._bot_runtime_cancel_order_family(
             "BOT_OPEN_BOTH",
-            Some(missing_side),
-            "bot_runtime_await_second_fill_filled_side_cancel",
-        );
-        let _ = self._bot_runtime_cancel_pair_build_orders(
-            Some(missing_side),
-            "bot_runtime_await_second_fill_filled_side_cancel",
-        );
-        let _ = self._bot_runtime_cancel_taper_orders(
-            Some(missing_side),
-            "bot_runtime_await_second_fill_filled_side_cancel",
-        );
-        let _ = self._bot_runtime_cancel_await_second_fill_orders(
             Some(missing_side),
             "bot_runtime_await_second_fill_filled_side_cancel",
         );
@@ -1537,6 +1528,12 @@ impl MakerHedgeCapBot {
                 "bot_runtime_await_second_fill_hard_paused",
             );
             let _ = self._bot_runtime_cancel_await_second_fill_orders(
+                None,
+                "bot_runtime_await_second_fill_hard_paused",
+            );
+            // IMP-27: Also cancel filled-side orders on hard pause.
+            let _ = self._bot_runtime_cancel_order_family(
+                "BOT_FILLED_SIDE",
                 None,
                 "bot_runtime_await_second_fill_hard_paused",
             );
@@ -2096,6 +2093,42 @@ impl MakerHedgeCapBot {
                 q_yes,
                 q_no,
             );
+        }
+        // IMP-27: Post on the FILLED side too — only at prices below the
+        // filled side's current VWAP so that any fills pull the VWAP down
+        // and help pair sum converge.  Vidardx posts ~50/50 on both sides
+        // continuously and never stops posting on either side.
+        let filled_side = missing_side.opposite();
+        let filled_asset = match filled_side {
+            OutcomeSide::Yes => yes_asset,
+            OutcomeSide::No => no_asset,
+        };
+        let (filled_qty, filled_cost) = match filled_side {
+            OutcomeSide::Yes => (q_yes, cost_yes),
+            OutcomeSide::No => (q_no, cost_no),
+        };
+        if filled_qty > 1e-9 {
+            let filled_vwap = filled_cost / filled_qty;
+            let filled_bid = self
+                ._best_bid_ask(filled_asset)
+                .map(|(bid, _)| bid)
+                .unwrap_or(0.0);
+            // Only post if bid is below current VWAP (fills will pull VWAP down)
+            if filled_bid > 0.0 && filled_bid < filled_vwap - self.cfg.tick.max(0.001) {
+                let budget_remaining = total_usable_budget - total_cost;
+                let max_filled_size =
+                    (budget_remaining / filled_bid.max(0.01)).floor() as i64;
+                let filled_size = (cfg.clip_ladder[0] as i64).min(max_filled_size).max(0);
+                if filled_size >= self.cfg.min_shares as i64 {
+                    let filled_key = MakerOrderKey::buy(filled_asset);
+                    let _ = self._maker_order_upsert_gtc(
+                        &filled_key,
+                        filled_bid,
+                        filled_size as f64,
+                        "BOT_FILLED_SIDE",
+                    );
+                }
+            }
         }
     }
 }
