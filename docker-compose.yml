@@ -1,7 +1,7 @@
 services:
-  polybot-btc-1:
+  polybot-btc-claude-1:
     image: polybot-convert-rust:local
-    container_name: polybot-btc-1
+    container_name: polybot-btc-claude-1
     working_dir: /app/state
     build:
       context: .
@@ -22,7 +22,7 @@ services:
         max-file: "3"
     init: true
     env_file:
-      - btc_1.env
+      - bot-claude.env
     environment:
       LOG_DIR: /app/output
       EXEC_LATENCY_LOG_DIR: /app/logs
@@ -43,44 +43,4 @@ services:
       - /app/output:size=64m,mode=1777
       - /app/logs:size=64m,mode=1777
     restart: unless-stopped
-
-  # polybot-btc-2:
-  #   image: polybot-convert-rust:local
-  #   container_name: polybot-btc-2
-  #   working_dir: /app/state
-  #   network_mode: host
-  #   cpuset: "2"
-  #   ulimits:
-  #     nofile:
-  #       soft: 65535
-  #       hard: 65535
-  #   logging:
-  #     driver: local
-  #     options:
-  #       max-size: "10m"
-  #       max-file: "3"
-  #   init: true
-  #   env_file:
-  #     - btc_2.env
-  #   environment:
-  #     LOG_DIR: /app/output
-  #     EXEC_LATENCY_LOG_DIR: /app/logs
-  #     SIGNAL_FILE_DIR: /app/signals
-  #     EXEC_LATENCY_FILE_LOG_ENABLED: "false"
-  #     EXEC_LATENCY_JSONL_ENABLED: "false"
-  #     EXEC_LATENCY_CSV_ENABLED: "false"
-  #     MARKET_SYMBOL: btc
-  #     BOT_ID: polybot-btc-2
-  #     RTDS_STATE_PATH: /app/state/state/rtds_resolution_state_btc.json
-  #     RTDS_PRICE_TO_BEAT_STATE_PATH: /app/state/state/rtds_price_to_beat_state_btc.json
-  #     RTDS_LATEST_PATH: /app/state/state/rtds_latest_btc.json
-  #   volumes:
-  #     - ./data:/app/data
-  #     - ./signals:/app/signals
-  #     - ./state:/app/state
-  #   tmpfs:
-  #     - /app/output:size=64m,mode=1777
-  #     - /app/logs:size=64m,mode=1777
-  #   restart: unless-stopped
-
 
