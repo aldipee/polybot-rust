@@ -1674,7 +1674,7 @@ fn pair_build_submit_bookkeeping_skips_when_both_legs_are_refresh_noops() {
 
     let decision = bot_runtime_pair_build_decision(
         60.0, 12.0, 12.0, 12.0, 12.0, 0.40, 0.42, 0.40, 0.42, 20.0, 10.0, 1.0, 1.0, 0.01, &cfg,
-        false,
+        false, 0, false,
     )
     .expect("paired-growth decision");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::PairedGrowth);
@@ -4084,7 +4084,7 @@ fn taper_maintenance_decision_downshifts_paired_growth_to_min_lot() {
     let cfg = bot_runtime_config_defaults();
     let decision = bot_runtime_pair_build_decision(
         60.0, 40.0, 40.0, 12.0, 12.0, 0.30, 0.32, 0.30, 0.32, 500.0, 24.0, 1.0, 1.0, 0.01, &cfg,
-        false,
+        false, 0, false,
     )
     .expect("green paired growth should start at the large rung before taper maintenance");
     assert_eq!(decision.clip, 80);
@@ -4471,7 +4471,7 @@ fn trade_metrics_snapshot_reports_bot_runtime_fields() {
 fn metrics_snapshot_reports_exact_unmatched_fraction_and_state() {
     let mut state = BotRuntimeState::default();
     state.imbalance_state = BotRuntimeImbalanceState::Warning;
-    let snapshot = bot_runtime_metrics_snapshot(&state, 14.0, 10.0, 5.6, 4.0, 9.6);
+    let snapshot = bot_runtime_metrics_snapshot(&state, 14.0, 10.0, 5.6, 4.0, 9.6, 100.0);
     assert_eq!(snapshot.unmatched_size, 4.0);
     assert!((snapshot.unmatched_fraction - (4.0 / 24.0)).abs() < 1e-9);
     assert!((snapshot.match_ratio - (10.0 / 14.0)).abs() < 1e-9);
@@ -5813,7 +5813,7 @@ fn runtime_metrics_snapshot_exposes_pair_and_daily_taker_share() {
     state.yes_refresh_cap_block_count = 3;
     state.no_refresh_cap_block_count = 4;
 
-    let metrics = bot_runtime_metrics_snapshot(&state, 10.0, 10.0, 4.0, 4.0, 8.0);
+    let metrics = bot_runtime_metrics_snapshot(&state, 10.0, 10.0, 4.0, 4.0, 8.0, 100.0);
 
     assert!((metrics.pair_taker_share - 0.05).abs() < 1e-9);
     assert!((metrics.daily_taker_share - 0.05).abs() < 1e-9);

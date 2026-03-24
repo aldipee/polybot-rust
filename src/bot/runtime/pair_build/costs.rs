@@ -104,6 +104,27 @@ pub(in crate::bot) fn bot_runtime_pair_build_projected_paired_cost_band(
     }
 }
 
+/// Implements repair-specific projected paired cost band with configurable thresholds.
+/// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
+
+pub(in crate::bot) fn bot_runtime_pair_build_repair_cost_band(
+    projected_paired_cost: f64,
+    danger_threshold: f64,
+    stop_add_threshold: f64,
+) -> BotRuntimePairedCostBand {
+    if !projected_paired_cost.is_finite() || projected_paired_cost >= danger_threshold - 1e-9 {
+        BotRuntimePairedCostBand::Danger
+    } else if projected_paired_cost >= stop_add_threshold - 1e-9 {
+        BotRuntimePairedCostBand::StopAdd
+    } else if projected_paired_cost >= 0.97 - 1e-9 {
+        BotRuntimePairedCostBand::Caution
+    } else if projected_paired_cost >= 0.94 - 1e-9 {
+        BotRuntimePairedCostBand::Acceptable
+    } else {
+        BotRuntimePairedCostBand::Preferred
+    }
+}
+
 /// Implements price-zone hold reason for the BOT runtime.
 /// This is a pure pair-build helper used for BOT runtime policy, math, and decision boundaries.
 

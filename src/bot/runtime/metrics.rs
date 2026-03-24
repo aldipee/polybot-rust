@@ -320,6 +320,7 @@ pub(in crate::bot) fn bot_runtime_note_fill_event(
     if t_into_s >= cfg.late_balance_only_start_seconds {
         state.late_fill_events_after_225 = state.late_fill_events_after_225.saturating_add(1);
     }
+    state.last_fill_t_into_s = t_into_s;
 }
 /// Implements metrics snapshot for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -331,6 +332,7 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
     cost_yes: f64,
     cost_no: f64,
     total_cost: f64,
+    t_into_s: f64,
 ) -> BotRuntimeMetricsSnapshot {
     let total_fill_shares = state.total_fill_shares.max(0.0);
     let maker_fill_share = if total_fill_shares > 1e-9 {
@@ -422,6 +424,14 @@ pub(in crate::bot) fn bot_runtime_metrics_snapshot(
         no_refresh_cap_block_count: state.no_refresh_cap_block_count,
         audit_decision_event_count: state.audit_decision_event_count,
         audit_runtime_event_count: state.audit_runtime_event_count,
+        idle_before_settlement: if state.last_fill_t_into_s > 0.0 {
+            (t_into_s - state.last_fill_t_into_s).max(0.0)
+        } else {
+            t_into_s
+        },
+        one_directional_detected: state.one_directional_detected,
+        one_sided_yes_heavy: state.one_sided_yes_heavy_transitions,
+        one_sided_no_heavy: state.one_sided_no_heavy_transitions,
     }
 }
 /// Implements canary success for the BOT runtime.

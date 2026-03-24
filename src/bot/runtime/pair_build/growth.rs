@@ -94,7 +94,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_optional_buy_policy(
     let small_clip_cap = round_down_to_lot(cfg.clip_ladder[0].max(lot), lot);
     let reduced_clip = round_down_to_lot(current_clip.min(small_clip_cap), lot);
     let weak_edge_reduced = hold_reason.is_none()
-        && (!snapshot_reliable || min_snapshot_edge + 1e-9 < 0.05)
+        && (!snapshot_reliable || min_snapshot_edge + 1e-9 < cfg.weak_edge_threshold)
         && reduced_clip + 1e-9 >= lot
         && reduced_clip + 1e-9 < current_clip;
     Some(BotRuntimeOptionalBuyPolicy {
@@ -342,6 +342,9 @@ impl MakerHedgeCapBot {
             if let Ok(mut st) = self.bot_runtime_state.lock() {
                 st.pair_build_last_paired_growth_yes_bid = context.y_bid;
                 st.pair_build_last_paired_growth_no_bid = context.n_bid;
+                if st.post_repair_cooldown_remaining > 0 {
+                    st.post_repair_cooldown_remaining -= 1;
+                }
             }
         }
         let submit_elapsed_ms = ((now_ts_f64() - submit_started).max(0.0)) * 1000.0;

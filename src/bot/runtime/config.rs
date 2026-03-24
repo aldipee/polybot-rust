@@ -37,6 +37,14 @@ pub(crate) struct BotRuntimeConfigSnapshot {
     pub(crate) bad_regime_window_seconds: f64,
     pub(crate) bad_regime_expensive_fraction: f64,
     pub(crate) mean_reversion_tilt_fraction: f64,
+    pub(crate) post_repair_cooldown_cycles: u32,
+    pub(crate) repair_refresh_timeout_seconds: f64,
+    pub(crate) repair_price_zone_danger: f64,
+    pub(crate) repair_price_zone_stop_add: f64,
+    pub(crate) green_price_threshold: f64,
+    pub(crate) weak_edge_threshold: f64,
+    pub(crate) one_directional_threshold: f64,
+    pub(crate) one_directional_min_fills: u32,
 }
 /// Implements config defaults for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -79,6 +87,14 @@ pub(crate) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot {
         bad_regime_window_seconds: 120.0,
         bad_regime_expensive_fraction: 0.60,
         mean_reversion_tilt_fraction: 0.55,
+        post_repair_cooldown_cycles: 2,
+        repair_refresh_timeout_seconds: 6.0,
+        repair_price_zone_danger: 1.06,
+        repair_price_zone_stop_add: 1.03,
+        green_price_threshold: 0.99,
+        weak_edge_threshold: 0.03,
+        one_directional_threshold: 0.70,
+        one_directional_min_fills: 4,
     }
 }
 /// Implements env float for the BOT runtime.
@@ -348,6 +364,46 @@ where
         cfg.mean_reversion_tilt_fraction,
     )
     .clamp(0.50, 0.70);
+    cfg.post_repair_cooldown_cycles = bot_runtime_env_float(
+        &mut get,
+        "BOT_POST_REPAIR_COOLDOWN_CYCLES",
+        cfg.post_repair_cooldown_cycles as f64,
+    ) as u32;
+    cfg.repair_refresh_timeout_seconds = bot_runtime_env_float(
+        &mut get,
+        "BOT_REPAIR_REFRESH_TIMEOUT_SECONDS",
+        cfg.repair_refresh_timeout_seconds,
+    );
+    cfg.repair_price_zone_danger = bot_runtime_env_float(
+        &mut get,
+        "BOT_REPAIR_PRICE_ZONE_DANGER",
+        cfg.repair_price_zone_danger,
+    );
+    cfg.repair_price_zone_stop_add = bot_runtime_env_float(
+        &mut get,
+        "BOT_REPAIR_PRICE_ZONE_STOP_ADD",
+        cfg.repair_price_zone_stop_add,
+    );
+    cfg.green_price_threshold = bot_runtime_env_float(
+        &mut get,
+        "BOT_GREEN_PRICE_THRESHOLD",
+        cfg.green_price_threshold,
+    );
+    cfg.weak_edge_threshold = bot_runtime_env_float(
+        &mut get,
+        "BOT_WEAK_EDGE_THRESHOLD",
+        cfg.weak_edge_threshold,
+    );
+    cfg.one_directional_threshold = bot_runtime_env_float(
+        &mut get,
+        "BOT_ONE_DIRECTIONAL_THRESHOLD",
+        cfg.one_directional_threshold,
+    );
+    cfg.one_directional_min_fills = bot_runtime_env_float(
+        &mut get,
+        "BOT_ONE_DIRECTIONAL_MIN_FILLS",
+        cfg.one_directional_min_fills as f64,
+    ) as u32;
     cfg
 }
 /// Implements config from env for the BOT runtime.

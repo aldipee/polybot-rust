@@ -514,6 +514,14 @@ impl BotRuntimeConfigSnapshotV1 {
             bad_regime_window_seconds: self.bad_regime_window_seconds,
             bad_regime_expensive_fraction: self.bad_regime_expensive_fraction,
             mean_reversion_tilt_fraction: self.mean_reversion_tilt_fraction,
+            post_repair_cooldown_cycles: 2,
+            repair_refresh_timeout_seconds: 6.0,
+            repair_price_zone_danger: 1.06,
+            repair_price_zone_stop_add: 1.03,
+            green_price_threshold: 0.99,
+            weak_edge_threshold: 0.03,
+            one_directional_threshold: 0.70,
+            one_directional_min_fills: 4,
         }
     }
 }

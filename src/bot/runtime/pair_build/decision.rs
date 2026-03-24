@@ -163,7 +163,7 @@ pub(in crate::bot) fn bot_runtime_pair_build_green_conditions(
     let both_sides_filled = q_yes > 1e-9 && q_no > 1e-9;
     let projected_unmatched_fraction =
         bot_runtime_projected_unmatched_fraction(mode, side, clip.max(0.0), q_yes, q_no);
-    let price_ok = effective_marginal_pair_cost + 1e-9 < 0.97;
+    let price_ok = effective_marginal_pair_cost + 1e-9 < cfg.green_price_threshold;
     let imbalance_ok = projected_unmatched_fraction + 1e-9 < cfg.imbalance_target_fraction;
     let time_ok = t_into_s + 1e-9 < 180.0;
     let budget_ok = remaining_budget + 1e-9 >= clip.max(0.0) * budget_reference_cost.max(0.0);
@@ -315,6 +315,8 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     tick_size: f64,
     cfg: &BotRuntimeConfigSnapshot,
     under_min_target: bool,
+    post_repair_cooldown_remaining: u32,
+    one_directional_detected: bool,
 ) -> Result<BotRuntimePairBuildDecision, String> {
     let min_lot = min_shares.max(1.0);
     let remaining_budget = (total_usable_budget.max(0.0) - total_cost.max(0.0)).max(0.0);
@@ -576,9 +578,15 @@ pub(in crate::bot) fn bot_runtime_pair_build_decision(
     let pair_budget_clip_cap = (remaining_budget / pair_sum.max(0.0001)).floor();
     let cpp_clip_cap =
         bot_runtime_growth_cpp_clip_cap(requested_clip, cfg, cpp_hint, under_min_target);
+    let cooldown_clip_cap = if post_repair_cooldown_remaining > 0 || one_directional_detected {
+        cfg.clip_ladder[0]
+    } else {
+        f64::INFINITY
+    };
     let final_clip_cap = large_allowed_clip_cap
         .min(cpp_clip_cap)
-        .min(pair_budget_clip_cap);
+        .min(pair_budget_clip_cap)
+        .min(cooldown_clip_cap);
     let Some((clip, selected_rung)) = bot_runtime_growth_clip_choice(final_clip_cap, cfg) else {
         return Err("budget_too_small".to_string());
     };
@@ -666,8 +674,13 @@ pub(in crate::bot) fn bot_runtime_await_second_fill_live_order_timeout_seconds(
 pub(in crate::bot) fn bot_runtime_pair_build_lighter_live_order_timeout_seconds(
     stale_seconds: f64,
     decision: &BotRuntimePairBuildDecision,
+    repair_refresh_timeout_seconds: f64,
 ) -> f64 {
-    let base = (stale_seconds.max(1.0) * 2.0).max(6.0);
+    let base = if repair_refresh_timeout_seconds > 0.0 {
+        repair_refresh_timeout_seconds.max(3.0)
+    } else {
+        (stale_seconds.max(1.0) * 2.0).max(6.0)
+    };
     if bot_runtime_pair_build_has_large_clip_intent(decision) {
         base.max(7.0)
     } else {

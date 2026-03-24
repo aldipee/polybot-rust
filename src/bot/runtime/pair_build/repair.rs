@@ -3,6 +3,7 @@ use super::costs::{
     bot_runtime_pair_build_price_zone_hold_reason,
     bot_runtime_pair_build_projected_paired_cost_band,
     bot_runtime_pair_build_projected_repair_inventory_vwap_sum,
+    bot_runtime_pair_build_repair_cost_band,
 };
 use super::decision::{
     bot_runtime_lighter_repair_opposite_order_policy,
@@ -508,11 +509,13 @@ impl MakerHedgeCapBot {
         _cost_no: f64,
         context: &BotRuntimePairBuildMarketContext,
         plan: &BotRuntimePairBuildPlan,
+        cfg: &BotRuntimeConfigSnapshot,
     ) {
         let decision = plan.decision;
         let lighter_live_timeout_s = bot_runtime_pair_build_lighter_live_order_timeout_seconds(
             self.cfg.stale_seconds as f64,
             &decision,
+            cfg.repair_refresh_timeout_seconds,
         );
         let price_tick = self.cfg.tick.max(0.0001);
         let active_side = decision.side.unwrap_or(OutcomeSide::Yes);
@@ -686,8 +689,17 @@ impl MakerHedgeCapBot {
                 return;
             }
         }
+        let effective_repair_price_zone = if decision.reduces_imbalance {
+            bot_runtime_pair_build_repair_cost_band(
+                decision.effective_marginal_pair_cost,
+                cfg.repair_price_zone_danger,
+                cfg.repair_price_zone_stop_add,
+            )
+        } else {
+            decision.price_zone
+        };
         if let Some(reason) = bot_runtime_pair_build_price_zone_hold_reason(
-            decision.price_zone,
+            effective_repair_price_zone,
             decision.marginal_cost_mode,
             decision.effective_marginal_pair_cost,
         ) {
@@ -731,7 +743,18 @@ impl MakerHedgeCapBot {
             };
             if filled_side_price > 0.0 && pg_y_bid > 0.0 && pg_n_bid > 0.0 {
                 let target_pair_sum = pg_y_bid + pg_n_bid;
-                let pair_economics_cap = target_pair_sum - filled_side_price;
+                let mut pair_economics_cap = target_pair_sum - filled_side_price;
+                // When repairing from HardDisable, allow bidding up to the filled side's price
+                let is_hard_disable = self
+                    .bot_runtime_state
+                    .lock()
+                    .map(|st| {
+                        matches!(st.imbalance_state, BotRuntimeImbalanceState::HardDisable)
+                    })
+                    .unwrap_or(false);
+                if is_hard_disable {
+                    pair_economics_cap = pair_economics_cap.max(filled_side_price);
+                }
                 let tick = self.cfg.tick.max(0.0001);
                 let max_adverse_spread = (tick * 3.0).max(0.03);
                 let spread_floor = active_bid - max_adverse_spread;

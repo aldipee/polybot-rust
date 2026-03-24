@@ -342,6 +342,11 @@ pub(in crate::bot) struct BotRuntimeState {
     pub(in crate::bot) no_refresh_cap_block_count: u32,
     pub(in crate::bot) audit_decision_event_count: u32,
     pub(in crate::bot) audit_runtime_event_count: u32,
+    pub(in crate::bot) post_repair_cooldown_remaining: u32,
+    pub(in crate::bot) one_sided_yes_heavy_transitions: u32,
+    pub(in crate::bot) one_sided_no_heavy_transitions: u32,
+    pub(in crate::bot) one_directional_detected: bool,
+    pub(in crate::bot) last_fill_t_into_s: f64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::bot) struct BotRuntimePreArmStatus {
@@ -678,6 +683,10 @@ pub(in crate::bot) struct BotRuntimeMetricsSnapshot {
     pub(in crate::bot) no_refresh_cap_block_count: u32,
     pub(in crate::bot) audit_decision_event_count: u32,
     pub(in crate::bot) audit_runtime_event_count: u32,
+    pub(in crate::bot) idle_before_settlement: f64,
+    pub(in crate::bot) one_directional_detected: bool,
+    pub(in crate::bot) one_sided_yes_heavy: u32,
+    pub(in crate::bot) one_sided_no_heavy: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::bot) struct BotRuntimeBudgetSnapshot {

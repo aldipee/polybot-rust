@@ -909,6 +909,7 @@ impl MakerHedgeCapBot {
             state.c_yes,
             state.c_no,
             state.c_yes + state.c_no,
+            0.0,
         );
         let (phase, owner, safety_gate, safety_gate_reason) = self
             .bot_runtime_state

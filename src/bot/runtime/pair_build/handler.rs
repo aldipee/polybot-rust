@@ -18,6 +18,11 @@ impl MakerHedgeCapBot {
         budget_snapshot: BotRuntimeBudgetSnapshot,
         cfg: &BotRuntimeConfigSnapshot,
     ) -> Result<BotRuntimePairBuildPlan, String> {
+        let (cooldown_remaining, one_dir_detected) = self
+            .bot_runtime_state
+            .lock()
+            .map(|st| (st.post_repair_cooldown_remaining, st.one_directional_detected))
+            .unwrap_or((0, false));
         let mut decision = bot_runtime_pair_build_decision(
             t_into_s,
             q_yes,
@@ -35,6 +40,8 @@ impl MakerHedgeCapBot {
             self.cfg.tick.max(0.0001),
             cfg,
             budget_snapshot.under_min_target,
+            cooldown_remaining,
+            one_dir_detected,
         )?;
         decision = bot_runtime_pair_build_apply_tail_repair_priority(
             decision,
@@ -554,7 +561,7 @@ impl MakerHedgeCapBot {
         }
         if plan.decision.mode == BotRuntimePairBuildMode::LighterSideFirst {
             self._bot_runtime_pair_build_handle_lighter_side_repair(
-                now, t_into_s, total_cost, q_yes, q_no, cost_yes, cost_no, &context, &plan,
+                now, t_into_s, total_cost, q_yes, q_no, cost_yes, cost_no, &context, &plan, cfg,
             );
             return;
         }

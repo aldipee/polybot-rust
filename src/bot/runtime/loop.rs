@@ -30,6 +30,29 @@ impl MakerHedgeCapBot {
             if previous_state != next_state {
                 st.imbalance_state = next_state;
                 st.imbalance_state_enter_ts = now;
+                if previous_state == BotRuntimeImbalanceState::HardDisable
+                    && next_state != BotRuntimeImbalanceState::HardDisable
+                {
+                    st.post_repair_cooldown_remaining = cfg.post_repair_cooldown_cycles;
+                }
+                if matches!(previous_state, BotRuntimeImbalanceState::Normal)
+                    && matches!(
+                        next_state,
+                        BotRuntimeImbalanceState::Warning
+                            | BotRuntimeImbalanceState::HardDisable
+                    )
+                {
+                    if q_yes > q_no + 1e-9 {
+                        st.one_sided_yes_heavy_transitions += 1;
+                    } else if q_no > q_yes + 1e-9 {
+                        st.one_sided_no_heavy_transitions += 1;
+                    }
+                    let total_one_sided =
+                        st.one_sided_yes_heavy_transitions + st.one_sided_no_heavy_transitions;
+                    if total_one_sided >= cfg.one_directional_min_fills {
+                        st.one_directional_detected = true;
+                    }
+                }
                 self.logger.info(&format!(
                     "[BOT] pair_id={} imbalance_state {} -> {} unmatched_fraction={:.3} match_ratio={:.3} qYES={:.2} qNO={:.2}",
                     pair_id,
@@ -67,8 +90,13 @@ impl MakerHedgeCapBot {
             .lock()
             .map(|st| st.clone())
             .unwrap_or_default();
+        let metrics_t_into = if state.open_confirmed_ts > 0.0 {
+            (now_ts_f64() - state.open_confirmed_ts).max(0.0)
+        } else {
+            0.0
+        };
         let metrics =
-            bot_runtime_metrics_snapshot(&state, q_yes, q_no, cost_yes, cost_no, total_cost);
+            bot_runtime_metrics_snapshot(&state, q_yes, q_no, cost_yes, cost_no, total_cost, metrics_t_into);
         let combined_avg_paid = if metrics.inventory_vwap_sum.is_finite() {
             format!("{:.3}", metrics.inventory_vwap_sum)
         } else {
@@ -122,7 +150,7 @@ impl MakerHedgeCapBot {
         let new_orders_after_stop_label =
             bot_runtime_late_metric_label("new_orders", cfg.late_stop_new_orders_start_seconds);
         self.logger.info(&format!(
-            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} taker_fill_events={} taker_fill_shares={:.2} pair_taker_share={:.3} daily_maker_fill_shares={:.2} daily_taker_fill_shares={:.2} daily_taker_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} refresh_cycles_yes={} refresh_cycles_no={} refresh_cap_blocks_yes={} refresh_cap_blocks_no={} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} audit_decision_events={} audit_runtime_events={} {}={} {}={} {}={} {}={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={}",
+            "[BOT][METRICS] pair_id={} exit_reason={} market_participated={} market_participation={:.3} fills_per_market={} total_fill_shares={:.2} maker_fill_share={:.3} taker_fill_events={} taker_fill_shares={:.2} pair_taker_share={:.3} daily_maker_fill_shares={:.2} daily_taker_fill_shares={:.2} daily_taker_share={:.3} fill_events_by_segment={} fill_shares_by_segment={} paired_size={:.2} unmatched_size={:.2} unmatched_fraction={:.3} match_ratio={:.3} imbalance_state={} pair_coverage={:.3} share_skew={:.3} combined_avg_paid={} paired_cost_band_occupancy={} paired_cost_band_occupancy_rate={} paired_size_delta_by_state={} below_snapshot_optional_submit_count={} below_snapshot_optional_submit_shares={:.2} below_snapshot_optional_fill_count={} below_snapshot_optional_fill_shares={:.2} below_snapshot_optional_fill_rate={:.3} refresh_cycles_yes={} refresh_cycles_no={} refresh_cap_blocks_yes={} refresh_cap_blocks_no={} tail_at_expiry={:.2} worst_case_settlement_floor={:+.2} bad_regime_expensive_ratio={:.3} bad_regime_shutdown={} canary_success={} canary_failure_summary={} audit_decision_events={} audit_runtime_events={} {}={} {}={} {}={} {}={} prearm_ready_before_open={} seed_anchor_t_into={} first_yes_seed_submit_t_into={} first_no_seed_submit_t_into={} seed_by_5s_met={} late_seed_used={} seed_submit_delta_ms={} seed_submit_delta_met={} second_side_by_15s={} second_side_by_30s={} first_fill_to_second_fill_ms={} await_second_fill_rescue_used={} await_second_fill_hard_paused={} skipped_optional_adds={} repair_reserve_blocks={} floor_tail_blocks={} startup_completion_blocked={} idle_before_settlement={:.1} one_directional_detected={} one_sided_yes_heavy={} one_sided_no_heavy={}",
             pair_id,
             exit_reason,
             metrics.market_participated,
@@ -190,7 +218,11 @@ impl MakerHedgeCapBot {
             metrics.skipped_optional_add_count,
             metrics.repair_reserve_blocked_count,
             metrics.floor_tail_blocked_count,
-            metrics.startup_completion_blocked_count
+            metrics.startup_completion_blocked_count,
+            metrics.idle_before_settlement,
+            metrics.one_directional_detected,
+            metrics.one_sided_yes_heavy,
+            metrics.one_sided_no_heavy
         ));
     }
 

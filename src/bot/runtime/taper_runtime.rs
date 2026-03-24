@@ -335,6 +335,8 @@ impl MakerHedgeCapBot {
             self.cfg.tick.max(0.0001),
             cfg,
             false,
+            0,
+            false,
         )
         .map(|decision| {
             bot_runtime_taper_maintenance_decision(
