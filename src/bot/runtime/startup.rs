@@ -52,6 +52,13 @@ impl MakerHedgeCapBot {
             cfg.bad_regime_window_seconds,
             cfg.bad_regime_expensive_fraction
         ));
+        if (cfg.mean_reversion_tilt_fraction - 0.50).abs() > 1e-9 {
+            self.logger.info(&format!(
+                "[BOT][CFG] mean_reversion_tilt_fraction={:.2} (underdog side gets {:.0}% of clip shares)",
+                cfg.mean_reversion_tilt_fraction,
+                cfg.mean_reversion_tilt_fraction * 100.0
+            ));
+        }
     }
     /// Implements quote input status for the BOT runtime.
     /// This helper coordinates BOT phase routing, runtime state transitions, or metrics for the
@@ -878,8 +885,17 @@ impl MakerHedgeCapBot {
         }
         self._set_pending_entry_reason("BOT_OPEN_BOTH");
         let submit_started = now_ts_f64();
-        let (y_oid, n_oid) = self._maker_submit_pair_orders(
+        let tick_size = self.cfg.tick.max(0.0001);
+        let (_, seed_underdog_side) =
+            bot_runtime_favorite_underdog_sides(y_bid, n_bid, tick_size);
+        let (y_seed, n_seed) = bot_runtime_mean_reversion_clip_pair(
             size_int,
+            cfg.mean_reversion_tilt_fraction,
+            seed_underdog_side,
+        );
+        let (y_oid, n_oid) = self._maker_submit_pair_orders_asymmetric(
+            y_seed,
+            n_seed,
             y_bid,
             n_bid,
             "GTC",

@@ -902,8 +902,14 @@ impl MakerHedgeCapBot {
         let prev_no_slot = no_slot;
         self._set_pending_entry_reason("BOT_TAPER");
         let submit_started = now_ts_f64();
-        let (y_oid, n_oid) = self._maker_submit_pair_orders(
-            decision.clip,
+        let (y_clip, n_clip) = bot_runtime_mean_reversion_clip_pair(
+            decision.clip as i64,
+            cfg.mean_reversion_tilt_fraction,
+            decision.underdog_side,
+        );
+        let (y_oid, n_oid) = self._maker_submit_pair_orders_asymmetric(
+            y_clip,
+            n_clip,
             y_bid,
             n_bid,
             "GTC",

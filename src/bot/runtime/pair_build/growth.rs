@@ -302,8 +302,14 @@ impl MakerHedgeCapBot {
                 .and_then(|row| row.order_id)
         });
         let submit_started = now_ts_f64();
-        let (y_oid, n_oid) = self._maker_submit_pair_orders(
-            decision.clip,
+        let (y_clip, n_clip) = bot_runtime_mean_reversion_clip_pair(
+            decision.clip as i64,
+            cfg.mean_reversion_tilt_fraction,
+            decision.underdog_side,
+        );
+        let (y_oid, n_oid) = self._maker_submit_pair_orders_asymmetric(
+            y_clip,
+            n_clip,
             context.y_bid,
             context.n_bid,
             "GTC",

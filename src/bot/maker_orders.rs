@@ -2090,10 +2090,24 @@ impl MakerHedgeCapBot {
         post_only: Option<bool>,
         origin: &str,
     ) -> (Option<String>, Option<String>) {
-        if size_int <= 0 {
+        self._maker_submit_pair_orders_asymmetric(size_int, size_int, y_px, n_px, order_type, post_only, origin)
+    }
+
+    pub(super) fn _maker_submit_pair_orders_asymmetric(
+        &self,
+        y_size_int: i64,
+        n_size_int: i64,
+        y_px: f64,
+        n_px: f64,
+        order_type: &str,
+        post_only: Option<bool>,
+        origin: &str,
+    ) -> (Option<String>, Option<String>) {
+        if y_size_int <= 0 || n_size_int <= 0 {
             return (None, None);
         }
-        let qty = size_int as f64;
+        let y_raw_qty = y_size_int as f64;
+        let n_raw_qty = n_size_int as f64;
         let tick_size = Self::_tick_size_from_f64(self.cfg.tick.max(0.0001));
         let (yes, no) = match (&self.yes_asset, &self.no_asset) {
             (Some(y), Some(n)) => (y.as_str(), n.as_str()),
@@ -2105,14 +2119,14 @@ impl MakerHedgeCapBot {
         let track_taker_fallback = pair_submit_tracks_taker_fallback(&resolved);
         let use_limit_precision = matches!(resolved.as_str(), "GTC" | "GTD");
         let y_qty = if use_limit_precision {
-            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, y_px, qty, tick_size)
+            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, y_px, y_raw_qty, tick_size)
         } else {
-            qty
+            y_raw_qty
         };
         let n_qty = if use_limit_precision {
-            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, n_px, qty, tick_size)
+            Self::_maker_limit_exchange_quantized_size(ClobSide::Buy, n_px, n_raw_qty, tick_size)
         } else {
-            qty
+            n_raw_qty
         };
         if y_qty <= 0.0 || n_qty <= 0.0 {
             return (None, None);

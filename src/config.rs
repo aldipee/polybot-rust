@@ -420,6 +420,12 @@ pub struct BotRuntimeConfigSnapshotV1 {
     pub tail_cap_late_fraction: f64,
     pub bad_regime_window_seconds: f64,
     pub bad_regime_expensive_fraction: f64,
+    #[serde(default = "default_mean_reversion_tilt_fraction")]
+    pub mean_reversion_tilt_fraction: f64,
+}
+
+fn default_mean_reversion_tilt_fraction() -> f64 {
+    0.55
 }
 
 fn default_imbalance_recovery_fraction() -> f64 {
@@ -464,6 +470,7 @@ impl From<&BotRuntimeConfigSnapshot> for BotRuntimeConfigSnapshotV1 {
             tail_cap_late_fraction: value.tail_cap_late_fraction,
             bad_regime_window_seconds: value.bad_regime_window_seconds,
             bad_regime_expensive_fraction: value.bad_regime_expensive_fraction,
+            mean_reversion_tilt_fraction: value.mean_reversion_tilt_fraction,
         }
     }
 }
@@ -506,6 +513,7 @@ impl BotRuntimeConfigSnapshotV1 {
             tail_cap_late_fraction: self.tail_cap_late_fraction,
             bad_regime_window_seconds: self.bad_regime_window_seconds,
             bad_regime_expensive_fraction: self.bad_regime_expensive_fraction,
+            mean_reversion_tilt_fraction: self.mean_reversion_tilt_fraction,
         }
     }
 }

@@ -36,6 +36,7 @@ pub(crate) struct BotRuntimeConfigSnapshot {
     pub(crate) tail_cap_late_fraction: f64,
     pub(crate) bad_regime_window_seconds: f64,
     pub(crate) bad_regime_expensive_fraction: f64,
+    pub(crate) mean_reversion_tilt_fraction: f64,
 }
 /// Implements config defaults for the BOT runtime.
 /// This is a pure BOT runtime helper used for configuration, policy, or metrics calculations.
@@ -77,6 +78,7 @@ pub(crate) fn bot_runtime_config_defaults() -> BotRuntimeConfigSnapshot {
         tail_cap_late_fraction: 0.02,
         bad_regime_window_seconds: 120.0,
         bad_regime_expensive_fraction: 0.60,
+        mean_reversion_tilt_fraction: 0.55,
     }
 }
 /// Implements env float for the BOT runtime.
@@ -340,6 +342,12 @@ where
         "BOT_BAD_REGIME_EXPENSIVE_FRACTION",
         cfg.bad_regime_expensive_fraction,
     );
+    cfg.mean_reversion_tilt_fraction = bot_runtime_env_float(
+        &mut get,
+        "BOT_MEAN_REVERSION_TILT_FRACTION",
+        cfg.mean_reversion_tilt_fraction,
+    )
+    .clamp(0.50, 0.70);
     cfg
 }
 /// Implements config from env for the BOT runtime.

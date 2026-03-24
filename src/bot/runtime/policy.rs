@@ -481,3 +481,36 @@ pub(in crate::bot) fn bot_runtime_budget_snapshot(
         under_min_target: cost + 1e-9 < cumulative_min_cost,
     }
 }
+/// Computes asymmetric per-side clip sizes for mean-reversion tilt.
+///
+/// Given a base clip and a tilt fraction (e.g. 0.55), returns (yes_clip, no_clip) such that
+/// the underdog side (cheaper bid) gets `tilt_fraction` of the total shares and the favorite
+/// side gets `1 - tilt_fraction`. When `tilt_fraction == 0.50` or `underdog_side` is None,
+/// both sides get the base clip unchanged.
+///
+/// The total shares across both sides is always `2 * base_clip` (before rounding). Each side
+/// is rounded to the nearest integer with a minimum of 1.
+pub(in crate::bot) fn bot_runtime_mean_reversion_clip_pair(
+    base_clip: i64,
+    tilt_fraction: f64,
+    underdog_side: Option<OutcomeSide>,
+) -> (i64, i64) {
+    if base_clip <= 0 {
+        return (0, 0);
+    }
+    let frac = tilt_fraction.clamp(0.50, 0.70);
+    let underdog = match underdog_side {
+        Some(side) => side,
+        None => return (base_clip, base_clip),
+    };
+    if (frac - 0.50).abs() < 1e-9 {
+        return (base_clip, base_clip);
+    }
+    let total = 2.0 * base_clip as f64;
+    let tilt_shares = (total * frac).round().max(1.0) as i64;
+    let anti_shares = (total * (1.0 - frac)).round().max(1.0) as i64;
+    match underdog {
+        OutcomeSide::Yes => (tilt_shares, anti_shares),
+        OutcomeSide::No => (anti_shares, tilt_shares),
+    }
+}

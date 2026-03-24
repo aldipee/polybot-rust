@@ -5871,3 +5871,60 @@ fn await_second_fill_rescue_hard_pauses_when_taker_cap_is_breached() {
     assert!(!runtime_state.await_second_fill_rescue_used);
     assert!(runtime_state.await_second_fill_hard_paused);
 }
+
+#[test]
+fn mean_reversion_tilt_default_is_fifty_five_percent() {
+    let cfg = bot_runtime_config_defaults();
+    assert!((cfg.mean_reversion_tilt_fraction - 0.55).abs() < 1e-9);
+}
+
+#[test]
+fn mean_reversion_clip_pair_neutral_when_no_underdog() {
+    let (y, n) = bot_runtime_mean_reversion_clip_pair(12, 0.55, None);
+    assert_eq!(y, 12);
+    assert_eq!(n, 12);
+}
+
+#[test]
+fn mean_reversion_clip_pair_neutral_at_fifty_percent() {
+    let (y, n) = bot_runtime_mean_reversion_clip_pair(12, 0.50, Some(OutcomeSide::Yes));
+    assert_eq!(y, 12);
+    assert_eq!(n, 12);
+}
+
+#[test]
+fn mean_reversion_clip_pair_tilts_toward_underdog_yes() {
+    // underdog=YES means YES gets more shares
+    let (y, n) = bot_runtime_mean_reversion_clip_pair(12, 0.55, Some(OutcomeSide::Yes));
+    assert!(y > n, "YES (underdog) should get more: y={y} n={n}");
+    // total should be 2*12=24, split 55/45 → 13/11
+    assert_eq!(y + n, 24);
+    assert_eq!(y, 13);
+    assert_eq!(n, 11);
+}
+
+#[test]
+fn mean_reversion_clip_pair_tilts_toward_underdog_no() {
+    // underdog=NO means NO gets more shares
+    let (y, n) = bot_runtime_mean_reversion_clip_pair(12, 0.55, Some(OutcomeSide::No));
+    assert!(n > y, "NO (underdog) should get more: y={y} n={n}");
+    assert_eq!(y + n, 24);
+    assert_eq!(y, 11);
+    assert_eq!(n, 13);
+}
+
+#[test]
+fn mean_reversion_clip_pair_clamps_extreme_fractions() {
+    // fraction > 0.70 gets clamped to 0.70
+    let (y, n) = bot_runtime_mean_reversion_clip_pair(10, 0.90, Some(OutcomeSide::Yes));
+    // clamped to 0.70: total=20, tilt=14, anti=6
+    assert_eq!(y, 14);
+    assert_eq!(n, 6);
+}
+
+#[test]
+fn mean_reversion_clip_pair_handles_zero_clip() {
+    let (y, n) = bot_runtime_mean_reversion_clip_pair(0, 0.55, Some(OutcomeSide::Yes));
+    assert_eq!(y, 0);
+    assert_eq!(n, 0);
+}
