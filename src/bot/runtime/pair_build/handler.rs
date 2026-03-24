@@ -55,7 +55,16 @@ impl MakerHedgeCapBot {
             decision.marginal_cost_mode,
             decision.effective_marginal_pair_cost,
         ) {
-            return Err(reason);
+            // During HardDisable, allow lighter-side repair regardless of price zone;
+            // the bid cap in the repair handler still prevents overpaying.
+            let hard_disable_repair = decision.mode == BotRuntimePairBuildMode::LighterSideFirst
+                && matches!(
+                    decision.imbalance_state,
+                    BotRuntimeImbalanceState::HardDisable
+                );
+            if !hard_disable_repair {
+                return Err(reason);
+            }
         }
         if let Some(reason) = bot_runtime_pair_build_residual_direction_hold_reason(&decision) {
             return Err(reason);

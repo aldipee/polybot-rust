@@ -691,16 +691,23 @@ impl MakerHedgeCapBot {
             decision.marginal_cost_mode,
             decision.effective_marginal_pair_cost,
         ) {
-            self._bot_runtime_log_pair_build_state(
-                "hold",
-                &reason,
-                Some(decision),
-                t_into_s,
-                total_cost,
-                q_yes,
-                q_no,
-            );
-            return;
+            // During HardDisable, allow lighter-side repair regardless of price zone;
+            // the bid cap below still prevents overpaying.
+            if !matches!(
+                decision.imbalance_state,
+                BotRuntimeImbalanceState::HardDisable
+            ) {
+                self._bot_runtime_log_pair_build_state(
+                    "hold",
+                    &reason,
+                    Some(decision),
+                    t_into_s,
+                    total_cost,
+                    q_yes,
+                    q_no,
+                );
+                return;
+            }
         }
         let (repair_bid_capped, repair_original_bid) = {
             let (pg_y_bid, pg_n_bid) = self

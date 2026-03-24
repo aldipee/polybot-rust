@@ -1487,6 +1487,35 @@ fn tail_rewrite_price_zone_hold_cancels_live_pair_build_lighter_order() {
 }
 
 #[test]
+fn hard_disable_bypasses_price_zone_for_lighter_side_repair() {
+    let mut bot = make_pair_build_test_bot();
+    bot.cfg.max_total_cost = 500.0;
+    // n_bid=0.70 is high enough that rebalance_add marginal cost will be in danger zone
+    set_quotes(&bot, 0.30, 0.32, 0.70, 0.72);
+    // Set runtime imbalance state to HardDisable
+    if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
+        runtime_state.imbalance_state = BotRuntimeImbalanceState::HardDisable;
+    }
+
+    let cfg = *bot._bot_runtime_cfg();
+    // q_yes=40, q_no=20 -> fraction=20/60=0.333 -> HardDisable
+    // lighter side=NO, residual_unit_cost=cost_yes/q_yes=16.0/40=0.40
+    // effective_marginal=0.40+0.70=1.10 -> Danger zone
+    // Without bypass: would be blocked by price_zone_danger
+    // With bypass: repair order should be placed on NO side
+    bot._bot_runtime_pair_build_handler(40.0, 40.0, 0.0, 40.0, 20.0, 16.0, 6.0, &cfg);
+
+    let state = bot.state.lock().expect("bot state");
+    // Repair order should be submitted on the lighter (NO) side despite danger zone
+    assert!(
+        state.open_orders.contains_key("no_asset_id"),
+        "expected lighter-side repair order on NO despite price_zone_danger during HardDisable"
+    );
+    // Growth orders should NOT be placed on the heavier (YES) side
+    assert!(!state.open_orders.contains_key("yes_asset_id"));
+}
+
+#[test]
 fn hard_disable_cancels_lingering_open_both_orders_before_returning() {
     let bot = make_pair_build_test_bot();
     if let Ok(mut runtime_state) = bot.bot_runtime_state.lock() {
