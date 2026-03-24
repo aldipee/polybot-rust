@@ -2098,7 +2098,10 @@ impl MakerHedgeCapBot {
         };
         // Cap the missing side bid to preserve structural edge (combined VWAP < 0.97).
         // If the filled side has a known VWAP, cap missing_bid so that
-        // filled_side_vwap + missing_bid <= 0.97 (3% structural edge target).
+        // filled_side_vwap + missing_bid <= 1.00 (at-par StopAdd boundary).
+        // During startup AwaitSecondFill the bot has already committed to one
+        // side and must complete the pair — blocking at 0.97 leaves a naked
+        // position.  Paired growth will enforce the tighter Caution threshold.
         let capped_missing_bid = {
             let (filled_qty, filled_cost) = match missing_side {
                 OutcomeSide::Yes => (q_no, cost_no),
@@ -2106,10 +2109,10 @@ impl MakerHedgeCapBot {
             };
             if filled_qty > 1e-9 {
                 let filled_vwap = filled_cost / filled_qty;
-                let max_missing_price = (0.97 - filled_vwap).max(0.01);
+                let max_missing_price = (1.00 - filled_vwap).max(0.01);
                 if missing_bid > max_missing_price {
                     self.logger.info(&format!(
-                        "[BOT][AWAIT_SECOND_FILL] pair_id={} capping missing_bid from {:.3} to {:.3} (filled_vwap={:.3} edge_cap=0.97)",
+                        "[BOT][AWAIT_SECOND_FILL] pair_id={} capping missing_bid from {:.3} to {:.3} (filled_vwap={:.3} edge_cap=1.00)",
                         pair_id, missing_bid, max_missing_price, filled_vwap,
                     ));
                 }
