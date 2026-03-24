@@ -91,13 +91,13 @@ pub(in crate::bot) fn bot_runtime_pair_build_projected_inventory_vwap_sum(
 pub(in crate::bot) fn bot_runtime_pair_build_projected_paired_cost_band(
     projected_paired_cost: f64,
 ) -> BotRuntimePairedCostBand {
-    if !projected_paired_cost.is_finite() || projected_paired_cost >= 1.05 - 1e-9 {
+    if !projected_paired_cost.is_finite() || projected_paired_cost >= 1.03 - 1e-9 {
         BotRuntimePairedCostBand::Danger
-    } else if projected_paired_cost >= 1.02 - 1e-9 {
+    } else if projected_paired_cost >= 1.00 - 1e-9 {
         BotRuntimePairedCostBand::StopAdd
-    } else if projected_paired_cost >= 0.99 - 1e-9 {
+    } else if projected_paired_cost >= 0.97 - 1e-9 {
         BotRuntimePairedCostBand::Caution
-    } else if projected_paired_cost >= 0.96 - 1e-9 {
+    } else if projected_paired_cost >= 0.94 - 1e-9 {
         BotRuntimePairedCostBand::Acceptable
     } else {
         BotRuntimePairedCostBand::Preferred

@@ -166,19 +166,19 @@ fn bot_runtime_pair_build_clip_bucket_boundaries() {
 #[test]
 fn bot_runtime_pair_build_paired_cost_band_transitions() {
     assert_eq!(
-        bot_runtime_pair_build_projected_paired_cost_band(1.05),
+        bot_runtime_pair_build_projected_paired_cost_band(1.03),
         BotRuntimePairedCostBand::Danger
     );
     assert_eq!(
-        bot_runtime_pair_build_projected_paired_cost_band(1.03),
+        bot_runtime_pair_build_projected_paired_cost_band(1.00),
         BotRuntimePairedCostBand::StopAdd
     );
     assert_eq!(
-        bot_runtime_pair_build_projected_paired_cost_band(1.00),
+        bot_runtime_pair_build_projected_paired_cost_band(0.97),
         BotRuntimePairedCostBand::Caution
     );
     assert_eq!(
-        bot_runtime_pair_build_projected_paired_cost_band(0.97),
+        bot_runtime_pair_build_projected_paired_cost_band(0.94),
         BotRuntimePairedCostBand::Acceptable
     );
     assert_eq!(
@@ -190,14 +190,14 @@ fn bot_runtime_pair_build_paired_cost_band_transitions() {
 #[test]
 fn pair_build_price_zone_invariant_blocks_all_adds_at_or_above_one_for_both_modes() {
     let blocking_cases = [
-        (1.02, BotRuntimePairedCostBand::StopAdd),
-        (1.020_001, BotRuntimePairedCostBand::StopAdd),
-        (1.049, BotRuntimePairedCostBand::StopAdd),
-        (1.049_999, BotRuntimePairedCostBand::StopAdd),
-        (1.05, BotRuntimePairedCostBand::Danger),
+        (1.00, BotRuntimePairedCostBand::StopAdd),
+        (1.000_001, BotRuntimePairedCostBand::StopAdd),
+        (1.029, BotRuntimePairedCostBand::StopAdd),
+        (1.029_999, BotRuntimePairedCostBand::StopAdd),
+        (1.03, BotRuntimePairedCostBand::Danger),
         (1.20, BotRuntimePairedCostBand::Danger),
     ];
-    let non_blocking_cases = [0.90, 0.96, 0.99, 1.019];
+    let non_blocking_cases = [0.90, 0.94, 0.97, 0.999];
 
     for mode in [
         BotRuntimeMarginalCostMode::BalancedAdd,
@@ -254,13 +254,14 @@ fn pair_build_decision_surfaces_balanced_add_stop_add_zone_for_runtime_gating() 
 #[test]
 fn pair_build_decision_allows_balanced_add_below_one_even_with_high_inventory_vwap() {
     let cfg = bot_runtime_config_defaults();
+    // pair_sum = 0.50 + 0.50 = 1.00 -> StopAdd zone (>= 1.00)
     let decision = bot_runtime_pair_build_decision(
         60.0, 20.0, 20.0, 10.4, 10.4, 0.50, 0.52, 0.50, 0.52, 80.0, 20.8, 1.0, 1.0, 0.01, &cfg,
         false,
     )
-    .expect("caution-zone balanced add should remain legal");
+    .expect("decision should still be computed even in stop-add zone");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::PairedGrowth);
-    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::Caution);
+    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::StopAdd);
     assert_eq!(
         decision.marginal_cost_mode,
         BotRuntimeMarginalCostMode::BalancedAdd
@@ -277,7 +278,7 @@ fn pair_build_decision_uses_rebalance_effective_marginal_pair_cost() {
     .expect("sub-one rebalance add should remain legal");
     assert_eq!(decision.mode, BotRuntimePairBuildMode::LighterSideFirst);
     assert_eq!(decision.side, Some(OutcomeSide::No));
-    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::Preferred);
+    assert_eq!(decision.price_zone, BotRuntimePairedCostBand::Acceptable);
     assert_eq!(
         decision.marginal_cost_mode,
         BotRuntimeMarginalCostMode::RebalanceAdd
