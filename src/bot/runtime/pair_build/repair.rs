@@ -693,10 +693,15 @@ impl MakerHedgeCapBot {
         ) {
             // During HardDisable, allow lighter-side repair regardless of price zone;
             // the bid cap below still prevents overpaying.
-            if !matches!(
-                decision.imbalance_state,
-                BotRuntimeImbalanceState::HardDisable
-            ) {
+            // Use the sticky runtime state (not the raw fraction-based state in the decision)
+            // so this also covers the hysteresis band where fraction is between recovery
+            // and disable thresholds.
+            let runtime_hard_disable = self
+                .bot_runtime_state
+                .lock()
+                .map(|st| matches!(st.imbalance_state, BotRuntimeImbalanceState::HardDisable))
+                .unwrap_or(false);
+            if !runtime_hard_disable {
                 self._bot_runtime_log_pair_build_state(
                     "hold",
                     &reason,
